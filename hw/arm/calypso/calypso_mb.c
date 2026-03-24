@@ -1,20 +1,6 @@
 /*
  * calypso_mb.c - Calypso development board machine
- *
- * Complete machine definition with:
- * - ARM946E-S CPU
- * - Calypso SoC (with all integrated peripherals)
- * - External RAM (8 MiB at 0x01000000)
- * - Flash memory (4 MiB NOR at 0x02000000)
- * - Firmware loading support
- *
- * Usage:
- *   qemu-system-arm -M calypso \
- *     -cpu arm946 \
- *     -kernel loader.highram.elf \
- *     -serial pty \
- *     -monitor stdio \
- *     -nographic
+ * DEBUG BUILD — verbose flash/memory debug
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -39,43 +25,21 @@
 
 #include "hw/arm/calypso/calypso_soc.h"
 
-/* ========================================================================
- * Memory map (board-level, external to SoC)
- * ======================================================================== */
-
-/* External RAM */
 #define CALYPSO_XRAM_BASE     0x01000000
 #define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
 
-/* Flash */
-#define CALYPSO_FLASH_BASE    0x02000000
+#define CALYPSO_FLASH_BASE    0x00000000
 #define CALYPSO_FLASH_SIZE    (4 * 1024 * 1024)
-
-/* ========================================================================
- * Machine state
- * ======================================================================== */
 
 typedef struct CalypsoMachineState {
     MachineState parent;
-
     ARMCPU *cpu;
     CalypsoSoCState soc;
-
-    /* External memory */
     MemoryRegion xram;
-    MemoryRegion flash;
-
-    /* Memory aliases for boot/high vectors */
-    MemoryRegion ram_alias0;
-    MemoryRegion high_vectors;
 } CalypsoMachineState;
 
 #define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
 OBJECT_DECLARE_SIMPLE_TYPE(CalypsoMachineState, CALYPSO_MACHINE)
-
-/* ========================================================================
- * Machine initialization
- * ======================================================================== */
 
 static void calypso_machine_init(MachineState *machine)
 {
@@ -84,90 +48,76 @@ static void calypso_machine_init(MachineState *machine)
     Object *cpuobj;
     Error *err = NULL;
 
-    /* -------------------------------------------------
-     * CPU: ARM946E-S
-     * ------------------------------------------------- */
+    fprintf(stderr, "[MB] === calypso_machine_init START ===\n");
+
+    /* ---- CPU ---- */
     cpuobj = object_new(machine->cpu_type);
     s->cpu = ARM_CPU(cpuobj);
-
     if (!qdev_realize(DEVICE(cpuobj), NULL, &err)) {
         error_report_err(err);
         exit(1);
     }
 
-    /* -------------------------------------------------
-     * SoC
-     * ------------------------------------------------- */
+    /* ---- SoC ---- */
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_CALYPSO_SOC);
-
     qdev_prop_set_int32(DEVICE(&s->soc.parent_obj), "trx-port", 4729);
     qdev_prop_set_bit(DEVICE(&s->soc.parent_obj), "enable-trx", true);
-
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->soc), &err)) {
         error_report_err(err);
         exit(1);
     }
 
-    /* -------------------------------------------------
-     * IRQ / FIQ vers CPU
-     * ------------------------------------------------- */
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc), 0,
         qdev_get_gpio_in(DEVICE(&s->cpu->parent_obj), ARM_CPU_IRQ));
-
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc), 1,
         qdev_get_gpio_in(DEVICE(&s->cpu->parent_obj), ARM_CPU_FIQ));
 
-    /* -------------------------------------------------
-     * External RAM : 8 MiB @ 0x01000000
-     * ------------------------------------------------- */
+    /* ---- External RAM ---- */
     memory_region_init_ram(&s->xram,
                            OBJECT(&s->soc.parent_obj),
                            "calypso.xram",
                            CALYPSO_XRAM_SIZE,
                            &error_fatal);
-
     memory_region_add_subregion(sysmem, CALYPSO_XRAM_BASE, &s->xram);
+    fprintf(stderr, "[MB] XRAM @ 0x%08x (%d MiB)\n",
+            CALYPSO_XRAM_BASE, CALYPSO_XRAM_SIZE / (1024*1024));
 
-    /* -------------------------------------------------
-     * Flash NOR
-     * ------------------------------------------------- */
+    /* ---- Flash NOR @ 0x00000000 ----
+     *
+     * Real Compal E88: Intel 28F320 (4 MiB) on CS0 at 0x00000000.
+     * 16-bit bus width (Calypso CS0 is 16-bit).
+     * Manufacturer 0x0089 = Intel, Device 0x0018 = 28F320J3.
+     * 64 KiB sectors.
+     *
+     * The loader does CFI queries here. If there's no pflash or
+     * something else shadows this address, we get "Failed to
+     * initialize flash!".
+     */
     DriveInfo *dinfo = drive_get(IF_PFLASH, 0, 0);
+
+    fprintf(stderr, "[MB] Flash: registering pflash_cfi01 @ 0x%08x\n",
+            CALYPSO_FLASH_BASE);
+    fprintf(stderr, "[MB]   size=%d MiB, sector=64K, width=2 (16-bit)\n",
+            CALYPSO_FLASH_SIZE / (1024*1024));
+    fprintf(stderr, "[MB]   mfr=0x0089 (Intel), dev=0x0018 (28F320J3)\n");
+    fprintf(stderr, "[MB]   drive=%s\n", dinfo ? "attached" : "NONE (blank 0xFF)");
 
     pflash_cfi01_register(CALYPSO_FLASH_BASE,
                           "calypso.flash",
                           CALYPSO_FLASH_SIZE,
                           dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
-                          64 * 1024,
-                          1,
-                          0x0089,
-                          0x0018,
+                          64 * 1024,   /* sector size */
+                          1,           /* 8-bit bus width */
+                          0x0089,      /* Intel */
+                          0x0018,      /* 28F320J3 */
                           0, 0, 0);
 
-    /* -------------------------------------------------
-     * Vector aliases (LOW vectors only)
-     * ------------------------------------------------- */
+    fprintf(stderr, "[MB] Flash: pflash_cfi01 registered OK\n");
 
-    /* Low vectors @ 0x00000000 */
-    memory_region_init_alias(&s->ram_alias0,
-                             OBJECT(&s->soc.parent_obj),
-                             "calypso.ram_alias0",
-                             &s->soc.iram,
-                             0,
-                             128 * 1024);
+    /* ---- NO vector aliases ---- */
+    fprintf(stderr, "[MB] NO ram_alias0, NO high_vectors (flash owns 0x0)\n");
 
-    memory_region_add_subregion_overlap(sysmem, 0x00000000,
-                                        &s->ram_alias0, 1);
-
-    /* IMPORTANT:
-     * Do NOT map high vectors.
-     * Compal loader expects vectors at 0x00000000.
-     */
-    // memory_region_init_alias(&s->high_vectors, ...);
-    // memory_region_add_subregion(sysmem, 0xFFFF0000, &s->high_vectors);
-
-    /* -------------------------------------------------
-     * Firmware load
-     * ------------------------------------------------- */
+    /* ---- Firmware load ---- */
     if (machine->kernel_filename) {
         uint64_t entry;
         int ret;
@@ -190,27 +140,31 @@ static void calypso_machine_init(MachineState *machine)
 
         cpu_set_pc(CPU(s->cpu), entry);
 
-        printf("Calypso firmware loaded:\n");
-        printf("  Entry: 0x%08lx\n", (unsigned long)entry);
-        printf("  Size:  %d bytes\n", ret);
+        fprintf(stderr, "[MB] Firmware: '%s'\n", machine->kernel_filename);
+        fprintf(stderr, "[MB]   entry=0x%08lx  size=%d bytes\n",
+                (unsigned long)entry, ret);
     }
 
-    printf("\nCalypso machine ready.\n");
+    fprintf(stderr, "[MB] === Machine ready ===\n");
+    fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",
+            CALYPSO_FLASH_BASE,
+            CALYPSO_FLASH_BASE + CALYPSO_FLASH_SIZE - 1,
+            CALYPSO_FLASH_SIZE / (1024*1024));
+    fprintf(stderr, "[MB]   IRAM:   0x00800000–0x0083FFFF (256 KiB)\n");
+    fprintf(stderr, "[MB]   XRAM:   0x%08x–0x%08x (%d MiB)\n",
+            CALYPSO_XRAM_BASE,
+            CALYPSO_XRAM_BASE + CALYPSO_XRAM_SIZE - 1,
+            CALYPSO_XRAM_SIZE / (1024*1024));
 }
-
-/* ========================================================================
- * Machine class
- * ======================================================================== */
 
 static void calypso_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
-
     mc->desc = "Calypso SoC development board (modular architecture)";
     mc->init = calypso_machine_init;
     mc->max_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm946");
-    mc->default_ram_size = 0;  /* RAM is fixed in the machine */
+    mc->default_ram_size = 0;
     mc->alias = "calypso-high";
 }
 
@@ -226,6 +180,4 @@ static void calypso_machine_register_types(void)
     type_register_static(&calypso_machine_info);
 }
 
-/* Existing machine */
 type_init(calypso_machine_register_types)
-

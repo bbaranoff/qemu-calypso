@@ -1,12 +1,6 @@
 /*
  * Calypso SoC - TI Calypso DBB (Digital Baseband)
- *
- * COMPLETE REWRITE with debug on every step.
- *
- * Chardev approach:
- *   qdev_prop_set_chr() BEFORE realize.
- *   calypso_uart_realize() sets handlers with correct opaque.
- *   NO late-binding. NO qemu_chr_fe_init in this file.
+ * DEBUG BUILD — verbose memory map logging
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -38,17 +32,10 @@
 #define CALYPSO_SPI_BASE      0xFFFE3000
 #define CALYPSO_KEYPAD_BASE   0xFFFE4800
 
-/*
- * UART addresses — verified against TI Calypso datasheet:
- *   UART0 (IrDA)  = 0xFFFF5000
- *   UART1 (Modem) = 0xFFFF5800
- *
- * OsmocomBB firmware (loader.highram) uses UART1 for osmocon.
- */
 #define CALYPSO_UART_IRDA     0xFFFF5000
 #define CALYPSO_UART_MODEM    0xFFFF5800
 
-/* ---- IRQ numbers (must match calypso_trx.h) ---- */
+/* ---- IRQ numbers ---- */
 #define IRQ_TIMER1            1
 #define IRQ_TIMER2            2
 #define IRQ_UART_MODEM        7
@@ -86,6 +73,7 @@ static void add_stub(MemoryRegion *sys, const char *name,
     MemoryRegion *mr = g_new(MemoryRegion, 1);
     memory_region_init_io(mr, NULL, ops, NULL, name, 0x100);
     memory_region_add_subregion(sys, base, mr);
+    fprintf(stderr, "[SOC] stub '%s' @ 0x%08lx (0x100)\n", name, (unsigned long)base);
 }
 
 /* ================================================================
@@ -101,15 +89,14 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
 
     fprintf(stderr, "[SOC] === calypso_soc_realize START ===\n");
 
-    /* ---- IRAM ---- */
+    /* ---- IRAM at 0x00800000 ONLY ----
+     * NO alias at 0x00000000 — flash lives there (board-level).
+     */
     memory_region_init_ram(&s->iram, OBJECT(dev), "calypso.iram",
                            CALYPSO_IRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, CALYPSO_IRAM_BASE, &s->iram);
-
-    memory_region_init_alias(&s->iram_alias, OBJECT(dev),
-                             "calypso.iram.alias",
-                             &s->iram, 0, CALYPSO_IRAM_SIZE);
-    memory_region_add_subregion(sysmem, 0x00000000, &s->iram_alias);
+    fprintf(stderr, "[SOC] IRAM @ 0x%08x (%d KiB) — NO alias at 0x00000000\n",
+            CALYPSO_IRAM_BASE, CALYPSO_IRAM_SIZE / 1024);
 
     /* ---- INTH ---- */
     object_initialize_child(OBJECT(dev), "inth", &s->inth, TYPE_CALYPSO_INTH);
@@ -154,18 +141,12 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi), 0, CALYPSO_SPI_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi), 0, INTH_IRQ(IRQ_SPI));
 
-    /* ================================================================
-     * UART MODEM @ 0xFFFF5800
-     *
-     * This is where osmocon talks. The chardev is bound via
-     * qdev_prop_set_chr() BEFORE realize, so that
-     * calypso_uart_realize() can set up handlers.
-     * ================================================================ */
+    /* ---- UART MODEM ---- */
     {
         Chardev *chr = qemu_chr_find("modem");
         if (!chr) chr = serial_hd(0);
 
-        fprintf(stderr, "[SOC] UART modem: chardev lookup → %s\n",
+        fprintf(stderr, "[SOC] UART modem: chardev → %s\n",
                 chr ? (chr->label ? chr->label : "(no label)") : "NULL");
 
         object_initialize_child(OBJECT(dev), "uart-modem",
@@ -174,10 +155,6 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
 
         if (chr) {
             qdev_prop_set_chr(DEVICE(&s->uart_modem), "chardev", chr);
-            fprintf(stderr, "[SOC] UART modem: chardev SET to '%s'\n",
-                    chr->label ? chr->label : "(no label)");
-        } else {
-            fprintf(stderr, "[SOC] UART modem: NO CHARDEV!\n");
         }
 
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart_modem), &err)) {
@@ -186,14 +163,9 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_modem), 0, CALYPSO_UART_MODEM);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_modem), 0,
                            INTH_IRQ(IRQ_UART_MODEM));
-
-        fprintf(stderr, "[SOC] UART modem: mapped @ 0x%08x, IRQ %d\n",
-                CALYPSO_UART_MODEM, IRQ_UART_MODEM);
     }
 
-    /* ================================================================
-     * UART IRDA @ 0xFFFF5000 (optional, for debug console)
-     * ================================================================ */
+    /* ---- UART IRDA ---- */
     {
         Chardev *chr = qemu_chr_find("irda");
         if (!chr) chr = serial_hd(1);
@@ -224,7 +196,12 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
 
     #undef INTH_IRQ
 
-    /* ---- Stubs ---- */
+    /* ---- Stubs ----
+     *
+     * IMPORTANT: NO stub at 0x00000300 ("calypso.low300")!
+     * That address falls inside the flash range 0x00000000–0x003FFFFF
+     * and would shadow pflash CFI queries → "Failed to initialize flash!"
+     */
     add_stub(sysmem, "calypso.keypad",     CALYPSO_KEYPAD_BASE, &calypso_keypad_ops);
     add_stub(sysmem, "calypso.tmr6800",    0xFFFE6800, &calypso_mmio8_ops);
     add_stub(sysmem, "calypso.mmio_80xx",  0xFFFE8000, &calypso_mmio8_ops);
@@ -236,7 +213,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     add_stub(sysmem, "calypso.mmio_fcxx",  0xFFFFFC00, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.cntl",       0xFFFFFD00, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.dio",        0xFFFFFF00, &calypso_mmio8_ops);
-    add_stub(sysmem, "calypso.low300",     0x00000300, &calypso_mmio16_ops);
+    /* NO calypso.low300 — it overlaps flash! */
 
     /* Catch-all (lowest priority) */
     {

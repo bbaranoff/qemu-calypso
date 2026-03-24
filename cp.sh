@@ -1,6 +1,5 @@
 # Extraire le zip
-unzip calypso_final.zip -d /tmp/calypso_src
-SRC=/tmp/calypso_src/calypso
+SRC=/home/nirvana/qemu-calypso
 QEMU=~/qemu
 
 # ── Créer les dossiers manquants ─────────────────────────────────────────────
