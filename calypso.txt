@@ -1,0 +1,3585 @@
+/*
+ * calypso_inth.h — Calypso INTH (Interrupt Handler) QOM device
+ *
+ * Two-level interrupt controller with 32 IRQ lines,
+ * priority-based arbitration, and IRQ/FIQ routing.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_INTC_CALYPSO_INTH_H
+#define HW_INTC_CALYPSO_INTH_H
+
+#include "hw/sysbus.h"
+#include "qom/object.h"
+
+#define TYPE_CALYPSO_INTH "calypso-inth"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoINTHState, CALYPSO_INTH)
+
+#define CALYPSO_INTH_NUM_IRQS  32
+
+struct CalypsoINTHState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+
+    /*< public >*/
+    MemoryRegion iomem;
+
+    /* Output lines to CPU */
+    qemu_irq parent_irq;   /* CPU IRQ line */
+    qemu_irq parent_fiq;   /* CPU FIQ line */
+
+    /* Interrupt Level Registers: bits[4:0]=priority, bit[8]=FIQ */
+    uint16_t ilr[CALYPSO_INTH_NUM_IRQS];
+
+    uint16_t ith_v;        /* Current highest-priority pending IRQ number */
+    uint32_t pending;      /* Bitmask of pending IRQs */
+    uint32_t mask;         /* Bitmask: 1 = masked (disabled) */
+};
+
+#endif /* HW_INTC_CALYPSO_INTH_H */
+/*
+ * calypso_trx.h — Calypso DSP/TPU/TRX bridge for virtual GSM
+ *
+ * Includes FCCH/SCH ARFCN sync simulation for TRX firmware.
+ */
+
+#ifndef CALYPSO_TRX_H
+#define CALYPSO_TRX_H
+
+#include "hw/irq.h"
+#include "exec/memory.h"
+
+/* =====================================================================
+ * Correct Calypso IRQ map (from OsmocomBB calypso/irq.h)
+ * ===================================================================== */
+
+#define CALYPSO_IRQ_WATCHDOG       0
+#define CALYPSO_IRQ_TIMER1         1
+#define CALYPSO_IRQ_TIMER2         2
+#define CALYPSO_IRQ_TSP_RX         3
+#define CALYPSO_IRQ_TPU_FRAME      4
+#define CALYPSO_IRQ_TPU_PAGE       5
+#define CALYPSO_IRQ_SIM            6
+#define CALYPSO_IRQ_UART_MODEM     7
+#define CALYPSO_IRQ_KEYPAD_GPIO    8
+#define CALYPSO_IRQ_RTC_TIMER      9
+#define CALYPSO_IRQ_RTC_ALARM      10
+#define CALYPSO_IRQ_ULPD_GAUGING   11
+#define CALYPSO_IRQ_EXTERNAL       12
+#define CALYPSO_IRQ_SPI            13
+#define CALYPSO_IRQ_DMA            14
+#define CALYPSO_IRQ_API            15
+#define CALYPSO_IRQ_SIM_DETECT     16
+#define CALYPSO_IRQ_EXTERNAL_FIQ   17
+#define CALYPSO_IRQ_UART_IRDA      18
+#define CALYPSO_IRQ_ULPD_GSM_TIMER 19
+#define CALYPSO_IRQ_GEA            20
+#define CALYPSO_NUM_IRQS           32
+
+/* =====================================================================
+ * Hardware addresses
+ * ===================================================================== */
+
+#define CALYPSO_DSP_BASE      0xFFD00000
+#define CALYPSO_DSP_SIZE      (64 * 1024)
+
+/* DB/NDB byte offsets from DSP_BASE (ARM view)
+ *
+ * DSP word addr → ARM byte offset = word_addr * 2
+ *
+ *   DSP word 0x0000 → byte 0x0000 : DB Write Page 0
+ *   DSP word 0x0800 → byte 0x1000 : DB Write Page 1
+ *   DSP word 0x1000 → byte 0x2000 : DB Read Page 0
+ *   DSP word 0x1800 → byte 0x3000 : DB Read Page 1
+ *   DSP word 0x2000 → byte 0x4000 : NDB
+ *   DSP word 0x2400 → byte 0x4800 : PARAM
+ */
+#define DSP_API_W_PAGE0       0x0000
+#define DSP_API_W_PAGE1       0x1000
+#define DSP_API_R_PAGE0       0x2000
+#define DSP_API_R_PAGE1       0x3000
+#define DSP_API_NDB           0x4000
+#define DSP_API_PARAM         0x4800
+#define DSP_PAGE_SIZE         0x1000
+
+#define CALYPSO_TPU_BASE      0xFFFE0000
+#define CALYPSO_TPU_SIZE      0x0800
+
+#define CALYPSO_TSP_BASE      0xFFFE0800
+#define CALYPSO_TSP_SIZE      0x0100
+
+#define CALYPSO_ULPD_BASE     0xFFFE2800
+#define CALYPSO_ULPD_SIZE     0x0100
+
+/* TPU register offsets */
+#define TPU_CTRL              0x0000
+#define TPU_IDLE              0x0002
+#define TPU_INT_CTRL          0x0004
+#define TPU_INT_STAT          0x0006
+#define TPU_DSP_PAGE          0x0008
+#define TPU_FRAME             0x000A
+#define TPU_OFFSET            0x000C
+#define TPU_SYNCHRO           0x000E
+#define TPU_IT_DSP_PG         0x0020
+#define TPU_RAM_BASE          0x0400
+
+#define TPU_CTRL_ENABLE       (1 << 0)
+#define TPU_CTRL_RESET        (1 << 1)
+#define TPU_CTRL_IDLE         (1 << 2)
+
+/* TSP register offsets */
+#define TSP_TX_REG            0x00
+#define TSP_CTRL1             0x02
+#define TSP_CTRL2             0x04
+#define TSP_TX_SIZE           0x06
+#define TSP_RX_REG            0x08
+#define TSP_MASK1             0x0A
+#define TSP_ACT               0x0C
+#define TSP_ACT_L             0x0E
+
+/* ULPD register offsets */
+#define ULPD_SETUP_CLK13      0x00
+#define ULPD_SETUP_SLICER     0x02
+#define ULPD_SETUP_VTCXO      0x04
+#define ULPD_SETUP_RF         0x06
+#define ULPD_DCXO_SETUP       0x08
+#define ULPD_ITP_1            0x12
+#define ULPD_ITP_2            0x14
+#define ULPD_COUNTER_HI       0x1C
+#define ULPD_COUNTER_LO       0x1E
+#define ULPD_GAUGING_CTRL     0x24
+#define ULPD_GSM_TIMER        0x28
+
+/* GSM timing */
+#define GSM_TDMA_NS           4615000
+#define GSM_HYPERFRAME        2715648
+#define GSM_BURST_BITS        148
+#define GSM_BURST_WORDS       78
+
+/* TRX UDP protocol (TRXD v0) */
+#define TRX_DEFAULT_PORT      4729
+#define TRX_HDR_LEN_TX        6
+#define TRX_HDR_LEN_RX        8
+#define TRX_BURST_LEN         148
+#define TRX_PKT_LEN_TX        (TRX_HDR_LEN_TX + TRX_BURST_LEN)
+#define TRX_PKT_LEN_RX        (TRX_HDR_LEN_RX + TRX_BURST_LEN)
+
+/* =====================================================================
+ * DB write page structure — word offsets from page base
+ *
+ * The firmware writes d_task_d / d_task_u at the start of the
+ * active DB write page.  Exact layout (from dsp_api.h):
+ *
+ *   Word 0:  d_task_d   (DL task command + burst_id + tsc)
+ *   Word 1:  d_burst_d  (DL burst identifier)
+ *   Word 2:  d_task_u   (UL task command)
+ *   Word 3:  d_burst_u  (UL burst identifier)
+ * ===================================================================== */
+
+#define DB_W_D_TASK_D         0   /* word offset */
+#define DB_W_D_BURST_D        1
+#define DB_W_D_TASK_U         2
+#define DB_W_D_BURST_U        3
+
+/* =====================================================================
+ * NDB structure — word offsets from NDB base (byte 0x4000)
+ *
+ * IMPORTANT: These offsets MUST match the T_NDB_MCU_TO_DSP struct
+ * compiled into the firmware you are running.  The values below
+ * match the standard OsmocomBB TCS211-compatible DSP API.
+ *
+ * If your firmware uses different offsets, enable TRX_DEBUG_DSP=1
+ * and look at which NDB words are read after an FB/SB task.
+ * Then update these constants accordingly.
+ *
+ * The NDB is a FLAT shared-memory area used in both directions:
+ *   MCU→DSP (control): d_dsp_page, d_fn, task mirrors, etc.
+ *   DSP→MCU (results): d_fb_det, a_cd[], a_sch26[], etc.
+ * ===================================================================== */
+
+/* MCU→DSP control fields */
+#define NDB_W_D_DSP_PAGE      0x0000  /* Current active page (bit 0) */
+#define NDB_W_D_TASK_D        0x0001  /* DL task mirror */
+#define NDB_W_D_TASK_U        0x0002  /* UL task mirror */
+#define NDB_W_D_FN            0x0003  /* Frame number (low 16 bits) */
+
+/*
+ * DSP→MCU result fields (FB / SB / PM)
+ *
+ * The offsets below are for the standard Calypso TCS211 API.
+ * d_fb_det and friends sit after ~20 control words in the NDB.
+ *
+ * TUNING NOTE: If your firmware doesn't sync, the most likely
+ * cause is that these offsets are wrong.  Enable TRX_DEBUG_DSP
+ * and search the log for NDB reads in the 0x4014-0x4080 range
+ * that happen right after FB/SB tasks fire.
+ */
+#define NDB_W_D_FB_DET        10   /* FB detection flag: 1=found */
+#define NDB_W_D_FB_MODE       11   /* FB mode / attempt count */
+
+/* a_cd[4]: carrier demod results (TOA, PM, ANGLE, SNR) */
+#define NDB_W_A_CD_TOA        12   /* Time Of Arrival (quarter-bits) */
+#define NDB_W_A_CD_PM         13   /* Power Measurement (1/64 dBm) */
+#define NDB_W_A_CD_ANGLE      14   /* Freq offset angle (Hz, signed) */
+#define NDB_W_A_CD_SNR        15   /* Signal/Noise Ratio (dB, fx6.10) */
+
+/* a_sch26[5]: SCH decoded data (25 info bits + parity) */
+#define NDB_W_A_SCH26         18   /* 5 consecutive words */
+#define NDB_W_A_SCH26_LEN     5
+
+/* =====================================================================
+ * DSP boot / download status
+ *
+ * Location: word 0 of the entire API RAM (byte offset 0x0000)
+ * The firmware polls this during dsp_power_on():
+ *   0x0000 → DSP in reset
+ *   0x0001 → DSP ROM running, waiting for patches
+ *   0x0002 → DSP ready (patches applied)
+ *
+ * API version is read from a nearby offset after status == 2.
+ * Standard Calypso DSP version: 0x3606 0x0000
+ * ===================================================================== */
+
+#define DSP_DL_STATUS_ADDR    0x0000  /* byte offset in API RAM */
+#define DSP_API_VER_ADDR      0x0004  /* byte offset: version word 1 */
+#define DSP_API_VER2_ADDR     0x0006  /* byte offset: version word 2 */
+
+#define DSP_DL_STATUS_RESET   0x0000
+#define DSP_DL_STATUS_BOOT    0x0001
+#define DSP_DL_STATUS_READY   0x0002
+#define DSP_API_VERSION       0x3606
+
+/* =====================================================================
+ * ARFCN sync state machine
+ * ===================================================================== */
+
+typedef enum {
+    SYNC_IDLE = 0,       /* No sync in progress */
+    SYNC_FCCH_SEARCH,    /* Searching for FCCH (frequency burst) */
+    SYNC_FCCH_FOUND,     /* FCCH detected, preparing for SCH */
+    SYNC_SCH_SEARCH,     /* Waiting for SCH (sync burst) decode */
+    SYNC_LOCKED,         /* TDMA locked to reference cell */
+} SyncState;
+
+/* =====================================================================
+ * Simulated cell parameters (virtual BTS we pretend to see)
+ * ===================================================================== */
+
+#define SYNC_DEFAULT_ARFCN     1      /* Default reference ARFCN */
+#define SYNC_DEFAULT_BSIC      0x3C   /* BSIC: NCC=7, BCC=4 */
+#define SYNC_DEFAULT_RSSI       -62   /* dBm */
+#define SYNC_FB_DETECT_DELAY    5     /* Frames until FB found */
+#define SYNC_SB_DECODE_DELAY    2     /* Frames until SB decoded */
+
+/* =====================================================================
+ * SCH encoding helpers
+ *
+ * GSM 05.02 §3.3.2.2.1: SCH carries 25 info bits:
+ *   bits[0..5]   = BSIC (NCC:3 + BCC:3)
+ *   bits[6..16]  = T1   (FN / 1326)
+ *   bits[17..19] = T3'  ((T3-1)/10, where T3 = FN mod 51)
+ *   bits[20..24] = T2   (FN mod 26)
+ *
+ * The DSP packs the decoded result into a_sch26[5] (5 × 16-bit words).
+ * Standard packing: bits are MSB-first across the words.
+ *   a_sch26[0] = bits[0..15]
+ *   a_sch26[1] = bits[16..24] << 7  (upper 9 bits, rest zero)
+ *   a_sch26[2..4] = 0 (unused / CRC residue)
+ * ===================================================================== */
+
+static inline void sch_encode(uint16_t *a_sch26, uint8_t bsic, uint32_t fn)
+{
+    /* Compute T1, T2, T3, T3' from frame number */
+    uint32_t t1  = fn / (26 * 51);            /* 11 bits */
+    uint32_t t2  = fn % 26;                    /*  5 bits */
+    uint32_t t3  = fn % 51;                    /*  6 bits */
+    uint32_t t3p = (t3 >= 1) ? ((t3 - 1) / 10) : 0;  /* 3 bits */
+
+    /* Pack 25 bits: BSIC[5:0] T1[10:0] T3'[2:0] T2[4:0] */
+    uint32_t packed = 0;
+    packed |= ((uint32_t)(bsic & 0x3F)) << 19;   /* bits 24..19 */
+    packed |= ((uint32_t)(t1 & 0x7FF))  <<  8;   /* bits 18..8  */
+    packed |= ((uint32_t)(t3p & 0x07))  <<  5;   /* bits  7..5  */
+    packed |= ((uint32_t)(t2 & 0x1F))   <<  0;   /* bits  4..0  */
+
+    /* Store in a_sch26[] — MSB-first, 16-bit words */
+    a_sch26[0] = (packed >> 9) & 0xFFFF;   /* upper 16 of 25 bits */
+    a_sch26[1] = (packed & 0x01FF) << 7;   /* lower 9 bits, shifted */
+    a_sch26[2] = 0;                         /* CRC ok (zero residue) */
+    a_sch26[3] = 0;
+    a_sch26[4] = 0;
+}
+
+/* =====================================================================
+ * Public interface
+ * ===================================================================== */
+
+void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port);
+
+#endif /* CALYPSO_TRX_H */
+/*
+ * calypso_uart.h — Calypso UART QOM device
+ *
+ * TI Calypso 16550-like UART with 64-byte FIFO, DLAB routing,
+ * enhanced mode (EFR), and level-sensitive IRQ.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_CHAR_CALYPSO_UART_H
+#define HW_CHAR_CALYPSO_UART_H
+
+#include "hw/sysbus.h"
+#include "chardev/char-fe.h"
+#include "qom/object.h"
+
+#define TYPE_CALYPSO_UART "calypso-uart"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoUARTState, CALYPSO_UART)
+
+#define CALYPSO_UART_FIFO_SIZE  64  /* Hardware FIFO depth */
+
+struct CalypsoUARTState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+
+    /*< public >*/
+    MemoryRegion iomem;
+    CharBackend  chr;          /* QOM property: chardev backend */
+    qemu_irq     irq;
+
+    /* Identification (for debug logs) */
+    char *name;
+
+    /* RX FIFO (circular buffer) */
+    uint8_t rx_fifo[CALYPSO_UART_FIFO_SIZE];
+    int     rx_head;
+    int     rx_tail;
+    int     rx_count;
+
+    /* Standard UART registers */
+    uint8_t ier;       /* Interrupt Enable Register          */
+    uint8_t lcr;       /* Line Control Register              */
+    uint8_t mcr;       /* Modem Control Register             */
+    uint8_t msr;       /* Modem Status Register              */
+    uint8_t scr;       /* Scratch Pad Register (SPR)         */
+    uint8_t mdr1;      /* Mode Definition Register 1         */
+    uint8_t dll;       /* Divisor Latch Low                  */
+    uint8_t dlh;       /* Divisor Latch High                 */
+    uint8_t efr;       /* Enhanced Feature Register          */
+    uint8_t tlr;       /* Trigger Level Register             */
+    uint8_t fcr;       /* FIFO Control (write-only shadow)   */
+    uint8_t xon1, xon2;
+    uint8_t xoff1, xoff2;
+
+    /* IRQ state tracking */
+    bool    thri_pending;  /* THR empty interrupt pending */
+    bool    irq_raised;
+};
+
+#endif /* HW_CHAR_CALYPSO_UART_H */
+/*
+ * calypso_spi.h — Calypso SPI + TWL3025 ABB stub QOM device
+ *
+ * SPI controller with integrated TWL3025 Analog Baseband Chip emulation.
+ * Handles the Calypso SPI protocol: bit15=R/W, bits[14:6]=addr, bits[5:0]=data.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_SSI_CALYPSO_SPI_H
+#define HW_SSI_CALYPSO_SPI_H
+
+#include "hw/sysbus.h"
+#include "qom/object.h"
+
+#define TYPE_CALYPSO_SPI "calypso-spi"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoSPIState, CALYPSO_SPI)
+
+struct CalypsoSPIState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+
+    /*< public >*/
+    MemoryRegion iomem;
+    qemu_irq     irq;
+
+    uint16_t ctrl;
+    uint16_t status;
+    uint16_t tx_data;
+    uint16_t rx_data;
+
+    /* TWL3025 shadow registers (256 possible addresses) */
+    uint16_t abb_regs[256];
+};
+
+/* TWL3025 important register addresses */
+#define ABB_VRPCDEV    0x01
+#define ABB_VRPCSTS    0x02
+#define ABB_VBUCTRL    0x03
+#define ABB_VBDR1      0x04
+#define ABB_TOGBR1     0x09
+#define ABB_TOGBR2     0x0A
+#define ABB_AUXLED     0x17
+#define ABB_ITSTATREG  0x1B
+
+/* SPI status bits */
+#define SPI_STATUS_TX_READY  (1 << 0)
+#define SPI_STATUS_RX_READY  (1 << 1)
+
+#endif /* HW_SSI_CALYPSO_SPI_H */
+/*
+ * calypso_timer.h — Calypso GP/Watchdog Timer QOM device
+ *
+ * 16-bit down-counter with auto-reload and IRQ support.
+ * Clocked from 13 MHz / (prescaler + 1).
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_TIMER_CALYPSO_TIMER_H
+#define HW_TIMER_CALYPSO_TIMER_H
+
+#include "hw/sysbus.h"
+#include "qom/object.h"
+#include "qemu/timer.h"
+
+#define TYPE_CALYPSO_TIMER "calypso-timer"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoTimerState, CALYPSO_TIMER)
+
+struct CalypsoTimerState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+
+    /*< public >*/
+    MemoryRegion iomem;
+    QEMUTimer    *timer;
+    qemu_irq     irq;
+
+    uint16_t load;        /* Reload value */
+    uint16_t count;       /* Current counter */
+    uint16_t ctrl;        /* Control: bit0=start, bit1=auto-reload, bit2=irq-en */
+    uint16_t prescaler;
+    int64_t  tick_ns;     /* Nanoseconds per tick */
+    bool     running;
+};
+
+#endif /* HW_TIMER_CALYPSO_TIMER_H */
+/*
+ * calypso_soc.h - TI Calypso System-on-Chip
+ *
+ * Complete SoC device containing all integrated peripherals:
+ * - Internal RAM (256 KiB)
+ * - Interrupt Controller (INTH)
+ * - 2x Timers
+ * - 2x UARTs
+ * - SPI + TWL3025 ABB
+ * - DSP/TPU/TRX bridge
+ *
+ * This provides a modular alternative to the monolithic calypso_high.c
+ * machine, with better separation between SoC and board-level components.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_ARM_CALYPSO_SOC_H
+#define HW_ARM_CALYPSO_SOC_H
+
+#include "hw/sysbus.h"
+#include "qom/object.h"
+#include "hw/arm/calypso/calypso_inth.h"
+#include "hw/arm/calypso/calypso_timer.h"
+#include "hw/arm/calypso/calypso_uart.h"
+#include "hw/arm/calypso/calypso_spi.h"
+
+#define TYPE_CALYPSO_SOC "calypso-soc"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoSoCState, CALYPSO_SOC)
+
+/* Number of IRQ lines from SoC to CPU */
+#define CALYPSO_SOC_NUM_IRQS  2  /* IRQ and FIQ */
+
+struct CalypsoSoCState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+
+    /*< public >*/
+    /* Internal RAM (256 KiB at 0x00800000) */
+    MemoryRegion iram;
+
+    /* Integrated peripherals (as embedded objects) */
+    CalypsoINTHState  inth;
+    CalypsoTimerState timer1;
+    CalypsoTimerState timer2;
+    CalypsoUARTState  uart_modem;
+    CalypsoUARTState  uart_irda;
+    CalypsoSPIState   spi;
+
+    /* TRX bridge (created dynamically, not embedded) */
+    void *trx;  /* Opaque pointer to avoid circular dependency */
+
+    /* IRQ outputs to CPU (connected in machine init) */
+    qemu_irq cpu_irq;
+    qemu_irq cpu_fiq;
+
+    /* Configuration properties */
+    int trx_port;       /* TRX UDP port (0 = disabled) */
+    bool enable_trx;    /* Enable TRX bridge */
+};
+
+#endif /* HW_ARM_CALYPSO_SOC_H */
+/*
+ * calypso_socket.h — Calypso Socket device for communication with transceiver
+ *
+ * Version améliorée sans threads - utilise le système d'événements QEMU
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_ARM_CALYPSO_SOCKET_H
+#define HW_ARM_CALYPSO_SOCKET_H
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "qom/object.h"
+
+#define TYPE_CALYPSO_SOCKET "calypso-socket"
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoSocketState, CALYPSO_SOCKET)
+
+/* Device state */
+struct CalypsoSocketState {
+    /*< private >*/
+    SysBusDevice parent_obj;
+    
+    /*< public >*/
+    /* Socket handling */
+    int socket_fd;              /* Listening socket */
+    int client_fd;              /* Connected client */
+    struct sockaddr_un socket_addr;
+    
+    /* Buffer for incoming data */
+    uint8_t rx_buffer[1024];
+    uint32_t rx_len;
+    
+    /* Configuration */
+    char *socket_path;          /* QOM property: path to UNIX socket */
+    
+    /* Device status */
+    uint32_t status;
+    
+    /* Memory region */
+    MemoryRegion mmio;
+};
+
+/* Register offsets */
+#define CALYPSO_SOCKET_CTRL   0x00
+#define CALYPSO_SOCKET_STATUS 0x04
+#define CALYPSO_SOCKET_DATA   0x08
+
+/* Control bits */
+#define CALYPSO_SOCKET_CTRL_START  (1 << 0)
+#define CALYPSO_SOCKET_CTRL_STOP   (1 << 1)
+#define CALYPSO_SOCKET_CTRL_RESET  (1 << 2)
+
+/* Status bits */
+#define CALYPSO_SOCKET_STATUS_READY (1 << 0)  /* Data available or connected */
+#define CALYPSO_SOCKET_STATUS_ERROR (1 << 1)  /* Error occurred */
+#define CALYPSO_SOCKET_STATUS_TX    (1 << 2)  /* TX completed */
+
+/* Reset function */
+void calypso_socket_reset(DeviceState *dev);
+
+#endif /* HW_ARM_CALYPSO_SOCKET_H */
+/*
+ * calypso_mb.c - Calypso development board machine
+ *
+ * Complete machine definition with:
+ * - ARM946E-S CPU
+ * - Calypso SoC (with all integrated peripherals)
+ * - External RAM (8 MiB at 0x01000000)
+ * - Flash memory (4 MiB NOR at 0x02000000)
+ * - Firmware loading support
+ *
+ * Usage:
+ *   qemu-system-arm -M calypso \
+ *     -cpu arm946 \
+ *     -kernel loader.highram.elf \
+ *     -serial pty \
+ *     -monitor stdio \
+ *     -nographic
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "hw/boards.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/loader.h"
+#include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
+#include "hw/block/flash.h"
+#include "hw/char/serial.h"
+#include "sysemu/sysemu.h"
+#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
+#include "qemu/error-report.h"
+#include "exec/address-spaces.h"
+#include "elf.h"
+#include "target/arm/cpu.h"
+
+#include "hw/arm/calypso/calypso_soc.h"
+
+/* ========================================================================
+ * Memory map (board-level, external to SoC)
+ * ======================================================================== */
+
+/* External RAM */
+#define CALYPSO_XRAM_BASE     0x01000000
+#define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
+
+/* Flash */
+#define CALYPSO_FLASH_BASE    0x02000000
+#define CALYPSO_FLASH_SIZE    (4 * 1024 * 1024)
+
+/* ========================================================================
+ * Machine state
+ * ======================================================================== */
+
+typedef struct CalypsoMachineState {
+    MachineState parent;
+
+    ARMCPU *cpu;
+    CalypsoSoCState soc;
+
+    /* External memory */
+    MemoryRegion xram;
+    MemoryRegion flash;
+
+    /* Memory aliases for boot/high vectors */
+    MemoryRegion ram_alias0;
+    MemoryRegion high_vectors;
+} CalypsoMachineState;
+
+#define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
+OBJECT_DECLARE_SIMPLE_TYPE(CalypsoMachineState, CALYPSO_MACHINE)
+
+/* ========================================================================
+ * Machine initialization
+ * ======================================================================== */
+
+static void calypso_machine_init(MachineState *machine)
+{
+    CalypsoMachineState *s = CALYPSO_MACHINE(machine);
+    MemoryRegion *sysmem = get_system_memory();
+    Object *cpuobj;
+    Error *err = NULL;
+
+    /* -------------------------------------------------
+     * CPU: ARM946E-S
+     * ------------------------------------------------- */
+    cpuobj = object_new(machine->cpu_type);
+    s->cpu = ARM_CPU(cpuobj);
+
+    if (!qdev_realize(DEVICE(cpuobj), NULL, &err)) {
+        error_report_err(err);
+        exit(1);
+    }
+
+    /* -------------------------------------------------
+     * SoC
+     * ------------------------------------------------- */
+    object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_CALYPSO_SOC);
+
+    qdev_prop_set_int32(DEVICE(&s->soc.parent_obj), "trx-port", 4729);
+    qdev_prop_set_bit(DEVICE(&s->soc.parent_obj), "enable-trx", true);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->soc), &err)) {
+        error_report_err(err);
+        exit(1);
+    }
+
+    /* IRQ / FIQ vers CPU */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc), 0,
+        qdev_get_gpio_in(DEVICE(&s->cpu->parent_obj), ARM_CPU_IRQ));
+
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc), 1,
+        qdev_get_gpio_in(DEVICE(&s->cpu->parent_obj), ARM_CPU_FIQ));
+
+    /* -------------------------------------------------
+     * External RAM : 8 MiB @ 0x01000000
+     * (owner = SoC, PAS la machine)
+     * ------------------------------------------------- */
+    memory_region_init_ram(&s->xram,
+                           OBJECT(&s->soc.parent_obj),
+                           "calypso.xram",
+                           CALYPSO_XRAM_SIZE,
+                           &error_fatal);
+
+    memory_region_add_subregion(sysmem, CALYPSO_XRAM_BASE, &s->xram);
+
+    /* -------------------------------------------------
+     * Flash NOR
+     * ------------------------------------------------- */
+    DriveInfo *dinfo = drive_get(IF_PFLASH, 0, 0);
+
+    pflash_cfi01_register(CALYPSO_FLASH_BASE,
+                          "calypso.flash",
+                          CALYPSO_FLASH_SIZE,
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          64 * 1024,
+                          1,
+                          0x0089,
+                          0x0018,
+                          0, 0, 0);
+
+    /* -------------------------------------------------
+     * ARM vector aliases (owner = SoC)
+     * ------------------------------------------------- */
+
+    /* Low vectors @ 0x00000000 */
+    memory_region_init_alias(&s->ram_alias0,
+                             OBJECT(&s->soc.parent_obj),
+                             "calypso.ram_alias0",
+                             &s->soc.iram,
+                             0,
+                             128 * 1024);
+
+    memory_region_add_subregion_overlap(sysmem, 0x00000000,
+                                        &s->ram_alias0, 1);
+
+    /* High vectors @ 0xFFFF0000 */
+    memory_region_init_alias(&s->high_vectors,
+                             OBJECT(&s->soc.parent_obj),
+                             "calypso.high_vectors",
+                             &s->soc.iram,
+                             0,
+                             64 * 1024);
+
+    memory_region_add_subregion(sysmem, 0xFFFF0000, &s->high_vectors);
+
+    /* -------------------------------------------------
+     * Firmware load
+     * ------------------------------------------------- */
+    if (machine->kernel_filename) {
+        uint64_t entry;
+        int ret;
+
+        ret = load_elf(machine->kernel_filename, NULL, NULL, NULL,
+                       &entry, NULL, NULL, NULL,
+                       0, EM_ARM, 1, 0);
+
+        if (ret < 0) {
+            ret = load_image_targphys(machine->kernel_filename,
+                                      CALYPSO_XRAM_BASE,
+                                      CALYPSO_XRAM_SIZE);
+            if (ret < 0) {
+                error_report("Could not load firmware '%s'",
+                             machine->kernel_filename);
+                exit(1);
+            }
+            entry = CALYPSO_XRAM_BASE;
+        }
+
+        cpu_set_pc(CPU(s->cpu), entry);
+
+        printf("Calypso firmware loaded:\n");
+        printf("  Entry: 0x%08lx\n", (unsigned long)entry);
+        printf("  Size:  %d bytes\n", ret);
+    } else {
+        printf("No firmware specified. CPU will start at reset vector.\n");
+    }
+
+    printf("\nCalypso machine ready.\n");
+}
+
+/* ========================================================================
+ * Machine class
+ * ======================================================================== */
+
+static void calypso_machine_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    mc->desc = "Calypso SoC development board (modular architecture)";
+    mc->init = calypso_machine_init;
+    mc->max_cpus = 1;
+    mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm946");
+    mc->default_ram_size = 0;  /* RAM is fixed in the machine */
+}
+
+static const TypeInfo calypso_machine_info = {
+    .name          = TYPE_CALYPSO_MACHINE,
+    .parent        = TYPE_MACHINE,
+    .instance_size = sizeof(CalypsoMachineState),
+    .class_init    = calypso_machine_class_init,
+};
+
+static void calypso_machine_register_types(void)
+{
+    type_register_static(&calypso_machine_info);
+}
+
+type_init(calypso_machine_register_types)
+/*
+ * calypso_trx.c — Calypso DSP/TPU/TRX bridge for virtual GSM
+ *
+ * This module provides the missing peripherals between OsmocomBB L1 firmware
+ * and a TRX UDP endpoint (e.g. osmo-bts-trx or a virtual radio bridge).
+ *
+ * Architecture:
+ *
+ *   OsmocomBB TRX firmware (in QEMU)
+ *       │ writes TX bursts to DSP API RAM
+ *       │ programs TPU scenario
+ *       │ enables TPU
+ *       ▼
+ *   calypso_trx.c (this file)
+ *       │ intercepts TPU enable → extracts burst from API RAM
+ *       │ sends via TRX UDP socket
+ *       │ receives RX bursts from TRX UDP
+ *       │ injects into API RAM → fires IRQ_API
+ *       │ TDMA timer fires IRQ_TPU_FRAME every 4.615 ms
+ *       │
+ *       │ ★ NEW: ARFCN sync simulation ★
+ *       │ Monitors DSP tasks (FB/SB) and simulates:
+ *       │   - FCCH detection (frequency burst found)
+ *       │   - SCH decode (sync burst with BSIC + FN)
+ *       │   - Power measurements
+ *       │   - TDMA lock to virtual reference cell
+ *       ▼
+ *   TRX UDP endpoint (osmo-bts-trx / virtual radio)
+ *
+ * QEMU 9.2 compatible.
+ */
+
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu/timer.h"
+#include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "exec/address-spaces.h"
+#include "hw/irq.h"
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#include "hw/arm/calypso/calypso_trx.h"
+#include <arpa/inet.h>
+
+#define GSMTAP_PORT 4729
+#define GSMTAP_TYPE_UM 0x01
+
+static int gsmtap_fd = -1;
+static struct sockaddr_in gsmtap_addr;
+
+struct __attribute__((packed)) gsmtap_hdr {
+    uint8_t  version;
+    uint8_t  hdr_len;
+    uint8_t  type;
+    uint8_t  timeslot;
+    uint16_t arfcn;
+    int8_t   signal_dbm;
+    int8_t   snr_db;
+    uint32_t frame_number;
+    uint16_t sub_type;
+    uint16_t antenna_nr;
+    uint32_t res;
+};
+
+/* =====================================================================
+ * Debug logging
+ * ===================================================================== */
+
+#define TRX_LOG(fmt, ...) \
+    fprintf(stderr, "[calypso-trx] " fmt "\n", ##__VA_ARGS__)
+
+/*
+ * Set to 1 for verbose per-access logging.
+ * TRX_DEBUG_DSP is the most useful for tuning NDB offsets —
+ * it prints every DSP RAM read/write with byte offset and value.
+ */
+#define TRX_DEBUG_DSP    0
+#define TRX_DEBUG_TPU    0
+#define TRX_DEBUG_TSP    0
+#define TRX_DEBUG_ULPD   0
+#define TRX_DEBUG_TDMA   0
+#define TRX_DEBUG_SYNC   1   /* FCCH/SCH sync logging (recommended on) */
+
+/* =====================================================================
+ * TRX state
+ * ===================================================================== */
+
+typedef struct CalypsoTRX {
+    /* IRQ lines (borrowed from INTH) */
+    qemu_irq *irqs;
+
+    /* ----- DSP API RAM ----- */
+    MemoryRegion dsp_iomem;
+    uint16_t     dsp_ram[CALYPSO_DSP_SIZE / 2];  /* 64K as 16-bit words */
+    uint8_t      dsp_page;                        /* Current DSP page (0/1) */
+
+    /* ----- TPU ----- */
+    MemoryRegion tpu_iomem;
+    uint16_t     tpu_regs[CALYPSO_TPU_SIZE / 2];
+    uint16_t     tpu_ram[1024];                   /* TPU instruction RAM */
+    bool         tpu_enabled;
+
+    /* ----- TSP ----- */
+    MemoryRegion tsp_iomem;
+    uint16_t     tsp_regs[CALYPSO_TSP_SIZE / 2];
+
+    /* ----- ULPD ----- */
+    MemoryRegion ulpd_iomem;
+    uint16_t     ulpd_regs[CALYPSO_ULPD_SIZE / 2];
+    uint32_t     ulpd_counter;
+
+    /* ----- TDMA frame timing ----- */
+    QEMUTimer   *tdma_timer;
+    uint32_t     fn;              /* GSM frame number */
+    bool         tdma_running;
+
+    /* ----- DSP task completion timer ----- */
+    QEMUTimer   *dsp_timer;
+
+    /* ----- TRX UDP socket ----- */
+    int          trx_fd;          /* Data socket fd (-1 if disabled) */
+    int          trx_port;
+    struct sockaddr_in trx_remote;
+    bool         trx_connected;
+
+    /* ----- Burst buffer ----- */
+    uint8_t      tx_burst[GSM_BURST_BITS];
+    uint8_t      rx_burst[GSM_BURST_BITS];
+    bool         rx_pending;
+    uint8_t      rx_tn;
+    int8_t       rx_rssi;
+    int16_t      rx_toa;
+
+    /* ----- ARFCN Sync state machine ----- */
+    SyncState    sync_state;
+    uint32_t     sync_fb_countdown;   /* Frames until FB detection */
+    uint32_t     sync_sb_countdown;   /* Frames until SB decode */
+    uint16_t     sync_arfcn;          /* Reference ARFCN */
+    uint8_t      sync_bsic;           /* Fake BSIC */
+    int8_t       sync_rssi;           /* Fake RSSI (dBm) */
+    uint32_t     sync_ref_fn;         /* Reference FN at lock time */
+    uint32_t     sync_task_count;     /* Total tasks seen */
+    uint32_t     sync_fb_tasks;       /* FB tasks counted */
+    uint32_t     sync_sb_tasks;       /* SB tasks counted */
+    bool         sync_dsp_booted;     /* DSP boot sequence complete */
+    uint32_t     sync_boot_frame;     /* Frame when boot status polled */
+} CalypsoTRX;
+
+static CalypsoTRX *g_trx;  /* Global for timer callbacks */
+
+/* Forward declarations */
+static void calypso_dsp_done(void *opaque);
+static void calypso_sync_tick(CalypsoTRX *s);
+
+/* =====================================================================
+ * DSP API RAM — shared memory between ARM and (virtual) DSP
+ *
+ * All OsmocomBB firmware variants access DSP through this 64KB window.
+ * We intercept reads/writes to simulate DSP behavior.
+ * ===================================================================== */
+
+static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint64_t val;
+
+    if (offset >= CALYPSO_DSP_SIZE) {
+        return 0;
+    }
+
+    if (size == 2) {
+        val = s->dsp_ram[offset / 2];
+    } else if (size == 4) {
+        val = s->dsp_ram[offset / 2] |
+              ((uint32_t)s->dsp_ram[offset / 2 + 1] << 16);
+    } else {
+        val = ((uint8_t *)s->dsp_ram)[offset];
+    }
+
+    /*
+     * DSP boot status polling detection:
+     * The firmware polls word 0 (byte 0x0000) waiting for 0x0001 then 0x0002.
+     * If we see repeated reads of offset 0, progress the boot state.
+     */
+    if (offset == DSP_DL_STATUS_ADDR && !s->sync_dsp_booted) {
+        s->sync_boot_frame++;
+        if (s->sync_boot_frame > 3 &&
+            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] == DSP_DL_STATUS_BOOT) {
+            /* Firmware has polled enough — transition to READY */
+            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_READY;
+            s->dsp_ram[DSP_API_VER_ADDR / 2]   = DSP_API_VERSION;
+            s->dsp_ram[DSP_API_VER2_ADDR / 2]  = 0x0000;
+            s->sync_dsp_booted = true;
+            TRX_LOG("DSP boot: status → 0x0002 (READY), version=0x%04x",
+                    DSP_API_VERSION);
+            val = DSP_DL_STATUS_READY;
+        }
+    }
+
+#if TRX_DEBUG_DSP
+    TRX_LOG("DSP read  [0x%04x] = 0x%04x (size=%d)", (unsigned)offset,
+            (unsigned)val, size);
+#endif
+    return val;
+}
+
+static void calypso_dsp_write(void *opaque, hwaddr offset,
+                               uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    if (offset >= CALYPSO_DSP_SIZE) {
+        return;
+    }
+
+#if TRX_DEBUG_DSP
+    TRX_LOG("DSP write [0x%04x] = 0x%04x (size=%d)", (unsigned)offset,
+            (unsigned)value, size);
+#endif
+
+    if (size == 2) {
+        s->dsp_ram[offset / 2] = (uint16_t)value;
+    } else if (size == 4) {
+        s->dsp_ram[offset / 2] = (uint16_t)value;
+        s->dsp_ram[offset / 2 + 1] = (uint16_t)(value >> 16);
+    } else {
+        ((uint8_t *)s->dsp_ram)[offset] = (uint8_t)value;
+    }
+
+    /* Track DSP page changes in NDB area */
+    if (offset == DSP_API_NDB + NDB_W_D_DSP_PAGE * 2) {
+        s->dsp_page = value & 1;
+    }
+
+    /*
+     * Detect DSP boot sequence writes:
+     * Firmware writes to PARAM area or specific NDB fields during DSP init.
+     * When it writes to the download trigger location, advance boot status.
+     */
+    if (offset == DSP_DL_STATUS_ADDR && value == DSP_DL_STATUS_BOOT) {
+        /* Firmware acknowledging boot — we'll transition to READY on next read */
+        s->sync_boot_frame = 0;
+    }
+}
+
+static const MemoryRegionOps calypso_dsp_ops = {
+    .read = calypso_dsp_read,
+    .write = calypso_dsp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* =====================================================================
+ * TRX UDP — send TX burst, receive RX burst
+ * ===================================================================== */
+
+static void trx_send_burst(CalypsoTRX *s, uint8_t tn, uint32_t fn,
+                            uint8_t *bits, int nbits)
+{
+
+    if (gsmtap_fd >= 0) {
+        struct {
+            struct gsmtap_hdr h;
+            uint8_t payload[GSM_BURST_BITS];
+        } pkt;
+
+        memset(&pkt, 0, sizeof(pkt));
+
+        pkt.h.version = 0x02;
+        pkt.h.hdr_len = sizeof(struct gsmtap_hdr) / 4;
+        pkt.h.type = GSMTAP_TYPE_UM;
+        pkt.h.timeslot = tn;
+        pkt.h.arfcn = htons(s->sync_arfcn | 0x8000); /* uplink */
+        pkt.h.signal_dbm = s->sync_rssi;
+        pkt.h.snr_db = 20;
+        pkt.h.frame_number = htonl(fn);
+
+        memcpy(pkt.payload, bits, GSM_BURST_BITS);
+
+        sendto(gsmtap_fd,
+               &pkt,
+               sizeof(pkt.h) + GSM_BURST_BITS,
+               0,
+               (struct sockaddr *)&gsmtap_addr,
+               sizeof(gsmtap_addr));
+    }
+
+
+
+}
+
+static void trx_receive_cb(void *opaque)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint8_t buf[512];
+    struct sockaddr_in src;
+    socklen_t slen = sizeof(src);
+
+    ssize_t n = recvfrom(s->trx_fd, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&src, &slen);
+    if (n < TRX_HDR_LEN_RX + 1) {
+        return;
+    }
+
+    /* Remember remote for TX responses */
+    if (!s->trx_connected) {
+        s->trx_remote = src;
+        s->trx_connected = true;
+        TRX_LOG("TRX connected from %s:%d",
+                inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+    }
+
+    /* Parse RX burst (downlink to phone) */
+    s->rx_tn   = buf[0];
+    s->rx_rssi = (int8_t)buf[5];
+    s->rx_toa  = (int16_t)((buf[6] << 8) | buf[7]);
+
+    int burst_len = n - TRX_HDR_LEN_RX;
+    if (burst_len > GSM_BURST_BITS) burst_len = GSM_BURST_BITS;
+    memcpy(s->rx_burst, &buf[TRX_HDR_LEN_RX], burst_len);
+    s->rx_pending = true;
+
+#if TRX_DEBUG_TDMA
+    TRX_LOG("TRX RX burst TN=%d RSSI=%d len=%d", s->rx_tn, s->rx_rssi,
+            burst_len);
+#endif
+}
+
+static void trx_socket_init(CalypsoTRX *s, int port)
+{
+    struct sockaddr_in addr;
+
+    s->trx_port = port;
+    s->trx_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (s->trx_fd < 0) {
+        TRX_LOG("WARNING: Cannot create TRX socket: %s", strerror(errno));
+        return;
+    }
+
+    int reuse = 1;
+    setsockopt(s->trx_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(s->trx_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        TRX_LOG("WARNING: Cannot bind TRX port %d: %s", port, strerror(errno));
+        close(s->trx_fd);
+        s->trx_fd = -1;
+        return;
+    }
+
+    /* Default remote: localhost:port+100 */
+    memset(&s->trx_remote, 0, sizeof(s->trx_remote));
+    s->trx_remote.sin_family = AF_INET;
+    s->trx_remote.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    s->trx_remote.sin_port = htons(port + 100);
+
+    qemu_set_fd_handler(s->trx_fd, trx_receive_cb, NULL, s);
+    TRX_LOG("TRX UDP listening on port %d (send to %d)", port, port + 100);
+}
+
+/* =====================================================================
+ * ARFCN sync simulation — FCCH / SCH state machine
+ *
+ * This is the core addition for making TRX firmware sync work.
+ *
+ * Flow on real hardware:
+ *   1) Firmware sends L1CTL_FBSB_REQ → tunes to ARFCN
+ *   2) L1 programs DSP for FB task (d_task_d = FB code)
+ *   3) DSP searches for FCCH over up to 12 frames
+ *   4) If found: d_fb_det=1, a_cd[TOA,PM,ANGLE,SNR] filled
+ *   5) L1 programs DSP for SB task (d_task_d = SB code)
+ *   6) DSP decodes SCH: a_sch26[5] filled with BSIC+FN
+ *   7) Firmware achieves TDMA lock
+ *
+ * We simulate this by watching d_task_d writes and injecting
+ * results into the NDB after appropriate delays.
+ * ===================================================================== */
+
+/*
+ * Inject FB detection result into NDB.
+ * Called when sync_state transitions to FCCH_FOUND.
+ */
+static void sync_inject_fb_result(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    /* d_fb_det = 1 → firmware sees "frequency burst found" */
+    ndb[NDB_W_D_FB_DET] = 1;
+
+    /* a_cd[]: carrier demod results */
+    ndb[NDB_W_A_CD_TOA]   = 384;     /* TOA in quarter-bits (typical) */
+    ndb[NDB_W_A_CD_PM]    = (uint16_t)((s->sync_rssi + 110) * 64);
+                                       /* PM in 1/64 dBm, biased */
+    ndb[NDB_W_A_CD_ANGLE] = 500;     /* Small freq offset (Hz) */
+    ndb[NDB_W_A_CD_SNR]   = 2048;    /* ~2 dB SNR in fx6.10 */
+
+#if TRX_DEBUG_SYNC
+    TRX_LOG("SYNC: FB detected! TOA=%d PM=%d ANGLE=%d SNR=%d (FN=%u)",
+            ndb[NDB_W_A_CD_TOA], ndb[NDB_W_A_CD_PM],
+            ndb[NDB_W_A_CD_ANGLE], ndb[NDB_W_A_CD_SNR], s->fn);
+#endif
+}
+
+/*
+ * Inject SCH decode result into NDB.
+ * Called when sync_state transitions to LOCKED.
+ */
+static void sync_inject_sb_result(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    /* Save reference FN at the moment of lock */
+    s->sync_ref_fn = s->fn;
+
+    /* Encode SCH data: BSIC + frame number → a_sch26[5] */
+    uint16_t sch26[5];
+    sch_encode(sch26, s->sync_bsic, s->fn);
+
+    for (int i = 0; i < NDB_W_A_SCH26_LEN; i++) {
+        ndb[NDB_W_A_SCH26 + i] = sch26[i];
+    }
+
+    /* Update a_cd with SB-specific results */
+    ndb[NDB_W_A_CD_TOA]   = 27;       /* Fine TOA (quarter-bits) */
+    ndb[NDB_W_A_CD_PM]    = (uint16_t)((s->sync_rssi + 110) * 64);
+    ndb[NDB_W_A_CD_ANGLE] = 431;      /* Residual freq offset */
+    ndb[NDB_W_A_CD_SNR]   = 4096;     /* Better SNR for SB */
+
+    /* Decode for debug logging */
+    uint32_t t1  = s->fn / (26 * 51);
+    uint32_t t2  = s->fn % 26;
+    uint32_t t3  = s->fn % 51;
+
+#if TRX_DEBUG_SYNC
+    TRX_LOG("SYNC: SCH decoded! BSIC=%d(NCC=%d,BCC=%d) FN=%u "
+            "T1=%u T2=%u T3=%u",
+            s->sync_bsic, (s->sync_bsic >> 3) & 7, s->sync_bsic & 7,
+            s->fn, t1, t2, t3);
+    TRX_LOG("SYNC: a_sch26 = [0x%04x 0x%04x 0x%04x 0x%04x 0x%04x]",
+            sch26[0], sch26[1], sch26[2], sch26[3], sch26[4]);
+#endif
+}
+
+/*
+ * calypso_sync_tick() — called every TDMA frame to advance sync state.
+ *
+ * The state machine monitors DSP tasks written by the firmware
+ * and injects appropriate results after configured delays.
+ */
+static void calypso_sync_tick(CalypsoTRX *s)
+{
+    uint16_t *ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    switch (s->sync_state) {
+
+    case SYNC_IDLE:
+        /*
+         * Check if firmware is requesting FB search.
+         * We detect this by looking for non-zero d_task_d in the
+         * active write page.  The firmware writes the task code
+         * and then enables TPU.
+         */
+        break;
+
+    case SYNC_FCCH_SEARCH:
+        /* Count down frames until we "detect" the FCCH */
+        if (s->sync_fb_countdown > 0) {
+            s->sync_fb_countdown--;
+#if TRX_DEBUG_SYNC
+            if (s->sync_fb_countdown == 0) {
+                TRX_LOG("SYNC: FCCH countdown reached zero → injecting FB");
+            }
+#endif
+        }
+        if (s->sync_fb_countdown == 0) {
+            /* Inject FB detection result */
+            sync_inject_fb_result(s);
+            s->sync_state = SYNC_FCCH_FOUND;
+            TRX_LOG("SYNC: state → FCCH_FOUND (FN=%u)", s->fn);
+        }
+        break;
+
+    case SYNC_FCCH_FOUND:
+        /*
+         * FB was detected.  Firmware should now read d_fb_det,
+         * then program an SB task to decode the SCH.
+         * We wait for the SB task to appear.
+         */
+        break;
+
+    case SYNC_SCH_SEARCH:
+        /* Count down frames until we "decode" the SCH */
+        if (s->sync_sb_countdown > 0) {
+            s->sync_sb_countdown--;
+        }
+        if (s->sync_sb_countdown == 0) {
+            /* Inject SCH decode result */
+            sync_inject_sb_result(s);
+            s->sync_state = SYNC_LOCKED;
+            TRX_LOG("SYNC: ★ TDMA LOCKED ★ ARFCN=%d BSIC=%d FN=%u",
+                    s->sync_arfcn, s->sync_bsic, s->fn);
+        }
+        break;
+
+    case SYNC_LOCKED:
+        /*
+         * Maintain lock: update FN in NDB, provide PM results.
+         * The firmware reads d_fn to track time.
+         */
+        ndb[NDB_W_D_FN] = (uint16_t)(s->fn & 0xFFFF);
+        break;
+    }
+}
+
+/*
+ * Detect DSP task type from d_task_d value.
+ *
+ * The Calypso DSP task encoding varies, but the OsmocomBB firmware
+ * uses these identifiers (from tdma_sched.h):
+ *
+ *   Task code | Type
+ *   ----------+------------------
+ *   0         | No task
+ *   1-3       | TCH (traffic)
+ *   4         | FB (frequency burst) ← FCCH detection
+ *   5         | SB (sync burst) ← SCH decode
+ *   6-7       | TCH_FB, TCH_SB (dedicated)
+ *   8         | RACH
+ *   9         | EXT
+ *   10        | NB (normal burst)
+ *   11        | ALLC
+ *   12-14     | FB26, SB26, NB26
+ *   15        | DDL
+ *
+ * The d_task_d word in the DB write page typically contains the
+ * task code in the lower bits, plus tsc/flags in upper bits.
+ * We check bits [3:0] for the basic task type.
+ *
+ * NOTE: The actual numeric values depend on the firmware build.
+ * If sync doesn't work, enable TRX_DEBUG_DSP and check what values
+ * your firmware writes to d_task_d.
+ */
+
+typedef enum {
+    TASK_NONE = 0,
+    TASK_FB,        /* Frequency burst (FCCH) search */
+    TASK_SB,        /* Sync burst (SCH) decode */
+    TASK_NB,        /* Normal burst */
+    TASK_RACH,      /* Random access */
+    TASK_OTHER,     /* Anything else */
+} TaskType;
+
+static TaskType detect_task_type(uint16_t task_d)
+{
+    if (task_d == 0) return TASK_NONE;
+
+    /*
+     * Heuristic detection based on known OsmocomBB task codes.
+     *
+     * The standard mapping uses the task ID as an index.
+     * But the actual d_task_d value written to DSP may encode it
+     * differently.  We try several common patterns:
+     *
+     * Pattern 1: Direct task ID in lower nibble
+     *   FB=4, SB=5, NB=10
+     *
+     * Pattern 2: Bit-field encoding
+     *   d_task_d = (tsc << 5) | (bcch_freq << 3) | task_code
+     *   where task_code: FB=1, SB=2, NB=5, etc.
+     *
+     * Pattern 3: The "d_task_d" field actually contains the
+     *   DSP task command directly (0x000D for FB, 0x001C for SB, etc.)
+     *
+     * We check all patterns and also look at the raw value.
+     */
+
+    uint8_t lo_nib = task_d & 0x0F;
+    uint8_t lo3    = task_d & 0x07;
+
+    /* Pattern 1: Standard task IDs */
+    if (lo_nib == 4 || lo_nib == 12)  return TASK_FB;  /* FB_TASK or FB26_TASK */
+    if (lo_nib == 5 || lo_nib == 13)  return TASK_SB;  /* SB_TASK or SB26_TASK */
+    if (lo_nib == 10 || lo_nib == 14) return TASK_NB;  /* NB_TASK or NB26_TASK */
+    if (lo_nib == 8)                  return TASK_RACH;
+
+    /* Pattern 2: Lower 3-bit encoding */
+    if (lo3 == 1 && task_d < 0x20) return TASK_FB;
+    if (lo3 == 2 && task_d < 0x20) return TASK_SB;
+
+    /* Pattern 3: Known DSP command values */
+    if (task_d == 0x000D) return TASK_FB;
+    if (task_d == 0x000E) return TASK_FB;  /* FB1 (confirm) */
+    if (task_d == 0x001C) return TASK_SB;
+
+    /* Default: non-zero = some active task */
+    return TASK_OTHER;
+}
+
+/* =====================================================================
+ * DSP task processing — extract/inject bursts + sync handling
+ * ===================================================================== */
+
+static void calypso_dsp_process(CalypsoTRX *s)
+{
+    uint16_t *w_page, *r_page, *ndb;
+    uint16_t task_d, task_u;
+
+    /* Determine active pages */
+    if (s->dsp_page == 0) {
+        w_page = &s->dsp_ram[DSP_API_W_PAGE0 / 2];
+        r_page = &s->dsp_ram[DSP_API_R_PAGE0 / 2];
+    } else {
+        w_page = &s->dsp_ram[DSP_API_W_PAGE1 / 2];
+        r_page = &s->dsp_ram[DSP_API_R_PAGE1 / 2];
+    }
+    ndb = &s->dsp_ram[DSP_API_NDB / 2];
+
+    /* Read task words from write page header */
+    task_d = w_page[DB_W_D_TASK_D];
+    task_u = w_page[DB_W_D_TASK_U];
+
+    if (task_d != 0 || task_u != 0) {
+        s->sync_task_count++;
+    }
+
+    /* ---- Classify the DL task for sync handling ---- */
+    TaskType ttype = detect_task_type(task_d);
+
+    switch (ttype) {
+    case TASK_FB:
+        s->sync_fb_tasks++;
+#if TRX_DEBUG_SYNC
+        TRX_LOG("SYNC: FB task detected (d_task_d=0x%04x, count=%u, "
+                "state=%d, FN=%u)",
+                task_d, s->sync_fb_tasks, s->sync_state, s->fn);
+#endif
+        if (s->sync_state == SYNC_IDLE ||
+            s->sync_state == SYNC_FCCH_SEARCH) {
+            if (s->sync_state == SYNC_IDLE) {
+                /* First FB task — start FCCH search */
+                s->sync_fb_countdown = SYNC_FB_DETECT_DELAY;
+                s->sync_state = SYNC_FCCH_SEARCH;
+                TRX_LOG("SYNC: state → FCCH_SEARCH "
+                        "(will detect in %d frames)",
+                        SYNC_FB_DETECT_DELAY);
+            }
+            /* else: already searching, countdown handled in sync_tick */
+        }
+        break;
+
+    case TASK_SB:
+        s->sync_sb_tasks++;
+#if TRX_DEBUG_SYNC
+        TRX_LOG("SYNC: SB task detected (d_task_d=0x%04x, count=%u, "
+                "state=%d, FN=%u)",
+                task_d, s->sync_sb_tasks, s->sync_state, s->fn);
+#endif
+        if (s->sync_state == SYNC_FCCH_FOUND) {
+            /* FB was found, now searching for SB */
+            s->sync_sb_countdown = SYNC_SB_DECODE_DELAY;
+            s->sync_state = SYNC_SCH_SEARCH;
+            TRX_LOG("SYNC: state → SCH_SEARCH "
+                    "(will decode in %d frames)",
+                    SYNC_SB_DECODE_DELAY);
+        }
+        break;
+
+    case TASK_NB:
+        /* Normal burst — handle TX/RX when locked */
+        if (s->sync_state == SYNC_LOCKED) {
+            /* RX: inject burst from TRX UDP or silence */
+            if (s->rx_pending) {
+                uint16_t *burst_r = &r_page[0x19];
+                for (int i = 0; i < GSM_BURST_BITS; i++) {
+                    burst_r[i] = s->rx_burst[i];
+                }
+                r_page[0] = 1;   /* d_bursttype: normal */
+                r_page[1] = 0;   /* d_result: OK */
+                s->rx_pending = false;
+            } else {
+                /* Provide noise/empty burst */
+                uint16_t *burst_r = &r_page[0x19];
+                for (int i = 0; i < GSM_BURST_BITS; i++) {
+                    burst_r[i] = 128;  /* erasure */
+                }
+                r_page[0] = 0;
+                r_page[1] = 0;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    /* ---- Handle TX (uplink) burst ---- */
+    if (task_u != 0 && s->sync_state == SYNC_LOCKED) {
+        uint16_t *burst_w = &w_page[0x19];
+        uint8_t bits[GSM_BURST_BITS];
+
+        for (int i = 0; i < GSM_BURST_BITS && i < GSM_BURST_WORDS * 2; i++) {
+            if (i < 78) {
+                bits[i] = burst_w[i] & 1;
+            } else {
+                bits[i] = burst_w[78 + (i - 78)] & 1;
+            }
+        }
+
+        trx_send_burst(s, 0, s->fn, bits, GSM_BURST_BITS);
+
+#if TRX_DEBUG_TDMA
+        TRX_LOG("TX burst FN=%u task_u=0x%04x", s->fn, task_u);
+#endif
+    }
+
+    /* Clear task words (DSP "consumed" them) */
+    w_page[DB_W_D_TASK_D] = 0;
+    w_page[DB_W_D_TASK_U] = 0;
+
+    /* Write frame number to NDB */
+    ndb[NDB_W_D_FN] = (uint16_t)(s->fn & 0xFFFF);
+}
+
+/* DSP completion timer callback */
+static void calypso_dsp_done(void *opaque)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    /* Fire DSP API interrupt — wakes up firmware to read results */
+    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
+}
+
+/* =====================================================================
+ * TPU — Time Processing Unit
+ * ===================================================================== */
+
+static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint64_t val = 0;
+
+    switch (offset) {
+    case TPU_CTRL:
+        val = s->tpu_regs[TPU_CTRL / 2];
+        break;
+    case TPU_IDLE:
+        val = 1;  /* Always idle (processing is instant) */
+        break;
+    case TPU_INT_CTRL:
+        val = s->tpu_regs[TPU_INT_CTRL / 2];
+        break;
+    case TPU_INT_STAT:
+        val = 0;
+        break;
+    case TPU_DSP_PAGE:
+        val = s->dsp_page;
+        break;
+    case TPU_FRAME:
+        val = (uint16_t)(s->fn % 2715648);
+        break;
+    case TPU_OFFSET:
+        val = s->tpu_regs[TPU_OFFSET / 2];
+        break;
+    case TPU_SYNCHRO:
+        val = s->tpu_regs[TPU_SYNCHRO / 2];
+        break;
+    default:
+        if (offset >= TPU_RAM_BASE &&
+            offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
+            val = s->tpu_ram[(offset - TPU_RAM_BASE) / 2];
+        } else if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
+            val = s->tpu_regs[offset / 2];
+        }
+        break;
+    }
+
+#if TRX_DEBUG_TPU
+    TRX_LOG("TPU read  [0x%04x] = 0x%04x", (unsigned)offset, (unsigned)val);
+#endif
+    return val;
+}
+
+static void calypso_tpu_write(void *opaque, hwaddr offset,
+                               uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+#if TRX_DEBUG_TPU
+    TRX_LOG("TPU write [0x%04x] = 0x%04x", (unsigned)offset, (unsigned)value);
+#endif
+
+    /* Store register */
+    if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
+        s->tpu_regs[offset / 2] = (uint16_t)value;
+    }
+
+    /* TPU instruction RAM */
+    if (offset >= TPU_RAM_BASE &&
+        offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
+        s->tpu_ram[(offset - TPU_RAM_BASE) / 2] = (uint16_t)value;
+        return;
+    }
+
+    switch (offset) {
+    case TPU_CTRL:
+        if ((value & TPU_CTRL_ENABLE) && !s->tpu_enabled) {
+            /* TPU enabled — firmware triggered DSP processing */
+            s->tpu_enabled = true;
+
+            /* Process DSP tasks (sync detection + burst handling) */
+            calypso_dsp_process(s);
+
+            /* Schedule DSP completion IRQ after small delay (10 µs) */
+            timer_mod_ns(s->dsp_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10000);
+        }
+        if (value & TPU_CTRL_RESET) {
+            s->tpu_enabled = false;
+        }
+        break;
+
+    case TPU_OFFSET:
+    case TPU_SYNCHRO:
+        break;
+
+    case TPU_INT_CTRL:
+        break;
+
+    case TPU_DSP_PAGE:
+        s->dsp_page = value & 1;
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_tpu_ops = {
+    .read = calypso_tpu_read,
+    .write = calypso_tpu_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 2, .max_access_size = 2 },
+    .impl  = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* =====================================================================
+ * TSP — Time Serial Port (RF transceiver control)
+ * ===================================================================== */
+
+static uint64_t calypso_tsp_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint64_t val = 0;
+
+    switch (offset) {
+    case TSP_RX_REG:
+        val = 0xFFFF;
+        break;
+    case TSP_CTRL1:
+        val = s->tsp_regs[TSP_CTRL1 / 2];
+        break;
+    default:
+        if (offset / 2 < CALYPSO_TSP_SIZE / 2) {
+            val = s->tsp_regs[offset / 2];
+        }
+        break;
+    }
+
+#if TRX_DEBUG_TSP
+    TRX_LOG("TSP read  [0x%02x] = 0x%04x", (unsigned)offset, (unsigned)val);
+#endif
+    return val;
+}
+
+static void calypso_tsp_write(void *opaque, hwaddr offset,
+                               uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+#if TRX_DEBUG_TSP
+    TRX_LOG("TSP write [0x%02x] = 0x%04x", (unsigned)offset, (unsigned)value);
+#endif
+
+    if (offset / 2 < CALYPSO_TSP_SIZE / 2) {
+        s->tsp_regs[offset / 2] = (uint16_t)value;
+    }
+}
+
+static const MemoryRegionOps calypso_tsp_ops = {
+    .read = calypso_tsp_read,
+    .write = calypso_tsp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 2, .max_access_size = 2 },
+    .impl  = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* =====================================================================
+ * ULPD — Ultra Low Power Down (clocks, gauging, GSM timer)
+ * ===================================================================== */
+
+static uint64_t calypso_ulpd_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint64_t val = 0;
+
+    switch (offset) {
+    case ULPD_SETUP_CLK13:
+        val = 0x2003;  /* CLK13: enabled, stable */
+        break;
+    case ULPD_SETUP_SLICER:
+    case ULPD_SETUP_VTCXO:
+        val = 0;
+        break;
+    case ULPD_COUNTER_HI:
+        s->ulpd_counter += 100;
+        val = (s->ulpd_counter >> 16) & 0xFFFF;
+        break;
+    case ULPD_COUNTER_LO:
+        val = s->ulpd_counter & 0xFFFF;
+        break;
+    case ULPD_GAUGING_CTRL:
+        val = 0x0001;  /* Gauging complete */
+        break;
+    case ULPD_GSM_TIMER:
+        val = (uint16_t)(s->fn & 0xFFFF);
+        break;
+    default:
+        if (offset / 2 < CALYPSO_ULPD_SIZE / 2) {
+            val = s->ulpd_regs[offset / 2];
+        }
+        break;
+    }
+
+#if TRX_DEBUG_ULPD
+    TRX_LOG("ULPD read  [0x%02x] = 0x%04x", (unsigned)offset, (unsigned)val);
+#endif
+    return val;
+}
+
+static void calypso_ulpd_write(void *opaque, hwaddr offset,
+                                uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+#if TRX_DEBUG_ULPD
+    TRX_LOG("ULPD write [0x%02x] = 0x%04x", (unsigned)offset, (unsigned)value);
+#endif
+
+    if (offset / 2 < CALYPSO_ULPD_SIZE / 2) {
+        s->ulpd_regs[offset / 2] = (uint16_t)value;
+    }
+}
+
+static const MemoryRegionOps calypso_ulpd_ops = {
+    .read = calypso_ulpd_read,
+    .write = calypso_ulpd_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl  = { .min_access_size = 1, .max_access_size = 2 },
+};
+
+/* =====================================================================
+ * TDMA frame timer — drives L1 at 4.615 ms per frame
+ * ===================================================================== */
+
+static void calypso_tdma_tick(void *opaque)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    /* Advance frame number */
+    s->fn = (s->fn + 1) % GSM_HYPERFRAME;
+
+    /* Reset TPU enabled flag (new frame, new scenario needed) */
+    s->tpu_enabled = false;
+    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
+
+    /* Run sync state machine */
+    calypso_sync_tick(s);
+
+#if TRX_DEBUG_TDMA
+    if ((s->fn % 5000) == 0) {
+        TRX_LOG("TDMA FN=%u sync=%d tasks=%u fb=%u sb=%u",
+                s->fn, s->sync_state, s->sync_task_count,
+                s->sync_fb_tasks, s->sync_sb_tasks);
+    }
+#endif
+
+    /* Fire TPU frame interrupt — this wakes up L1 */
+    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
+
+    /* Schedule next frame */
+    if (s->tdma_running) {
+        timer_mod_ns(s->tdma_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+    }
+}
+
+/* =====================================================================
+ * Start TDMA and sync
+ * ===================================================================== */
+
+static void calypso_tdma_start(CalypsoTRX *s)
+{
+    if (s->tdma_running) return;
+    s->tdma_running = true;
+    s->fn = 0;
+    TRX_LOG("TDMA started (4.615ms frame timer)");
+    timer_mod_ns(s->tdma_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+}
+
+/* =====================================================================
+ * DSP API RAM initialization
+ * ===================================================================== */
+
+static void calypso_dsp_api_init(CalypsoTRX *s)
+{
+    memset(s->dsp_ram, 0, sizeof(s->dsp_ram));
+
+    /*
+     * DSP boot status — firmware polls word 0 of API RAM.
+     * Start at BOOT (0x0001); we'll transition to READY
+     * when the firmware has polled enough times (see dsp_read).
+     */
+     
+    s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_READY;
+    s->sync_dsp_booted = true;
+}
+
+/* =====================================================================
+ * Sync state initialization
+ * ===================================================================== */
+
+static void calypso_sync_init(CalypsoTRX *s)
+{
+    s->sync_state       = SYNC_IDLE;
+    s->sync_fb_countdown = 0;
+    s->sync_sb_countdown = 0;
+    s->sync_arfcn       = SYNC_DEFAULT_ARFCN;
+    s->sync_bsic        = SYNC_DEFAULT_BSIC;
+    s->sync_rssi        = SYNC_DEFAULT_RSSI;
+    s->sync_ref_fn      = 0;
+    s->sync_task_count  = 0;
+    s->sync_fb_tasks    = 0;
+    s->sync_sb_tasks    = 0;
+    s->sync_dsp_booted  = false;
+    s->sync_boot_frame  = 0;
+
+    TRX_LOG("Sync init: ARFCN=%d BSIC=0x%02x(%d,%d) RSSI=%d dBm",
+            s->sync_arfcn, s->sync_bsic,
+            (s->sync_bsic >> 3) & 7, s->sync_bsic & 7,
+            s->sync_rssi);
+    TRX_LOG("  FB detect delay: %d frames", SYNC_FB_DETECT_DELAY);
+    TRX_LOG("  SB decode delay: %d frames", SYNC_SB_DECODE_DELAY);
+    TRX_LOG("  NDB offsets: d_fb_det=w%d a_cd=w%d-%d a_sch26=w%d-%d",
+            NDB_W_D_FB_DET,
+            NDB_W_A_CD_TOA, NDB_W_A_CD_SNR,
+            NDB_W_A_SCH26, NDB_W_A_SCH26 + NDB_W_A_SCH26_LEN - 1);
+}
+
+/* =====================================================================
+ * calypso_trx_init() — Main entry point
+ * ===================================================================== */
+
+void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
+{
+    CalypsoTRX *s = g_new0(CalypsoTRX, 1);
+    g_trx = s;
+    s->irqs = irqs;
+    s->trx_fd = -1;
+
+    TRX_LOG("=== Calypso TRX bridge init (with ARFCN sync) ===");
+    gsmtap_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (gsmtap_fd >= 0) {
+        memset(&gsmtap_addr, 0, sizeof(gsmtap_addr));
+        gsmtap_addr.sin_family = AF_INET;
+        gsmtap_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        gsmtap_addr.sin_port = htons(GSMTAP_PORT);
+    }
+
+    /* ---- DSP API RAM ---- */
+    memory_region_init_io(&s->dsp_iomem, NULL, &calypso_dsp_ops, s,
+                          "calypso.dsp_api", CALYPSO_DSP_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_DSP_BASE, &s->dsp_iomem);
+    calypso_dsp_api_init(s);
+
+    /* ---- Sync state ---- */
+    calypso_sync_init(s);
+
+    /* ---- TPU ---- */
+    memory_region_init_io(&s->tpu_iomem, NULL, &calypso_tpu_ops, s,
+                          "calypso.tpu", CALYPSO_TPU_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_TPU_BASE, &s->tpu_iomem);
+
+    /* ---- TSP ---- */
+    memory_region_init_io(&s->tsp_iomem, NULL, &calypso_tsp_ops, s,
+                          "calypso.tsp", CALYPSO_TSP_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_TSP_BASE, &s->tsp_iomem);
+
+    /* ---- ULPD ---- */
+    memory_region_init_io(&s->ulpd_iomem, NULL, &calypso_ulpd_ops, s,
+                          "calypso.ulpd", CALYPSO_ULPD_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_ULPD_BASE, &s->ulpd_iomem);
+
+    /* ---- TDMA frame timer ---- */
+    s->tdma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_tdma_tick, s);
+
+    /* ---- DSP completion timer ---- */
+    s->dsp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_dsp_done, s);
+
+    /* ---- TRX UDP socket ---- */
+    if (trx_port > 0) {
+        trx_socket_init(s, trx_port);
+    } else {
+        TRX_LOG("TRX UDP disabled");
+    }
+
+    /* ---- Auto-start TDMA ---- */
+    calypso_tdma_start(s);
+    TRX_LOG("=== TRX bridge ready ===");
+    TRX_LOG("  DSP API:  0x%08x (%d KiB)", CALYPSO_DSP_BASE,
+            CALYPSO_DSP_SIZE / 1024);
+    TRX_LOG("  TPU:      0x%08x", CALYPSO_TPU_BASE);
+    TRX_LOG("  TSP:      0x%08x", CALYPSO_TSP_BASE);
+    TRX_LOG("  ULPD:     0x%08x", CALYPSO_ULPD_BASE);
+    TRX_LOG("  TDMA:     4.615ms → IRQ %d", CALYPSO_IRQ_TPU_FRAME);
+    TRX_LOG("  DSP done: → IRQ %d", CALYPSO_IRQ_API);
+    TRX_LOG("  Sync:     ARFCN=%d BSIC=%d", s->sync_arfcn, s->sync_bsic);
+    if (s->trx_fd >= 0) {
+        TRX_LOG("  TRX UDP:  port %d", trx_port);
+    }
+}
+/*
+ * calypso_soc.c - TI Calypso System-on-Chip
+ *
+ * Complete SoC device with all integrated peripherals.
+ * This is a QOM container device that instantiates and connects:
+ * - INTH (interrupt controller)
+ * - Timers, UARTs, SPI
+ * - DSP/TPU/TRX bridge
+ * - Internal RAM
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "exec/memory.h"
+#include "exec/address-spaces.h"
+#include "hw/misc/unimp.h"
+#include "sysemu/sysemu.h"
+#include "hw/arm/calypso/calypso_soc.h"
+#include "hw/arm/calypso/calypso_trx.h"
+
+/* ========================================================================
+ * Memory map (SoC internal peripherals)
+ * ======================================================================== */
+
+/* Internal RAM */
+#define CALYPSO_IRAM_BASE     0x00800000
+#define CALYPSO_IRAM_SIZE     (256 * 1024)
+
+/* Peripheral bases */
+#define CALYPSO_MMIO_18XX     0xFFFE1800
+#define CALYPSO_MMIO_28XX     0xFFFE2800
+#define CALYPSO_SPI_BASE      0xFFFE3000
+#define CALYPSO_TIMER1_BASE   0xFFFE3800
+#define CALYPSO_KEYPAD_BASE   0xFFFE4800
+#define CALYPSO_TIMER2_BASE   0xFFFE6800
+#define CALYPSO_MMIO_80XX     0xFFFE8000
+#define CALYPSO_MMIO_F0XX     0xFFFEF000
+#define CALYPSO_UART_MODEM    0xFFFF5000
+#define CALYPSO_UART_IRDA     0xFFFF5800
+#define CALYPSO_MMIO_98XX     0xFFFF9800
+#define CALYPSO_MMIO_F9XX     0xFFFFF900
+#define CALYPSO_INTH_BASE     0xFFFFFA00
+#define CALYPSO_SYSTEM_FB     0xFFFFFB00
+#define CALYPSO_MMIO_FCXX     0xFFFFFC00
+#define CALYPSO_SYSTEM_FD     0xFFFFFD00
+#define CALYPSO_MMIO_FFXX     0xFFFFFF00
+
+#define CALYPSO_PERIPH_SIZE   256
+
+/* IRQ numbers (must match calypso_trx.h) */
+#define IRQ_TIMER1        1
+#define IRQ_TIMER2        2
+#define IRQ_UART_MODEM    7
+#define IRQ_KEYPAD        8
+#define IRQ_SPI          13
+#define IRQ_UART_IRDA    18
+
+/* ========================================================================
+ * Stub peripherals (minimal implementations)
+ * ======================================================================== */
+
+static uint64_t calypso_keypad_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0x0000;
+}
+
+static void calypso_keypad_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+}
+
+static const MemoryRegionOps calypso_keypad_ops = {
+    .read = calypso_keypad_read,
+    .write = calypso_keypad_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+static uint64_t calypso_mmio8_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0xFF;
+}
+
+static void calypso_mmio8_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+}
+
+static const MemoryRegionOps calypso_mmio8_ops = {
+    .read = calypso_mmio8_read,
+    .write = calypso_mmio8_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+};
+
+static uint64_t calypso_mmio16_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0;
+}
+
+static void calypso_mmio16_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+}
+
+static const MemoryRegionOps calypso_mmio16_ops = {
+    .read = calypso_mmio16_read,
+    .write = calypso_mmio16_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* Helper to create stub MMIO regions */
+static void calypso_create_mmio_stub(MemoryRegion *parent, const char *name,
+                                     hwaddr base, const MemoryRegionOps *ops,
+                                     void *opaque)
+{
+    MemoryRegion *mr = g_new(MemoryRegion, 1);
+    memory_region_init_io(mr, NULL, ops, opaque, name, CALYPSO_PERIPH_SIZE);
+    memory_region_add_subregion(parent, base, mr);
+}
+
+/* ========================================================================
+ * SoC realize
+ * ======================================================================== */
+
+static void calypso_soc_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoSoCState *s = CALYPSO_SOC(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    MemoryRegion *sysmem = get_system_memory();
+    Error *err = NULL;
+
+    /* ---- Internal RAM ---- */
+    memory_region_init_ram(&s->iram, OBJECT(dev), "calypso.iram",
+                           CALYPSO_IRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, CALYPSO_IRAM_BASE, &s->iram);
+
+    /* ---- Interrupt Controller (INTH) ---- */
+    object_initialize_child(OBJECT(dev), "inth", &s->inth, TYPE_CALYPSO_INTH);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->inth), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->inth), 0, CALYPSO_INTH_BASE);
+
+    /* Connect INTH outputs to SoC-level IRQ/FIQ outputs */
+    sysbus_init_irq(sbd, &s->cpu_irq);
+    sysbus_init_irq(sbd, &s->cpu_fiq);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->inth), 0, s->cpu_irq);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->inth), 1, s->cpu_fiq);
+
+    /* Convenience macro for getting INTH input lines */
+    #define INTH_IRQ(n) qdev_get_gpio_in(DEVICE(&s->inth), (n))
+
+    /* ---- Timer 1 ---- */
+    object_initialize_child(OBJECT(dev), "timer1", &s->timer1,
+                           TYPE_CALYPSO_TIMER);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer1), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer1), 0, CALYPSO_TIMER1_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer1), 0, INTH_IRQ(IRQ_TIMER1));
+
+    /* ---- Timer 2 ---- */
+    object_initialize_child(OBJECT(dev), "timer2", &s->timer2,
+                           TYPE_CALYPSO_TIMER);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer2), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer2), 0, CALYPSO_TIMER2_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->timer2), 0, INTH_IRQ(IRQ_TIMER2));
+
+    /* ---- SPI + TWL3025 ABB ---- */
+    object_initialize_child(OBJECT(dev), "spi", &s->spi, TYPE_CALYPSO_SPI);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi), 0, CALYPSO_SPI_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi), 0, INTH_IRQ(IRQ_SPI));
+
+    /* ---- UART Modem (no chardev by default) ---- */
+    object_initialize_child(OBJECT(dev), "uart-modem", &s->uart_modem,
+                           TYPE_CALYPSO_UART);
+    qdev_prop_set_string(DEVICE(&s->uart_modem), "label", "modem");
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart_modem), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_modem), 0, CALYPSO_UART_MODEM);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_modem), 0,
+                       INTH_IRQ(IRQ_UART_MODEM));
+
+    /* ---- UART IrDA ---- */
+    object_initialize_child(OBJECT(dev), "uart-irda", &s->uart_irda,
+                           TYPE_CALYPSO_UART);
+
+    qdev_prop_set_string(DEVICE(&s->uart_irda.parent_obj), "label", "irda");
+
+    /* Hook serial0 HERE, before realize */
+    Chardev *chr = serial_hd(0);
+    if (chr) {
+        qdev_prop_set_chr(DEVICE(&s->uart_irda.parent_obj), "chardev", chr);
+    }
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart_irda), &err)) {
+        error_propagate(errp, err);
+        return;
+    }
+
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_irda), 0, CALYPSO_UART_IRDA);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_irda), 0,
+                       INTH_IRQ(IRQ_UART_IRDA));
+
+    /* ---- TRX bridge (DSP/TPU/TSP/ULPD) ---- */
+    if (s->enable_trx) {
+        /* Collect all IRQ lines for TRX */
+        qemu_irq *irqs = g_new0(qemu_irq, CALYPSO_NUM_IRQS);
+        for (int i = 0; i < CALYPSO_NUM_IRQS; i++) {
+            irqs[i] = INTH_IRQ(i);
+        }
+        
+        /* Initialize TRX bridge (non-QOM module) */
+        calypso_trx_init(sysmem, irqs, s->trx_port);
+    }
+
+    #undef INTH_IRQ
+
+    /* ---- Stub peripherals ---- */
+    calypso_create_mmio_stub(sysmem, "calypso.keypad",
+                             CALYPSO_KEYPAD_BASE, &calypso_keypad_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_18xx",
+                             CALYPSO_MMIO_18XX, &calypso_mmio8_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_28xx",
+                             CALYPSO_MMIO_28XX, &calypso_mmio8_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_80xx",
+                             CALYPSO_MMIO_80XX, &calypso_mmio8_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_f0xx",
+                             CALYPSO_MMIO_F0XX, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_98xx",
+                             CALYPSO_MMIO_98XX, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_f9xx",
+                             CALYPSO_MMIO_F9XX, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.system_fb",
+                             CALYPSO_SYSTEM_FB, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_fcxx",
+                             CALYPSO_MMIO_FCXX, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.system_fd",
+                             CALYPSO_SYSTEM_FD, &calypso_mmio16_ops, NULL);
+    calypso_create_mmio_stub(sysmem, "calypso.mmio_ffxx",
+                             CALYPSO_MMIO_FFXX, &calypso_mmio8_ops, NULL);
+}
+
+static Property calypso_soc_properties[] = {
+    DEFINE_PROP_INT32("trx-port", CalypsoSoCState, trx_port, 4729),
+    DEFINE_PROP_BOOL("enable-trx", CalypsoSoCState, enable_trx, true),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void calypso_soc_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = calypso_soc_realize;
+    dc->desc = "TI Calypso System-on-Chip";
+    device_class_set_props(dc, calypso_soc_properties);
+}
+
+static const TypeInfo calypso_soc_info = {
+    .name          = TYPE_CALYPSO_SOC,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoSoCState),
+    .class_init    = calypso_soc_class_init,
+};
+
+static void calypso_soc_register_types(void)
+{
+    type_register_static(&calypso_soc_info);
+}
+
+type_init(calypso_soc_register_types)
+/*
+ * calypso_socket.c — Calypso Socket device for communication with transceiver
+ *
+ * Version améliorée utilisant le système d'événements QEMU au lieu de threads.
+ * Plus propre et mieux intégré avec QEMU.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "hw/qdev-properties.h"
+#include "qemu/error-report.h"
+#include "qapi/error.h"
+#include "qemu/main-loop.h"
+#include "hw/arm/calypso/calypso_socket.h"
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <errno.h>
+#include "qemu/cutils.h"
+
+/* Forward declarations */
+static void calypso_socket_read_handler(void *opaque);
+static void calypso_socket_accept_handler(void *opaque);
+
+void calypso_socket_reset(DeviceState *dev)
+{
+    CalypsoSocketState *s = CALYPSO_SOCKET(dev);
+
+    if (s->socket_fd >= 0) {
+        qemu_set_fd_handler(s->socket_fd, NULL, NULL, NULL);
+        close(s->socket_fd);
+        s->socket_fd = -1;
+    }
+    
+    if (s->client_fd >= 0) {
+        qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+        close(s->client_fd);
+        s->client_fd = -1;
+    }
+    
+    s->status = 0;
+    s->rx_len = 0;
+}
+
+/* Called when there's data to read from the client connection */
+static void calypso_socket_read_handler(void *opaque)
+{
+    CalypsoSocketState *s = (CalypsoSocketState *)opaque;
+    uint8_t buffer[1024];
+    
+    int bytes_received = recv(s->client_fd, buffer, sizeof(buffer), 0);
+    
+    if (bytes_received > 0) {
+        /* Store in RX buffer if there's space */
+        if (s->rx_len + bytes_received < sizeof(s->rx_buffer)) {
+            memcpy(&s->rx_buffer[s->rx_len], buffer, bytes_received);
+            s->rx_len += bytes_received;
+            s->status |= CALYPSO_SOCKET_STATUS_READY;
+        } else {
+            s->status |= CALYPSO_SOCKET_STATUS_ERROR;
+        }
+    } else if (bytes_received == 0) {
+        /* Client disconnected */
+        qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+        close(s->client_fd);
+        s->client_fd = -1;
+        s->status &= ~CALYPSO_SOCKET_STATUS_READY;
+    } else {
+        /* Error */
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            s->status |= CALYPSO_SOCKET_STATUS_ERROR;
+            qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+            close(s->client_fd);
+            s->client_fd = -1;
+        }
+    }
+}
+
+/* Called when there's a new connection to accept */
+static void calypso_socket_accept_handler(void *opaque)
+{
+    CalypsoSocketState *s = (CalypsoSocketState *)opaque;
+    struct sockaddr_un client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    
+    /* Close existing client if any */
+    if (s->client_fd >= 0) {
+        qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+        close(s->client_fd);
+    }
+    
+    /* Accept new connection */
+    s->client_fd = accept(s->socket_fd, (struct sockaddr *)&client_addr, &client_len);
+    
+    if (s->client_fd < 0) {
+        error_report("calypso-socket: accept failed: %s", strerror(errno));
+        return;
+    }
+    
+    /* Set non-blocking */
+    int flags = fcntl(s->client_fd, F_GETFL, 0);
+    fcntl(s->client_fd, F_SETFL, flags | O_NONBLOCK);
+    
+    /* Register read handler for this client */
+    qemu_set_fd_handler(s->client_fd, calypso_socket_read_handler, NULL, s);
+    
+    s->status |= CALYPSO_SOCKET_STATUS_READY;
+}
+
+static uint64_t calypso_socket_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoSocketState *s = (CalypsoSocketState *)opaque;
+    
+    switch (offset) {
+    case CALYPSO_SOCKET_STATUS:
+        return s->status;
+    
+    case CALYPSO_SOCKET_DATA:
+        if (s->rx_len > 0) {
+            uint8_t data = s->rx_buffer[0];
+            s->rx_len--;
+            memmove(&s->rx_buffer[0], &s->rx_buffer[1], s->rx_len);
+            
+            /* Clear ready flag if buffer now empty */
+            if (s->rx_len == 0) {
+                s->status &= ~CALYPSO_SOCKET_STATUS_READY;
+            }
+            
+            return data;
+        }
+        return 0;
+    
+    default:
+        return 0;
+    }
+}
+
+static void calypso_socket_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+    CalypsoSocketState *s = (CalypsoSocketState *)opaque;
+    
+    switch (offset) {
+    case CALYPSO_SOCKET_CTRL:
+        if (value & CALYPSO_SOCKET_CTRL_START) {
+            if (s->socket_fd >= 0 && s->client_fd < 0) {
+                /* Already have listening socket, just wait for connection */
+                s->status |= CALYPSO_SOCKET_STATUS_READY;
+            }
+        }
+        
+        if (value & CALYPSO_SOCKET_CTRL_STOP) {
+            if (s->client_fd >= 0) {
+                qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+                close(s->client_fd);
+                s->client_fd = -1;
+            }
+            s->status &= ~CALYPSO_SOCKET_STATUS_READY;
+        }
+        
+        if (value & CALYPSO_SOCKET_CTRL_RESET) {
+            calypso_socket_reset(DEVICE(&s->parent_obj));
+        }
+        break;
+    
+    case CALYPSO_SOCKET_DATA:
+        /* Send data to client if connected */
+        if (s->client_fd >= 0) {
+            uint8_t byte = value & 0xFF;
+            ssize_t sent = send(s->client_fd, &byte, 1, 0);
+            
+            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                s->status |= CALYPSO_SOCKET_STATUS_ERROR;
+            } else if (sent > 0) {
+                s->status |= CALYPSO_SOCKET_STATUS_TX;
+            }
+        }
+        break;
+    
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_socket_ops = {
+    .read = calypso_socket_read,
+    .write = calypso_socket_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void calypso_socket_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoSocketState *s = CALYPSO_SOCKET(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    if (s->socket_path[0] == '\0') {
+        error_setg(errp, "socket-path property not set");
+        return;
+    }
+
+    /* Create UNIX socket */
+    s->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s->socket_fd < 0) {
+        error_setg(errp, "Failed to create UNIX socket: %s", strerror(errno));
+        return;
+    }
+
+    /* Set non-blocking */
+    int flags = fcntl(s->socket_fd, F_GETFL, 0);
+    fcntl(s->socket_fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Remove existing socket file if present */
+    unlink(s->socket_path);
+
+    /* Set up socket address */
+    memset(&s->socket_addr, 0, sizeof(s->socket_addr));
+    s->socket_addr.sun_family = AF_UNIX;
+    pstrcpy(s->socket_addr.sun_path,
+            sizeof(s->socket_addr.sun_path),
+            s->socket_path);
+
+    /* Bind to socket path */
+    if (bind(s->socket_fd, (struct sockaddr *)&s->socket_addr,
+             sizeof(s->socket_addr)) < 0) {
+        error_setg(errp, "Failed to bind to socket: %s", strerror(errno));
+        close(s->socket_fd);
+        s->socket_fd = -1;
+        return;
+    }
+
+    /* Listen on socket */
+    if (listen(s->socket_fd, 1) < 0) {
+        error_setg(errp, "Failed to listen on socket: %s", strerror(errno));
+        close(s->socket_fd);
+        s->socket_fd = -1;
+        return;
+    }
+
+    /* Register accept handler with QEMU event loop */
+    qemu_set_fd_handler(s->socket_fd, calypso_socket_accept_handler, NULL, s);
+
+    /* Set up MMIO region */
+    memory_region_init_io(&s->mmio, OBJECT(dev), &calypso_socket_ops, s,
+                          TYPE_CALYPSO_SOCKET, 0x10);
+    sysbus_init_mmio(sbd, &s->mmio);
+}
+
+static void calypso_socket_instance_init(Object *obj)
+{
+    CalypsoSocketState *s = CALYPSO_SOCKET(obj);
+    
+    s->socket_fd = -1;
+    s->client_fd = -1;
+    s->status = 0;
+    s->rx_len = 0;
+}
+
+static void calypso_socket_finalize(Object *obj)
+{
+    CalypsoSocketState *s = CALYPSO_SOCKET(obj);
+    
+    if (s->socket_fd >= 0) {
+        qemu_set_fd_handler(s->socket_fd, NULL, NULL, NULL);
+        close(s->socket_fd);
+        unlink(s->socket_path);
+        s->socket_fd = -1;
+    }
+    
+    if (s->client_fd >= 0) {
+        qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
+        close(s->client_fd);
+        s->client_fd = -1;
+    }
+}
+
+static Property calypso_socket_properties[] = {
+    DEFINE_PROP_STRING("socket-path", CalypsoSocketState, socket_path),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void calypso_socket_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    
+    dc->realize = calypso_socket_realize;
+    device_class_set_legacy_reset(dc, calypso_socket_reset);
+    dc->desc = "Calypso UNIX domain socket interface";
+    device_class_set_props(dc, calypso_socket_properties);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo calypso_socket_info = {
+    .name = TYPE_CALYPSO_SOCKET,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoSocketState),
+    .instance_init = calypso_socket_instance_init,
+    .instance_finalize = calypso_socket_finalize,
+    .class_init = calypso_socket_class_init,
+};
+
+static void calypso_socket_register_types(void)
+{
+    type_register_static(&calypso_socket_info);
+}
+
+type_init(calypso_socket_register_types)
+/*
+ * calypso_inth.c — Calypso INTH (Interrupt Handler)
+ *
+ * Two-level interrupt controller at 0xFFFFFA00.
+ * 32 IRQ inputs, priority-based arbitration, IRQ/FIQ routing via ILR.
+ *
+ * Register map (16-bit, offsets from base):
+ *   0x00        IT_REG1   (pending bits [15:0], read-only)
+ *   0x02        IT_REG2   (pending bits [31:16], read-only)
+ *   0x04        MASK_IT_REG1 (mask low)
+ *   0x06        MASK_IT_REG2 (mask high)
+ *   0x20..0x5F  ILR[0..31] (2 bytes each: bits[4:0]=prio, bit[8]=FIQ)
+ *   0x80        IRQ_NUM   (current IRQ number, read-only)
+ *   0x82        FIQ_NUM   (current FIQ number, read-only)
+ *   0x84        IRQ_CTRL  (write 1 to acknowledge current IRQ)
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/irq.h"
+#include "hw/sysbus.h"
+#include "qemu/log.h"
+#include "hw/arm/calypso/calypso_inth.h"
+
+/* ---- Priority arbitration ---- */
+
+static void calypso_inth_update(CalypsoINTHState *s)
+{
+    uint32_t active = s->pending & ~s->mask;
+    int best_irq = -1;
+    int best_prio = 0x7F;
+    int is_fiq = 0;
+
+    for (int i = 0; i < CALYPSO_INTH_NUM_IRQS; i++) {
+        if (active & (1u << i)) {
+            int prio = s->ilr[i] & 0x1F;
+            if (prio < best_prio) {
+                best_prio = prio;
+                best_irq = i;
+                is_fiq = (s->ilr[i] >> 8) & 1;
+            }
+        }
+    }
+
+    if (best_irq >= 0) {
+        s->ith_v = best_irq;
+        if (is_fiq) {
+            qemu_irq_raise(s->parent_fiq);
+            qemu_irq_lower(s->parent_irq);
+        } else {
+            qemu_irq_raise(s->parent_irq);
+            qemu_irq_lower(s->parent_fiq);
+        }
+    } else {
+        s->ith_v = 0;
+        qemu_irq_lower(s->parent_irq);
+        qemu_irq_lower(s->parent_fiq);
+    }
+}
+
+/* ---- GPIO input handler (one per IRQ line) ---- */
+
+static void calypso_inth_set_irq(void *opaque, int irq, int level)
+{
+    CalypsoINTHState *s = CALYPSO_INTH(opaque);
+
+    if (level) {
+        s->pending |= (1u << irq);
+    } else {
+        s->pending &= ~(1u << irq);
+    }
+    calypso_inth_update(s);
+}
+
+/* ---- MMIO read/write ---- */
+
+static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoINTHState *s = CALYPSO_INTH(opaque);
+
+    switch (offset) {
+    case 0x00: /* IT_REG1 — pending bits [15:0] */
+        return s->pending & 0xFFFF;
+    case 0x02: /* IT_REG2 — pending bits [31:16] */
+        return (s->pending >> 16) & 0xFFFF;
+    case 0x04: /* MASK_IT_REG1 */
+        return s->mask & 0xFFFF;
+    case 0x06: /* MASK_IT_REG2 */
+        return (s->mask >> 16) & 0xFFFF;
+    case 0x80: /* IRQ_NUM */
+        return s->ith_v;
+    case 0x82: /* FIQ_NUM */
+        return s->ith_v;
+    case 0x84: /* IRQ_CTRL */
+        return 0;
+    default:
+        if (offset >= 0x20 && offset < 0x60) {
+            int idx = (offset - 0x20) / 2;
+            return s->ilr[idx];
+        }
+        qemu_log_mask(LOG_UNIMP, "calypso_inth: unimplemented read at 0x%02x\n",
+                       (unsigned)offset);
+        return 0;
+    }
+}
+
+static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    CalypsoINTHState *s = CALYPSO_INTH(opaque);
+
+    switch (offset) {
+    case 0x04: /* MASK_IT_REG1 */
+        s->mask = (s->mask & 0xFFFF0000) | (value & 0xFFFF);
+        calypso_inth_update(s);
+        break;
+    case 0x06: /* MASK_IT_REG2 */
+        s->mask = (s->mask & 0x0000FFFF) | ((value & 0xFFFF) << 16);
+        calypso_inth_update(s);
+        break;
+    case 0x84: /* IRQ_CTRL — acknowledge current IRQ */
+        if (s->ith_v < CALYPSO_INTH_NUM_IRQS) {
+            s->pending &= ~(1u << s->ith_v);
+        }
+        calypso_inth_update(s);
+        break;
+    default:
+        if (offset >= 0x20 && offset < 0x60) {
+            int idx = (offset - 0x20) / 2;
+            s->ilr[idx] = value & 0x1FFF;
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_inth_ops = {
+    .read = calypso_inth_read,
+    .write = calypso_inth_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* ---- QOM lifecycle ---- */
+
+static void calypso_inth_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoINTHState *s = CALYPSO_INTH(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(dev), &calypso_inth_ops, s,
+                          "calypso-inth", 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /* Two output lines: IRQ and FIQ to CPU */
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->parent_irq);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->parent_fiq);
+
+    /* 32 input IRQ lines */
+    qdev_init_gpio_in(dev, calypso_inth_set_irq, CALYPSO_INTH_NUM_IRQS);
+}
+
+static void calypso_inth_reset(DeviceState *dev)
+{
+    CalypsoINTHState *s = CALYPSO_INTH(dev);
+
+    s->pending = 0;
+    s->mask = 0xFFFFFFFF;  /* All masked at reset */
+    s->ith_v = 0;
+    memset(s->ilr, 0, sizeof(s->ilr));
+}
+
+static void calypso_inth_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = calypso_inth_realize;
+    device_class_set_legacy_reset(dc, calypso_inth_reset);
+    dc->desc = "Calypso INTH interrupt controller";
+}
+
+static const TypeInfo calypso_inth_info = {
+    .name          = TYPE_CALYPSO_INTH,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoINTHState),
+    .class_init    = calypso_inth_class_init,
+};
+
+static void calypso_inth_register_types(void)
+{
+    type_register_static(&calypso_inth_info);
+}
+
+type_init(calypso_inth_register_types)
+/*
+ * calypso_timer.c — Calypso GP/Watchdog Timer
+ *
+ * 16-bit down-counter with auto-reload, prescaler, and IRQ.
+ * Calypso base clock: 13 MHz. Effective rate = 13 MHz / (prescaler + 1).
+ *
+ * Register map (16-bit, offsets from base):
+ *   0x00  CNTL       Control (bit0=start, bit1=auto-reload, bit2=irq-enable)
+ *   0x02  LOAD       Reload value (written before starting)
+ *   0x04  READ       Current count (read-only)
+ *   0x06  PRESCALER  Clock divider
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "qemu/timer.h"
+#include "hw/arm/calypso/calypso_timer.h"
+
+#define TIMER_CTRL_START   (1 << 0)
+#define TIMER_CTRL_RELOAD  (1 << 1)
+#define TIMER_CTRL_IRQ_EN  (1 << 2)
+
+#define CALYPSO_BASE_CLK   13000000LL  /* 13 MHz */
+
+static void calypso_timer_tick(void *opaque)
+{
+    CalypsoTimerState *s = CALYPSO_TIMER(opaque);
+
+    if (!s->running) {
+        return;
+    }
+
+    s->count--;
+    if (s->count == 0) {
+        /* Fire IRQ if enabled */
+        if (s->ctrl & TIMER_CTRL_IRQ_EN) {
+            qemu_irq_pulse(s->irq);
+        }
+        /* Auto-reload or stop */
+        if (s->ctrl & TIMER_CTRL_RELOAD) {
+            s->count = s->load;
+        } else {
+            s->running = false;
+            return;
+        }
+    }
+
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
+}
+
+static void calypso_timer_start(CalypsoTimerState *s)
+{
+    if (s->load == 0) {
+        return;
+    }
+    s->count = s->load;
+    s->running = true;
+    int64_t freq = CALYPSO_BASE_CLK / (s->prescaler + 1);
+    s->tick_ns = NANOSECONDS_PER_SECOND / freq;
+    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
+}
+
+/* ---- MMIO ---- */
+
+static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTimerState *s = CALYPSO_TIMER(opaque);
+
+    switch (offset) {
+    case 0x00: return s->ctrl;
+    case 0x02: return s->load;
+    case 0x04: return s->count;
+    case 0x06: return s->prescaler;
+    default:   return 0;
+    }
+}
+
+static void calypso_timer_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    CalypsoTimerState *s = CALYPSO_TIMER(opaque);
+
+    switch (offset) {
+    case 0x00: /* CNTL */
+        s->ctrl = value & 0x07;
+        if (value & TIMER_CTRL_START) {
+            calypso_timer_start(s);
+        } else {
+            s->running = false;
+            timer_del(s->timer);
+        }
+        break;
+    case 0x02: /* LOAD */
+        s->load = value;
+        break;
+    case 0x06: /* PRESCALER */
+        s->prescaler = value;
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_timer_ops = {
+    .read = calypso_timer_read,
+    .write = calypso_timer_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* ---- QOM lifecycle ---- */
+
+static void calypso_timer_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoTimerState *s = CALYPSO_TIMER(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(dev), &calypso_timer_ops, s,
+                          "calypso-timer", 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_timer_tick, s);
+}
+
+static void calypso_timer_reset(DeviceState *dev)
+{
+    CalypsoTimerState *s = CALYPSO_TIMER(dev);
+
+    s->load = 0;
+    s->count = 0;
+    s->ctrl = 0;
+    s->prescaler = 0;
+    s->running = false;
+    timer_del(s->timer);
+}
+
+static void calypso_timer_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = calypso_timer_realize;
+    device_class_set_legacy_reset(dc, calypso_timer_reset);
+    dc->desc = "Calypso GP/Watchdog timer";
+}
+
+static const TypeInfo calypso_timer_info = {
+    .name          = TYPE_CALYPSO_TIMER,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoTimerState),
+    .class_init    = calypso_timer_class_init,
+};
+
+static void calypso_timer_register_types(void)
+{
+    type_register_static(&calypso_timer_info);
+}
+
+type_init(calypso_timer_register_types)
+/*
+ * calypso_spi.c — Calypso SPI + TWL3025 ABB
+ *
+ * SPI controller with integrated TWL3025 Analog Baseband emulation.
+ *
+ * BUG FIX vs previous implementation:
+ *   - twl3025_spi_xfer() is now actually called on TX writes
+ *     (was marked __unused__, calypso_spi_read returned hardcoded 0x2)
+ *   - Firmware can now read VRPCSTS, ITSTATREG, etc. via SPI protocol
+ *
+ * Calypso SPI wire protocol:
+ *   TX word: bit[15]=R/W, bits[14:6]=register addr, bits[5:0]=write data
+ *   RX word: for reads, returns the register value
+ *
+ * Register map (16-bit, offsets from base):
+ *   0x00  STATUS  (bit0=TX_READY, bit1=RX_READY)
+ *   0x02  CTRL
+ *   0x04  TX      (write triggers SPI transaction)
+ *   0x06  RX      (result of last transaction)
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "qemu/log.h"
+#include "hw/arm/calypso/calypso_spi.h"
+
+/* ---- TWL3025 ABB SPI transaction ---- */
+
+static uint16_t twl3025_spi_xfer(CalypsoSPIState *s, uint16_t tx)
+{
+    int read  = (tx >> 15) & 1;
+    int addr  = (tx >> 6) & 0x1FF;
+    int wdata = tx & 0x3F;
+
+    if (addr >= 256) {
+        addr = 0;
+    }
+
+    if (read) {
+        return s->abb_regs[addr];
+    } else {
+        s->abb_regs[addr] = wdata;
+        /* Side effects for specific registers */
+        if (addr == ABB_VRPCDEV) {
+            /* Writing power control → update power status */
+            s->abb_regs[ABB_VRPCSTS] = 0x1F; /* All regulators on */
+        }
+        return 0;
+    }
+}
+
+/* ---- MMIO ---- */
+
+static uint64_t calypso_spi_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoSPIState *s = CALYPSO_SPI(opaque);
+
+    switch (offset) {
+    case 0x00: /* STATUS */
+        return s->status;
+    case 0x02: /* CTRL */
+        return s->ctrl;
+    case 0x04: /* TX (read-back) */
+        return s->tx_data;
+    case 0x06: /* RX */
+        return s->rx_data;
+    default:
+        qemu_log_mask(LOG_UNIMP, "calypso-spi: unimplemented read 0x%02x\n",
+                       (unsigned)offset);
+        return 0;
+    }
+}
+
+static void calypso_spi_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    CalypsoSPIState *s = CALYPSO_SPI(opaque);
+
+    switch (offset) {
+    case 0x00: /* STATUS (write to clear bits) */
+        s->status &= ~(value & 0xFFFF);
+        break;
+    case 0x02: /* CTRL */
+        s->ctrl = value & 0xFFFF;
+        break;
+    case 0x04: /* TX — triggers SPI transaction */
+        s->tx_data = value & 0xFFFF;
+        s->rx_data = twl3025_spi_xfer(s, s->tx_data);
+        s->status = SPI_STATUS_TX_READY | SPI_STATUS_RX_READY;
+        /* Raise IRQ to signal completion */
+        qemu_irq_pulse(s->irq);
+        break;
+    case 0x06: /* RX (write ignored) */
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_spi_ops = {
+    .read = calypso_spi_read,
+    .write = calypso_spi_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
+/* ---- QOM lifecycle ---- */
+
+static void calypso_spi_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoSPIState *s = CALYPSO_SPI(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(dev), &calypso_spi_ops, s,
+                          "calypso-spi", 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+}
+
+static void calypso_spi_reset(DeviceState *dev)
+{
+    CalypsoSPIState *s = CALYPSO_SPI(dev);
+
+    s->ctrl = 0;
+    s->status = SPI_STATUS_TX_READY;  /* TX ready at reset */
+    s->tx_data = 0;
+    s->rx_data = 0;
+    memset(s->abb_regs, 0, sizeof(s->abb_regs));
+
+    /* Power-on defaults: all regulators on */
+    s->abb_regs[ABB_VRPCSTS] = 0x1F;
+    s->abb_regs[ABB_ITSTATREG] = 0x00;
+}
+
+static void calypso_spi_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = calypso_spi_realize;
+    device_class_set_legacy_reset(dc, calypso_spi_reset);
+    dc->desc = "Calypso SPI controller + TWL3025 ABB";
+}
+
+static const TypeInfo calypso_spi_info = {
+    .name          = TYPE_CALYPSO_SPI,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoSPIState),
+    .class_init    = calypso_spi_class_init,
+};
+
+static void calypso_spi_register_types(void)
+{
+    type_register_static(&calypso_spi_info);
+}
+
+type_init(calypso_spi_register_types)
+/*
+ * calypso_uart.c — Calypso UART with CharBackend
+ *
+ * TI Calypso 16550-like UART with 64-byte FIFO, DLAB routing,
+ * enhanced mode (LCR=0xBF → EFR access), level-sensitive IRQ.
+ *
+ * BUG FIXES vs previous inline implementation:
+ *   1. RHR now pops from FIFO (was hardcoded 0x41)
+ *   2. IIR computed dynamically (was hardcoded RDI|FIFO_EN)
+ *   3. LSR DR bit reflects actual FIFO state (was always set)
+ *
+ * Register map (8-bit, offsets from base):
+ *   Offset  DLAB=0/R     DLAB=0/W     DLAB=1       LCR=0xBF
+ *   0x00    RHR          THR          DLL          DLL
+ *   0x01    IER          IER          DLH          IER
+ *   0x02    IIR          FCR          IIR/FCR      EFR
+ *   0x03    LCR          LCR          LCR          LCR
+ *   0x04    MCR          MCR          MCR          XON1
+ *   0x05    LSR          —            LSR          XON2
+ *   0x06    MSR          MSR          MSR          XOFF1
+ *   0x07    SPR          SPR          SPR          XOFF2
+ *   0x08    MDR1         MDR1
+ *   0x10    SCR/SSR      SCR/SSR
+ *   0x18    TXFLL        —
+ *   0x1A    RXFLL        —
+ *   0x80    DLL alias (Calypso-specific)
+ *   0x81    DLH alias (Calypso-specific)
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
+#include "chardev/char-fe.h"
+#include "qemu/log.h"
+#include "hw/arm/calypso/calypso_uart.h"
+
+/* ---- LSR bits ---- */
+#define UART_LSR_DR   0x01  /* Data Ready (FIFO has data)     */
+#define UART_LSR_OE   0x02  /* Overrun Error                  */
+#define UART_LSR_THRE 0x20  /* THR Empty                      */
+#define UART_LSR_TEMT 0x40  /* Transmitter completely Empty    */
+
+/* ---- IER bits ---- */
+#define UART_IER_RDI  0x01  /* RX Data Available interrupt    */
+#define UART_IER_THRI 0x02  /* THR Empty interrupt            */
+#define UART_IER_RLSI 0x04  /* RX Line Status interrupt       */
+#define UART_IER_MSI  0x08  /* Modem Status interrupt         */
+
+/* ---- IIR values ---- */
+#define UART_IIR_NO_INT    0x01  /* No interrupt pending       */
+#define UART_IIR_RDI       0x04  /* RX Data Available          */
+#define UART_IIR_THRI      0x02  /* THR Empty                  */
+#define UART_IIR_RLSI      0x06  /* RX Line Status             */
+#define UART_IIR_FIFO_EN   0xC0  /* FIFOs enabled indicator    */
+
+/* ---- LCR bits ---- */
+#define UART_LCR_DLAB     0x80  /* Divisor Latch Access Bit   */
+#define UART_LCR_ENHANCED 0xBF  /* Magic value for EFR access */
+
+/* ================================================================
+ * FIFO helpers
+ * ================================================================ */
+
+static inline bool uart_rx_empty(CalypsoUARTState *s)
+{
+    return s->rx_count == 0;
+}
+
+static inline bool uart_rx_full(CalypsoUARTState *s)
+{
+    return s->rx_count >= CALYPSO_UART_FIFO_SIZE;
+}
+
+static void uart_rx_push(CalypsoUARTState *s, uint8_t byte)
+{
+    if (uart_rx_full(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "calypso-uart-%s: RX FIFO overrun (dropped 0x%02x)\n",
+                      s->name ? s->name : "?", byte);
+        return;
+    }
+    s->rx_fifo[s->rx_head] = byte;
+    s->rx_head = (s->rx_head + 1) % CALYPSO_UART_FIFO_SIZE;
+    s->rx_count++;
+}
+
+static uint8_t uart_rx_pop(CalypsoUARTState *s)
+{
+    uint8_t byte;
+    if (uart_rx_empty(s)) {
+        return 0x00;
+    }
+    byte = s->rx_fifo[s->rx_tail];
+    s->rx_tail = (s->rx_tail + 1) % CALYPSO_UART_FIFO_SIZE;
+    s->rx_count--;
+    return byte;
+}
+
+static void uart_rx_reset(CalypsoUARTState *s)
+{
+    s->rx_head = 0;
+    s->rx_tail = 0;
+    s->rx_count = 0;
+}
+
+/* ================================================================
+ * IRQ management (level-sensitive, 16550-style priorities)
+ *
+ * Priority order (highest first):
+ *   1. RX Line Status (IIR=0x06) — not implemented yet
+ *   2. RX Data Available (IIR=0x04) — FIFO non-empty + IER.RDI
+ *   3. THR Empty (IIR=0x02) — IER.THRI + one-shot after TX/IIR read
+ *   4. Modem Status (IIR=0x00) — not implemented yet
+ * ================================================================ */
+
+static void calypso_uart_update_irq(CalypsoUARTState *s)
+{
+    bool should_raise = false;
+
+    /* RX data available */
+    if ((s->ier & UART_IER_RDI) && !uart_rx_empty(s)) {
+        should_raise = true;
+    }
+    /* THR empty (one-shot: cleared on IIR read when THRI is source) */
+    if ((s->ier & UART_IER_THRI) && s->thri_pending) {
+        should_raise = true;
+    }
+
+    if (should_raise && !s->irq_raised) {
+        qemu_irq_raise(s->irq);
+        s->irq_raised = true;
+    } else if (!should_raise && s->irq_raised) {
+        qemu_irq_lower(s->irq);
+        s->irq_raised = false;
+    }
+}
+
+/*
+ * FIX #2: Compute IIR dynamically
+ *
+ * Returns the highest-priority pending interrupt identification.
+ * Reading IIR clears the THRI condition (standard 16550 behavior).
+ */
+static uint8_t calypso_uart_get_iir(CalypsoUARTState *s)
+{
+    uint8_t iir = UART_IIR_NO_INT | UART_IIR_FIFO_EN;
+
+    /* Priority 1: RX data available */
+    if ((s->ier & UART_IER_RDI) && !uart_rx_empty(s)) {
+        iir = UART_IIR_RDI | UART_IIR_FIFO_EN;
+        return iir;
+    }
+    /* Priority 2: THR empty (one-shot) */
+    if ((s->ier & UART_IER_THRI) && s->thri_pending) {
+        iir = UART_IIR_THRI | UART_IIR_FIFO_EN;
+        /* Reading IIR when THRI is the source clears THRI pending */
+        s->thri_pending = false;
+        calypso_uart_update_irq(s);
+        return iir;
+    }
+
+    return iir;  /* No interrupt pending (bit 0 = 1) */
+}
+
+/* ================================================================
+ * CharBackend callbacks
+ * ================================================================ */
+
+static void calypso_uart_rx_callback(void *opaque, const uint8_t *buf, int size)
+{
+    CalypsoUARTState *s = CALYPSO_UART(opaque);
+
+    for (int i = 0; i < size; i++) {
+        uart_rx_push(s, buf[i]);
+    }
+    calypso_uart_update_irq(s);
+}
+
+static int calypso_uart_can_receive(void *opaque)
+{
+    CalypsoUARTState *s = CALYPSO_UART(opaque);
+    int avail = CALYPSO_UART_FIFO_SIZE - s->rx_count;
+    return avail > 0 ? avail : 0;
+}
+
+static void calypso_uart_event(void *opaque, QEMUChrEvent event)
+{
+    /* Nothing needed */
+}
+
+/* ================================================================
+ * Register access
+ * ================================================================ */
+
+static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoUARTState *s = CALYPSO_UART(opaque);
+    uint64_t ret = 0;
+    bool dlab = (s->lcr & UART_LCR_DLAB);
+    bool enhanced = (s->lcr == UART_LCR_ENHANCED);
+
+    switch (offset) {
+    case 0x00: /* RHR / DLL */
+        if (dlab || enhanced) {
+            ret = s->dll;
+        } else {
+            /*
+             * FIX #1: Pop from FIFO instead of returning hardcoded 0x41.
+             * This is the critical fix that makes osmocon communication work.
+             */
+            ret = uart_rx_pop(s);
+            calypso_uart_update_irq(s);
+            qemu_chr_fe_accept_input(&s->chr);
+        }
+        break;
+
+    case 0x01: /* IER / DLH */
+        if (dlab && !enhanced) {
+            ret = s->dlh;
+        } else {
+            ret = s->ier;
+        }
+        break;
+
+    case 0x02: /* IIR / EFR */
+        if (enhanced) {
+            ret = s->efr;
+        } else {
+            /* FIX #2: Compute IIR dynamically */
+            ret = calypso_uart_get_iir(s);
+        }
+        break;
+
+    case 0x03: /* LCR */
+        ret = s->lcr;
+        break;
+
+    case 0x04: /* MCR / XON1 */
+        ret = enhanced ? s->xon1 : s->mcr;
+        break;
+
+    case 0x05: /* LSR / XON2 */
+        if (enhanced) {
+            ret = s->xon2;
+        } else {
+            /*
+             * FIX #3: LSR DR bit reflects actual FIFO state.
+             * TX side is always ready (we transmit instantly).
+             */
+            ret = UART_LSR_THRE | UART_LSR_TEMT;
+            if (!uart_rx_empty(s)) {
+                ret |= UART_LSR_DR;
+            }
+        }
+        break;
+
+    case 0x06: /* MSR / XOFF1 */
+        ret = enhanced ? s->xoff1 : s->msr;
+        break;
+
+    case 0x07: /* SPR / XOFF2 */
+        ret = enhanced ? s->xoff2 : s->scr;
+        break;
+
+    case 0x08: /* MDR1 */
+        ret = s->mdr1;
+        break;
+
+    case 0x10: /* SCR - Supplementary Control Register */
+        ret = 0x00;
+        break;
+
+    case 0x11: /* SSR - Supplementary Status Register */
+        ret = 0x00; /* TX FIFO not full */
+        break;
+
+    case 0x12: /* ACREG */
+        ret = 0x00;
+        break;
+
+    case 0x18: /* TXFLL */
+        ret = 0x00;
+        break;
+
+    case 0x19: /* TXFLH */
+        ret = 0x00;
+        break;
+
+    case 0x1A: /* RXFLL */
+        ret = s->rx_count & 0xFF;
+        break;
+
+    case 0x1B: /* RXFLH */
+        ret = 0x00;
+        break;
+
+    case 0x80: /* DLL alias (Calypso-specific) */
+        ret = s->dll;
+        break;
+
+    case 0x81: /* DLH alias (Calypso-specific) */
+        ret = s->dlh;
+        break;
+
+    default:
+        ret = 0;
+        break;
+    }
+
+    return ret;
+}
+
+static void calypso_uart_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    CalypsoUARTState *s = CALYPSO_UART(opaque);
+    uint8_t val = value & 0xFF;
+    bool dlab = (s->lcr & UART_LCR_DLAB);
+    bool enhanced = (s->lcr == UART_LCR_ENHANCED);
+    printf("CALYPSO UART WRITE offset=0x%lx val=0x%lx size=%u\n",
+       (unsigned long)offset,
+       (unsigned long)value,
+       size);
+
+    switch (offset) {
+    case 0x00: /* THR / DLL */
+        if (dlab || enhanced) {
+            s->dll = val;
+        } else {
+            /* Transmit byte via chardev */
+            qemu_chr_fe_write_all(&s->chr, &val, 1);
+            /*
+             * After TX, raise THRI one-shot so firmware gets a
+             * THR-empty interrupt on next IRQ evaluation.
+             */
+            s->thri_pending = true;
+            calypso_uart_update_irq(s);
+        }
+        break;
+
+    case 0x01: /* IER / DLH */
+        if (dlab && !enhanced) {
+            s->dlh = val;
+        } else {
+            uint8_t old_ier = s->ier;
+            s->ier = val & 0x0F;
+            /*
+             * 16550 behavior: when THRI is enabled while THR is empty,
+             * immediately assert THRI (one-shot).
+             */
+            if (!(old_ier & UART_IER_THRI) && (s->ier & UART_IER_THRI)) {
+                s->thri_pending = true;
+            }
+            calypso_uart_update_irq(s);
+        }
+        break;
+
+    case 0x02: /* FCR / EFR */
+        if (enhanced) {
+            s->efr = val;
+        } else {
+            s->fcr = val;
+            if (val & 0x02) { /* Reset RX FIFO */
+                uart_rx_reset(s);
+                calypso_uart_update_irq(s);
+            }
+            /* Bit 2: reset TX FIFO (no-op) */
+        }
+        break;
+
+    case 0x03: /* LCR */
+        s->lcr = val;
+        break;
+
+    case 0x04: /* MCR / XON1 */
+        if (enhanced) {
+            s->xon1 = val;
+        } else {
+            s->mcr = val;
+        }
+        break;
+
+    case 0x05: /* XON2 (enhanced only; LSR is read-only) */
+        if (enhanced) {
+            s->xon2 = val;
+        }
+        break;
+
+    case 0x06: /* XOFF1 (enhanced) */
+        if (enhanced) {
+            s->xoff1 = val;
+        }
+        break;
+
+    case 0x07: /* SPR / XOFF2 */
+        if (enhanced) {
+            s->xoff2 = val;
+        } else {
+            s->scr = val;
+        }
+        break;
+
+    case 0x08: /* MDR1 */
+        s->mdr1 = val;
+        break;
+
+    case 0x10: /* SCR */
+    case 0x11: /* SSR — read-only */
+    case 0x12: /* ACREG */
+        break;
+
+    case 0x80: /* DLL alias */
+        s->dll = val;
+        break;
+
+    case 0x81: /* DLH alias */
+        s->dlh = val;
+        break;
+
+    default:
+        qemu_log_mask(LOG_UNIMP, "calypso-uart-%s: unhandled write 0x%02x "
+                      "← 0x%02x\n", s->name ? s->name : "?",
+                      (unsigned)offset, val);
+        break;
+    }
+}
+
+static const MemoryRegionOps calypso_uart_ops = {
+    .read = calypso_uart_read,
+    .write = calypso_uart_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* ================================================================
+ * QOM lifecycle
+ * ================================================================ */
+
+static void calypso_uart_realize(DeviceState *dev, Error **errp)
+{
+    CalypsoUARTState *s = CALYPSO_UART(dev);
+
+    memory_region_init_io(&s->iomem, OBJECT(dev), &calypso_uart_ops, s,
+                          "calypso-uart", 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+
+    /* Connect CharBackend handlers if a chardev was attached */
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_set_handlers(&s->chr,
+                                 calypso_uart_can_receive,
+                                 calypso_uart_rx_callback,
+                                 calypso_uart_event,
+                                 NULL, s, NULL, true);
+    }
+}
+
+static void calypso_uart_reset(DeviceState *dev)
+{
+    CalypsoUARTState *s = CALYPSO_UART(dev);
+
+    uart_rx_reset(s);
+    s->ier = 0;
+    s->lcr = 0;
+    s->mcr = 0;
+    s->msr = 0;
+    s->scr = 0;
+    s->mdr1 = 0;
+    s->dll = 0;
+    s->dlh = 0;
+    s->efr = 0;
+    s->fcr = 0;
+    s->xon1 = s->xon2 = 0;
+    s->xoff1 = s->xoff2 = 0;
+    s->thri_pending = false;
+    s->irq_raised = false;
+}
+
+static Property calypso_uart_properties[] = {
+    DEFINE_PROP_CHR("chardev", CalypsoUARTState, chr),
+    DEFINE_PROP_STRING("label", CalypsoUARTState, name),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void calypso_uart_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = calypso_uart_realize;
+    device_class_set_legacy_reset(dc, calypso_uart_reset);
+    dc->desc = "Calypso UART with 64-byte FIFO";
+    device_class_set_props(dc, calypso_uart_properties);
+}
+
+static const TypeInfo calypso_uart_info = {
+    .name          = TYPE_CALYPSO_UART,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CalypsoUARTState),
+    .class_init    = calypso_uart_class_init,
+};
+
+static void calypso_uart_register_types(void)
+{
+    type_register_static(&calypso_uart_info);
+}
+
+type_init(calypso_uart_register_types)

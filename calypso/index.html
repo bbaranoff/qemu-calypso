@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Calypso QEMU Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --text: #c9d1d9;
+    --dim: #6e7681;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 16px;
+  }
+  h1 {
+    color: var(--blue);
+    font-size: 16px;
+    margin-bottom: 16px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  #conn-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--red);
+    display: inline-block;
+    transition: background 0.3s;
+  }
+  #conn-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+  }
+  .panel-title {
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+  }
+
+  /* Sync state badge */
+  .sync-state {
+    font-size: 18px;
+    font-weight: bold;
+    padding: 6px 10px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-bottom: 8px;
+  }
+  .sync-IDLE        { color: var(--dim);    background: #1c2128; }
+  .sync-FCCH_SEARCH { color: var(--yellow); background: #2d2008; }
+  .sync-FCCH_FOUND  { color: var(--yellow); background: #2d2008; }
+  .sync-SCH_SEARCH  { color: var(--yellow); background: #2d2008; }
+  .sync-LOCKED      { color: var(--green);  background: #0d2016; box-shadow: 0 0 8px #3fb95044; }
+
+  .kv { display: flex; justify-content: space-between; margin: 3px 0; }
+  .kv .k { color: var(--dim); }
+  .kv .v { color: var(--blue); font-weight: bold; }
+  .kv .v.green { color: var(--green); }
+  .kv .v.red   { color: var(--red);   }
+  .kv .v.yel   { color: var(--yellow);}
+
+  /* FN bar */
+  #fn-bar-wrap {
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  #fn-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--blue), var(--purple));
+    border-radius: 3px;
+    transition: width 0.1s;
+  }
+
+  /* TRXC log */
+  #trxc-log {
+    height: 140px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  #trxc-log .cmd  { color: var(--yellow); }
+  #trxc-log .rsp  { color: var(--green); }
+  #trxc-log .info { color: var(--dim); }
+  #trxc-log .ts   { color: #3d4450; margin-right: 4px; }
+
+  /* Burst activity */
+  #burst-canvas {
+    width: 100%;
+    height: 60px;
+    display: block;
+  }
+
+  /* GSMTAP log */
+  #gsmtap-log {
+    height: 140px;
+    overflow-y: auto;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .burst-row { display: flex; gap: 8px; }
+  .burst-row .fn  { color: var(--purple); min-width: 80px; }
+  .burst-row .tn  { color: var(--blue); }
+  .burst-row .dir { color: var(--green); min-width: 24px; }
+  .burst-row .rssi{ color: var(--yellow); }
+
+  /* Send command */
+  .cmd-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .cmd-row input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 4px 8px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+  }
+  .cmd-row input:focus { outline: none; border-color: var(--blue); }
+  .cmd-row button {
+    background: var(--blue);
+    color: #000;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 12px;
+  }
+  .cmd-row button:hover { background: #79b8ff; }
+
+  /* Status bar */
+  #statusbar {
+    color: var(--dim);
+    font-size: 11px;
+    margin-top: 10px;
+    text-align: right;
+  }
+
+  /* Wide panels */
+  .span2 { grid-column: span 2; }
+  .span3 { grid-column: span 3; }
+</style>
+</head>
+<body>
+
+<h1><span id="conn-dot"></span> Calypso QEMU Monitor</h1>
+
+<div class="grid">
+
+  <!-- SYNC STATE -->
+  <div class="panel">
+    <div class="panel-title">GSM Sync</div>
+    <div class="sync-state sync-IDLE" id="sync-state-badge">IDLE</div>
+    <div class="kv"><span class="k">ARFCN</span><span class="v" id="arfcn">—</span></div>
+    <div class="kv"><span class="k">BSIC</span><span class="v" id="bsic">—</span></div>
+    <div class="kv"><span class="k">RSSI</span><span class="v" id="rssi">—</span></div>
+    <div class="kv"><span class="k">TDMA FN</span><span class="v" id="fn">0</span></div>
+    <div id="fn-bar-wrap"><div id="fn-bar"></div></div>
+  </div>
+
+  <!-- TRX STATUS -->
+  <div class="panel">
+    <div class="panel-title">TRX Sockets</div>
+    <div class="kv"><span class="k">TRXC port</span><span class="v" id="trxc-port">—</span></div>
+    <div class="kv"><span class="k">TRXD port</span><span class="v" id="trxd-port">—</span></div>
+    <div class="kv"><span class="k">GSMTAP</span><span class="v green">4729</span></div>
+    <div class="kv"><span class="k">BTS connected</span><span class="v" id="bts-conn">—</span></div>
+    <div class="kv"><span class="k">Powered ON</span><span class="v" id="powered">—</span></div>
+    <div class="kv"><span class="k">TX bursts</span><span class="v" id="tx-count">0</span></div>
+    <div class="kv"><span class="k">RX bursts</span><span class="v" id="rx-count">0</span></div>
+  </div>
+
+  <!-- DSP TASKS -->
+  <div class="panel">
+    <div class="panel-title">DSP Tasks</div>
+    <div class="kv"><span class="k">Total tasks</span><span class="v" id="task-count">0</span></div>
+    <div class="kv"><span class="k">FB tasks</span><span class="v" id="fb-count">0</span></div>
+    <div class="kv"><span class="k">SB tasks</span><span class="v" id="sb-count">0</span></div>
+    <div class="kv"><span class="k">DSP booted</span><span class="v" id="dsp-boot">—</span></div>
+    <div class="kv"><span class="k">DSP page</span><span class="v" id="dsp-page">0</span></div>
+    <div class="kv"><span class="k">TDMA running</span><span class="v" id="tdma-run">—</span></div>
+  </div>
+
+  <!-- TRXC LOG -->
+  <div class="panel">
+    <div class="panel-title">TRXC Commands</div>
+    <div id="trxc-log"></div>
+    <div class="cmd-row">
+      <input id="trxc-input" placeholder="CMD POWERON" />
+      <button onclick="sendTRXC()">Send</button>
+    </div>
+  </div>
+
+  <!-- BURST ACTIVITY -->
+  <div class="panel span2">
+    <div class="panel-title">Burst Activity (last 200 frames)</div>
+    <canvas id="burst-canvas" height="60"></canvas>
+    <div id="gsmtap-log" style="margin-top:8px;"></div>
+  </div>
+
+</div>
+
+<div id="statusbar">Not connected — bridge: ws://localhost:9999</div>
+
+<script>
+const WS_URL = 'ws://localhost:9999';
+const GSM_HYPERFRAME = 2715648;
+const BURST_HISTORY = 200;
+
+let ws = null;
+let reconnectTimer = null;
+let state = {
+  sync: 'IDLE', arfcn: 0, bsic: 0, rssi: 0, fn: 0,
+  trxcPort: 6700, trxdPort: 6701,
+  btsConn: false, powered: false,
+  txCount: 0, rxCount: 0,
+  taskCount: 0, fbCount: 0, sbCount: 0,
+  dspBooted: false, dspPage: 0, tdmaRunning: false,
+};
+let burstHistory = new Array(BURST_HISTORY).fill(0); // 0=none,1=tx,2=rx
+
+// ---- Canvas ----
+const canvas = document.getElementById('burst-canvas');
+const ctx = canvas.getContext('2d');
+
+function drawBursts() {
+  const W = canvas.offsetWidth;
+  const H = canvas.height;
+  canvas.width = W;
+  ctx.clearRect(0, 0, W, H);
+  const bw = W / BURST_HISTORY;
+  for (let i = 0; i < BURST_HISTORY; i++) {
+    const v = burstHistory[i];
+    if (v === 0) continue;
+    ctx.fillStyle = v === 1 ? '#58a6ff' : '#3fb950';
+    ctx.fillRect(i * bw, v === 1 ? 0 : H/2, bw - 1, H/2 - 1);
+  }
+}
+
+// ---- UI update ----
+function updateUI() {
+  const badge = document.getElementById('sync-state-badge');
+  badge.textContent = state.sync;
+  badge.className = 'sync-state sync-' + state.sync;
+
+  document.getElementById('arfcn').textContent = state.arfcn || '—';
+  document.getElementById('bsic').textContent  = state.bsic !== undefined
+    ? `0x${state.bsic.toString(16).padStart(2,'0')} (NCC=${(state.bsic>>3)&7},BCC=${state.bsic&7})`
+    : '—';
+  document.getElementById('rssi').textContent  = state.rssi ? state.rssi + ' dBm' : '—';
+  document.getElementById('fn').textContent    = state.fn.toLocaleString();
+
+  const pct = (state.fn / GSM_HYPERFRAME) * 100;
+  document.getElementById('fn-bar').style.width = pct + '%';
+
+  document.getElementById('trxc-port').textContent = state.trxcPort;
+  document.getElementById('trxd-port').textContent = state.trxdPort;
+
+  const btsEl = document.getElementById('bts-conn');
+  btsEl.textContent = state.btsConn ? 'YES' : 'NO';
+  btsEl.className   = 'v ' + (state.btsConn ? 'green' : 'red');
+
+  const pwEl = document.getElementById('powered');
+  pwEl.textContent = state.powered ? 'YES' : 'NO';
+  pwEl.className   = 'v ' + (state.powered ? 'green' : 'red');
+
+  document.getElementById('tx-count').textContent   = state.txCount.toLocaleString();
+  document.getElementById('rx-count').textContent   = state.rxCount.toLocaleString();
+  document.getElementById('task-count').textContent = state.taskCount.toLocaleString();
+  document.getElementById('fb-count').textContent   = state.fbCount.toLocaleString();
+  document.getElementById('sb-count').textContent   = state.sbCount.toLocaleString();
+
+  const dbEl = document.getElementById('dsp-boot');
+  dbEl.textContent = state.dspBooted ? 'YES' : 'NO';
+  dbEl.className   = 'v ' + (state.dspBooted ? 'green' : 'yel');
+
+  document.getElementById('dsp-page').textContent  = state.dspPage;
+
+  const trEl = document.getElementById('tdma-run');
+  trEl.textContent = state.tdmaRunning ? 'YES' : 'NO';
+  trEl.className   = 'v ' + (state.tdmaRunning ? 'green' : 'red');
+
+  drawBursts();
+}
+
+// ---- TRXC log ----
+function logTRXC(cls, text) {
+  const log = document.getElementById('trxc-log');
+  const ts = new Date().toTimeString().slice(0,8);
+  const div = document.createElement('div');
+  div.innerHTML = `<span class="ts">${ts}</span><span class="${cls}">${text}</span>`;
+  log.appendChild(div);
+  if (log.children.length > 200) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---- GSMTAP log ----
+function logBurst(dir, fn, tn, rssi) {
+  burstHistory.push(dir === 'UL' ? 1 : 2);
+  if (burstHistory.length > BURST_HISTORY) burstHistory.shift();
+
+  const log = document.getElementById('gsmtap-log');
+  const div = document.createElement('div');
+  div.className = 'burst-row';
+  div.innerHTML = `<span class="fn">FN=${fn}</span><span class="tn">TS${tn}</span><span class="dir">${dir}</span><span class="rssi">${rssi}dBm</span>`;
+  log.appendChild(div);
+  if (log.children.length > 100) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---- WebSocket ----
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    document.getElementById('conn-dot').className = 'ok';
+    document.getElementById('statusbar').textContent =
+      `Connected to bridge ${WS_URL}`;
+    logTRXC('info', '✓ Connected to ws bridge');
+    clearTimeout(reconnectTimer);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('conn-dot').className = '';
+    document.getElementById('statusbar').textContent =
+      `Disconnected — retrying in 3s…`;
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {};
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+
+    switch (msg.type) {
+      case 'state':
+        Object.assign(state, msg.data);
+        updateUI();
+        break;
+
+      case 'trxc_cmd':
+        logTRXC('cmd', '← ' + msg.text);
+        break;
+
+      case 'trxc_rsp':
+        logTRXC('rsp', '→ ' + msg.text);
+        break;
+
+      case 'burst':
+        if (msg.dir === 'UL') state.txCount++;
+        else state.rxCount++;
+        logBurst(msg.dir, msg.fn, msg.tn, msg.rssi);
+        updateUI();
+        break;
+
+      case 'info':
+        logTRXC('info', msg.text);
+        break;
+    }
+  };
+}
+
+// ---- Send TRXC command ----
+function sendTRXC() {
+  const inp = document.getElementById('trxc-input');
+  const txt = inp.value.trim();
+  if (!txt || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'trxc_send', text: txt }));
+  logTRXC('cmd', '→ ' + txt);
+  inp.value = '';
+}
+document.getElementById('trxc-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendTRXC();
+});
+
+// ---- Init ----
+updateUI();
+connect();
+</script>
+</body>
+</html>
