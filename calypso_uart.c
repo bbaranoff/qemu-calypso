@@ -6,7 +6,6 @@
  *  - banked registers via LCR[7] / LCR==0xBF
  *  - SCR / SSR implemented
  *  - RX FIFO with verbose debug
- *  - raw RX/TX dumps to /tmp/qemu-*.raw
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -66,17 +65,6 @@
 
 /* SSR bits (minimal model) */
 #define SSR_TX_FIFO_FULL  (1 << 0)
-
-static void uart_log_raw(const char *path, const uint8_t *buf, size_t len)
-{
-    FILE *f = fopen(path, "ab");
-    if (!f) {
-        return;
-    }
-
-    fwrite(buf, 1, len, f);
-    fclose(f);
-}
 
 /* ---- FIFO helpers ---- */
 
@@ -176,12 +164,6 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
     }
     fprintf(stderr, "\n");
 
-    if (s->label && !strcmp(s->label, "modem")) {
-        uart_log_raw("/tmp/qemu-modem-rx.raw", buf, size);
-    } else if (s->label && !strcmp(s->label, "irda")) {
-        uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
-    }
-
     for (int i = 0; i < size; i++) {
         fifo_push(s, buf[i]);
     }
@@ -206,7 +188,6 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
             val = s->dll;
         } else {
             val = fifo_pop(s);
-
             if (s->rx_count > 0) {
                 s->lsr |= LSR_DR;
             } else {
@@ -289,6 +270,11 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         break;
 
     case REG_SSR:
+        /*
+         * Minimal model:
+         *  bit0 = TX FIFO full.
+         * We expose "not full" by default.
+         */
         val = s->ssr & ~SSR_TX_FIFO_FULL;
         break;
 
@@ -310,17 +296,10 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             s->dll = value;
         } else {
             uint8_t ch = (uint8_t)value;
-
             fprintf(stderr, "[UART:%s] TX>>> 0x%02x '%c'\n",
                     s->label ? s->label : "?",
                     ch,
                     (ch >= 0x20 && ch < 0x7f) ? ch : '.');
-
-            if (s->label && !strcmp(s->label, "modem")) {
-                uart_log_raw("/tmp/qemu-modem-tx.raw", &ch, 1);
-            } else if (s->label && !strcmp(s->label, "irda")) {
-                uart_log_raw("/tmp/qemu-irda-tx.raw", &ch, 1);
-            }
 
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
 
@@ -443,7 +422,6 @@ static void calypso_uart_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
     connected = qemu_chr_fe_backend_connected(&s->chr);
-
     fprintf(stderr, "### UART PATCH ACTIVE ###\n");
     fprintf(stderr, "[UART:%s] realize: chardev %s\n",
             s->label ? s->label : "?",

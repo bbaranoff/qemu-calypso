@@ -15,10 +15,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(CalypsoUARTState, CALYPSO_UART)
 
 /*
- * Minimal RX FIFO
- * (Compal download protocol can burst multiple bytes)
+ * Large RX FIFO to tolerate Compal/sercomm bursts.
  */
-#define CALYPSO_UART_RX_FIFO_SIZE 16
+#define CALYPSO_UART_RX_FIFO_SIZE 8192
 
 typedef struct CalypsoUARTState {
     SysBusDevice parent_obj;
@@ -33,8 +32,7 @@ typedef struct CalypsoUARTState {
     /* Debug label ("modem", "irda") */
     char *label;
 
-    /* Registers */
-    uint8_t rbr;
+    /* Base registers */
     uint8_t ier;
     uint8_t iir;
     uint8_t fcr;
@@ -47,25 +45,31 @@ typedef struct CalypsoUARTState {
     uint8_t dlh;
     uint8_t mdr1;
 
+    /* Extended/banked registers used by Calypso loader/uart driver */
+    uint8_t efr;
+    uint8_t xon1;
+    uint8_t xon2;
+    uint8_t xoff1;
+    uint8_t xoff2;
+    uint8_t scr;
+    uint8_t ssr;
+
     /* RX FIFO */
     uint8_t rx_fifo[CALYPSO_UART_RX_FIFO_SIZE];
-    uint8_t rx_head;
-    uint8_t rx_tail;
-    uint8_t rx_count;
+    uint16_t rx_head;
+    uint16_t rx_tail;
+    uint16_t rx_count;
 
-    /* IRQ output level tracking (avoid redundant transitions) */
+    /* IRQ output level tracking */
     bool irq_level;
 
-    /* TX empty fires only once per THR transition (16550 behavior) */
+    /* TX empty fires once per THR transition */
     bool thr_empty_pending;
 
 } CalypsoUARTState;
 
-
-/* Char backend callbacks (must be non-static in .c) */
-int  calypso_uart_can_receive(void *opaque);
-void calypso_uart_receive(void *opaque,
-                          const uint8_t *buf,
-                          int size);
+/* Char backend callbacks */
+int calypso_uart_can_receive(void *opaque);
+void calypso_uart_receive(void *opaque, const uint8_t *buf, int size);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */
