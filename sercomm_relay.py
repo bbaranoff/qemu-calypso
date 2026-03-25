@@ -27,61 +27,70 @@ import socket
 import struct
 import sys
 import termios
+from typing import Optional, Dict, List, Tuple, Any
 
+# Sercomm framing constants
 DLCI_TX = 9
 DLCI_RX = 9
 CTRL = 0x03
-
 FLAG = 0x7E
 ESCAPE = 0x7D
 ESCAPE_XOR = 0x20
 
+# Socket and protocol paths/constants
 SOCK_PATH = "/tmp/osmocom_loader"
 
+# Loader protocol commands
 LOADER_PING = 0x01
 LOADER_MEM_WRITE = 0x08
 
+# Chunking configuration
 # Keep this comfortably below the original 248-byte socket payload size.
 # 64 data bytes per sub-write is a conservative starting point.
 MEMWRITE_CHUNK = 64
 
 
 def hexdump(data: bytes) -> str:
+    """Convert binary data to a hex dump string."""
     return " ".join(f"{b:02x}" for b in data)
 
 
 def set_raw(fd: int) -> None:
+    """Configure terminal fd for raw 8N1 mode at 115200 baud."""
     attrs = termios.tcgetattr(fd)
 
-    # iflag
+    # iflag: disable all input processing
     attrs[0] = 0
 
-    # oflag
+    # oflag: disable all output processing
     attrs[1] = 0
 
     # cflag: 8N1, local, read enabled
     attrs[2] &= ~(termios.PARENB | termios.CSTOPB | termios.CSIZE)
     attrs[2] |= termios.CS8 | termios.CLOCAL | termios.CREAD
 
-    # lflag
+    # lflag: disable canonical mode, echoes, signals
     attrs[3] = 0
 
-    # ispeed / ospeed
+    # ispeed / ospeed: 115200 baud
     attrs[4] = termios.B115200
     attrs[5] = termios.B115200
 
-    # cc
+    # cc: VMIN=1 (block until 1 byte), VTIME=0 (no timeout)
     attrs[6][termios.VMIN] = 1
     attrs[6][termios.VTIME] = 0
 
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
+
 def set_nonblock(fd: int) -> None:
+    """Set file descriptor to non-blocking mode."""
     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
 
 def sercomm_escape(data: bytes) -> bytes:
+    """Apply Sercomm HDLC-style escaping to data."""
     out = bytearray()
     for b in data:
         if b in (FLAG, ESCAPE):
@@ -90,9 +99,10 @@ def sercomm_escape(data: bytes) -> bytes:
         else:
             out.append(b)
     return bytes(out)
-    
+
 
 def sercomm_unescape(data: bytes) -> bytes:
+    """Remove Sercomm HDLC-style escaping from data."""
     out = bytearray()
     i = 0
     while i < len(data):
@@ -109,6 +119,7 @@ def sercomm_unescape(data: bytes) -> bytes:
 
 
 def sercomm_wrap(dlci: int, payload: bytes) -> bytes:
+    """Wrap payload in a Sercomm frame with DLCI and control byte."""
     inner = bytes([dlci, CTRL]) + payload
     return bytes([FLAG]) + sercomm_escape(inner) + bytes([FLAG])
 
@@ -116,6 +127,7 @@ def sercomm_wrap(dlci: int, payload: bytes) -> bytes:
 def osmo_crc16(data: bytes) -> int:
     """
     CRC-16/CCITT as used by Osmocom loader code via osmo_crc16(0, ...).
+    
     Init = 0x0000, poly = 0x1021, no xorout.
     """
     crc = 0x0000
@@ -130,12 +142,15 @@ def osmo_crc16(data: bytes) -> int:
 
 
 class SercommParser:
+    """Parse Sercomm HDLC frames from a byte stream."""
+    
     def __init__(self) -> None:
         self.buf = bytearray()
 
-    def feed(self, data: bytes):
+    def feed(self, data: bytes) -> List[Tuple[int, bytes]]:
+        """Feed data into parser and return list of (dlci, payload) tuples."""
         self.buf.extend(data)
-        frames = []
+        frames: List[Tuple[int, bytes]] = []
 
         while True:
             try:
@@ -174,12 +189,15 @@ class SercommParser:
 
 
 class LengthPrefixReader:
+    """Parse length-prefixed messages (2-byte big-endian length)."""
+    
     def __init__(self) -> None:
         self.buf = bytearray()
 
-    def feed(self, data: bytes):
+    def feed(self, data: bytes) -> List[bytes]:
+        """Feed data into parser and return list of complete message payloads."""
         self.buf.extend(data)
-        msgs = []
+        msgs: List[bytes] = []
 
         while True:
             if len(self.buf) < 2:
@@ -196,13 +214,22 @@ class LengthPrefixReader:
         return msgs
 
 
-def split_memwrite(payload: bytes, chunk_size: int = MEMWRITE_CHUNK):
+def split_memwrite(
+    payload: bytes, chunk_size: int = MEMWRITE_CHUNK
+) -> Optional[Dict[str, Any]]:
     """
+    Split a LOADER_MEM_WRITE payload into smaller chunks.
+    
     Input payload format from osmoload:
         [cmd=0x08][nbytes][crc16][address][data...]
 
-    Returns None for non-MEM_WRITE payloads.
-    Returns a dict describing split chunks otherwise.
+    Args:
+        payload: The original loader message payload.
+        chunk_size: Maximum data bytes per chunk.
+        
+    Returns:
+        None for non-MEM_WRITE payloads.
+        A dict describing split chunks otherwise.
     """
     if len(payload) < 8:
         return None
@@ -219,7 +246,7 @@ def split_memwrite(payload: bytes, chunk_size: int = MEMWRITE_CHUNK):
     base_addr = struct.unpack(">I", payload[4:8])[0]
     data = payload[8 : 8 + total_nbytes]
 
-    chunks = []
+    chunks: List[bytes] = []
     off = 0
     while off < len(data):
         chunk = data[off : off + chunk_size]
@@ -245,25 +272,30 @@ def split_memwrite(payload: bytes, chunk_size: int = MEMWRITE_CHUNK):
 
 
 def make_socket_msg(payload: bytes) -> bytes:
+    """Wrap payload with 2-byte big-endian length prefix."""
     return struct.pack(">H", len(payload)) + payload
 
 
 def main() -> None:
+    """Main entry point for the Sercomm relay."""
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <pty-path>", file=sys.stderr)
         sys.exit(1)
 
     pty_path = sys.argv[1]
 
+    # Clean up stale socket file
     try:
         os.unlink(SOCK_PATH)
     except FileNotFoundError:
         pass
 
+    # Open and configure PTY
     pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
     set_raw(pty_fd)
     set_nonblock(pty_fd)
 
+    # Create Unix domain socket server
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK_PATH)
     srv.listen(1)
@@ -278,13 +310,13 @@ def main() -> None:
     parser = SercommParser()
     lp_reader = LengthPrefixReader()
 
-    client = None
+    client: Optional[socket.socket] = None
     running = True
 
     # For split MEM_WRITE aggregation.
-    pending_reply = None
+    pending_reply: Optional[Dict[str, Any]] = None
 
-    def shutdown(_sig, _frame):
+    def shutdown(_sig: int, _frame: Any) -> None:
         nonlocal running
         running = False
 
@@ -302,10 +334,12 @@ def main() -> None:
             except (OSError, ValueError):
                 break
 
+            # Accept new client connections
             if srv in readable:
                 conn, _ = srv.accept()
                 conn.setblocking(False)
 
+                # Close existing client if any
                 if client is not None:
                     try:
                         client.close()
@@ -317,6 +351,7 @@ def main() -> None:
                 pending_reply = None
                 print("sercomm-relay: client connected", flush=True)
 
+            # Handle incoming socket messages
             if client is not None and client in readable:
                 try:
                     raw = client.recv(4096)
@@ -340,6 +375,7 @@ def main() -> None:
                         split = split_memwrite(payload, chunk_size=MEMWRITE_CHUNK)
 
                         if split is None:
+                            # Normal passthrough
                             frame = sercomm_wrap(DLCI_TX, payload)
                             print(f"  [->PTY] {hexdump(frame)}", flush=True)
                             try:
@@ -348,6 +384,7 @@ def main() -> None:
                                 if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                                     raise
                         else:
+                            # Split MEM_WRITE into chunks
                             pending_reply = {
                                 "cmd": split["original_cmd"],
                                 "nbytes": split["original_nbytes"],
@@ -377,6 +414,7 @@ def main() -> None:
                                     if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                                         raise
 
+            # Handle incoming PTY data
             if pty_fd in readable:
                 try:
                     raw = os.read(pty_fd, 4096)
@@ -412,6 +450,7 @@ def main() -> None:
                         )
 
                         if pending_reply["remaining"] == 0:
+                            # All chunks acknowledged - send synthesized response
                             synth = bytearray()
                             synth.append(pending_reply["cmd"])
                             synth.append(pending_reply["nbytes"])

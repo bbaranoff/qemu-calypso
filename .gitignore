@@ -1,0 +1,33 @@
+```
+# Compiled and build artifacts
+*.o
+*.obj
+*.out
+
+# Dependencies
+__pycache__/
+*.pyc
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Build directories
+build/
+dist/
+target/
+```
