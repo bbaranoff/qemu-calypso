@@ -1,18 +1,26 @@
 /*
  * calypso_inth.c — Calypso INTH (Interrupt Handler)
  *
- * Two-level interrupt controller at 0xFFFFFA00.
+ * Level-sensitive interrupt controller at 0xFFFFFA00.
  * 32 IRQ inputs, priority-based arbitration, IRQ/FIQ routing via ILR.
  *
+ * The Calypso INTH is LEVEL-SENSITIVE: it tracks the current level of
+ * each input line. When a peripheral deasserts its IRQ (e.g. UART clears
+ * TX_EMPTY by reading IIR), the INTH immediately sees the change and
+ * lowers its output if no other active interrupts remain.
+ *
+ * The firmware does NOT use IRQ_CTRL to acknowledge interrupts — it
+ * relies on the peripheral clearing its interrupt source instead.
+ *
  * Register map (16-bit, offsets from base):
- *   0x00        IT_REG1   (pending bits [15:0], read-only)
- *   0x02        IT_REG2   (pending bits [31:16], read-only)
+ *   0x00        IT_REG1   (active bits [15:0], read-only)
+ *   0x02        IT_REG2   (active bits [31:16], read-only)
  *   0x04        MASK_IT_REG1 (mask low)
  *   0x06        MASK_IT_REG2 (mask high)
  *   0x20..0x5F  ILR[0..31] (2 bytes each: bits[4:0]=prio, bit[8]=FIQ)
- *   0x80        IRQ_NUM   (current IRQ number, read-only)
- *   0x82        FIQ_NUM   (current FIQ number, read-only)
- *   0x84        IRQ_CTRL  (write 1 to acknowledge current IRQ)
+ *   0x10        IRQ_NUM   (current IRQ number, read-only)
+ *   0x12        FIQ_NUM   (current FIQ number, read-only)
+ *   0x14        IRQ_CTRL  (write to acknowledge — kept for compat)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -27,7 +35,7 @@
 
 static void calypso_inth_update(CalypsoINTHState *s)
 {
-    uint32_t active = s->pending & ~s->mask;
+    uint32_t active = s->levels & ~s->mask;
     int best_irq = -1;
     int best_prio = 0x7F;
     int is_fiq = 0;
@@ -42,8 +50,6 @@ static void calypso_inth_update(CalypsoINTHState *s)
             }
         }
     }
-
-    /* debug disabled — was causing QEMU freeze */
 
     if (best_irq >= 0) {
         s->ith_v = best_irq;
@@ -67,13 +73,11 @@ static void calypso_inth_set_irq(void *opaque, int irq, int level)
 {
     CalypsoINTHState *s = CALYPSO_INTH(opaque);
 
-    /* debug disabled — was causing QEMU freeze */
-
-    /* CRITICAL FIX: Actually update pending bits! */
+    /* Level-sensitive: track current input level directly */
     if (level) {
-        s->pending |= (1 << irq);
+        s->levels |= (1u << irq);
     } else {
-        s->pending &= ~(1 << irq);
+        s->levels &= ~(1u << irq);
     }
 
     calypso_inth_update(s);
@@ -86,27 +90,28 @@ static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
     CalypsoINTHState *s = CALYPSO_INTH(opaque);
 
     switch (offset) {
-    case 0x00: /* IT_REG1 — pending bits [15:0] */
-        return s->pending & 0xFFFF;
-    case 0x02: /* IT_REG2 — pending bits [31:16] */
-        return (s->pending >> 16) & 0xFFFF;
+    case 0x00: /* IT_REG1 — active bits [15:0] */
+        return s->levels & 0xFFFF;
+    case 0x02: /* IT_REG2 — active bits [31:16] */
+        return (s->levels >> 16) & 0xFFFF;
     case 0x04: /* MASK_IT_REG1 */
         return s->mask & 0xFFFF;
     case 0x06: /* MASK_IT_REG2 */
         return (s->mask >> 16) & 0xFFFF;
-    case 0x80: /* IRQ_NUM */
+    case 0x10: /* IRQ_NUM */
+    case 0x80: /* IRQ_NUM (legacy) */
         return s->ith_v;
-    case 0x82: /* FIQ_NUM */
+    case 0x12: /* FIQ_NUM */
+    case 0x82: /* FIQ_NUM (legacy) */
         return s->ith_v;
-    case 0x84: /* IRQ_CTRL */
+    case 0x14: /* IRQ_CTRL */
+    case 0x84: /* IRQ_CTRL (legacy) */
         return 0;
     default:
         if (offset >= 0x20 && offset < 0x60) {
             int idx = (offset - 0x20) / 2;
             return s->ilr[idx];
         }
-        qemu_log_mask(LOG_UNIMP, "calypso_inth: unimplemented read at 0x%02x\n",
-                       (unsigned)offset);
         return 0;
     }
 }
@@ -125,10 +130,8 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
         s->mask = (s->mask & 0x0000FFFF) | ((value & 0xFFFF) << 16);
         calypso_inth_update(s);
         break;
-    case 0x84: /* IRQ_CTRL — acknowledge current IRQ */
-        if (s->ith_v < CALYPSO_INTH_NUM_IRQS) {
-            s->pending &= ~(1u << s->ith_v);
-        }
+    case 0x14: /* IRQ_CTRL — acknowledge (compat, not used by firmware) */
+    case 0x84:
         calypso_inth_update(s);
         break;
     default:
@@ -144,7 +147,8 @@ static const MemoryRegionOps calypso_inth_ops = {
     .read = calypso_inth_read,
     .write = calypso_inth_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl = { .min_access_size = 2, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl  = { .min_access_size = 1, .max_access_size = 2 },
 };
 
 /* ---- QOM lifecycle ---- */
@@ -169,11 +173,8 @@ static void calypso_inth_reset(DeviceState *dev)
 {
     CalypsoINTHState *s = CALYPSO_INTH(dev);
 
-    s->pending = 0;
-
-    /* UNMASK ALL IRQs at reset (baremetal firmware expects this) */
+    s->levels = 0;
     s->mask = 0x00000000;
-
     s->ith_v = 0;
     memset(s->ilr, 0, sizeof(s->ilr));
 }

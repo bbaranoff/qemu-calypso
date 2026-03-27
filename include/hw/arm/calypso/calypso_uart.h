@@ -60,9 +60,6 @@ typedef struct CalypsoUARTState {
     uint16_t rx_tail;
     uint16_t rx_count;
 
-    /* IRQ output level tracking */
-    bool irq_level;
-
     /* TX empty fires once per THR transition */
     bool thr_empty_pending;
 

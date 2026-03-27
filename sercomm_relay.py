@@ -36,7 +36,7 @@ FLAG = 0x7E
 ESCAPE = 0x7D
 ESCAPE_XOR = 0x20
 
-SOCK_PATH = "/tmp/osmocom_loader"
+SOCK_PATH = os.environ.get("SERCOMM_SOCK_PATH", "/tmp/osmocom_loader")
 
 LOADER_PING = 0x01
 LOADER_MEM_WRITE = 0x08

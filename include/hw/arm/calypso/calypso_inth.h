@@ -32,8 +32,8 @@ struct CalypsoINTHState {
     /* Interrupt Level Registers: bits[4:0]=priority, bit[8]=FIQ */
     uint16_t ilr[CALYPSO_INTH_NUM_IRQS];
 
-    uint16_t ith_v;        /* Current highest-priority pending IRQ number */
-    uint32_t pending;      /* Bitmask of pending IRQs */
+    uint16_t ith_v;        /* Current highest-priority active IRQ number */
+    uint32_t levels;       /* Bitmask of current input levels (level-sensitive) */
     uint32_t mask;         /* Bitmask: 1 = masked (disabled) */
 };
 

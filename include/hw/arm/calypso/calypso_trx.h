@@ -63,11 +63,17 @@
 #define DSP_API_PARAM         0x4800
 #define DSP_PAGE_SIZE         0x1000
 
-#define CALYPSO_TPU_BASE      0xFFFE0000
-#define CALYPSO_TPU_SIZE      0x0800
+#define CALYPSO_TPU_BASE      0xFFFF1000
+#define CALYPSO_TPU_SIZE      0x0100
+
+#define CALYPSO_TPU_RAM_BASE  0xFFFF9000
+#define CALYPSO_TPU_RAM_SIZE  0x0800
 
 #define CALYPSO_TSP_BASE      0xFFFE0800
 #define CALYPSO_TSP_SIZE      0x0100
+
+#define CALYPSO_SIM_BASE      0xFFFE0000
+#define CALYPSO_SIM_SIZE      0x0100
 
 #define CALYPSO_ULPD_BASE     0xFFFE2800
 #define CALYPSO_ULPD_SIZE     0x0100
@@ -201,12 +207,12 @@
  * Standard Calypso DSP version: 0x3606 0x0000
  * ===================================================================== */
 
-#define DSP_DL_STATUS_ADDR    0x0000  /* byte offset in API RAM */
+#define DSP_DL_STATUS_ADDR    0x0FFE  /* byte offset in API RAM (end of page 0) */
 #define DSP_API_VER_ADDR      0x0004  /* byte offset: version word 1 */
 #define DSP_API_VER2_ADDR     0x0006  /* byte offset: version word 2 */
 
 #define DSP_DL_STATUS_RESET   0x0000
-#define DSP_DL_STATUS_BOOT    0x0001
+#define DSP_DL_STATUS_BOOT    0x0001  /* DSP ROM ready for patches */
 #define DSP_DL_STATUS_READY   0x0002
 #define DSP_API_VERSION       0x3606
 

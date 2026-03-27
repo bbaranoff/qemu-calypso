@@ -36,6 +36,7 @@ typedef struct CalypsoMachineState {
     ARMCPU *cpu;
     CalypsoSoCState soc;
     MemoryRegion xram;
+    MemoryRegion bootrom;
 } CalypsoMachineState;
 
 #define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
@@ -114,8 +115,45 @@ static void calypso_machine_init(MachineState *machine)
 
     fprintf(stderr, "[MB] Flash: pflash_cfi01 registered OK\n");
 
-    /* ---- NO vector aliases ---- */
-    fprintf(stderr, "[MB] NO ram_alias0, NO high_vectors (flash owns 0x0)\n");
+    /* ---- Synthetic boot ROM at address 0 ----
+     *
+     * The real Calypso has internal ROM at 0x00000000 containing
+     * exception vector stubs that branch to IRAM exception handlers.
+     * OsmocomBB firmware installs handlers at IRAM+0x1C through IRAM+0x34.
+     * The boot ROM vectors use: ldr pc, [pc, #0x18] + address table.
+     *
+     * Layout (0x00-0x3F):
+     *   0x00-0x1C: ldr pc, [pc, #0x18] for each exception
+     *   0x20-0x3C: handler addresses in IRAM
+     */
+    {
+        uint32_t bootrom_data[16];
+        /* ARM instruction: ldr pc, [pc, #0x18] = 0xe59ff018 */
+        for (int i = 0; i < 8; i++) {
+            bootrom_data[i] = 0xe59ff018;
+        }
+        /* Handler addresses (read via the ldr pc above):
+         * Each vector at offset N reads from offset N+0x20 */
+        bootrom_data[8]  = 0x00820000;  /* reset → _start */
+        bootrom_data[9]  = 0x0080001C;  /* undef → IRAM _undef_instr */
+        bootrom_data[10] = 0x00800020;  /* SWI → IRAM _sw_interr */
+        bootrom_data[11] = 0x00800024;  /* prefetch abort → IRAM */
+        bootrom_data[12] = 0x00800028;  /* data abort → IRAM */
+        bootrom_data[13] = 0x0080002C;  /* reserved → IRAM */
+        bootrom_data[14] = 0x00800030;  /* IRQ → IRAM _irq */
+        bootrom_data[15] = 0x00800034;  /* FIQ → IRAM _fiq */
+
+        memory_region_init_ram(&s->bootrom, NULL,
+                                "calypso.bootrom", 64, &error_fatal);
+        memory_region_add_subregion_overlap(sysmem, 0x00000000,
+                                             &s->bootrom, 1);
+        /* Write vector table into the boot ROM RAM */
+        {
+            void *ptr = memory_region_get_ram_ptr(&s->bootrom);
+            memcpy(ptr, bootrom_data, sizeof(bootrom_data));
+        }
+        fprintf(stderr, "[MB] Boot ROM @ 0x00000000 (64 bytes, exception vectors)\n");
+    }
 
     /* ---- Firmware load ---- */
     if (machine->kernel_filename) {

@@ -89,9 +89,15 @@ typedef struct CalypsoTRX {
 
     /* TPU */
     MemoryRegion tpu_iomem;
+    MemoryRegion tpu_ram_iomem;
     uint16_t     tpu_regs[CALYPSO_TPU_SIZE / 2];
-    uint16_t     tpu_ram[1024];
+    uint16_t     tpu_ram[CALYPSO_TPU_RAM_SIZE / 2];
     bool         tpu_enabled;
+
+    /* SIM controller */
+    MemoryRegion sim_iomem;
+    uint16_t     sim_regs[CALYPSO_SIM_SIZE / 2];
+    QEMUTimer   *sim_atr_timer;
 
     /* TSP */
     MemoryRegion tsp_iomem;
@@ -538,14 +544,15 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 
     if (offset == DSP_DL_STATUS_ADDR && !s->sync_dsp_booted) {
         s->sync_boot_frame++;
-        if (s->sync_boot_frame > 3 &&
-            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] == DSP_DL_STATUS_BOOT) {
-            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_READY;
+        if (s->sync_boot_frame > 3) {
+            /* DSP bootloader ROM signals ready by writing 1 */
+            s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_BOOT;
             s->dsp_ram[DSP_API_VER_ADDR  / 2]  = DSP_API_VERSION;
             s->dsp_ram[DSP_API_VER2_ADDR / 2]  = 0x0000;
             s->sync_dsp_booted = true;
-            TRX_LOG("DSP boot: READY, version=0x%04x", DSP_API_VERSION);
-            val = DSP_DL_STATUS_READY;
+            TRX_LOG("DSP boot: ROM ready (status=1), version=0x%04x",
+                    DSP_API_VERSION);
+            val = DSP_DL_STATUS_BOOT;
         }
     }
 
@@ -579,8 +586,16 @@ static void calypso_dsp_write(void *opaque, hwaddr offset,
     if (offset == DSP_API_NDB + NDB_W_D_DSP_PAGE * 2) {
         s->dsp_page = value & 1;
     }
-    if (offset == DSP_DL_STATUS_ADDR && value == DSP_DL_STATUS_BOOT) {
-        s->sync_boot_frame = 0;
+    if (offset == DSP_DL_STATUS_ADDR) {
+        if (value == 0x0000) {
+            /* Firmware clearing DSP status → allow re-boot sequence */
+            s->sync_dsp_booted = false;
+            s->sync_boot_frame = 0;
+            TRX_LOG("DSP reset: status cleared, re-enabling boot sequence");
+        } else if (value == DSP_DL_STATUS_BOOT) {
+            s->sync_boot_frame = 0;
+        }
+        /* DSP_DL_STATUS_READY (0x0002) = normal operation, no action */
     }
 }
 
@@ -813,6 +828,11 @@ static void calypso_dsp_process(CalypsoTRX *s)
 static void calypso_dsp_done(void *opaque)
 {
     CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    /* TPU finished processing — clear enable bit so firmware sees completion */
+    s->tpu_enabled = false;
+    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
+
     qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
 }
 
@@ -826,7 +846,11 @@ static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
     uint64_t val = 0;
 
     switch (offset) {
-    case TPU_CTRL:     val = s->tpu_regs[TPU_CTRL / 2]; break;
+    case TPU_CTRL:
+        /* Return 0 for all status/busy bits — TPU completes instantly */
+        val = 0;
+        { static int c=0; if(c<5) { fprintf(stderr,"[TPU] CTRL read=0\n"); c++; } }
+        break;
     case TPU_IDLE:     val = 1; break;
     case TPU_INT_CTRL: val = s->tpu_regs[TPU_INT_CTRL / 2]; break;
     case TPU_INT_STAT: val = 0; break;
@@ -835,11 +859,16 @@ static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
     case TPU_OFFSET:   val = s->tpu_regs[TPU_OFFSET / 2]; break;
     case TPU_SYNCHRO:  val = s->tpu_regs[TPU_SYNCHRO / 2]; break;
     default:
-        if (offset >= TPU_RAM_BASE &&
-            offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
-            val = s->tpu_ram[(offset - TPU_RAM_BASE) / 2];
-        } else if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
+        if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
             val = s->tpu_regs[offset / 2];
+        }
+        {
+            static int tpu_unk_cnt = 0;
+            if (tpu_unk_cnt < 20) {
+                fprintf(stderr, "[TPU] READ offset=0x%04x val=0x%04x\n",
+                        (unsigned)offset, (unsigned)val);
+                tpu_unk_cnt++;
+            }
         }
         break;
     }
@@ -861,19 +890,20 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
     if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
         s->tpu_regs[offset / 2] = (uint16_t)value;
     }
-    if (offset >= TPU_RAM_BASE &&
-        offset < TPU_RAM_BASE + sizeof(s->tpu_ram)) {
-        s->tpu_ram[(offset - TPU_RAM_BASE) / 2] = (uint16_t)value;
-        return;
-    }
 
     switch (offset) {
     case TPU_CTRL:
         if ((value & TPU_CTRL_ENABLE) && !s->tpu_enabled) {
             s->tpu_enabled = true;
             calypso_dsp_process(s);
+            /* Immediately mark TPU as done — firmware polls TPU_CTRL
+             * in a tight loop and virtual time doesn't advance during
+             * CPU polling, so a timer-based clear doesn't work. */
+            s->tpu_enabled = false;
+            s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
+            /* Schedule API interrupt for next opportunity */
             timer_mod_ns(s->dsp_timer,
-                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10000);
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
         }
         if (value & TPU_CTRL_RESET) {
             s->tpu_enabled = false;
@@ -894,8 +924,8 @@ static const MemoryRegionOps calypso_tpu_ops = {
     .read  = calypso_tpu_read,
     .write = calypso_tpu_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 2, .max_access_size = 2 },
-    .impl  = { .min_access_size = 2, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* =====================================================================
@@ -922,8 +952,8 @@ static const MemoryRegionOps calypso_tsp_ops = {
     .read  = calypso_tsp_read,
     .write = calypso_tsp_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 2, .max_access_size = 2 },
-    .impl  = { .min_access_size = 2, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /* =====================================================================
@@ -1027,6 +1057,8 @@ static void calypso_dsp_api_init(CalypsoTRX *s)
 {
     memset(s->dsp_ram, 0, sizeof(s->dsp_ram));
     s->dsp_ram[DSP_DL_STATUS_ADDR / 2] = DSP_DL_STATUS_READY;
+    s->dsp_ram[DSP_API_VER_ADDR  / 2]  = DSP_API_VERSION;
+    s->dsp_ram[DSP_API_VER2_ADDR / 2]  = 0x0000;
     s->sync_dsp_booted = true;
 }
 
@@ -1051,6 +1083,124 @@ static void calypso_sync_init(CalypsoTRX *s)
             s->sync_rssi);
 }
 
+/* =====================================================================
+ * TPU RAM (separate region at 0xFFFF9000)
+ * ===================================================================== */
+
+static uint64_t calypso_tpu_ram_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    if (offset / 2 >= CALYPSO_TPU_RAM_SIZE / 2) return 0;
+    return s->tpu_ram[offset / 2];
+}
+
+static void calypso_tpu_ram_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    if (offset / 2 >= CALYPSO_TPU_RAM_SIZE / 2) return;
+    s->tpu_ram[offset / 2] = (uint16_t)value;
+}
+
+static const MemoryRegionOps calypso_tpu_ram_ops = {
+    .read  = calypso_tpu_ram_read,
+    .write = calypso_tpu_ram_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* =====================================================================
+ * SIM controller (minimal — just enough to unblock firmware init)
+ *
+ * Calypso SIM registers at 0xFFFE0000:
+ *   0x00  SIM_CMD
+ *   0x02  SIM_STAT
+ *   0x04  SIM_CONF1
+ *   0x06  SIM_CONF2
+ *   0x08  SIM_IT       (interrupt status)
+ *   0x0A  SIM_DRX      (received data)
+ *   0x0C  SIM_DTX      (transmit data)
+ *   0x0E  SIM_MASKIT   (interrupt mask)
+ *   0x10  SIM_IT_CD    (card detect interrupt)
+ * ===================================================================== */
+
+#define SIM_CMD     0x00
+#define SIM_STAT    0x02
+#define SIM_CONF1   0x04
+#define SIM_CONF2   0x06
+#define SIM_IT      0x08
+#define SIM_DRX     0x0A
+#define SIM_DTX     0x0C
+#define SIM_MASKIT  0x0E
+#define SIM_IT_CD   0x10
+
+/* SIM IRQ bit: card inserted + ATR received */
+#define SIM_IT_SIM  (1 << 0)
+
+static void calypso_sim_atr_cb(void *opaque)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    /* The firmware's calypso_sim_powerup() spins on rxDoneFlag at a
+     * fixed address in IRAM.  Rather than implementing the full SIM
+     * ATR protocol, we write directly to rxDoneFlag to unblock it.
+     *
+     * rxDoneFlag address = 0x00830510 (from layer1.highram.elf symbol table)
+     */
+    static const hwaddr rxDoneFlag_addr = 0x00830510;
+    uint32_t val = 1;
+    cpu_physical_memory_write(rxDoneFlag_addr, &val, sizeof(val));
+
+    s->sim_regs[SIM_IT / 2] |= SIM_IT_SIM;
+    s->sim_regs[SIM_STAT / 2] = 0x0001;
+    TRX_LOG("SIM: ATR done, rxDoneFlag=1 written at 0x%08lx",
+            (unsigned long)rxDoneFlag_addr);
+    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_SIM]);
+}
+
+static uint64_t calypso_sim_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    uint16_t val = 0;
+
+    if (offset / 2 < CALYPSO_SIM_SIZE / 2) {
+        val = s->sim_regs[offset / 2];
+    }
+
+    /* Reading SIM_IT clears the interrupt bits */
+    if (offset == SIM_IT) {
+        s->sim_regs[SIM_IT / 2] = 0;
+    }
+
+    return val;
+}
+
+static void calypso_sim_write(void *opaque, hwaddr offset,
+                               uint64_t value, unsigned size)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+
+    if (offset / 2 < CALYPSO_SIM_SIZE / 2) {
+        s->sim_regs[offset / 2] = (uint16_t)value;
+    }
+
+    /* When firmware unmasks SIM interrupts, schedule ATR delivery */
+    if (offset == SIM_MASKIT) {
+        TRX_LOG("SIM: MASKIT write = 0x%04x, scheduling ATR", (unsigned)value);
+        timer_mod_ns(s->sim_atr_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
+    }
+}
+
+static const MemoryRegionOps calypso_sim_ops = {
+    .read  = calypso_sim_read,
+    .write = calypso_sim_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
 {
     CalypsoTRX *s = g_new0(CalypsoTRX, 1);
@@ -1074,10 +1224,16 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
 
     calypso_sync_init(s);
 
-    /* TPU */
+    /* TPU registers */
     memory_region_init_io(&s->tpu_iomem, NULL, &calypso_tpu_ops, s,
                           "calypso.tpu", CALYPSO_TPU_SIZE);
     memory_region_add_subregion(sysmem, CALYPSO_TPU_BASE, &s->tpu_iomem);
+
+    /* TPU RAM (separate from registers) */
+    memory_region_init_io(&s->tpu_ram_iomem, NULL, &calypso_tpu_ram_ops, s,
+                          "calypso.tpu_ram", CALYPSO_TPU_RAM_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_TPU_RAM_BASE,
+                                &s->tpu_ram_iomem);
 
     /* TSP */
     memory_region_init_io(&s->tsp_iomem, NULL, &calypso_tsp_ops, s,
@@ -1088,6 +1244,12 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
     memory_region_init_io(&s->ulpd_iomem, NULL, &calypso_ulpd_ops, s,
                           "calypso.ulpd", CALYPSO_ULPD_SIZE);
     memory_region_add_subregion(sysmem, CALYPSO_ULPD_BASE, &s->ulpd_iomem);
+
+    /* SIM controller */
+    memory_region_init_io(&s->sim_iomem, NULL, &calypso_sim_ops, s,
+                          "calypso.sim", CALYPSO_SIM_SIZE);
+    memory_region_add_subregion(sysmem, CALYPSO_SIM_BASE, &s->sim_iomem);
+    s->sim_atr_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_sim_atr_cb, s);
 
     /* Timers */
     s->tdma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_tdma_tick, s);

@@ -60,6 +60,58 @@ static const MemoryRegionOps calypso_mmio16_ops = {
     .impl = { .min_access_size = 2, .max_access_size = 2 },
 };
 
+/* ---- CNTL register (EXTRA_CONF) at 0xFFFFFD00 ----
+ * Bit [8:9] = bootrom mapping control
+ *   When cleared (0), IRAM is aliased at 0x00000000
+ *   When set (3), internal ROM is mapped at 0x00000000
+ *
+ * On real Calypso, firmware calls calypso_bootrom(0) to disable
+ * bootrom and enable IRAM at address 0 for exception vectors.
+ */
+static uint64_t calypso_cntl_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CalypsoSoCState *s = CALYPSO_SOC(opaque);
+    if (offset == 0) return s->extra_conf;
+    return 0;
+}
+
+static void calypso_cntl_write(void *opaque, hwaddr offset,
+                                uint64_t value, unsigned size)
+{
+    CalypsoSoCState *s = CALYPSO_SOC(opaque);
+    if (offset != 0) return;
+
+    s->extra_conf = (uint16_t)value;
+
+    /* Bits [9:8] control bootrom/IRAM mapping at address 0 */
+    bool bootrom_enabled = (value >> 8) & 3;
+
+    if (!bootrom_enabled && !s->iram_at_zero) {
+        /* Map IRAM at address 0 (higher priority than flash) */
+        MemoryRegion *sysmem = get_system_memory();
+        memory_region_init_alias(&s->iram_alias, OBJECT(s),
+                                  "calypso.iram_at_zero",
+                                  &s->iram, 0, CALYPSO_IRAM_SIZE);
+        memory_region_add_subregion_overlap(sysmem, 0x00000000,
+                                             &s->iram_alias, 1);
+        s->iram_at_zero = true;
+        fprintf(stderr, "[SOC] CNTL: IRAM aliased at 0x00000000 (bootrom disabled)\n");
+    } else if (bootrom_enabled && s->iram_at_zero) {
+        /* Remove IRAM alias */
+        memory_region_del_subregion(get_system_memory(), &s->iram_alias);
+        object_unparent(OBJECT(&s->iram_alias));
+        s->iram_at_zero = false;
+        fprintf(stderr, "[SOC] CNTL: IRAM alias removed (bootrom enabled)\n");
+    }
+}
+
+static const MemoryRegionOps calypso_cntl_ops = {
+    .read = calypso_cntl_read,
+    .write = calypso_cntl_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
 static uint64_t calypso_kp_read(void *o, hwaddr a, unsigned s) { return 0xFF; }
 static void calypso_kp_write(void *o, hwaddr a, uint64_t v, unsigned s) {}
 static const MemoryRegionOps calypso_keypad_ops = {
@@ -105,10 +157,11 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->inth), 0, CALYPSO_INTH_BASE);
 
-    sysbus_init_irq(sbd, &s->cpu_irq);
-    sysbus_init_irq(sbd, &s->cpu_fiq);
-    sysbus_connect_irq(SYS_BUS_DEVICE(&s->inth), 0, s->cpu_irq);
-    sysbus_connect_irq(SYS_BUS_DEVICE(&s->inth), 1, s->cpu_fiq);
+    /* Pass INTH's output IRQs (parent_irq, parent_fiq) through
+     * the SoC device so the board can connect them to the CPU.
+     * This avoids the ordering issue where sysbus_connect_irq
+     * captures a NULL qemu_irq before the board connects it. */
+    sysbus_pass_irq(sbd, SYS_BUS_DEVICE(&s->inth));
 
     #define INTH_IRQ(n) qdev_get_gpio_in(DEVICE(&s->inth), (n))
 
@@ -211,7 +264,12 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     add_stub(sysmem, "calypso.rhea",       0xFFFFF900, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.clkm",       0xFFFFFB00, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.mmio_fcxx",  0xFFFFFC00, &calypso_mmio16_ops);
-    add_stub(sysmem, "calypso.cntl",       0xFFFFFD00, &calypso_mmio16_ops);
+    /* CNTL (EXTRA_CONF) - controls IRAM-at-zero mapping */
+    memory_region_init_io(&s->cntl_iomem, OBJECT(dev), &calypso_cntl_ops, s,
+                          "calypso.cntl", 0x100);
+    memory_region_add_subregion(sysmem, 0xFFFFFD00, &s->cntl_iomem);
+    s->extra_conf = 0x0300; /* bootrom enabled at reset */
+    s->iram_at_zero = false;
     add_stub(sysmem, "calypso.dio",        0xFFFFFF00, &calypso_mmio8_ops);
     /* NO calypso.low300 — it overlaps flash! */
 

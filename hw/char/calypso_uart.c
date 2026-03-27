@@ -67,6 +67,15 @@
 /* SSR bits (minimal model) */
 #define SSR_TX_FIFO_FULL  (1 << 0)
 
+/**
+ * uart_log_raw - Log raw UART data to a file
+ * @path: Path to the log file
+ * @buf: Buffer containing the data
+ * @len: Length of the data
+ *
+ * Appends binary data to the specified file. Used for debugging
+ * modem and IrDA traffic. Silently ignores errors.
+ */
 static void uart_log_raw(const char *path, const uint8_t *buf, size_t len)
 {
     FILE *f = fopen(path, "ab");
@@ -80,6 +89,10 @@ static void uart_log_raw(const char *path, const uint8_t *buf, size_t len)
 
 /* ---- FIFO helpers ---- */
 
+/**
+ * fifo_reset - Reset the RX FIFO state
+ * @s: UART device state
+ */
 static void fifo_reset(CalypsoUARTState *s)
 {
     s->rx_head = 0;
@@ -87,6 +100,13 @@ static void fifo_reset(CalypsoUARTState *s)
     s->rx_count = 0;
 }
 
+/**
+ * fifo_push - Push a byte into the RX FIFO
+ * @s: UART device state
+ * @data: Byte to push
+ *
+ * Sets overrun error flag if FIFO is full.
+ */
 static void fifo_push(CalypsoUARTState *s, uint8_t data)
 {
     if (s->rx_count >= CALYPSO_UART_RX_FIFO_SIZE) {
@@ -105,6 +125,12 @@ static void fifo_push(CalypsoUARTState *s, uint8_t data)
     s->rx_count++;
 }
 
+/**
+ * fifo_pop - Pop a byte from the RX FIFO
+ * @s: UART device state
+ *
+ * Returns: The popped byte, or 0 if FIFO is empty.
+ */
 static uint8_t fifo_pop(CalypsoUARTState *s)
 {
     uint8_t data = 0;
@@ -140,11 +166,11 @@ static void calypso_uart_update_irq(CalypsoUARTState *s)
 
     s->iir = iir;
 
-    if (want && !s->irq_level) {
-        s->irq_level = true;
+    /* Level-sensitive: assert/deassert IRQ based on current state.
+     * The INTH tracks input levels directly. */
+    if (want) {
         qemu_irq_raise(s->irq);
-    } else if (!want && s->irq_level) {
-        s->irq_level = false;
+    } else {
         qemu_irq_lower(s->irq);
     }
 }
@@ -311,10 +337,7 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
         } else {
             uint8_t ch = (uint8_t)value;
 
-            fprintf(stderr, "[UART:%s] TX>>> 0x%02x '%c'\n",
-                    s->label ? s->label : "?",
-                    ch,
-                    (ch >= 0x20 && ch < 0x7f) ? ch : '.');
+            /* TX logging disabled to reduce noise */
 
             if (s->label && !strcmp(s->label, "modem")) {
                 uart_log_raw("/tmp/qemu-modem-tx.raw", &ch, 1);
@@ -336,6 +359,14 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
         } else {
             uint8_t old = s->ier;
             s->ier = value & 0x0F;
+
+            if (old != s->ier) {
+                fprintf(stderr, "[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
+                        s->label ? s->label : "?",
+                        s->ier,
+                        !!(s->ier & IER_RX_DATA),
+                        !!(s->ier & IER_TX_EMPTY));
+            }
 
             if (!(old & IER_TX_EMPTY) &&
                 (s->ier & IER_TX_EMPTY) &&
@@ -486,7 +517,6 @@ static void calypso_uart_reset_state(DeviceState *dev)
     s->scr = 0;
     s->ssr = 0;
 
-    s->irq_level = false;
     s->thr_empty_pending = false;
 
     fifo_reset(s);

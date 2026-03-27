@@ -37,6 +37,12 @@ struct CalypsoSoCState {
     qemu_irq cpu_irq;
     qemu_irq cpu_fiq;
 
+    /* IRAM-at-zero alias (controlled by CNTL register) */
+    MemoryRegion iram_alias;
+    bool iram_at_zero;
+    MemoryRegion cntl_iomem;
+    uint16_t extra_conf;
+
     uint16_t trx_port;
     bool enable_trx;
 };
