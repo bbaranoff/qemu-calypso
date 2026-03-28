@@ -145,6 +145,7 @@ All patches are applied at first UART MDR1 write (before any console output). Ad
 ## Documentation
 
 - [`doc/CALYPSO-QEMU.md`](doc/CALYPSO-QEMU.md) — Full technical documentation
+- [`doc/PROJECT-UML.md`](doc/PROJECT-UML.md) — UML documentation
 - [`doc/hardware-map.md`](doc/hardware-map.md) — Memory map, peripherals, DSP API layout, firmware symbols
 
 ## Next Steps
