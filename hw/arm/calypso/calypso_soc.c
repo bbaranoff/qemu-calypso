@@ -16,6 +16,9 @@
 #include "sysemu/sysemu.h"
 #include "hw/arm/calypso/calypso_soc.h"
 #include "hw/arm/calypso/calypso_trx.h"
+
+/* Global reference for TDMA tick to kick UART RX */
+CalypsoUARTState *g_uart_modem;
 #include "chardev/char-fe.h"
 #include "chardev/char.h"
 #include "qemu/error-report.h"
@@ -216,6 +219,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_modem), 0, CALYPSO_UART_MODEM);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_modem), 0,
                            INTH_IRQ(IRQ_UART_MODEM));
+        g_uart_modem = &s->uart_modem;
     }
 
     /* ---- UART IRDA ---- */
@@ -288,7 +292,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
 
 static Property calypso_soc_properties[] = {
     DEFINE_PROP_BOOL("enable-trx", CalypsoSoCState, enable_trx, true),
-    DEFINE_PROP_UINT16("trx-port", CalypsoSoCState, trx_port, 4729),
+    DEFINE_PROP_UINT16("trx-port", CalypsoSoCState, trx_port, 6700),
     DEFINE_PROP_END_OF_LIST(),
 };
 

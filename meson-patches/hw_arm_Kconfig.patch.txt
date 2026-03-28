@@ -1,0 +1,6 @@
+1:config CALYPSO
+2-    bool
+3-    default y
+4-    depends on ARM
+5-    select PFLASH_CFI01
+6-

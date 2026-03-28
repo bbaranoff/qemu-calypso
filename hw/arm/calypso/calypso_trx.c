@@ -35,6 +35,10 @@
 #include <errno.h>
 
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/calypso_uart.h"
+
+/* Global reference to UART modem for TDMA tick RX kick */
+extern CalypsoUARTState *g_uart_modem;
 
 /* =====================================================================
  * GSMTAP (Wireshark monitoring, fixed port 4729)
@@ -116,6 +120,9 @@ typedef struct CalypsoTRX {
     /* DSP task completion timer */
     QEMUTimer   *dsp_timer;
 
+    /* Frame IRQ deassert timer */
+    QEMUTimer   *frame_irq_timer;
+
     /* ------------------------------------------------------------------
      * TRXD socket (binary burst data, trx_port + 1)
      * ------------------------------------------------------------------ */
@@ -157,6 +164,13 @@ typedef struct CalypsoTRX {
     uint32_t     sync_sb_tasks;
     bool         sync_dsp_booted;
     uint32_t     sync_boot_frame;
+
+    /* PM measurement tracking */
+    uint32_t     pm_count;
+    uint32_t     pm_debug_reads;     /* countdown: log read-page accesses after PM */
+
+    /* Firmware patching (one-shot, applied on first DSP access) */
+    bool         fw_patched;
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
@@ -164,6 +178,7 @@ static CalypsoTRX *g_trx;
 /* Forward declarations */
 static void calypso_dsp_done(void *opaque);
 static void calypso_sync_tick(CalypsoTRX *s);
+static void calypso_tdma_start(CalypsoTRX *s);
 
 /* =====================================================================
  * TRXC — ASCII command/response interface
@@ -204,15 +219,23 @@ static uint16_t khz_to_arfcn(uint32_t khz)
     if (khz == 0) {
         return s_arfcn_default;
     }
-    /* GSM900 uplink: 890.0–915.0 MHz */
+    /* E-GSM900 uplink: 880.0–890.0 MHz → ARFCN 975–1023,0 */
+    if (khz >= 880000 && khz < 890000) {
+        int n = (int)(khz - 890000) / 200 + 1024;
+        if (n >= 975 && n <= 1023) return (uint16_t)n;
+        if (n == 1024) return 0;
+    }
+    /* GSM900 uplink: 890.0–915.0 MHz → ARFCN 0–124 */
     if (khz >= 890000 && khz <= 915000) {
-        return (uint16_t)((khz - 890000) / 200 + 1);
+        int n = (int)(khz - 890000) / 200;
+        if (n == 0) return 0;
+        return (uint16_t)n;
     }
     /* DCS1800 uplink: 1710.2–1784.8 MHz */
     if (khz >= 1710200 && khz <= 1784800) {
         return (uint16_t)(((khz - 1710200) / 200) + 512);
     }
-    return 1; /* unknown band, fallback */
+    return s_arfcn_default; /* unknown band, use default */
 }
 
 /*
@@ -526,12 +549,118 @@ static void gsmtap_init(void)
  * DSP API RAM
  * ===================================================================== */
 
+/*
+ * One-shot firmware patches, applied on first DSP access.
+ * At this point the firmware ELF is loaded and executing.
+ * Must run BEFORE console output starts (dsp_power_on is early boot).
+ */
+static void calypso_fw_patch(CalypsoTRX *s)
+{
+    if (s->fw_patched) return;
+    s->fw_patched = true;
+
+    uint32_t val;
+    uint32_t bx_lr = 0xe12fff1e;
+
+    /* 0) NOP specific high-frequency debug output that fills the pool.
+     *    Keep general printf/puts working to maintain UART TX alive
+     *    (needed for L1CTL message delivery like PM_CONF).
+     *
+     *    NOP targets (bl printf/puts → nop):
+     *    - cons_puts: boot debug, fills pool early
+     *    - 0x8254d4: bl printf in l1s_pm_resp ("PM MEAS: ARFCN=...")
+     *    - 0x828914: bl printf in frame_irq ("LOST %d!")
+     *    - 0x828828: bl printf in frame_irq (debug dump)
+     *    - 0x828858: bl printf in frame_irq (conditional debug)
+     *    - 0x828880: bl printf in frame_irq (conditional debug)
+     */
+    uint32_t nop_arm = 0xe1a00000;  /* mov r0, r0 = NOP */
+    /* NOP cons_puts function entirely */
+    cpu_physical_memory_read(0x0082a1b0, &val, 4);
+    if (val != 0x00000000 && val != 0xe12fff1e) {
+        cpu_physical_memory_write(0x0082a1b0, &bx_lr, 4);
+        TRX_LOG("FW-PATCH: cons_puts@0x82a1b0 → bx lr");
+    }
+    /* NOP specific bl/blcc printf/puts calls in hot paths.
+     * Includes unconditional bl (0xEB) and conditional (blgt=0xCB, blhi=0x8B). */
+    /* NOP high-frequency debug output in frame_irq.
+     * Keep l1s_pm_resp printf (0x8254d4) — it keeps sercomm TX alive.
+     * Also NOP puts globally (0x829ea0) — it generates LOST spam. */
+    cpu_physical_memory_read(0x00829ea0, &val, 4);
+    if (val != 0x00000000 && val != 0xe12fff1e) {
+        cpu_physical_memory_write(0x00829ea0, &bx_lr, 4);
+        TRX_LOG("FW-PATCH: puts@0x829ea0 → bx lr");
+    }
+    static const hwaddr nop_calls[] = {
+        0x00828914,  /* frame_irq: bl printf "LOST %d!" */
+        0x00828828,  /* frame_irq: bl printf (debug) */
+        0x00828830,  /* frame_irq: bl puts (debug) */
+        0x00828858,  /* frame_irq: blgt printf (conditional) */
+        0x00828880,  /* frame_irq: blhi printf (conditional) */
+    };
+    for (int i = 0; i < 5; i++) {
+        cpu_physical_memory_read(nop_calls[i], &val, 4);
+        /* Match any bl/blcc: bits[27:25]=101, bit[24]=1 → (val & 0x0E000000) == 0x0A000000 AND bit24 set */
+        if ((val & 0x0F000000) == 0x0B000000) {
+            cpu_physical_memory_write(nop_calls[i], &nop_arm, 4);
+            TRX_LOG("FW-PATCH: NOP bl@0x%lx (was 0x%08x)",
+                    (unsigned long)nop_calls[i], val);
+        }
+    }
+
+    /* 1) Expand msgb pool: change "cmp r3, #32" to "cmp r3, #128"
+     *    at 0x82c33c.  The pool starts at 0x833b5c with 332-byte slots.
+     *    Extra 96 slots use zero-initialized IRAM after the original pool,
+     *    which is free (IRAM ends at 0x83FFFF).
+     *    32 * 332 = 10624 → 128 * 332 = 42496 (still within IRAM).
+     *    Pool end: 0x833b5c + 42496 = 0x83dfdc < 0x840000. Safe. */
+    cpu_physical_memory_read(0x0082c33c, &val, 4);
+    if (val == 0xe3530020) {  /* cmp r3, #32 */
+        /* Max safe: 148 slots. Pool end: 0x833b5c + 148*332 = 0x83fb4c < 0x840000 */
+        uint32_t cmp148 = 0xe3530094;  /* cmp r3, #148 */
+        cpu_physical_memory_write(0x0082c33c, &cmp148, 4);
+        TRX_LOG("FW-PATCH: talloc pool 32→148 slots @0x82c33c");
+    }
+
+    /* 2) talloc panic: replace infinite loop with retry + IRQs.
+     *    With 128 slots, this should rarely trigger. */
+    cpu_physical_memory_read(0x0082c350, &val, 4);
+    if (val == 0xeafffffe) {
+        uint32_t patch[2] = {
+            0xe121f008,  /* msr CPSR_c, r8 (re-enable IRQs) */
+            0xeaffffdf,  /* b 0x0082c2d4 (retry slot scan) */
+        };
+        cpu_physical_memory_write(0x0082c34c, patch, sizeof(patch));
+        TRX_LOG("FW-PATCH: talloc panic → retry with IRQs");
+    }
+
+    /* 3) handle_abort: keep IRQs enabled in abort infinite loop.
+     *    Without this, a data abort permanently freezes the system.
+     *    Original: msr CPSR_c, #0xc0 (disable) + b self
+     *    Patched:  msr CPSR_c, #0x00 (enable) + b self */
+    cpu_physical_memory_read(0x00821f98, &val, 4);
+    if (val == 0xeafffffe) {
+        uint32_t enable_irq = 0xe321f000;
+        cpu_physical_memory_write(0x00821f94, &enable_irq, 4);
+        TRX_LOG("FW-PATCH: handle_abort@0x821f94 → IRQs enabled");
+    }
+}
+
+void calypso_fw_patch_apply(void)
+{
+    if (g_trx) {
+        calypso_fw_patch(g_trx);
+    }
+}
+
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = (CalypsoTRX *)opaque;
     uint64_t val;
 
     if (offset >= CALYPSO_DSP_SIZE) return 0;
+
+    /* Patches are now triggered from first UART access (earlier than DSP) */
 
     if (size == 2) {
         val = s->dsp_ram[offset / 2];
@@ -553,6 +682,23 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             TRX_LOG("DSP boot: ROM ready (status=1), version=0x%04x",
                     DSP_API_VERSION);
             val = DSP_DL_STATUS_BOOT;
+        }
+    }
+
+    /* PM diagnostic: after a PM task, log read-page accesses to find
+     * the exact offset the firmware reads a_pm[] from. */
+    if (s->pm_debug_reads > 0) {
+        bool in_rpage0 = (offset >= DSP_API_R_PAGE0 &&
+                          offset < DSP_API_R_PAGE0 + DSP_PAGE_SIZE);
+        bool in_rpage1 = (offset >= DSP_API_R_PAGE1 &&
+                          offset < DSP_API_R_PAGE1 + DSP_PAGE_SIZE);
+        if (in_rpage0 || in_rpage1) {
+            hwaddr rel = in_rpage0 ? (offset - DSP_API_R_PAGE0)
+                                   : (offset - DSP_API_R_PAGE1);
+            TRX_LOG("PM-DIAG: read r_page[0x%03x] (word %u) = 0x%04x pg=%d",
+                    (unsigned)rel, (unsigned)(rel / 2),
+                    (unsigned)val, in_rpage1 ? 1 : 0);
+            s->pm_debug_reads--;
         }
     }
 
@@ -594,8 +740,14 @@ static void calypso_dsp_write(void *opaque, hwaddr offset,
             TRX_LOG("DSP reset: status cleared, re-enabling boot sequence");
         } else if (value == DSP_DL_STATUS_BOOT) {
             s->sync_boot_frame = 0;
+        } else if (value == DSP_DL_STATUS_READY) {
+            /* Firmware wrote "patches applied, DSP ready".
+             * Now plant the API version so firmware reads it. */
+            s->dsp_ram[DSP_API_VER_ADDR  / 2] = DSP_API_VERSION;
+            s->dsp_ram[DSP_API_VER2_ADDR / 2] = 0x0000;
+            TRX_LOG("DSP ready: planted version 0x%04x at 0x%04x",
+                    DSP_API_VERSION, DSP_API_VER_ADDR);
         }
-        /* DSP_DL_STATUS_READY (0x0002) = normal operation, no action */
     }
 }
 
@@ -750,8 +902,22 @@ static void calypso_dsp_process(CalypsoTRX *s)
     uint16_t task_d = w_page[DB_W_D_TASK_D];
     uint16_t task_u = w_page[DB_W_D_TASK_U];
 
-    if (task_d != 0 || task_u != 0) {
+    uint16_t task_md = w_page[DB_W_D_TASK_MD];
+
+    if (task_d != 0 || task_u != 0 || task_md != 0) {
         s->sync_task_count++;
+    }
+
+    /* Debug: after PM starts, log task activity (both present and absent)
+     * to understand scheduling pattern and where PM stops */
+    if (s->pm_count > 0 && s->pm_count <= 10) {
+        if (task_d != 0 || task_u != 0 || task_md != 0) {
+            TRX_LOG("DSP-TASK: d=0x%04x u=0x%04x md=0x%04x FN=%u pg=%d",
+                    task_d, task_u, task_md, s->fn, s->dsp_page);
+        } else if (s->fn <= s->sync_ref_fn + 50) {
+            /* Only log empties for 50 frames after last PM to avoid spam */
+            TRX_LOG("DSP-TASK: (none) FN=%u pg=%d", s->fn, s->dsp_page);
+        }
     }
 
     TaskType ttype = detect_task_type(task_d);
@@ -806,6 +972,11 @@ static void calypso_dsp_process(CalypsoTRX *s)
         }
         break;
 
+    case TASK_OTHER:
+        TRX_LOG("DSP: unknown task_d=0x%04x FN=%u (may be PM via task_d)",
+                task_d, s->fn);
+        break;
+
     default:
         break;
     }
@@ -820,8 +991,56 @@ static void calypso_dsp_process(CalypsoTRX *s)
         trx_send_burst(s, 0, s->fn, bits, GSM_BURST_BITS);
     }
 
+    /* ── Monitoring / PM task (d_task_md, word 4 of write page) ──
+     *
+     * The firmware writes a non-zero value to d_task_md when it wants
+     * a power measurement on the currently-tuned ARFCN.  We inject a
+     * synthetic PM result so the firmware can build PM_CONF for layer23.
+     *
+     * Result placement: write to several candidate offsets in the DB
+     * read page (a_pm[]) AND to NDB a_cd_pm, since the exact offset
+     * varies between DSP API versions.  The pm_debug_reads counter
+     * enables diagnostic logging to pinpoint the real offset.
+     */
+    /* task_md already read above */
+    if (task_md != 0) {
+        /* PM raw value: firmware does pm_raw >> 3, then agc_inp_dbm8_by_pm().
+         * PM_RAW_STRONG (4864) → about -62 dBm at RF. */
+        uint16_t pm_val = PM_RAW_STRONG;
+
+        /* DB read page PM results.
+         * CRITICAL: The real Calypso DSP page layout is NOT at 0x2000/0x3000.
+         * From disasm of frame_irq:
+         *   page=0: db_r_ptr = 0xFFD00050 → offset 0x50 from DSP base
+         *   page=1: db_r_ptr = 0xFFD00078 → offset 0x78 from DSP base
+         * PM at db_r_ptr + 24 bytes = db_r_ptr + 12 words:
+         *   page=0: word (0x50+24)/2 = 0x68/2 = 52
+         *   page=1: word (0x78+24)/2 = 0x90/2 = 72
+         * Write to BOTH pages. */
+        for (int i = 0; i < DB_R_A_PM_COUNT; i++) {
+            s->dsp_ram[52 + i] = pm_val;   /* R_PAGE0 + a_pm offset */
+            s->dsp_ram[72 + i] = pm_val;   /* R_PAGE1 + a_pm offset */
+        }
+
+        s->pm_count++;
+        s->sync_ref_fn = s->fn;  /* track last PM frame for debug window */
+
+        /* Enable diagnostic read logging for first 10 PM tasks */
+        if (s->pm_count <= 10) {
+            s->pm_debug_reads = 20;  /* log next 20 read-page accesses */
+        }
+
+        if (s->pm_count <= 5 || (s->pm_count % 25) == 0 ||
+            s->pm_count == 125 || s->pm_count == 126) {
+            TRX_LOG("PM: task_md=0x%04x → pm=%u (~%d dBm) #%u FN=%u pg=%d",
+                    task_md, pm_val, s->sync_rssi,
+                    s->pm_count, s->fn, s->dsp_page);
+        }
+    }
+
     w_page[DB_W_D_TASK_D] = 0;
     w_page[DB_W_D_TASK_U] = 0;
+    w_page[DB_W_D_TASK_MD] = 0;
     ndb[NDB_W_D_FN] = (uint16_t)(s->fn & 0xFFFF);
 }
 
@@ -829,15 +1048,27 @@ static void calypso_dsp_done(void *opaque)
 {
     CalypsoTRX *s = (CalypsoTRX *)opaque;
 
-    /* TPU finished processing — clear enable bit so firmware sees completion */
+    /* TPU finished processing — clear EN bit so firmware sees completion */
     s->tpu_enabled = false;
-    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
+    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_EN;
 
     qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
 }
 
 /* =====================================================================
- * TPU
+ * TPU — correct bit definitions from OsmocomBB tpu.c
+ *
+ * The firmware uses tpu_wait_ctrl_bit() to poll specific bits:
+ *   - RESET (bit 0): set on reset, firmware waits for set then clear
+ *   - CK_ENABLE (bit 10): firmware sets it and waits for readback
+ *   - EN (bit 2): firmware sets to run a TPU scenario
+ *   - DSP_EN (bit 4): firmware sets for DSP frame IRQ
+ *   - IDLE (bit 8): firmware polls to wait for TPU idle (0 = idle)
+ *
+ * Key insight: the firmware writes a bit and then reads it back.
+ * For most bits, the hardware echoes the written value immediately.
+ * For EN, the hardware clears it when the scenario finishes.
+ * For IDLE, hardware sets it while running, clears when done.
  * ===================================================================== */
 
 static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
@@ -847,28 +1078,27 @@ static uint64_t calypso_tpu_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case TPU_CTRL:
-        /* Return 0 for all status/busy bits — TPU completes instantly */
-        val = 0;
-        { static int c=0; if(c<5) { fprintf(stderr,"[TPU] CTRL read=0\n"); c++; } }
+        /* Return the stored register — bits are maintained by write handler */
+        val = s->tpu_regs[TPU_CTRL / 2];
         break;
-    case TPU_IDLE:     val = 1; break;
-    case TPU_INT_CTRL: val = s->tpu_regs[TPU_INT_CTRL / 2]; break;
-    case TPU_INT_STAT: val = 0; break;
-    case TPU_DSP_PAGE: val = s->dsp_page; break;
-    case TPU_FRAME:    val = (uint16_t)(s->fn % GSM_HYPERFRAME); break;
-    case TPU_OFFSET:   val = s->tpu_regs[TPU_OFFSET / 2]; break;
-    case TPU_SYNCHRO:  val = s->tpu_regs[TPU_SYNCHRO / 2]; break;
+    case TPU_INT_CTRL:
+        val = s->tpu_regs[TPU_INT_CTRL / 2];
+        break;
+    case TPU_INT_STAT:
+        val = 0;
+        break;
+    case TPU_OFFSET:
+        val = s->tpu_regs[TPU_OFFSET / 2];
+        break;
+    case TPU_SYNCHRO:
+        val = s->tpu_regs[TPU_SYNCHRO / 2];
+        break;
+    case TPU_IT_DSP_PG:
+        val = s->dsp_page;
+        break;
     default:
         if (offset / 2 < CALYPSO_TPU_SIZE / 2) {
             val = s->tpu_regs[offset / 2];
-        }
-        {
-            static int tpu_unk_cnt = 0;
-            if (tpu_unk_cnt < 20) {
-                fprintf(stderr, "[TPU] READ offset=0x%04x val=0x%04x\n",
-                        (unsigned)offset, (unsigned)val);
-                tpu_unk_cnt++;
-            }
         }
         break;
     }
@@ -892,27 +1122,48 @@ static void calypso_tpu_write(void *opaque, hwaddr offset,
     }
 
     switch (offset) {
-    case TPU_CTRL:
-        if ((value & TPU_CTRL_ENABLE) && !s->tpu_enabled) {
+    case TPU_CTRL: {
+        uint16_t reg = (uint16_t)value;
+
+        /* RESET (bit 0): echoed back immediately.
+         * The firmware writes RESET|TSP_RESET, polls for RESET set,
+         * then clears it and polls for RESET clear. */
+        /* CK_ENABLE (bit 10): echoed back immediately. */
+        /* These are already stored by the write above. */
+
+        /* EN (bit 2): firmware sets this to execute a TPU scenario.
+         * We process the DSP task immediately, then clear EN. */
+        if ((reg & TPU_CTRL_EN) && !s->tpu_enabled) {
             s->tpu_enabled = true;
             calypso_dsp_process(s);
-            /* Immediately mark TPU as done — firmware polls TPU_CTRL
-             * in a tight loop and virtual time doesn't advance during
-             * CPU polling, so a timer-based clear doesn't work. */
+            /* Mark scenario as done: clear EN, clear IDLE */
             s->tpu_enabled = false;
-            s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
-            /* Schedule API interrupt for next opportunity */
+            s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_EN;
+            s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_IDLE;
+            /* Schedule API interrupt */
             timer_mod_ns(s->dsp_timer,
                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
         }
-        if (value & TPU_CTRL_RESET) {
+
+        /* DSP_EN (bit 4): echoed, cleared by DSP frame IRQ */
+
+        /* If RESET is being asserted, reset FN sync */
+        if (reg & TPU_CTRL_RESET) {
             s->tpu_enabled = false;
             s->fn_synced   = false;
             s->fn_offset   = 0;
-            TRX_LOG("TPU reset → FN sync reset");
         }
         break;
-    case TPU_DSP_PAGE:
+    }
+    case TPU_INT_CTRL:
+        /* When firmware enables MCU frame IRQ (clears ICTRL_MCU_FRAME bit),
+         * start the TDMA timer. In OsmocomBB tpu.c, tpu_frame_irq_en(1,x)
+         * clears bit 0 to enable MCU frame interrupts. */
+        if (!(value & ICTRL_MCU_FRAME) && !s->tdma_running) {
+            calypso_tdma_start(s);
+        }
+        break;
+    case TPU_IT_DSP_PG:
         s->dsp_page = value & 1;
         break;
     default:
@@ -1003,6 +1254,13 @@ static const MemoryRegionOps calypso_ulpd_ops = {
     .impl  = { .min_access_size = 1, .max_access_size = 2 },
 };
 
+/* Deassert TPU_FRAME IRQ after the ISR has had time to fire */
+static void calypso_frame_irq_lower(void *opaque)
+{
+    CalypsoTRX *s = (CalypsoTRX *)opaque;
+    qemu_irq_lower(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
+}
+
 /* =====================================================================
  * TDMA frame timer — drives L1 at 4.615 ms per frame
  * ===================================================================== */
@@ -1014,22 +1272,37 @@ static void calypso_tdma_tick(void *opaque)
     s->fn = (s->fn + 1) % GSM_HYPERFRAME;
 
     s->tpu_enabled = false;
-    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_ENABLE;
+    s->tpu_regs[TPU_CTRL / 2] &= ~TPU_CTRL_EN;
 
     calypso_sync_tick(s);
 
-#if TRX_DEBUG_TDMA
     if ((s->fn % 5000) == 0) {
-        TRX_LOG("TDMA FN=%u sync=%d tasks=%u fb=%u sb=%u powered=%d",
+        TRX_LOG("TDMA FN=%u sync=%d tasks=%u fb=%u sb=%u pm=%u powered=%d",
                 s->fn, s->sync_state, s->sync_task_count,
-                s->sync_fb_tasks, s->sync_sb_tasks, s->powered_on);
+                s->sync_fb_tasks, s->sync_sb_tasks,
+                s->pm_count, s->powered_on);
     }
-#endif
 
-    /* FIX #1: IRQ was commented out — re-enabled.
-     * Without this pulse, the L1 firmware scheduler never wakes up
-     * and the TDMA machinery is dead even though the timer fires. */
-    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
+    /* Kick UART modem — RX and TX:
+     * 1) poll_backend: nudge chardev PTY to deliver pending RX bytes
+     * 2) kick_rx: re-raise IRQ if RX data is in FIFO
+     * 3) kick_tx: with console output NOPed, sercomm TX needs periodic
+     *    nudging to drain queued L1CTL messages (PM_CONF etc.) */
+    if (g_uart_modem) {
+        calypso_uart_poll_backend(g_uart_modem);
+        calypso_uart_kick_rx(g_uart_modem);
+        calypso_uart_kick_tx(g_uart_modem);
+    }
+
+    /* Raise TPU_FRAME IRQ briefly. The read-to-ack in the INTH clears
+     * the level when the firmware reads IRQ_NUM. We also schedule a
+     * timer to lower the IRQ after 1ms, ensuring there is a window
+     * between TDMA frames where other IRQs (UART) can be serviced.
+     * Without this, the TDMA tick re-raises TPU_FRAME before the
+     * firmware can handle pending UART interrupts. */
+    qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
+    timer_mod_ns(s->frame_irq_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 
     if (s->tdma_running) {
         timer_mod_ns(s->tdma_timer,
@@ -1044,6 +1317,10 @@ static void calypso_tdma_start(CalypsoTRX *s)
     s->fn_synced    = false;
     s->fn_offset    = 0;
     s->fn           = 0;
+
+    /* cons_puts + talloc patches are now applied in calypso_mb.c
+     * BEFORE CPU execution starts, preventing pool exhaustion. */
+
     TRX_LOG("TDMA started (4.615ms frame timer)");
     timer_mod_ns(s->tdma_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
@@ -1252,8 +1529,9 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
     s->sim_atr_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_sim_atr_cb, s);
 
     /* Timers */
-    s->tdma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_tdma_tick, s);
-    s->dsp_timer  = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_dsp_done, s);
+    s->tdma_timer      = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_tdma_tick, s);
+    s->dsp_timer       = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_dsp_done, s);
+    s->frame_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_frame_irq_lower, s);
 
     /* TRX sockets */
     if (trx_port > 0) {
@@ -1262,6 +1540,6 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port)
         TRX_LOG("TRX sockets disabled");
     }
 
-    calypso_tdma_start(s);
-    TRX_LOG("=== TRX bridge ready ===");
+    /* TDMA timer starts when firmware enables TPU frame IRQ (INT_CTRL write) */
+    TRX_LOG("=== TRX bridge ready (TDMA will start on TPU frame IRQ enable) ===");
 }

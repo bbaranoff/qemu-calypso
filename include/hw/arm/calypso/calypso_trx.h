@@ -78,21 +78,32 @@
 #define CALYPSO_ULPD_BASE     0xFFFE2800
 #define CALYPSO_ULPD_SIZE     0x0100
 
-/* TPU register offsets */
+/* TPU register offsets (from OsmocomBB calypso/tpu.h) */
 #define TPU_CTRL              0x0000
-#define TPU_IDLE              0x0002
-#define TPU_INT_CTRL          0x0004
-#define TPU_INT_STAT          0x0006
-#define TPU_DSP_PAGE          0x0008
-#define TPU_FRAME             0x000A
+#define TPU_INT_CTRL          0x0002
+#define TPU_INT_STAT          0x0004
 #define TPU_OFFSET            0x000C
 #define TPU_SYNCHRO           0x000E
 #define TPU_IT_DSP_PG         0x0020
 #define TPU_RAM_BASE          0x0400
 
-#define TPU_CTRL_ENABLE       (1 << 0)
-#define TPU_CTRL_RESET        (1 << 1)
-#define TPU_CTRL_IDLE         (1 << 2)
+/* TPU_CTRL bits (from OsmocomBB tpu.c enum tpu_ctrl_bits) */
+#define TPU_CTRL_RESET        (1 << 0)
+#define TPU_CTRL_PAGE         (1 << 1)
+#define TPU_CTRL_EN           (1 << 2)
+#define TPU_CTRL_DSP_EN       (1 << 4)
+#define TPU_CTRL_MCU_RAM_ACC  (1 << 6)
+#define TPU_CTRL_TSP_RESET    (1 << 7)
+#define TPU_CTRL_IDLE         (1 << 8)
+#define TPU_CTRL_WAIT         (1 << 9)
+#define TPU_CTRL_CK_ENABLE    (1 << 10)
+#define TPU_CTRL_FULL_WRITE   (1 << 11)
+
+/* TPU INT_CTRL bits */
+#define ICTRL_MCU_FRAME       (1 << 0)
+#define ICTRL_MCU_PAGE        (1 << 1)
+#define ICTRL_DSP_FRAME       (1 << 2)
+#define ICTRL_DSP_FRAME_FORCE (1 << 3)
 
 /* TSP register offsets */
 #define TSP_TX_REG            0x00
@@ -118,7 +129,9 @@
 #define ULPD_GSM_TIMER        0x28
 
 /* GSM timing */
-#define GSM_TDMA_NS           4615000
+/* Real GSM: 4615000 ns. Slowed 10x for emulation to give the firmware
+ * enough virtual CPU time between frames to process L1CTL and sercomm. */
+#define GSM_TDMA_NS           46150000
 #define GSM_HYPERFRAME        2715648
 #define GSM_BURST_BITS        148
 #define GSM_BURST_WORDS       78
@@ -147,6 +160,20 @@
 #define DB_W_D_BURST_D        1
 #define DB_W_D_TASK_U         2
 #define DB_W_D_BURST_U        3
+#define DB_W_D_TASK_MD        4   /* monitoring/PM task */
+
+/* DB read page — PM result array (a_pm[4])
+ * Confirmed by disasm of l1s_pm_resp: db_r_ptr + 24 bytes = word 12.
+ * The firmware does a_pm[i] >> 3 before passing to agc_inp_dbm8_by_pm. */
+#define DB_R_A_PM             12  /* word offset: a_pm[0] in read page */
+#define DB_R_A_PM_COUNT       4   /* 4 PM measurement slots */
+
+/* PM raw value calibration.
+ * agc_inp_dbm8_by_pm: dbm8 = (pm_raw >> 3) - (rffe_gain + agc_byte) * 8
+ * With default gain ≈ 138:  pm_raw = (target_dbm8 + gain*8) * 8
+ * For -62 dBm target: pm_raw = (-496 + 1104) * 8 = 4864 */
+#define PM_RAW_STRONG         4864   /* ≈ -62 dBm at RF */
+#define PM_RAW_NOISE          64     /* ≈ -137 dBm at RF (near noise floor) */
 
 /* =====================================================================
  * NDB structure — word offsets from NDB base (byte 0x4000)
@@ -208,8 +235,8 @@
  * ===================================================================== */
 
 #define DSP_DL_STATUS_ADDR    0x0FFE  /* byte offset in API RAM (end of page 0) */
-#define DSP_API_VER_ADDR      0x0004  /* byte offset: version word 1 */
-#define DSP_API_VER2_ADDR     0x0006  /* byte offset: version word 2 */
+#define DSP_API_VER_ADDR      0x01b4  /* byte offset: version word 1 */
+#define DSP_API_VER2_ADDR     0x01b6  /* byte offset: version word 2 */
 
 #define DSP_DL_STATUS_RESET   0x0000
 #define DSP_DL_STATUS_BOOT    0x0001  /* DSP ROM ready for patches */
@@ -232,7 +259,7 @@ typedef enum {
  * Simulated cell parameters (virtual BTS we pretend to see)
  * ===================================================================== */
 
-#define SYNC_DEFAULT_ARFCN     1      /* Default reference ARFCN */
+#define SYNC_DEFAULT_ARFCN     1022   /* Default reference ARFCN (E-GSM 934.6 MHz) */
 #define SYNC_DEFAULT_BSIC      0x3C   /* BSIC: NCC=7, BCC=4 */
 #define SYNC_DEFAULT_RSSI       -62   /* dBm */
 #define SYNC_FB_DETECT_DELAY    5     /* Frames until FB found */
@@ -282,5 +309,9 @@ static inline void sch_encode(uint16_t *a_sch26, uint8_t bsic, uint32_t fn)
  * ===================================================================== */
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port);
+
+/* Apply firmware patches (cons_puts NOP, talloc fix, abort fix).
+ * Call once from the earliest peripheral access after firmware load. */
+void calypso_fw_patch_apply(void);
 
 #endif /* CALYPSO_TRX_H */

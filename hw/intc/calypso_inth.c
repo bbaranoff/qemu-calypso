@@ -94,13 +94,38 @@ static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
         return s->levels & 0xFFFF;
     case 0x02: /* IT_REG2 — active bits [31:16] */
         return (s->levels >> 16) & 0xFFFF;
-    case 0x04: /* MASK_IT_REG1 */
+    case 0x08: /* MASK_IT_REG1 */
         return s->mask & 0xFFFF;
-    case 0x06: /* MASK_IT_REG2 */
+    case 0x0a: /* MASK_IT_REG2 */
         return (s->mask >> 16) & 0xFFFF;
-    case 0x10: /* IRQ_NUM */
+    case 0x10: /* IRQ_NUM — read-to-acknowledge on real Calypso */
     case 0x80: /* IRQ_NUM (legacy) */
-        return s->ith_v;
+    {
+        uint16_t num = s->ith_v;
+        /* Reading IRQ_NUM implicitly acknowledges the current interrupt.
+         * Only clear level for edge-like sources (TPU_FRAME=4, TPU_PAGE=5).
+         * True level-sensitive sources (UART, SIM, etc.) re-assert via
+         * their peripheral's qemu_irq_raise/lower. */
+        if (num == 4 || num == 5) {  /* CALYPSO_IRQ_TPU_FRAME, TPU_PAGE */
+            s->levels &= ~(1u << num);
+        }
+        {
+            static uint32_t irq_counts[32];
+            static uint32_t total = 0;
+            if (num < 32) irq_counts[num]++;
+            total++;
+            if (total == 100 || total == 500 || total == 1000) {
+                fprintf(stderr, "[INTH] IRQ_NUM read #%u: ", total);
+                for (int i = 0; i < 20; i++) {
+                    if (irq_counts[i])
+                        fprintf(stderr, "IRQ%d=%u ", i, irq_counts[i]);
+                }
+                fprintf(stderr, "levels=0x%08x\n", s->levels);
+            }
+        }
+        calypso_inth_update(s);
+        return num;
+    }
     case 0x12: /* FIQ_NUM */
     case 0x82: /* FIQ_NUM (legacy) */
         return s->ith_v;
@@ -122,16 +147,23 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
     CalypsoINTHState *s = CALYPSO_INTH(opaque);
 
     switch (offset) {
-    case 0x04: /* MASK_IT_REG1 */
+    case 0x08: /* MASK_IT_REG1 */
         s->mask = (s->mask & 0xFFFF0000) | (value & 0xFFFF);
         calypso_inth_update(s);
         break;
-    case 0x06: /* MASK_IT_REG2 */
+    case 0x0a: /* MASK_IT_REG2 */
         s->mask = (s->mask & 0x0000FFFF) | ((value & 0xFFFF) << 16);
         calypso_inth_update(s);
         break;
-    case 0x14: /* IRQ_CTRL — acknowledge (compat, not used by firmware) */
+    case 0x14: /* IRQ_CTRL — acknowledge current interrupt */
     case 0x84:
+        /* Clear the level bit for the currently-serviced IRQ.
+         * This allows edge-like peripherals (TPU_FRAME) to not re-trigger
+         * immediately after the ISR returns. The peripheral will re-raise
+         * the line on the next event. */
+        if (s->ith_v < CALYPSO_INTH_NUM_IRQS) {
+            s->levels &= ~(1u << s->ith_v);
+        }
         calypso_inth_update(s);
         break;
     default:

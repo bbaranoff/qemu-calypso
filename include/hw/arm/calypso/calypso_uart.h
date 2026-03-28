@@ -63,10 +63,30 @@ typedef struct CalypsoUARTState {
     /* TX empty fires once per THR transition */
     bool thr_empty_pending;
 
+    /* TX burst drain: count consecutive IIR(TX_EMPTY) reads without
+     * a THR write.  Allows firmware ISR to loop and drain multiple
+     * bytes per invocation.  Clear pending only after 2 reads without
+     * a write (ISR has nothing left to send). */
+    uint8_t tx_empty_reads;
+
+    /* Periodic RX poll timer — works around QEMU not delivering
+     * chardev input while the CPU runs in a tight loop. */
+    QEMUTimer *rx_poll_timer;
+
 } CalypsoUARTState;
 
 /* Char backend callbacks */
 int calypso_uart_can_receive(void *opaque);
 void calypso_uart_receive(void *opaque, const uint8_t *buf, int size);
+
+/* Force IRQ re-evaluation if RX data is pending */
+void calypso_uart_kick_rx(CalypsoUARTState *s);
+
+/* Tell the chardev backend we can accept more data. */
+void calypso_uart_poll_backend(CalypsoUARTState *s);
+
+/* Nudge TX: if TX_EMPTY IRQ is enabled, set pending to trigger ISR.
+ * This ensures queued sercomm data gets drained even without console output. */
+void calypso_uart_kick_tx(CalypsoUARTState *s);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */

@@ -26,8 +26,9 @@ import termios
 import time
 
 # ---- Sercomm constants ----
-DLCI_L1CTL   = 4    # SC_DLCI_L1A_L23
+DLCI_L1CTL   = 5    # SC_DLCI_L1A_L23 (OsmocomBB: 5, not 4)
 DLCI_LOADER  = 9
+DLCI_DEBUG   = 4    # SC_DLCI_DEBUG
 DLCI_CONSOLE = 10
 CTRL         = 0x03
 
@@ -163,10 +164,21 @@ def main() -> None:
     except FileNotFoundError:
         pass
 
-    # ---- Open PTY ----
-    pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
-    set_raw(pty_fd)
-    set_nonblock(pty_fd)
+    # ---- Open serial path (PTY or Unix socket) ----
+    if pty_path.endswith('.sock') or os.path.exists(pty_path) and not pty_path.startswith('/dev/'):
+        # Unix socket mode
+        import socket as sock_mod
+        pty_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        pty_sock.connect(pty_path)
+        pty_sock.setblocking(False)
+        pty_fd = pty_sock.fileno()
+        print(f"l1ctl-bridge: connected to socket {pty_path}", flush=True)
+    else:
+        # PTY mode
+        pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
+        set_raw(pty_fd)
+        set_nonblock(pty_fd)
+        pty_sock = None
 
     # ---- Create L1CTL server socket ----
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -235,6 +247,53 @@ def main() -> None:
                 else:
                     for payload in lp.feed(raw):
                         stats["tx"] += 1
+
+                        # ---- Intercept ALL PM_REQ ----
+                        # Handle PM entirely in the bridge to avoid
+                        # firmware msgb pool exhaustion from printf.
+                        # PM_REQ = msg_type 0x08.
+                        #   [8-9] band_arfcn_from  [10-11] band_arfcn_to
+                        # Return -62 dBm (rxlev=48=0x30) for all ARFCNs.
+                        # Don't forward to firmware.
+                        if (len(payload) >= 12 and payload[0] == 0x08):
+                            arfcn_from = (payload[8] << 8) | payload[9]
+                            arfcn_to = (payload[10] << 8) | payload[11]
+                            # Only target ARFCN gets strong signal.
+                            # Matches the cfile capture at ARFCN 1022 (E-GSM).
+                            PM_STRONG = 0x0030   # rxlev 48 = -62 dBm
+                            PM_NOISE  = 0x0000   # rxlev 0  = -110 dBm
+                            TARGET_ARFCN = 1022  # E-GSM, matches cfile
+                            strong_count = 0
+                            print(f"  [bridge] PM_REQ ARFCN {arfcn_from}-{arfcn_to}",
+                                  flush=True)
+                            entries = []
+                            for arfcn in range(arfcn_from, arfcn_to + 1):
+                                if arfcn == TARGET_ARFCN:
+                                    # 4 bytes: arfcn(BE) + pm1(byte) + pm2(byte)
+                                    entries.append(struct.pack(">HBB", arfcn, PM_STRONG, PM_STRONG))
+                                    strong_count += 1
+                                else:
+                                    entries.append(struct.pack(">HBB", arfcn, PM_NOISE, PM_NOISE))
+                            print(f"  [bridge] → {len(entries)} entries "
+                                  f"({strong_count} strong)", flush=True)
+                            batch_size = 50
+                            for batch_start in range(0, len(entries), batch_size):
+                                batch = entries[batch_start:batch_start + batch_size]
+                                is_last = (batch_start + batch_size >= len(entries))
+                                hdr = bytes([0x09, 0x01 if is_last else 0x00,
+                                             0x00, 0x00])
+                                pm_data = hdr + b"".join(batch)
+                                msg = struct.pack(">H", len(pm_data)) + pm_data
+                                if client is not None:
+                                    try:
+                                        client.sendall(msg)
+                                    except (BrokenPipeError, OSError):
+                                        pass
+                                stats["rx"] += 1
+                            print(f"  [bridge] Sent {len(entries)} PM_CONF entries",
+                                  flush=True)
+                            continue  # Don't forward to firmware
+
                         frame = sercomm_wrap(DLCI_L1CTL, payload)
                         try:
                             os.write(pty_fd, frame)

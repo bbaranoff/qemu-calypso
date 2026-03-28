@@ -22,6 +22,7 @@
 #include "exec/address-spaces.h"
 #include "elf.h"
 #include "target/arm/cpu.h"
+#include "sysemu/reset.h"
 
 #include "hw/arm/calypso/calypso_soc.h"
 
@@ -42,6 +43,20 @@ typedef struct CalypsoMachineState {
 #define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
 OBJECT_DECLARE_SIMPLE_TYPE(CalypsoMachineState, CALYPSO_MACHINE)
 
+/*
+ * Firmware patches applied after ROM blobs are loaded into memory.
+ * Called from qemu_system_reset() which runs after machine_init.
+ *
+ * 1) NOP cons_puts: prevents console output from filling the 32-slot
+ *    msgb pool, which causes talloc panic during boot.
+ *
+ * 2) Talloc panic → retry with IRQs: if the pool fills despite (1),
+ *    re-enable IRQs and retry instead of halting. The NOP at the
+ *    cons_puts call site prevents recursive allocation.
+ *
+ * 3) handle_abort → loop with IRQs enabled: prevents a stray data
+ *    abort from permanently disabling IRQs and halting the system.
+ */
 static void calypso_machine_init(MachineState *machine)
 {
     CalypsoMachineState *s = CALYPSO_MACHINE(machine);
@@ -61,7 +76,7 @@ static void calypso_machine_init(MachineState *machine)
 
     /* ---- SoC ---- */
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_CALYPSO_SOC);
-    qdev_prop_set_int32(DEVICE(&s->soc.parent_obj), "trx-port", 4729);
+    qdev_prop_set_int32(DEVICE(&s->soc.parent_obj), "trx-port", 6700);
     qdev_prop_set_bit(DEVICE(&s->soc.parent_obj), "enable-trx", true);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->soc), &err)) {
         error_report_err(err);
@@ -181,6 +196,7 @@ static void calypso_machine_init(MachineState *machine)
         fprintf(stderr, "[MB] Firmware: '%s'\n", machine->kernel_filename);
         fprintf(stderr, "[MB]   entry=0x%08lx  size=%d bytes\n",
                 (unsigned long)entry, ret);
+
     }
 
     fprintf(stderr, "[MB] === Machine ready ===\n");

@@ -16,9 +16,12 @@
 #include "hw/irq.h"
 #include "chardev/char-fe.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
+#include "hw/arm/calypso/calypso_trx.h"
 
 /* Register offsets */
 #define REG_RBR_THR   0x00
@@ -175,6 +178,50 @@ static void calypso_uart_update_irq(CalypsoUARTState *s)
     }
 }
 
+void calypso_uart_kick_rx(CalypsoUARTState *s)
+{
+    if (s->rx_count > 0 && (s->lsr & LSR_DR)) {
+        /* Force IRQ re-evaluation by pulsing the IRQ line */
+        qemu_irq_lower(s->irq);
+        calypso_uart_update_irq(s);
+    }
+}
+
+void calypso_uart_poll_backend(CalypsoUARTState *s)
+{
+    qemu_chr_fe_accept_input(&s->chr);
+}
+
+void calypso_uart_kick_tx(CalypsoUARTState *s)
+{
+    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
+     * Forcing IER/pending from here causes an IER write storm. */
+    (void)s;
+}
+
+/* ---- RX poll timer ----
+ * QEMU's chardev backend (PTY) only delivers data during the main event
+ * loop. If the ARM CPU runs in a tight loop without yielding, incoming
+ * bytes accumulate in the PTY buffer and never reach calypso_uart_receive.
+ * This periodic timer forces QEMU to check for pending chardev input. */
+
+#define UART_RX_POLL_NS  (10 * 1000 * 1000)  /* 10 ms */
+
+static void calypso_uart_rx_poll(void *opaque)
+{
+    CalypsoUARTState *s = (CalypsoUARTState *)opaque;
+
+    /* Kick the main loop to process any pending I/O sources.
+     * This is necessary because the CPU may run for long periods
+     * without returning to the event loop, starving chardev I/O. */
+    qemu_chr_fe_accept_input(&s->chr);
+    main_loop_wait(false);  /* non-blocking poll of all I/O sources */
+
+    /* Re-arm (realtime, 50ms) */
+    timer_mod(s->rx_poll_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
+}
+
 /* ---- Char backend callbacks ---- */
 
 int calypso_uart_can_receive(void *opaque)
@@ -263,8 +310,16 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         } else {
             val = s->iir;
             if ((s->iir & 0x0F) == IIR_TX_EMPTY) {
-                s->thr_empty_pending = false;
-                calypso_uart_update_irq(s);
+                /* TX burst drain: don't clear pending on the first read.
+                 * This lets the firmware ISR loop and drain multiple bytes.
+                 * Clear only after 2 consecutive reads without a THR write
+                 * (meaning the ISR has no more data to send). */
+                s->tx_empty_reads++;
+                if (s->tx_empty_reads >= 2) {
+                    s->thr_empty_pending = false;
+                    s->tx_empty_reads = 0;
+                    calypso_uart_update_irq(s);
+                }
             }
         }
         break;
@@ -349,6 +404,7 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
 
             s->lsr |= LSR_THRE | LSR_TEMT;
             s->thr_empty_pending = true;
+            s->tx_empty_reads = 0;  /* reset burst counter — ISR wrote a byte */
             calypso_uart_update_irq(s);
         }
         break;
@@ -385,6 +441,10 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             s->fcr = value;
 
             if (value & FCR_RX_RESET) {
+                if (s->rx_count > 0) {
+                    fprintf(stderr, "[UART:%s] FCR_RX_RESET with %u bytes in FIFO!\n",
+                            s->label ? s->label : "?", (unsigned)s->rx_count);
+                }
                 fifo_reset(s);
                 s->lsr &= ~LSR_DR;
             }
@@ -432,6 +492,9 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
 
     case REG_MDR1:
         s->mdr1 = value;
+        /* MDR1 write is one of the earliest firmware UART accesses.
+         * Trigger firmware patches now (before any cons_puts call). */
+        calypso_fw_patch_apply();
         fprintf(stderr, "[UART:%s] MDR1=0x%02x\n",
                 s->label ? s->label : "?",
                 (unsigned)value);
@@ -490,6 +553,13 @@ static void calypso_uart_realize(DeviceState *dev, Error **errp)
         fprintf(stderr, "[UART:%s] handlers installed, opaque=%p\n",
                 s->label ? s->label : "?",
                 (void *)s);
+
+        /* Start RX poll timer using REALTIME clock to force the CPU to
+         * yield and process chardev I/O from the PTY backend. */
+        s->rx_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                        calypso_uart_rx_poll, s);
+        timer_mod(s->rx_poll_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
     }
 }
 
