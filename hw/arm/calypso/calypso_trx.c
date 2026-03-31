@@ -665,7 +665,8 @@ static void trxd_receive_cb(void *opaque)
         s->air_buf[idx].valid = true;
     }
 
-    /* Always log received bursts with hex */
+    /* Log received bursts (gated by TRX_DEBUG_TDMA) */
+#if TRX_DEBUG_TDMA
     {
         char hex[64];
         int hlen = burst_len < 16 ? burst_len : 16;
@@ -675,6 +676,7 @@ static void trxd_receive_cb(void *opaque)
         TRX_LOG("TRXD RX TN=%d FN=%u len=%d rssi=%d bits=%s",
                 s->rx_tn, trx_fn, burst_len, s->rx_rssi, hex);
     }
+#endif
 #if TRX_DEBUG_TDMA
     TRX_LOG("TRXD RX (debug) TN=%d FN=%u len=%d rssi=%d", s->rx_tn, s->fn, burst_len, s->rx_rssi);
 #endif
@@ -1074,6 +1076,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     }
 
     /* Log reads to d_fb_det (0x01F0) and a_sch (0x005E-0x0068) */
+#if TRX_DEBUG_DSP
     if (offset == 0x01F0 && s->sync_fb_tasks > 0) {
         TRX_LOG("d_fb_det READ: 0x01F0 = 0x%04x (fb#%u)",
                 (unsigned)val, s->sync_fb_tasks);
@@ -1083,6 +1086,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         TRX_LOG("a_sch READ: [0x%04x] = 0x%04x",
                 (unsigned)offset, (unsigned)val);
     }
+#endif
     /* d_fb_mode/PM at word 213 (offset 0x01AA) — always strong */
     if (offset == 0x01AA && s->sync_dsp_booted) {
         val = PM_RAW_STRONG;
@@ -1148,9 +1152,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset,
     }
 
     /* Track writes to d_fb_det NDB offset */
+#if TRX_DEBUG_DSP
     if (offset == 0x01A8) {
         TRX_LOG("DSP-WRITE: d_fb_det (0x01A8) = 0x%04x", (unsigned)value);
     }
+#endif
 
     /* Intercept task_md write: immediately plant PM result
      * so firmware finds it on the SAME frame, not next frame. */
@@ -1413,10 +1419,12 @@ static void calypso_dsp_process(CalypsoTRX *s)
     /* Debug: after PM starts, log task activity (both present and absent)
      * to understand scheduling pattern and where PM stops */
     /* Log all non-zero tasks */
+#if TRX_DEBUG_DSP
     if (task_d != 0 || task_u != 0) {
         TRX_LOG("DSP-TASK: d=0x%04x u=0x%04x md=0x%04x FN=%u pg=%d",
                 task_d, task_u, task_md, s->fn, s->dsp_page);
     }
+#endif
 
     TaskType ttype = detect_task_type(task_d);
 
@@ -1464,11 +1472,13 @@ static void calypso_dsp_process(CalypsoTRX *s)
         /* Echo burst_id into the read page — the firmware checks this */
         r_page[1] = burst_id;
 
+#if TRX_DEBUG_DSP
         TRX_LOG("NB: burst_id=%d FN=%u rx_pending=%d air_buf[%d].valid=%d .fn=%u",
                 burst_id, s->fn, s->rx_pending,
                 s->fn % AIR_BUF_SIZE,
                 s->air_buf[s->fn % AIR_BUF_SIZE].valid,
                 s->air_buf[s->fn % AIR_BUF_SIZE].fn);
+#endif
 
         /* Look up the burst for the current FN from the ring buffer.
          * The burst may have arrived asynchronously via trxd_receive_cb. */
@@ -1525,9 +1535,15 @@ static void calypso_dsp_process(CalypsoTRX *s)
                 a_cd[3 + i] = l2_data[i] & 0xFF;
             }
 
-            TRX_LOG("NB DECODE: FN=%u l2=%02x%02x%02x%02x%02x... err=%d",
-                    s->fn, l2_data[0], l2_data[1], l2_data[2],
-                    l2_data[3], l2_data[4], n_err);
+            {
+                static uint32_t nb_decode_count = 0;
+                nb_decode_count++;
+                if (nb_decode_count <= 5 || (nb_decode_count % 200) == 0) {
+                    TRX_LOG("NB DECODE #%u: FN=%u l2=%02x%02x%02x%02x%02x... err=%d",
+                            nb_decode_count, s->fn, l2_data[0], l2_data[1], l2_data[2],
+                            l2_data[3], l2_data[4], n_err);
+                }
+            }
 
             s->nb_burst_count = 0;
         }
@@ -1535,8 +1551,10 @@ static void calypso_dsp_process(CalypsoTRX *s)
     }
 
     case TASK_OTHER:
+#if TRX_DEBUG_DSP
         TRX_LOG("DSP: unknown task_d=0x%04x FN=%u (may be PM via task_d)",
                 task_d, s->fn);
+#endif
         break;
 
     default:
