@@ -199,6 +199,19 @@ void calypso_uart_kick_tx(CalypsoUARTState *s)
     (void)s;
 }
 
+void calypso_uart_force_init(CalypsoUARTState *s)
+{
+    /* Force UART into operational state for firmware that gets stuck
+     * before completing its own UART init (e.g. trx.highram.elf).
+     * Sets MDR1=UART16x, enables RX+TX interrupts. */
+    if (s->mdr1 != 0x00) {
+        s->mdr1 = 0x00;  /* UART 16x mode */
+        s->scr = 0x01;
+    }
+    s->ier = 0x03;  /* RX + TX interrupts enabled */
+    calypso_uart_update_irq(s);
+}
+
 /* ---- RX poll timer ----
  * QEMU's chardev backend (PTY) only delivers data during the main event
  * loop. If the ARM CPU runs in a tight loop without yielding, incoming
@@ -401,6 +414,11 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             }
 
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
+
+            /* Feed TX byte to L1CTL socket (sercomm parser) */
+            if (s->label && !strcmp(s->label, "modem")) {
+                l1ctl_sock_uart_tx_byte(ch);
+            }
 
             s->lsr |= LSR_THRE | LSR_TEMT;
             s->thr_empty_pending = true;
