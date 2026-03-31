@@ -220,6 +220,12 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_modem), 0,
                            INTH_IRQ(IRQ_UART_MODEM));
         g_uart_modem = &s->uart_modem;
+
+        /* L1CTL socket: sercomm↔L1CTL relay for OsmocomBB mobile */
+        {
+            const char *l1ctl_path = getenv("L1CTL_SOCK");
+            l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2");
+        }
     }
 
     /* ---- UART IRDA ---- */
@@ -244,11 +250,35 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /* ---- TRX bridge ---- */
-    if (s->enable_trx) {
+    /* Allow override via env vars:
+     *   CALYPSO_TRX_PORT=0    → disable TRX sockets
+     *   CALYPSO_AIR_LOCAL=N   → air interface local port
+     *   CALYPSO_AIR_PEER=N    → air interface peer port
+     */
+    const char *env_port = getenv("CALYPSO_TRX_PORT");
+    if (env_port) {
+        int ep = atoi(env_port);
+        if (ep == 0) {
+            s->enable_trx = false;
+        } else {
+            s->trx_port = (uint16_t)ep;
+        }
+    }
+    int air_local = 0, air_peer = 0;
+    const char *env_air_l = getenv("CALYPSO_AIR_LOCAL");
+    const char *env_air_p = getenv("CALYPSO_AIR_PEER");
+    if (env_air_l) air_local = atoi(env_air_l);
+    if (env_air_p) air_peer = atoi(env_air_p);
+
+    /* Always init TRX bridge (needed for DSP/TPU/TDMA even without TRXD).
+     * Pass trx_port=0 to skip TRXC/TRXD sockets. */
+    {
         qemu_irq *irqs = g_new0(qemu_irq, CALYPSO_NUM_IRQS);
         for (int i = 0; i < CALYPSO_NUM_IRQS; i++)
             irqs[i] = INTH_IRQ(i);
-        calypso_trx_init(sysmem, irqs, s->trx_port);
+        calypso_trx_init(sysmem, irqs,
+                         s->enable_trx ? s->trx_port : 0,
+                         air_local, air_peer);
     }
 
     #undef INTH_IRQ

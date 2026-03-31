@@ -55,13 +55,16 @@
  *   DSP word 0x2000 → byte 0x4000 : NDB
  *   DSP word 0x2400 → byte 0x4800 : PARAM
  */
+/* DSP API page layout — MUST match firmware's BASE_API_* defines.
+ * These are byte offsets from DSP_BASE (0xFFD00000).
+ * Each DB page is 20 words (0x28 bytes). */
 #define DSP_API_W_PAGE0       0x0000
-#define DSP_API_W_PAGE1       0x1000
-#define DSP_API_R_PAGE0       0x2000
-#define DSP_API_R_PAGE1       0x3000
-#define DSP_API_NDB           0x4000
-#define DSP_API_PARAM         0x4800
-#define DSP_PAGE_SIZE         0x1000
+#define DSP_API_W_PAGE1       0x0028
+#define DSP_API_R_PAGE0       0x0050
+#define DSP_API_R_PAGE1       0x0078
+#define DSP_API_NDB           0x01A8
+#define DSP_API_PARAM         0x0862
+#define DSP_PAGE_SIZE         0x0028
 
 #define CALYPSO_TPU_BASE      0xFFFF1000
 #define CALYPSO_TPU_SIZE      0x0100
@@ -130,7 +133,8 @@
 
 /* GSM timing */
 /* Real GSM: 4615000 ns. Slowed 10x for emulation to give the firmware
- * enough virtual CPU time between frames to process L1CTL and sercomm. */
+ * enough virtual CPU time between frames to process L1CTL and sercomm.
+ * FN is resynced to fake_trx via CLK IND every 102 frames. */
 #define GSM_TDMA_NS           46150000
 #define GSM_HYPERFRAME        2715648
 #define GSM_BURST_BITS        148
@@ -208,17 +212,18 @@
  * and search the log for NDB reads in the 0x4014-0x4080 range
  * that happen right after FB/SB tasks fire.
  */
-#define NDB_W_D_FB_DET        10   /* FB detection flag: 1=found */
-#define NDB_W_D_FB_MODE       11   /* FB mode / attempt count */
+/* Confirmed by firmware disasm: d_fb_det read at 0x01F0 = NDB+0x48 = word 36 */
+#define NDB_W_D_FB_DET        36   /* FB detection flag: 1=found */
+#define NDB_W_D_FB_MODE       37   /* FB mode / attempt count */
 
-/* a_cd[4]: carrier demod results (TOA, PM, ANGLE, SNR) */
-#define NDB_W_A_CD_TOA        12   /* Time Of Arrival (quarter-bits) */
-#define NDB_W_A_CD_PM         13   /* Power Measurement (1/64 dBm) */
-#define NDB_W_A_CD_ANGLE      14   /* Freq offset angle (Hz, signed) */
-#define NDB_W_A_CD_SNR        15   /* Signal/Noise Ratio (dB, fx6.10) */
+/* a_sync_demod[4]: FB/SB demod results (TOA, PM, ANGLE, SNR) */
+#define NDB_W_A_CD_TOA        38   /* Time Of Arrival (quarter-bits) */
+#define NDB_W_A_CD_PM         39   /* Power Measurement (1/64 dBm) */
+#define NDB_W_A_CD_ANGLE      40   /* Freq offset angle (Hz, signed) */
+#define NDB_W_A_CD_SNR        41   /* Signal/Noise Ratio (dB, fx6.10) */
 
 /* a_sch26[5]: SCH decoded data (25 info bits + parity) */
-#define NDB_W_A_SCH26         18   /* 5 consecutive words */
+#define NDB_W_A_SCH26         42   /* 5 consecutive words */
 #define NDB_W_A_SCH26_LEN     5
 
 /* =====================================================================
@@ -259,8 +264,8 @@ typedef enum {
  * Simulated cell parameters (virtual BTS we pretend to see)
  * ===================================================================== */
 
-#define SYNC_DEFAULT_ARFCN     1022   /* Default reference ARFCN (E-GSM 934.6 MHz) */
-#define SYNC_DEFAULT_BSIC      0x3C   /* BSIC: NCC=7, BCC=4 */
+#define SYNC_DEFAULT_ARFCN     514    /* Default reference ARFCN (DCS1800, matches osmo-bsc arfcn 514) */
+#define SYNC_DEFAULT_BSIC      7      /* BSIC=7, matches BSC config */
 #define SYNC_DEFAULT_RSSI       -62   /* dBm */
 #define SYNC_FB_DETECT_DELAY    5     /* Frames until FB found */
 #define SYNC_SB_DECODE_DELAY    2     /* Frames until SB decoded */
@@ -308,7 +313,8 @@ static inline void sch_encode(uint16_t *a_sch26, uint8_t bsic, uint32_t fn)
  * Public interface
  * ===================================================================== */
 
-void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port);
+void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs, int trx_port,
+                      int air_local_port, int air_peer_port);
 
 /* Apply firmware patches (cons_puts NOP, talloc fix, abort fix).
  * Call once from the earliest peripheral access after firmware load. */

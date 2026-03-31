@@ -88,5 +88,10 @@ void calypso_uart_poll_backend(CalypsoUARTState *s);
 /* Nudge TX: if TX_EMPTY IRQ is enabled, set pending to trigger ISR.
  * This ensures queued sercomm data gets drained even without console output. */
 void calypso_uart_kick_tx(CalypsoUARTState *s);
+void calypso_uart_force_init(CalypsoUARTState *s);
+
+/* L1CTL socket — sercomm↔L1CTL relay */
+void l1ctl_sock_init(CalypsoUARTState *uart, const char *path);
+void l1ctl_sock_uart_tx_byte(uint8_t byte);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */
