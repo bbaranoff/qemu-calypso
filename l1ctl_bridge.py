@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
 """
-l1ctl_bridge.py — Multi-client bridge: launches QEMU, detects PTYs, bridges L1CTL.
-
-All-in-one: spawns QEMU firmware, grabs PTY from log, sends 'cont' via monitor
-socket (socat), then creates N L1CTL unix sockets for mobile clients.
+l1ctl_bridge.py — Bridge between mobile (layer23) and QEMU firmware via sercomm.
 
 Firmware-first mode: all L1CTL messages are forwarded to the firmware.
-Only RESET_REQ and PM_REQ are handled synthetically.
+Only RESET_REQ and PM_REQ are handled synthetically (firmware doesn't support them).
+The firmware handles FBSB, CCCH, RACH, DM_EST, DATA, etc. via its real DSP/TPU.
 
 Architecture:
-  QEMU (auto-launched) --(PTY sercomm)--> this bridge --(N unix sockets)--> mobile clients
-                                                      --(air UDP)--> burst decode
+  mobile <-> /tmp/osmocom_l2 (L1CTL) <-> this bridge <-> PTY (sercomm) <-> QEMU firmware
 
 Usage:
-  python3 l1ctl_bridge.py -k KERNEL [-n 4] [-s /tmp/osmocom_l2] [--qemu-bin PATH]
-  python3 l1ctl_bridge.py --pty /dev/pts/X [-n 4] [-s /tmp/osmocom_l2]  # skip QEMU launch
+  python3 l1ctl_bridge.py /dev/pts/X [/tmp/osmocom_l2_ms]
 """
 
 import errno
 import fcntl
 import os
-import re
 import select
 import signal
 import socket
 import struct
-import subprocess
 import sys
 import termios
 import time
@@ -253,235 +247,73 @@ class LengthPrefixReader:
         return msgs
 
 
-def l1ctl_send(sock, msg_type, payload=b""):
-    """Send L1CTL message to a single client with length prefix"""
+def l1ctl_send(client, msg_type, payload=b""):
+    """Send L1CTL message to mobile with length prefix"""
     hdr = struct.pack("BBxx", msg_type, 0)
     msg = hdr + payload
     frame = struct.pack(">H", len(msg)) + msg
     try:
-        sock.sendall(frame)
+        client.sendall(frame)
     except Exception:
         pass
 
 
-def broadcast_raw(clients, frame):
-    """Send raw length-prefixed frame to all connected clients"""
-    dead = []
-    for cid, info in clients.items():
-        try:
-            info["sock"].sendall(frame)
-        except (BrokenPipeError, OSError):
-            dead.append(cid)
-    for cid in dead:
-        print(f"l1ctl-bridge: client#{cid} send error, removing", flush=True)
-        try:
-            clients[cid]["sock"].close()
-        except OSError:
-            pass
-        del clients[cid]
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <pty-path> [socket-path]", file=sys.stderr)
+        sys.exit(1)
 
+    pty_path = sys.argv[1]
+    if len(sys.argv) > 2:
+        global L1CTL_SOCK
+        L1CTL_SOCK = sys.argv[2]
 
-def broadcast_l1ctl(clients, payload):
-    """Broadcast an L1CTL payload (with length prefix) to all clients"""
-    frame = struct.pack(">H", len(payload)) + payload
-    broadcast_raw(clients, frame)
-
-
-def launch_qemu(kernel, qemu_bin, mon_sock, env_extra=None, logfile="/tmp/qemu-bridge.log"):
-    """Launch QEMU, wait for PTY, send 'cont' via monitor socket.
-    Returns (pty_path, qemu_process)."""
-    # Cleanup stale monitor socket
     try:
-        os.unlink(mon_sock)
+        os.unlink(L1CTL_SOCK)
     except FileNotFoundError:
         pass
-
-    env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-
-    cmd = [
-        qemu_bin, "-M", "calypso", "-cpu", "arm946",
-        "-display", "none",
-        "-serial", "pty", "-serial", "pty",
-        "-monitor", f"unix:{mon_sock},server,nowait",
-        "-kernel", kernel,
-    ]
-    print(f"l1ctl-bridge: launching QEMU: {' '.join(cmd)}", flush=True)
-
-    log_fd = open(logfile, "w")
-    proc = subprocess.Popen(cmd, stdout=log_fd, stderr=subprocess.STDOUT, env=env)
-
-    # Wait for PTY to appear in log (up to 10s)
-    pty_path = None
-    for _ in range(100):
-        time.sleep(0.1)
-        if proc.poll() is not None:
-            log_fd.close()
-            with open(logfile) as f:
-                print(f"l1ctl-bridge: QEMU exited! log:\n{f.read()}", flush=True)
-            sys.exit(1)
-        try:
-            with open(logfile) as f:
-                content = f.read()
-            ptys = re.findall(r"/dev/pts/\d+", content)
-            if ptys:
-                pty_path = ptys[0]
-                break
-        except FileNotFoundError:
-            pass
-
-    if not pty_path:
-        print("l1ctl-bridge: FATAL: could not detect PTY from QEMU", flush=True)
-        proc.kill()
-        sys.exit(1)
-
-    print(f"l1ctl-bridge: QEMU PTY detected: {pty_path}", flush=True)
-
-    # Send 'cont' via monitor socket
-    time.sleep(1)
-    try:
-        mon = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        mon.connect(mon_sock)
-        mon.sendall(b"cont\n")
-        time.sleep(0.2)
-        mon.close()
-        print(f"l1ctl-bridge: sent 'cont' to QEMU monitor", flush=True)
-    except OSError as e:
-        print(f"l1ctl-bridge: WARNING: monitor connect failed: {e}", flush=True)
-
-    return pty_path, proc
-
-
-def main():
-    import argparse
-    ap = argparse.ArgumentParser(
-        description="Multi-client L1CTL bridge with optional QEMU auto-launch")
-    ap.add_argument("-k", "--kernel", default=None,
-                    help="Firmware ELF to launch QEMU with")
-    ap.add_argument("--pty", default=None,
-                    help="Use existing PTY (skip QEMU launch)")
-    ap.add_argument("-n", "--num-clients", type=int, default=4,
-                    help="Number of L1CTL client sockets (default: 4)")
-    ap.add_argument("-s", "--socket", default="/tmp/osmocom_l2",
-                    help="Base socket path (default: /tmp/osmocom_l2)")
-    ap.add_argument("--qemu-bin", default="./build/qemu-system-arm",
-                    help="Path to qemu-system-arm binary")
-    ap.add_argument("--mon-sock", default="/tmp/qemu-calypso-mon-bridge.sock",
-                    help="QEMU monitor socket path")
-    ap.add_argument("--env", action="append", default=[],
-                    help="Extra env vars for QEMU (KEY=VAL), repeatable")
-    # Legacy positional args support: l1ctl_bridge.py /dev/pts/X [socket]
-    ap.add_argument("legacy_pty", nargs="?", default=None)
-    ap.add_argument("legacy_sock", nargs="?", default=None)
-    args = ap.parse_args()
-
-    # Resolve PTY source
-    qemu_proc = None
-    if args.kernel:
-        env_extra = {}
-        for e in args.env:
-            k, v = e.split("=", 1)
-            env_extra[k] = v
-        pty_path, qemu_proc = launch_qemu(
-            args.kernel, args.qemu_bin, args.mon_sock, env_extra)
-    elif args.pty:
-        pty_path = args.pty
-    elif args.legacy_pty:
-        pty_path = args.legacy_pty
-        if args.legacy_sock:
-            args.socket = args.legacy_sock
-    else:
-        ap.print_help()
-        sys.exit(1)
-
-    base_sock = args.socket
-    num_clients = args.num_clients
-
-    # Build socket paths: /tmp/osmocom_l2, /tmp/osmocom_l2.2, .3, .4 ...
-    sock_paths = [base_sock]
-    for n in range(2, num_clients + 1):
-        sock_paths.append(f"{base_sock}.{n}")
 
     # Open PTY
     pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
     set_raw(pty_fd)
     set_nonblock(pty_fd)
 
-    # Create one listening socket per client slot
-    servers = {}  # sock_path -> {"srv": socket, "path": str, "slot": int}
-    for slot, path in enumerate(sock_paths):
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(path)
-        srv.listen(1)
-        srv.setblocking(False)
-        servers[path] = {"srv": srv, "path": path, "slot": slot + 1}
-        print(f"l1ctl-bridge: slot#{slot+1} listening on {path}", flush=True)
+    # L1CTL server socket
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(L1CTL_SOCK)
+    srv.listen(1)
+    srv.setblocking(False)
 
     # Air UDP socket — receive bursts and decode CCCH
-    AIR_PORT = int(os.environ.get("BRIDGE_AIR_PORT", "6800"))
+    AIR_PORT = int(os.environ.get("BRIDGE_AIR_PORT", "4801"))
     air_sock = None
     if AIR_PORT > 0:
         air_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         air_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            air_sock.bind(("0.0.0.0", AIR_PORT))
+            air_sock.bind(("0.0.0.0", AIR_PORT + 100))
             air_sock.setblocking(False)
-            print(f"l1ctl-bridge: air UDP on port {AIR_PORT}", flush=True)
+            print(f"l1ctl-bridge: air UDP on port {AIR_PORT + 100}", flush=True)
         except OSError:
             air_sock = None
-            print(f"l1ctl-bridge: air UDP port {AIR_PORT} busy",
+            print(f"l1ctl-bridge: air UDP port {AIR_PORT + 100} busy",
                   flush=True)
     else:
         print(f"l1ctl-bridge: air UDP disabled", flush=True)
 
-    print(f"l1ctl-bridge: PTY={pty_path} sockets={num_clients}", flush=True)
-    print(f"l1ctl-bridge: multi-client broadcast mode", flush=True)
-    print(f"l1ctl-bridge: firmware-first (synth: RESET, PM only)", flush=True)
-
-    TARGET_ARFCN = int(os.environ.get("TARGET_ARFCN", "514"))
-
-    # Send POWERON to fake_trx from Python (QEMU's sendto doesn't flush)
-    trxc_port = int(os.environ.get("CALYPSO_TRX_PORT", "6700"))
-    if trxc_port > 0:
-        trxc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        trxc_dest = ("127.0.0.1", trxc_port + 1)  # fake_trx CTRL = base+1
-        # Compute DCS1800 / GSM900 frequencies
-        if TARGET_ARFCN >= 512 and TARGET_ARFCN <= 885:
-            dl_khz = 1805200 + (TARGET_ARFCN - 512) * 200
-            ul_khz = 1710200 + (TARGET_ARFCN - 512) * 200
-        else:
-            dl_khz = 935000 + TARGET_ARFCN * 200
-            ul_khz = 890000 + TARGET_ARFCN * 200
-        for cmd in [f"CMD RXTUNE {dl_khz}", f"CMD TXTUNE {ul_khz}", "CMD POWERON"]:
-            trxc_sock.sendto(cmd.encode() + b'\0', trxc_dest)
-            print(f"l1ctl-bridge: → fake_trx: {cmd}", flush=True)
-        # Read responses
-        time.sleep(0.5)
-        for _ in range(10):
-            try:
-                data, _ = trxc_sock.recvfrom(256)
-                print(f"l1ctl-bridge: ← fake_trx: {data.decode(errors='replace').strip()}", flush=True)
-            except BlockingIOError:
-                break
-        trxc_sock.setblocking(False)
-        print(f"l1ctl-bridge: fake_trx POWERON done (ARFCN={TARGET_ARFCN})", flush=True)
-    else:
-        trxc_sock = None
+    print(f"l1ctl-bridge: PTY={pty_path} socket={L1CTL_SOCK}", flush=True)
+    print(f"l1ctl-bridge: firmware-first mode (synth: RESET, PM only)", flush=True)
 
     parser = SercommParser()
-    # clients dict: client_id -> {"sock", "lp", "id", "slot", "path"}
-    clients = {}
-    next_client_id = 1
+    lp = LengthPrefixReader()
+    client = None
     running = True
     stats = {"tx": 0, "rx": 0, "console": 0, "burst": 0, "decoded": 0}
 
+    TARGET_ARFCN = 514
+
     # Burst accumulator for CCCH decoding (4 bursts per block)
-    burst_buf = {}
+    burst_buf = {}  # block_id → [burst0, burst1, burst2, burst3]
 
     def shutdown(_sig, _frame):
         nonlocal running
@@ -491,186 +323,191 @@ def main():
 
     try:
         while running:
-            rlist = [pty_fd]
-            # Add all server sockets
-            for info in servers.values():
-                rlist.append(info["srv"])
+            rlist = [srv, pty_fd]
             if air_sock:
                 rlist.append(air_sock)
-            for info in clients.values():
-                rlist.append(info["sock"])
+            if client is not None:
+                rlist.append(client)
 
             try:
                 readable, _, _ = select.select(rlist, [], [], 0.5)
             except (OSError, ValueError):
                 break
 
-            # ---- Accept new mobile connections on any server socket ----
-            for path, sinfo in servers.items():
-                if sinfo["srv"] in readable:
-                    conn, _ = sinfo["srv"].accept()
-                    conn.setblocking(False)
-                    cid = next_client_id
-                    next_client_id += 1
-                    clients[cid] = {
-                        "sock": conn,
-                        "lp": LengthPrefixReader(),
-                        "id": cid,
-                        "slot": sinfo["slot"],
-                        "path": path,
-                    }
-                    print(f"l1ctl-bridge: client#{cid} connected on "
-                          f"{path} (slot#{sinfo['slot']}, "
-                          f"total: {len(clients)})", flush=True)
+            # ---- Accept new mobile connection ----
+            if srv in readable:
+                conn, _ = srv.accept()
+                conn.setblocking(False)
+                if client is not None:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                client = conn
+                lp = LengthPrefixReader()
+                print("l1ctl-bridge: mobile connected", flush=True)
 
             # ============================================================
-            # mobile(s) → firmware  (any client can send)
+            # mobile → firmware
             # ============================================================
-            dead_clients = []
-            for cid, info in list(clients.items()):
-                csock = info["sock"]
-                if csock not in readable:
-                    continue
+            if client is not None and client in readable:
                 try:
-                    raw = csock.recv(4096)
+                    raw = client.recv(4096)
                 except BlockingIOError:
                     raw = b""
 
                 if not raw:
-                    print(f"l1ctl-bridge: client#{cid} disconnected", flush=True)
-                    dead_clients.append(cid)
-                    continue
-
-                for payload in info["lp"].feed(raw):
-                    stats["tx"] += 1
-                    msg_type = payload[0] if payload else 0xFF
-                    name = L1CTL_NAMES.get(msg_type, f"0x{msg_type:02x}")
-
-                    # ---- RESET_REQ — synthetic, reply to requesting client ----
-                    if msg_type == MSG_RESET_REQ:
-                        reset_type = payload[4] if len(payload) > 4 else 1
-                        l1ctl_send(csock, MSG_RESET_CONF,
-                                   struct.pack("Bxxx", reset_type))
-                        print(f"  [synth] client#{cid} RESET_REQ "
-                              f"type={reset_type} → RESET_CONF", flush=True)
-                        continue
-
-                    # ---- PM_REQ — synthetic, reply to requesting client ----
-                    if msg_type == MSG_PM_REQ and len(payload) >= 12:
-                        arfcn_from = (payload[8] << 8) | payload[9]
-                        arfcn_to = (payload[10] << 8) | payload[11]
-                        entries = []
-                        for a in range(arfcn_from, arfcn_to + 1):
-                            rxlev = 0x30 if a == TARGET_ARFCN else 0x00
-                            entries.append(struct.pack(">HBB", a, rxlev, rxlev))
-                        batch_size = 50
-                        for i in range(0, len(entries), batch_size):
-                            batch = entries[i:i + batch_size]
-                            is_last = (i + batch_size >= len(entries))
-                            hdr = bytes([MSG_PM_CONF,
-                                         0x01 if is_last else 0x00,
-                                         0x00, 0x00])
-                            pm_data = hdr + b"".join(batch)
-                            msg = struct.pack(">H", len(pm_data)) + pm_data
-                            try:
-                                csock.sendall(msg)
-                            except (BrokenPipeError, OSError):
-                                pass
-                        print(f"  [synth] client#{cid} PM_REQ "
-                              f"{arfcn_from}-{arfcn_to} → PM_CONF", flush=True)
-                        continue
-
-                    # ---- Everything else → forward to firmware ----
-                    frame = sercomm_wrap(DLCI_L1CTL, payload)
+                    print("l1ctl-bridge: mobile disconnected", flush=True)
                     try:
-                        os.write(pty_fd, frame)
-                    except OSError as e:
-                        if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                            raise
-                    print(f"  [client#{cid}→fw] #{stats['tx']} {name} "
-                          f"len={len(payload)} {hexdump(payload, 16)}",
-                          flush=True)
+                        client.close()
+                    except OSError:
+                        pass
+                    client = None
+                else:
+                    for payload in lp.feed(raw):
+                        stats["tx"] += 1
+                        msg_type = payload[0] if payload else 0xFF
+                        name = L1CTL_NAMES.get(msg_type, f"0x{msg_type:02x}")
 
-            # Clean up disconnected clients
-            for cid in dead_clients:
-                try:
-                    clients[cid]["sock"].close()
-                except OSError:
-                    pass
-                del clients[cid]
+                        # ---- RESET_REQ — synthetic only ----
+                        # Firmware layer1 doesn't handle L1CTL RESET.
+                        # Respond with RESET_CONF + RESET_IND to start the phone.
+                        if msg_type == MSG_RESET_REQ:
+                            reset_type = payload[4] if len(payload) > 4 else 1
+                            l1ctl_send(client, MSG_RESET_CONF,
+                                       struct.pack("Bxxx", reset_type))
+                            print(f"  [synth] RESET_REQ type={reset_type} → RESET_CONF",
+                                  flush=True)
+                            continue  # don't forward
+
+                        # ---- PM_REQ — synthetic only ----
+                        # Firmware causes msgb pool exhaustion with PM.
+                        # Return strong signal on TARGET_ARFCN, noise elsewhere.
+                        if msg_type == MSG_PM_REQ and len(payload) >= 12:
+                            arfcn_from = (payload[8] << 8) | payload[9]
+                            arfcn_to = (payload[10] << 8) | payload[11]
+                            entries = []
+                            for a in range(arfcn_from, arfcn_to + 1):
+                                rxlev = 0x30 if a == TARGET_ARFCN else 0x00
+                                entries.append(struct.pack(">HBB", a, rxlev, rxlev))
+                            # Send in batches
+                            batch_size = 50
+                            for i in range(0, len(entries), batch_size):
+                                batch = entries[i:i + batch_size]
+                                is_last = (i + batch_size >= len(entries))
+                                hdr = bytes([MSG_PM_CONF,
+                                             0x01 if is_last else 0x00,
+                                             0x00, 0x00])
+                                pm_data = hdr + b"".join(batch)
+                                msg = struct.pack(">H", len(pm_data)) + pm_data
+                                try:
+                                    client.sendall(msg)
+                                except (BrokenPipeError, OSError):
+                                    pass
+                            print(f"  [synth] PM_REQ {arfcn_from}-{arfcn_to} → PM_CONF",
+                                  flush=True)
+                            continue  # don't forward
+
+                        # ---- Everything else → forward to firmware ----
+                        frame = sercomm_wrap(DLCI_L1CTL, payload)
+                        try:
+                            os.write(pty_fd, frame)
+                        except OSError as e:
+                            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                raise
+                        if True:
+                            print(f"  [mobile→fw] #{stats['tx']} {name} "
+                                  f"len={len(payload)} {hexdump(payload, 16)}",
+                                  flush=True)
 
             # ============================================================
-            # air bursts → DATA_IND broadcast to all clients
+            # air bursts → BURST_IND to mobile
             # ============================================================
             if air_sock and air_sock in readable:
                 try:
                     data, addr = air_sock.recvfrom(512)
                 except OSError:
                     data = b""
-                if len(data) >= 6 and clients:
-                    tn = data[0]
+                if len(data) >= 9 and client is not None:
+                    tn = data[0] & 0x07  # TRXD: lower 3 bits = TN
                     fn = struct.unpack(">I", data[1:5])[0]
-                    soft_bits = data[5:]
+                    soft_bits = data[8:]  # TRXD: skip 8-byte header (TN+FN+RSSI+TOA)
                     stats["burst"] += 1
 
+                    # Only process TS0 (BCCH/CCCH)
                     if tn != 0:
-                        pass  # Only process TS0
-                    else:
-                        coded = extract_burst_data(soft_bits)
+                        continue
 
-                        fn51 = fn % 51
-                        bcch_ccch_starts = [2, 6, 12, 16]
-                        block_id = None
-                        burst_idx = None
-                        chan_nr = 0x80
-                        for start in bcch_ccch_starts:
-                            if start <= fn51 < start + 4:
-                                burst_idx = fn51 - start
-                                block_id = (fn // 51, start)
-                                if start == 2:
-                                    chan_nr = 0x80
-                                else:
-                                    chan_nr = 0x90
-                                break
+                    # Extract 114 coded bits from the normal burst
+                    coded = extract_burst_data(soft_bits)
 
-                        if block_id is not None and burst_idx is not None:
-                            if block_id not in burst_buf:
-                                burst_buf[block_id] = [None] * 4
-                            burst_buf[block_id][burst_idx] = coded
+                    # Determine block position in 51-multiframe
+                    # Combined CCCH+SDCCH/4: BCCH=2-5, CCCH=6-9,12-15,16-19
+                    fn51 = fn % 51
+                    bcch_ccch_starts = [2, 6, 12, 16]
+                    block_id = None
+                    burst_idx = None
+                    chan_nr = 0x80
+                    for start in bcch_ccch_starts:
+                        if start <= fn51 < start + 4:
+                            burst_idx = fn51 - start
+                            block_id = (fn // 51, start)
+                            if start == 2:
+                                chan_nr = 0x80  # BCCH
+                            else:
+                                chan_nr = 0x90  # CCCH
+                            break
 
-                            if all(b is not None for b in burst_buf[block_id]):
-                                l2 = decode_ccch_block(burst_buf[block_id])
-                                del burst_buf[block_id]
-
-                                if l2 and len(l2) == 23:
-                                    hdr = struct.pack("BBxx", MSG_DATA_IND, 0)
-                                    info_dl = struct.pack(">BBHIBBBB",
-                                        chan_nr, 0, TARGET_ARFCN, fn,
-                                        48, 20, 0, 0)
-                                    msg = hdr + info_dl + l2
-                                    frame = struct.pack(">H", len(msg)) + msg
-                                    broadcast_raw(clients, frame)
-                                    stats["decoded"] += 1
-                                    if (stats["decoded"] <= 10 or
-                                            stats["decoded"] % 100 == 0):
-                                        print(f"  [air→ALL] DATA_IND "
-                                              f"#{stats['decoded']} FN={fn} "
-                                              f"ch=0x{chan_nr:02x} {l2.hex()}",
-                                              flush=True)
-
-                        stale = [k for k in burst_buf
-                                 if fn - k[0] * 51 > 200]
-                        for k in stale:
-                            del burst_buf[k]
-
-                        if stats["burst"] <= 30 or stats["burst"] % 500 == 0:
-                            fn51 = fn % 51
-                            print(f"  [air] burst #{stats['burst']} FN={fn} "
-                                  f"fn51={fn51} decoded={stats['decoded']}",
+                    if block_id is not None and burst_idx is not None:
+                        if block_id not in burst_buf:
+                            burst_buf[block_id] = [None] * 4
+                        burst_buf[block_id][burst_idx] = coded
+                        if burst_idx == 3 and chan_nr == 0x80 and stats["decoded"] <= 2200:
+                            # Dump full block for debug
+                            print(f"  [BLOCK] FN={fn} fn51={fn51} ch=0x{chan_nr:02x}",
                                   flush=True)
+                            for bi in range(4):
+                                b = burst_buf[block_id][bi]
+                                if b:
+                                    print(f"    burst[{bi}]: {''.join(str(x) for x in b[:30])}...",
+                                          flush=True)
+
+                        # All 4 bursts received?
+                        if all(b is not None for b in burst_buf[block_id]):
+                            l2 = decode_ccch_block(burst_buf[block_id])
+                            del burst_buf[block_id]
+
+                            if l2 and len(l2) == 23:
+                                # Send DATA_IND to mobile
+                                hdr = struct.pack("BBxx", MSG_DATA_IND, 0)
+                                # l1ctl_info_dl: chan_nr, link_id, arfcn(BE), fn(BE), rxlev, snr, num_biterr, fire_crc
+                                info_dl = struct.pack(">BBHIBBBB",
+                                    chan_nr, 0, TARGET_ARFCN, fn, 48, 20, 0, 0)
+                                msg = hdr + info_dl + l2
+                                frame = struct.pack(">H", len(msg)) + msg
+                                try:
+                                    client.sendall(frame)
+                                except (BrokenPipeError, OSError):
+                                    pass
+                                stats["decoded"] += 1
+                                if stats["decoded"] <= 10 or stats["decoded"] % 100 == 0:
+                                    print(f"  [air→mobile] DATA_IND #{stats['decoded']} "
+                                          f"FN={fn} ch=0x{chan_nr:02x} {l2.hex()}",
+                                          flush=True)
+
+                    # Clean old blocks
+                    stale = [k for k in burst_buf if fn - k[0] * 51 > 200]
+                    for k in stale:
+                        del burst_buf[k]
+
+                    if stats["burst"] <= 30 or stats["burst"] % 500 == 0:
+                        fn51 = fn % 51
+                        print(f"  [air] burst #{stats['burst']} FN={fn} "
+                              f"fn51={fn51} decoded={stats['decoded']}",
+                              flush=True)
 
             # ============================================================
-            # firmware → broadcast to ALL clients
+            # firmware → mobile
             # ============================================================
             if pty_fd in readable:
                 try:
@@ -686,24 +523,36 @@ def main():
 
                 for dlci, payload in parser.feed(raw):
                     if dlci == DLCI_L1CTL:
+                        # Filter out DATA_IND with chan_nr=0x00 from firmware
+                        # (firmware sends bad NB results, bridge decodes CCCH)
                         if (payload and payload[0] == MSG_DATA_IND and
                                 len(payload) >= 5 and payload[4] == 0x00):
                             continue
                         stats["rx"] += 1
-
-                        # Broadcast to all connected clients
-                        broadcast_l1ctl(clients, payload)
+                        if client is not None:
+                            msg = struct.pack(">H", len(payload)) + payload
+                            try:
+                                client.sendall(msg)
+                            except (BrokenPipeError, OSError):
+                                print("l1ctl-bridge: mobile send error",
+                                      flush=True)
+                                try:
+                                    client.close()
+                                except OSError:
+                                    pass
+                                client = None
 
                         if stats["rx"] <= 50 or stats["rx"] % 50 == 0:
                             rx_name = L1CTL_NAMES.get(
                                 payload[0] if payload else 0xFF,
                                 f"0x{payload[0]:02x}" if payload else "?")
+                            # For FBSB_CONF, show result byte
                             extra = ""
                             if payload and payload[0] == 0x02 and len(payload) >= 19:
                                 extra = f" result={payload[18]} bsic={payload[19]}"
-                            print(f"  [fw→ALL({len(clients)})] #{stats['rx']} "
-                                  f"{rx_name} len={len(payload)}{extra} "
-                                  f"{hexdump(payload, 20)}", flush=True)
+                            print(f"  [fw→mobile] #{stats['rx']} {rx_name} "
+                                  f"len={len(payload)}{extra} {hexdump(payload, 20)}",
+                                  flush=True)
 
                     elif dlci == DLCI_CONSOLE:
                         stats["console"] += 1
@@ -721,33 +570,22 @@ def main():
                         pass
 
     finally:
-        for cid, info in clients.items():
+        if client is not None:
             try:
-                info["sock"].close()
+                client.close()
             except OSError:
                 pass
-        for path, sinfo in servers.items():
-            try:
-                sinfo["srv"].close()
-            except OSError:
-                pass
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        srv.close()
         try:
             os.close(pty_fd)
         except OSError:
             pass
-        if qemu_proc and qemu_proc.poll() is None:
-            print("l1ctl-bridge: terminating QEMU...", flush=True)
-            qemu_proc.terminate()
-            try:
-                qemu_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                qemu_proc.kill()
+        try:
+            os.unlink(L1CTL_SOCK)
+        except OSError:
+            pass
         print(f"l1ctl-bridge: done (tx={stats['tx']} rx={stats['rx']} "
-              f"console={stats['console']} clients={len(clients)})", flush=True)
+              f"console={stats['console']})", flush=True)
 
 
 if __name__ == "__main__":
