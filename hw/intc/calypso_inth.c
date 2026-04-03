@@ -120,7 +120,7 @@ static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
                     if (irq_counts[i])
                         fprintf(stderr, "IRQ%d=%u ", i, irq_counts[i]);
                 }
-                fprintf(stderr, "levels=0x%08x\n", s->levels);
+                fprintf(stderr, "levels=0x%08x mask=0x%08x\n", s->levels, s->mask);
             }
         }
         calypso_inth_update(s);

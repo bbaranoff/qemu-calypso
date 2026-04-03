@@ -79,10 +79,6 @@ typedef struct CalypsoUARTState {
 int calypso_uart_can_receive(void *opaque);
 void calypso_uart_receive(void *opaque, const uint8_t *buf, int size);
 
-/* Inject bytes directly into RX FIFO, bypassing sercomm DLCI parser.
- * Used by l1ctl_sock to avoid interference with bridge DLCI 4 parsing. */
-void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size);
-
 /* Force IRQ re-evaluation if RX data is pending */
 void calypso_uart_kick_rx(CalypsoUARTState *s);
 

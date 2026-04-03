@@ -194,8 +194,6 @@ void calypso_uart_poll_backend(CalypsoUARTState *s)
 
 void calypso_uart_kick_tx(CalypsoUARTState *s)
 {
-    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
-     * Forcing IER/pending from here causes an IER write storm. */
     (void)s;
 }
 
@@ -268,14 +266,56 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
     }
 
-    for (int i = 0; i < size; i++) {
-        fifo_push(s, buf[i]);
+    /* Sercomm DLCI routing on modem UART RX:
+     * DLCI 4 (burst data) -> calypso_trx DSP RAM injection
+     * Everything else -> FIFO for firmware */
+    if (s->label && !strcmp(s->label, "modem")) {
+        static uint8_t sc_buf[512];
+        static int sc_len = 0;
+        static int sc_state = 0;
+        for (int i = 0; i < size; i++) {
+            uint8_t b = buf[i];
+            if (sc_state == 0) {
+                if (b == 0x7E) { sc_state = 1; sc_len = 0; }
+                else { fifo_push(s, b); }
+            } else if (sc_state == 2) {
+                if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b ^ 0x20;
+                sc_state = 1;
+            } else {
+                if (b == 0x7E) {
+                    if (sc_len >= 2 && sc_buf[0] == 4) {
+                        calypso_trx_rx_burst(&sc_buf[2], sc_len - 2);
+                    } else if (sc_len > 0) {
+                        fifo_push(s, 0x7E);
+                        for (int j = 0; j < sc_len; j++) fifo_push(s, sc_buf[j]);
+                        fifo_push(s, 0x7E);
+                    }
+                    sc_len = 0;
+                } else if (b == 0x7D) {
+                    sc_state = 2;
+                } else {
+                    if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b;
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < size; i++) { fifo_push(s, buf[i]); }
     }
 
     if (s->rx_count > 0) {
         s->lsr |= LSR_DR;
     }
 
+    calypso_uart_update_irq(s);
+}
+
+/* Inject raw bytes directly into FIFO — no sercomm parsing */
+void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size)
+{
+    for (int i = 0; i < size; i++)
+        fifo_push(s, buf[i]);
+    if (s->rx_count > 0)
+        s->lsr |= LSR_DR;
     calypso_uart_update_irq(s);
 }
 
