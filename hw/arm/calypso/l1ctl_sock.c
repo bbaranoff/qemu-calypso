@@ -105,16 +105,18 @@ static int sercomm_wrap(uint8_t dlci, const uint8_t *payload, int plen,
 
 static void l1ctl_send_to_mobile(L1CTLSock *s, const uint8_t *payload, int len)
 {
-    if (s->cli_fd < 0) return;
+    if (s->cli_fd < 0 || len <= 0 || len > 512) return;
 
-    uint8_t hdr[2];
-    hdr[0] = (len >> 8) & 0xFF;
-    hdr[1] = len & 0xFF;
+    /* Single atomic write: length header + payload */
+    uint8_t buf[514];
+    buf[0] = (len >> 8) & 0xFF;
+    buf[1] = len & 0xFF;
+    memcpy(&buf[2], payload, len);
 
-    /* Best-effort send */
-    if (send(s->cli_fd, hdr, 2, MSG_NOSIGNAL) != 2 ||
-        send(s->cli_fd, payload, len, MSG_NOSIGNAL) != len) {
-        L1CTL_LOG("client send error, closing");
+    int total = 2 + len;
+    int sent = send(s->cli_fd, buf, total, MSG_NOSIGNAL);
+    if (sent != total) {
+        L1CTL_LOG("client send error (%d/%d), closing", sent, total);
         close(s->cli_fd);
         s->cli_fd = -1;
     }
@@ -201,27 +203,27 @@ static void l1ctl_client_readable(void *opaque)
     memcpy(&s->lp_buf[s->lp_len], tmp, n);
     s->lp_len += (int)n;
 
-    /* Parse ONE L1CTL message per callback — let ARM CPU process before next */
-    if (s->lp_len >= 2) {
+    /* Parse complete L1CTL messages */
+    while (s->lp_len >= 2) {
         int msglen = (s->lp_buf[0] << 8) | s->lp_buf[1];
-        if (s->lp_len >= 2 + msglen) {
-            uint8_t *payload = &s->lp_buf[2];
+        if (s->lp_len < 2 + msglen) break;  /* incomplete */
 
-            /* Wrap in sercomm and inject into UART RX */
-            uint8_t frame[1024];
-            int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
-                                    frame, sizeof(frame));
-            if (flen > 0 && s->uart) {
-                L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
-                          msglen, payload[0], flen);
-                calypso_uart_inject_raw(s->uart, frame, flen);
-            }
+        uint8_t *payload = &s->lp_buf[2];
 
-            /* Consume from buffer */
-            int consumed = 2 + msglen;
-            memmove(s->lp_buf, &s->lp_buf[consumed], s->lp_len - consumed);
-            s->lp_len -= consumed;
+        /* Wrap in sercomm and inject into UART RX */
+        uint8_t frame[1024];
+        int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
+                                frame, sizeof(frame));
+        if (flen > 0 && s->uart) {
+            L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
+                      msglen, payload[0], flen);
+            calypso_uart_receive(s->uart, frame, flen);
         }
+
+        /* Consume from buffer */
+        int consumed = 2 + msglen;
+        memmove(s->lp_buf, &s->lp_buf[consumed], s->lp_len - consumed);
+        s->lp_len -= consumed;
     }
 }
 
@@ -246,16 +248,6 @@ static void l1ctl_accept_cb(void *opaque)
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     s->cli_fd = fd;
-
-    /* Send synthetic RESET_IND to new client — firmware already sent it
-     * before the client connected, so we replay it. */
-    {
-        uint8_t reset_ind[] = { 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-        uint8_t hdr[2] = { 0x00, 0x08 };  /* length = 8 */
-        send(fd, hdr, 2, MSG_NOSIGNAL);
-        send(fd, reset_ind, 8, MSG_NOSIGNAL);
-        L1CTL_LOG("sent synthetic RESET_IND to new client");
-    }
     s->lp_len = 0;
     s->sc_state = SC_IDLE;
     s->sc_len = 0;

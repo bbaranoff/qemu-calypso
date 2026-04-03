@@ -58,8 +58,8 @@ class SercommParser:
         return frames
 
 class Bridge:
-    def __init__(self, pty_path, bts_base=5700):
-        # UART PTY
+    def __init__(self, pty_path, burst_pty_path=None, bts_base=5700):
+        # UART PTY (L1CTL — modem)
         self.pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
         attrs = termios.tcgetattr(self.pty_fd)
         attrs[0] = attrs[1] = attrs[3] = 0
@@ -69,6 +69,18 @@ class Bridge:
         termios.tcsetattr(self.pty_fd, termios.TCSANOW, attrs)
         fcntl.fcntl(self.pty_fd, fcntl.F_SETFL,
                     fcntl.fcntl(self.pty_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+        # L1CTL unix socket (mobile ↔ bridge ↔ PTY)
+        l1ctl_path = "/tmp/osmocom_l2_1"
+        try: os.unlink(l1ctl_path)
+        except: pass
+        self.l1ctl_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.l1ctl_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.l1ctl_srv.bind(l1ctl_path)
+        self.l1ctl_srv.listen(1)
+        self.l1ctl_srv.setblocking(False)
+        self.l1ctl_cli = None
+        self.l1ctl_buf = b""  # length-prefix accumulator
 
         # BTS TRX sockets
         self.clk_sock  = udp_bind(bts_base)
@@ -82,7 +94,7 @@ class Bridge:
         self._stop = threading.Event()
         self.parser = SercommParser()
         self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0}
-        print(f"bridge: pty={pty_path} CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2}", flush=True)
+        print(f"bridge: pty={pty_path} l1ctl={l1ctl_path} CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2}", flush=True)
 
     def start_clock(self):
         threading.Thread(target=self._clock_loop, daemon=True).start()
@@ -130,17 +142,19 @@ class Bridge:
         self.trxc_sock.sendto((rsp + "\0").encode(), addr)
 
     def handle_trxd_from_bts(self):
-        """BTS DL burst → wrap in sercomm → inject into QEMU UART RX."""
+        """BTS DL burst → UDP 6802 → QEMU calypso_trx_rx_burst."""
         try: data, addr = self.trxd_sock.recvfrom(512)
         except OSError: return
         if len(data) < 6: return
         self.trxd_remote = addr
         self.stats["dl"] += 1
 
-        # Wrap raw TRXD in sercomm DLCI_BURST → write to PTY (UART RX)
-        frame = sercomm_wrap(DLCI_BURST, data)
-        try: os.write(self.pty_fd, frame)
-        except OSError: pass
+        # Forward DL burst as sercomm DLCI 4 on PTY (MS side)
+        tn = data[0] & 0x07
+        if tn == 0:
+            frame = sercomm_wrap(DLCI_BURST, data)
+            try: os.write(self.pty_fd, frame)
+            except OSError: pass
 
     def handle_uart_from_qemu(self):
         """QEMU firmware sercomm TX → parse → forward bursts to BTS."""
@@ -157,6 +171,65 @@ class Bridge:
                     try: self.trxd_sock.sendto(payload, self.trxd_remote)
                     except OSError: pass
                     self.stats["ul"] += 1
+            elif dlci == DLCI_L1CTL and payload:
+                # Firmware sent L1CTL → forward to mobile
+                self.handle_l1ctl_to_mobile(dlci, payload)
+
+    def handle_l1ctl_accept(self):
+        """Accept new mobile L1CTL client."""
+        try:
+            cli, _ = self.l1ctl_srv.accept()
+            cli.setblocking(False)
+        except OSError: return
+        if self.l1ctl_cli:
+            try: self.l1ctl_cli.close()
+            except: pass
+        self.l1ctl_cli = cli
+        self.l1ctl_buf = b""
+        print("bridge: L1CTL client connected", flush=True)
+        # Send synthetic RESET_IND via sercomm DLCI 5 to PTY
+        reset_ind = bytes([0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        frame = sercomm_wrap(DLCI_L1CTL, reset_ind)
+        try: os.write(self.pty_fd, frame)
+        except OSError: pass
+        # Also send RESET_IND directly to mobile
+        hdr = struct.pack(">H", 8)
+        try: cli.sendall(hdr + reset_ind)
+        except: pass
+
+    def handle_l1ctl_from_mobile(self):
+        """Mobile → L1CTL → sercomm DLCI 5 → PTY."""
+        if not self.l1ctl_cli: return
+        try:
+            data = self.l1ctl_cli.recv(4096)
+        except OSError: return
+        if not data:
+            print("bridge: L1CTL client disconnected", flush=True)
+            self.l1ctl_cli.close()
+            self.l1ctl_cli = None
+            return
+        self.l1ctl_buf += data
+        # Parse length-prefixed L1CTL messages
+        while len(self.l1ctl_buf) >= 2:
+            msglen = struct.unpack(">H", self.l1ctl_buf[:2])[0]
+            if len(self.l1ctl_buf) < 2 + msglen:
+                break
+            payload = self.l1ctl_buf[2:2+msglen]
+            self.l1ctl_buf = self.l1ctl_buf[2+msglen:]
+            # Wrap in sercomm DLCI 5 → PTY
+            frame = sercomm_wrap(DLCI_L1CTL, payload)
+            try: os.write(self.pty_fd, frame)
+            except OSError: pass
+
+    def handle_l1ctl_to_mobile(self, dlci, payload):
+        """PTY sercomm DLCI 5 → L1CTL length-prefixed → mobile."""
+        if not self.l1ctl_cli or not payload: return
+        hdr = struct.pack(">H", len(payload))
+        try: self.l1ctl_cli.sendall(hdr + payload)
+        except OSError:
+            print("bridge: L1CTL send error, closing", flush=True)
+            self.l1ctl_cli.close()
+            self.l1ctl_cli = None
 
     def run(self):
         self.start_clock()
@@ -167,9 +240,11 @@ class Bridge:
         signal.signal(signal.SIGTERM, shutdown)
 
         while running:
+            fds = [self.pty_fd, self.trxc_sock, self.trxd_sock, self.l1ctl_srv]
+            if self.l1ctl_cli:
+                fds.append(self.l1ctl_cli)
             try:
-                readable, _, _ = select.select(
-                    [self.pty_fd, self.trxc_sock, self.trxd_sock], [], [], 0.1)
+                readable, _, _ = select.select(fds, [], [], 0.1)
             except (OSError, ValueError) as e:
                 print(f"bridge: select error: {e}", flush=True)
                 break
@@ -177,6 +252,8 @@ class Bridge:
             if self.trxc_sock in readable: self.handle_trxc()
             if self.trxd_sock in readable: self.handle_trxd_from_bts()
             if self.pty_fd in readable: self.handle_uart_from_qemu()
+            if self.l1ctl_srv in readable: self.handle_l1ctl_accept()
+            if self.l1ctl_cli and self.l1ctl_cli in readable: self.handle_l1ctl_from_mobile()
 
             if self.stats["dl"] > 0 and self.stats["dl"] % 5000 == 0:
                 print(f"bridge: clk={self.stats['clk']} dl={self.stats['dl']} ul={self.stats['ul']}", flush=True)
@@ -188,4 +265,5 @@ class Bridge:
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <pty-path>"); sys.exit(1)
-    Bridge(sys.argv[1]).run()
+    burst_pty = sys.argv[2] if len(sys.argv) > 2 else None
+    Bridge(sys.argv[1], burst_pty).run()

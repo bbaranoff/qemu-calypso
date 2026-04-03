@@ -98,11 +98,16 @@ TI Calypso (TWL3014/DBB) — GSM baseband processor
 - Length-prefixed: 2-byte big-endian length + message
 - Message: type(1) + flags(1) + padding(2) + payload
 - Key types:
-  - 0x07: RESET_IND
-  - 0x0D: RESET_REQ (payload: reset_type at byte 0, 1=full)
-  - 0x0E: RESET_CONF
   - 0x01: FBSB_REQ
-  - 0x0A: FBSB_CONF
-  - 0x08: PM_REQ
-  - 0x02: PM_CONF
+  - 0x02: FBSB_CONF (result byte: 0=success, 255=fail)
   - 0x03: DATA_IND
+  - 0x04: RACH_REQ
+  - 0x05: DM_EST_REQ
+  - 0x06: DATA_REQ
+  - 0x07: RESET_IND (sent on boot)
+  - 0x08: PM_REQ
+  - 0x09: PM_CONF
+  - 0x0D: RESET_REQ (payload: reset_type, 1=full)
+  - 0x0E: RESET_CONF
+  - 0x10: CCCH_MODE_REQ
+  - 0x11: CCCH_MODE_CONF

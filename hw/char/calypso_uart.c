@@ -194,6 +194,8 @@ void calypso_uart_poll_backend(CalypsoUARTState *s)
 
 void calypso_uart_kick_tx(CalypsoUARTState *s)
 {
+    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
+     * Forcing IER/pending from here causes an IER write storm. */
     (void)s;
 }
 
@@ -245,25 +247,53 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
 {
     CalypsoUARTState *s = (CalypsoUARTState *)opaque;
 
-    fprintf(stderr,
-            "[UART:%s] <<<RX %d bytes from host (rx_count=%u free=%u):",
-            s->label ? s->label : "?",
-            size,
-            (unsigned)s->rx_count,
-            (unsigned)(CALYPSO_UART_RX_FIFO_SIZE - s->rx_count));
-
-    for (int i = 0; i < size && i < 64; i++) {
-        fprintf(stderr, " %02x", buf[i]);
+    /* Debug: only log non-modem UART (modem is too verbose) */
+    if (!s->label || strcmp(s->label, "modem") != 0) {
+        fprintf(stderr,
+                "[UART:%s] <<<RX %d bytes from host (rx_count=%u free=%u):",
+                s->label ? s->label : "?",
+                size,
+                (unsigned)s->rx_count,
+                (unsigned)(CALYPSO_UART_RX_FIFO_SIZE - s->rx_count));
+        for (int i = 0; i < size && i < 64; i++)
+            fprintf(stderr, " %02x", buf[i]);
+        if (size > 64) fprintf(stderr, " ...");
+        fprintf(stderr, "\n");
     }
-    if (size > 64) {
-        fprintf(stderr, " ...");
-    }
-    fprintf(stderr, "\n");
 
     if (s->label && !strcmp(s->label, "modem")) {
         uart_log_raw("/tmp/qemu-modem-rx.raw", buf, size);
     } else if (s->label && !strcmp(s->label, "irda")) {
         uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
+    }
+
+    /* IrDA UART: burst-only channel from bridge.
+     * Parse sercomm, extract DLCI 4, route to calypso_trx_rx_burst.
+     * Nothing goes to FIFO — this UART is dedicated to bursts. */
+    if (s->label && !strcmp(s->label, "irda")) {
+        static uint8_t ir_buf[512];
+        static int ir_len = 0;
+        static int ir_state = 0;
+        for (int i = 0; i < size; i++) {
+            uint8_t b = buf[i];
+            if (ir_state == 0) {
+                if (b == 0x7E) { ir_state = 1; ir_len = 0; }
+            } else if (ir_state == 2) {
+                if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b ^ 0x20;
+                ir_state = 1;
+            } else {
+                if (b == 0x7E) {
+                    if (ir_len >= 2 && ir_buf[0] == 4)
+                        calypso_trx_rx_burst(&ir_buf[2], ir_len - 2);
+                    ir_len = 0;
+                } else if (b == 0x7D) {
+                    ir_state = 2;
+                } else {
+                    if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b;
+                }
+            }
+        }
+        return;
     }
 
     /* Sercomm DLCI routing on modem UART RX:
@@ -309,16 +339,6 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
     calypso_uart_update_irq(s);
 }
 
-/* Inject raw bytes directly into FIFO — no sercomm parsing */
-void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size)
-{
-    for (int i = 0; i < size; i++)
-        fifo_push(s, buf[i]);
-    if (s->rx_count > 0)
-        s->lsr |= LSR_DR;
-    calypso_uart_update_irq(s);
-}
-
 /* ---- MMIO ---- */
 
 static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
@@ -339,11 +359,7 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
                 s->lsr &= ~LSR_DR;
             }
 
-            fprintf(stderr,
-                    "[UART:%s] RBR<<< 0x%02llx (remaining=%u)\n",
-                    s->label ? s->label : "?",
-                    (unsigned long long)val,
-                    (unsigned)s->rx_count);
+            /* RBR debug: too verbose for modem, skip */
 
             calypso_uart_update_irq(s);
         }
@@ -474,7 +490,7 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             uint8_t old = s->ier;
             s->ier = value & 0x0F;
 
-            if (old != s->ier) {
+            if (old != s->ier && s->label && strcmp(s->label, "modem") != 0) {
                 fprintf(stderr, "[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
                         s->label ? s->label : "?",
                         s->ier,

@@ -58,7 +58,6 @@
 #define PRD_ADDR  0x0025   /* Timer period */
 #define TCR_ADDR  0x0026   /* Timer control */
 
-/* TCR bit positions (TMS320C54x hardware spec) */
 #define TCR_TDDR_MASK  0x000F   /* bits 3:0 — prescaler reload value */
 #define TCR_TSS        (1 << 4) /* bit 4 — Timer Stop Status (1=stopped) */
 #define TCR_TRB        (1 << 5) /* bit 5 — Timer Reload (write 1 reloads) */
@@ -99,27 +98,12 @@
 /* Interrupt vectors */
 #define C54X_INT_RESET   0
 #define C54X_INT_NMI     1
-/* TMS320C54x interrupt mapping: vector = IMR_bit + 2
- * IMR bit 0 → INT0 → vec 2    IMR bit 5 → BRINT0 → vec 7
- * IMR bit 1 → INT1 → vec 3    IMR bit 6 → BXINT0 → vec 8
- * IMR bit 2 → INT2 → vec 4    IMR bit 7 → DMAC0  → vec 9
- * IMR bit 3 → INT3 → vec 5    IMR bit 8 → DMAC1  → vec 10
- * IMR bit 4 → TINT0→ vec 6    IMR bit 9 → INT4   → vec 11
- *                              IMR bit 10→ INT5   → vec 12 */
-/* TMS320C54x interrupt vector mapping (SPRU131):
- * Vec 0: RESET     Vec 16: INT0 (IMR bit 0)
- * Vec 1: NMI       Vec 17: INT1 (IMR bit 1)
- * Vec 2: SINT17    Vec 18: INT2 (IMR bit 2)
- * Vec 3: SINT18    Vec 19: INT3 (IMR bit 3)
- * Vec 4: SINT19    Vec 20: TINT0 (IMR bit 4)
- * Vec 5: SINT20    Vec 21: BRINT0 (IMR bit 5)
- * ...              Vec 22: BXINT0 (IMR bit 6)
- *                  Vec 23: DMAC0 (IMR bit 7)
- *                  Vec 24: DMAC1 (IMR bit 8)
- * Formula: vec = imr_bit + 16 */
-#define C54X_INT_FRAME_VEC   2   /* SINT17 (IMR bit 1) — enters boot code which dispatches frames */
-#define C54X_INT_FRAME_BIT   1   /* IMR bit 1 */
-#define C54X_NUM_INTS        16
+#define C54X_INT_SINT17  2  /* Software interrupt 17 = DSP frame IRQ on Calypso */
+#define C54X_INT_SINT18  3
+#define C54X_INT_SINT30  4
+#define C54X_INT_TINT0   5
+#define C54X_INT_HINT    8  /* Host interrupt (ARM→DSP) */
+#define C54X_NUM_INTS    16
 
 typedef struct C54xState {
     /* Accumulators (40-bit) stored as int64 for convenience */
@@ -151,7 +135,7 @@ typedef struct C54xState {
     uint32_t pc;     /* 16-bit (or 23-bit with XPC) */
     uint16_t xpc;
 
-    /* Timer0 prescale counter (PSC) — not memory-mapped directly */
+    /* Timer0 prescale counter */
     uint16_t timer_psc;
 
     /* RPT state */
@@ -204,8 +188,7 @@ void c54x_reset(C54xState *s);
 int c54x_run(C54xState *s, int n_insns);
 
 /* Raise an interrupt */
-/* Send interrupt: vec = vector number (for PC), imr_bit = bit in IMR/IFR */
-void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit);
+void c54x_interrupt(C54xState *s, int irq);
 
 /* Wake from IDLE */
 void c54x_wake(C54xState *s);

@@ -116,22 +116,41 @@ mobile / ccch_scan (OsmocomBB host tools)
 13. **Interrupt PC+1** — Push PC+1 when waking from IDLE (resume after IDLE)
 14. **Timer FN increment** — TINT0 increments frame number in DARAM
 
-## Current State
-- DSP boots correctly (86K insns → IDLE@0xFFFE, SP=0x0011)
-- DSP wakes, jumps to 0x8000, traverses TDMA slots
-- DSP reaches processing code at 0x8020+
-- BANZ at 0x8026 branches to 0x1231 (DARAM) with OVLY=1
-- **Problem: DARAM at 0x1231 is empty (0x0000)** — no code installed
-- AR0=65533 (wrapped from 0) causes BANZ to be taken incorrectly
-- PM_CONF sent to mobile, FBSB_REQ received, but no FBSB_CONF (DSP doesn't produce FB results)
+## Current State (2026-04-03)
+- Base: no_cell_found (API RAM intercepts for FB/SB/PM)
+- No_cell_found loop works: RESET→PM→FBSB cycle running
+- C54x DSP boots in parallel via TDMA ticks (2000 insns/frame)
+- SINT17 controlled by TPU_CTRL_DSP_EN (per hardware spec)
+- 0 UNIMPL instructions — all opcodes emulated
+- SP=0x06AA-0x0C2E after boot (correct, in DARAM)
+- DSP reaches PROM0 0x7000 init + PROM1 0x8159 processing
+
+## Bugs Fixed (session 2026-04-03)
+1. **RC conditionnel (F2xx)** — was unconditional RET, now eval_condition
+2. **PROM0 read protection** — prog_read returns prog[] for 0x7000-0xDFFF
+3. **PROM0 write protection** — prog_write ignores writes to ROM area
+4. **prog_write double-write** — return after prog[ext] for addr>=0x8000
+5. **DELAY instruction (D4/D5)** — pipeline delay, was UNIMPL
+6. **BCD 0xEF** — added to EE/ED branch conditional handler
+7. **XOR/OR #lk16 (B0/B1/B8/B9)** — was UNIMPL
+8. **Timer0 hardware** — TIM/PRD/TCR with prescaler and TINT0
+9. **IDLE skip TDMA slots** — 0x8000-0x801F IDLE treated as NOP
+10. **Parallel DSP boot** — no blocking c54x_run(10M), boot via TDMA ticks
+11. **DSP_EN SINT17** — interrupt only when firmware sets TPU_CTRL_DSP_EN
+12. **eval_condition** — full XC/RC condition decoder per SPRU172C Table 3-2
+13. **Interrupt dispatch** — check IFR&IMR in main loop each cycle
+14. **API IRQ** — raise IRQ15 in dsp_done, unmask at boot
+
+## d_fb_det Location
+- ARM offset: 0x01F0 (NDB + 0x48)
+- DSP address: 0x08F8
+- DSP ROM writes it at PROM0 0x7730-0x7990
 
 ## Next Steps
-1. Understand why AR0 is not correctly initialized at 0x8026
-2. Determine if DARAM code should be installed by ARM firmware or DSP boot
-3. Implement proper XC condition evaluation (currently implemented per SPRU172C)
-4. Full code review against SPRU172C for all C54x instructions
-5. Get burst samples to DSP at correct DARAM address and timing
-6. Achieve FBSB_CONF → BCCH decode → ccch_scan working
+1. DSP boot must reach IDLE@0xFFFE — currently runs but doesn't converge
+2. Once boot works, remove API RAM intercepts (let DSP produce results)
+3. Verify burst samples reach DSP at correct DARAM address
+4. Achieve FBSB_CONF(result=0) → SB decode → BCCH → mobile registered
 
 ## Docker
 - Container: `osmo-operator-1` (always running)

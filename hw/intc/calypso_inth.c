@@ -115,12 +115,12 @@ static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
             if (num < 32) irq_counts[num]++;
             total++;
             if (total == 100 || total == 500 || total == 1000) {
-                fprintf(stderr, "[INTH] IRQ_NUM read #%u: ", total);
+                if(0) fprintf(stderr, "[INTH] IRQ_NUM read #%u: ", total);
                 for (int i = 0; i < 20; i++) {
                     if (irq_counts[i])
-                        fprintf(stderr, "IRQ%d=%u ", i, irq_counts[i]);
+                        if(0) fprintf(stderr, "IRQ%d=%u ", i, irq_counts[i]);
                 }
-                fprintf(stderr, "levels=0x%08x mask=0x%08x\n", s->levels, s->mask);
+                if(0) fprintf(stderr, "levels=0x%08x\n", s->levels);
             }
         }
         calypso_inth_update(s);

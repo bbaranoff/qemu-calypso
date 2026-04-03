@@ -58,3 +58,45 @@ if [ "$DIRTY" = "0" ]; then
 elif [ "$MODE" = "check" ]; then
   echo "Files out of sync. Use: ./sync.sh pull|push"
 fi
+
+# Snapshot on push
+if [ "$MODE" = "push" ] && [ "$DIRTY" = "1" ]; then
+  STAMP=$(date +%Y%m%d-%H%M%S)
+  EVENT="${2:-}"
+  if [ -n "$EVENT" ]; then
+    SNAP="/home/nirvana/ALL-QEMUs/qemu-calypso-${STAMP}-${EVENT}"
+  else
+    SNAP="/home/nirvana/ALL-QEMUs/qemu-calypso-${STAMP}"
+  fi
+  mkdir -p "$SNAP"
+  for f in "${FILES[@]}"; do
+    mkdir -p "$SNAP/$(dirname $f)"
+    cp "$HOST_DIR/$f" "$SNAP/$f" 2>/dev/null
+  done
+  echo "$STAMP ${EVENT:-push}" >> "/home/nirvana/ALL-QEMUs/HISTORY.log"
+  echo "📸 Snapshot: $SNAP"
+fi
+
+# Check binary age vs source files
+BINARY="$CONT_DIR/build/qemu-system-arm"
+BIN_TS=$(docker exec "$CONTAINER" stat -c %Y "$BINARY" 2>/dev/null)
+if [ -n "$BIN_TS" ]; then
+  BIN_DATE=$(docker exec "$CONTAINER" date -d "@$BIN_TS" "+%H:%M:%S" 2>/dev/null)
+  STALE=0
+  for f in "${FILES[@]}"; do
+    [[ "$f" == *.py || "$f" == *.sh ]] && continue
+    SRC_TS=$(docker exec "$CONTAINER" stat -c %Y "$CONT_DIR/$f" 2>/dev/null)
+    if [ -n "$SRC_TS" ] && [ "$SRC_TS" -gt "$BIN_TS" ]; then
+      SRC_DATE=$(docker exec "$CONTAINER" date -d "@$SRC_TS" "+%H:%M:%S" 2>/dev/null)
+      echo "⚠️  STALE: $f ($SRC_DATE) newer than binary ($BIN_DATE)"
+      STALE=1
+    fi
+  done
+  if [ "$STALE" = "0" ]; then
+    echo "🔨 Binary up to date ($BIN_DATE)"
+  else
+    echo "🔨 Binary OUTDATED ($BIN_DATE) — run: ninja -C build"
+  fi
+else
+  echo "⚠️  Binary not found at $BINARY"
+fi
