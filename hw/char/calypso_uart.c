@@ -22,6 +22,7 @@
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/sercomm_gate.h"
 
 /* Register offsets */
 #define REG_RBR_THR   0x00
@@ -110,7 +111,7 @@ static void fifo_reset(CalypsoUARTState *s)
  *
  * Sets overrun error flag if FIFO is full.
  */
-static void fifo_push(CalypsoUARTState *s, uint8_t data)
+void calypso_uart_fifo_push(CalypsoUARTState *s, uint8_t data)
 {
     if (s->rx_count >= CALYPSO_UART_RX_FIFO_SIZE) {
         s->lsr |= LSR_OE;
@@ -277,88 +278,11 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         fprintf(stderr, "\n");
     }
 
+    /* Route modem UART via sercomm gate:
+     * DLCI 4 (bursts) → BSP emulation (calypso_trx_rx_burst)
+     * All others      → re-wrap → FIFO (firmware sercomm layer) */
     if (s->label && !strcmp(s->label, "modem")) {
-        uart_log_raw("/tmp/qemu-modem-rx.raw", buf, size);
-    } else if (s->label && !strcmp(s->label, "irda")) {
-        uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
-    }
-
-    /* IrDA UART: burst-only channel from bridge.
-     * Parse sercomm, extract DLCI 4, route to calypso_trx_rx_burst.
-     * Nothing goes to FIFO — this UART is dedicated to bursts. */
-    if (s->label && !strcmp(s->label, "irda")) {
-        static uint8_t ir_buf[512];
-        static int ir_len = 0;
-        static int ir_state = 0;
-        for (int i = 0; i < size; i++) {
-            uint8_t b = buf[i];
-            if (ir_state == 0) {
-                if (b == 0x7E) { ir_state = 1; ir_len = 0; }
-            } else if (ir_state == 2) {
-                if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b ^ 0x20;
-                ir_state = 1;
-            } else {
-                if (b == 0x7E) {
-                    if (ir_len >= 2 && ir_buf[0] == 4)
-                        calypso_trx_rx_burst(&ir_buf[2], ir_len - 2);
-                    ir_len = 0;
-                } else if (b == 0x7D) {
-                    ir_state = 2;
-                } else {
-                    if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b;
-                }
-            }
-        }
-        return;
-    }
-
-    /* Modem UART: parse sercomm, route by DLCI.
-     * DLCI 5 (L1CTL) → FIFO (firmware processes it)
-     * DLCI 4 (bursts) → calypso_trx_rx_burst (TRX filters timing)
-     * Other → FIFO (firmware handles) */
-    {
-        static uint8_t sc_buf[512];
-        static int sc_len = 0;
-        static int sc_state = 0; /* 0=idle, 1=in_frame, 2=escape */
-
-        for (int i = 0; i < size; i++) {
-            uint8_t b = buf[i];
-            if (sc_state == 0) {
-                if (b == 0x7E) { sc_state = 1; sc_len = 0; }
-                else { fifo_push(s, b); } /* pre-sercomm bytes → FIFO */
-            } else if (sc_state == 2) {
-                if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b ^ 0x20;
-                sc_state = 1;
-            } else {
-                if (b == 0x7E) {
-                    if (sc_len >= 2) {
-                        uint8_t dlci = sc_buf[0];
-                        if (dlci == 4) {
-                            /* Bursts → DSP via BSP (not FIFO) */
-                            calypso_trx_rx_burst(&sc_buf[2], sc_len - 2);
-                        } else {
-                            /* L1CTL + others → re-wrap and push to FIFO */
-                            fifo_push(s, 0x7E);
-                            for (int j = 0; j < sc_len; j++) {
-                                uint8_t c = sc_buf[j];
-                                if (c == 0x7E || c == 0x7D) {
-                                    fifo_push(s, 0x7D);
-                                    fifo_push(s, c ^ 0x20);
-                                } else {
-                                    fifo_push(s, c);
-                                }
-                            }
-                            fifo_push(s, 0x7E);
-                        }
-                    }
-                    sc_len = 0;
-                } else if (b == 0x7D) {
-                    sc_state = 2;
-                } else {
-                    if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b;
-                }
-            }
-        }
+        sercomm_gate_feed(s, buf, size);
     }
 
     if (s->rx_count > 0) {

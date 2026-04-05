@@ -298,10 +298,6 @@ void calypso_tint0_do_tick(uint32_t fn) {
         calypso_tint0_tpu_en_clear();
         s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
 
-        /* Don't send SINT17 until DSP has finished init (first IDLE) */
-        if (!s->dsp_init_done) {
-            goto skip_sint17;
-        }
 
         /* DMA: copy API write page to DSP DARAM */
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
@@ -324,7 +320,6 @@ void calypso_tint0_do_tick(uint32_t fn) {
         s->dsp->idle = false;  /* wake from IDLE for new frame */
         dsp_should_run = true;
     }
-skip_sint17:
     /* Also run DSP if still initializing (not yet reached first IDLE) */
     if (s->dsp && s->dsp->running && !s->dsp->idle && !dsp_should_run) {
         dsp_should_run = true;
@@ -640,7 +635,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             if (c54x_load_rom(s->dsp, rom_path) == 0) {
                 /* Don't reset/boot yet — wait for ARM to write DSP_DL_STATUS_READY */
                 s->dsp->running = false;
-                TRX_LOG("BUILD 2026-04-05T17:25:53 F4EB=RETE IMR_keep");
+                TRX_LOG("BUILD 2026-04-05T20:30:16 F4EB=RETE IMR_keep");
                 TRX_LOG("C54x DSP loaded from %s (waiting for ARM)", rom_path);
             } else {
                 TRX_LOG("C54x DSP ROM not found at %s", rom_path);

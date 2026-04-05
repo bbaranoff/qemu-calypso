@@ -85,6 +85,7 @@ void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int size);
 
 /* Force IRQ re-evaluation if RX data is pending */
 void calypso_uart_kick_rx(CalypsoUARTState *s);
+void calypso_uart_fifo_push(CalypsoUARTState *s, uint8_t data);
 
 /* Tell the chardev backend we can accept more data. */
 void calypso_uart_poll_backend(CalypsoUARTState *s);

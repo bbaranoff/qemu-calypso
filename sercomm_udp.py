@@ -66,6 +66,21 @@ def soft_to_int16(soft_bit):
     Maps: 0 -> +32767, 127 -> 0, 255 -> -32767"""
     return max(-32768, min(32767, int((127 - soft_bit) * 32767 / 127)))
 
+def soft_bits_to_gmsk_iq(soft_bits_raw, scale=4096):
+    """Convert TRXD soft bits to GMSK I/Q int16 samples for DSP BSP.
+    Calypso ABB delivers baseband I/Q from antenna; we generate equivalent
+    by GMSK-modulating the hard bits (BT=0.3, h=0.5, 1 sample/symbol)."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+    n = len(soft_bits_raw)
+    hard = np.array([0.0 if b < 128 else 1.0 for b in soft_bits_raw])
+    nrz = 1.0 - 2.0 * hard  # 0->+1, 1->-1 (GSM convention)
+    bt = 0.3
+    filtered = gaussian_filter1d(nrz, 1.0 / (2.0 * 3.141592653589793 * bt))
+    phase = np.cumsum(filtered) * 3.141592653589793 * 0.5
+    iq = np.clip(np.cos(phase) * scale, -32768, 32767).astype(np.int16)
+    return iq
+
 class Bridge:
     def __init__(self, pty_path, bts_base=5700):
         self.pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
@@ -89,6 +104,7 @@ class Bridge:
         self._stop = threading.Event()
         self.parser = SercommParser()
         self.stats = {'clk': 0, 'trxc': 0, 'dl': 0, 'ul': 0}
+        self.cfile_fd = open('/tmp/gsm_burst.cfile', 'wb')
         print('sercomm_udp: pty=%s CLK=%d TRXC=%d TRXD=%d' % (pty_path, bts_base, bts_base+1, bts_base+2), flush=True)
 
     def start_clock(self):
@@ -151,11 +167,20 @@ class Bridge:
         soft_bits = data[8:]
         nbits = min(len(soft_bits), 148)
 
-        # Convert soft bits to int16 samples for DSP BSP
+        # GMSK modulate soft bits → I/Q int16 samples for DSP BSP
+        iq_samples = soft_bits_to_gmsk_iq(soft_bits[:nbits])
         payload = bytearray(hdr)
-        for i in range(nbits):
-            s16 = soft_to_int16(soft_bits[i])
-            payload.extend(struct.pack('<h', s16))
+        payload.extend(iq_samples.tobytes())
+
+        # Log I/Q as complex float32 cfile for grgsm_decode
+        if self.cfile_fd is not None:
+            import numpy as np
+            cf = (iq_samples.astype(np.float32) / 4096.0).view(np.float32)
+            # Write as complex: I + 0j (real-only for now)
+            cplx = np.zeros(len(iq_samples) * 2, dtype=np.float32)
+            cplx[0::2] = cf  # I
+            # cplx[1::2] = 0  # Q = 0 (already zeroed)
+            self.cfile_fd.write(cplx.tobytes())
 
         frame = sercomm_wrap(DLCI_BURST, bytes(payload))
         try: os.write(self.pty_fd, frame)

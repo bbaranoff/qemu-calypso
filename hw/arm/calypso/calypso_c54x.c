@@ -391,6 +391,7 @@ static int c54x_exec_one(C54xState *s)
     int consumed = 1;
     s->lk_used = false;  /* reset before each instruction */
 
+
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
@@ -497,8 +498,22 @@ static int c54x_exec_one(C54xState *s)
         /* F4E2 = RSBX INTM (enable interrupts), F4E3 = SSBX INTM (disable interrupts) */
         if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
         if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
-        /* F4E0-F4FF: RSBX/SSBX status bits — treat as NOP (most don't affect emulation) */
-        if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
+        /* F4E1: IDLE — halt until interrupt.
+         * Per tic54x-opc.c: IDLE 0xF4E1 mask 0xFCFF. */
+        if ((op & 0xFCFF) == 0xF4E1) {
+            static int idle_log = 0;
+            if (idle_log < 20)
+                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u",
+                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count);
+            idle_log++;
+            if (s->pc >= 0x8000 && s->pc < 0x8020) {
+                return consumed + s->lk_used;
+            }
+            s->idle = true;
+            return 0;
+        }
+        /* F4E0-F4FF: misc F4Ex — treat as NOP (most don't affect emulation) */
+        if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4E5 && op != 0xF4EB) {
             return consumed + s->lk_used;
         }
         /* F4EB = RETE (return from interrupt, alternate encoding per tic54x-opc.c) */
@@ -511,33 +526,26 @@ static int c54x_exec_one(C54xState *s)
             s->st1 &= ~ST1_INTM;
             s->pc = ra; return 0;
         }
+        /* F4E4: FRET — far return.
+         * Per tic54x-opc.c: 0xF4E4 mask 0xFFFF.
+         * Pop XPC then PC from stack. */
         if (op == 0xF4E4) {
-            static int idle_log = 0;
-            if (idle_log < 20)
-                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
-                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count, s->xpc);
-            idle_log++;
-            /* TDMA slot table (0x8000-0x8020): skip IDLE, continue next slot.
-             * All other IDLEs: halt. Wake behavior decided by calypso_trx. */
-            if (s->pc >= 0x8000 && s->pc < 0x8020) {
-                return consumed + s->lk_used;
-            }
-            static int idle_total = 0;
-            idle_total++;
-            if (idle_total <= 10) {
-                C54_LOG("IDLE#%d @0x%04x SP=0x%04x stack=[0x%04x] insn=%u",
-                        idle_total, s->pc, s->sp, s->data[s->sp], s->insn_count);
-                /* Dump last 10 PCs before this IDLE */
-                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
-                        pc_ring[(pc_ring_idx-10)&15], pc_ring[(pc_ring_idx-9)&15],
-                        pc_ring[(pc_ring_idx-8)&15], pc_ring[(pc_ring_idx-7)&15],
-                        pc_ring[(pc_ring_idx-6)&15], pc_ring[(pc_ring_idx-5)&15],
-                        pc_ring[(pc_ring_idx-4)&15], pc_ring[(pc_ring_idx-3)&15],
-                        pc_ring[(pc_ring_idx-2)&15], pc_ring[(pc_ring_idx-1)&15]);
-            }
-            s->idle = true;
-            return 0;  /* PC stays on IDLE; wake code advances PC */
-        } /* IDLE */
+            s->xpc = data_read(s, s->sp); s->sp++;
+            if (s->xpc > 3) s->xpc &= 3;
+            uint16_t ra = data_read(s, s->sp); s->sp++;
+            s->pc = ra;
+            return 0;
+        }
+        /* F4E5: FRETE — far return from interrupt.
+         * Pop XPC then PC, clear INTM. */
+        if (op == 0xF4E5) {
+            s->xpc = data_read(s, s->sp); s->sp++;
+            if (s->xpc > 3) s->xpc &= 3;
+            uint16_t ra = data_read(s, s->sp); s->sp++;
+            s->st1 &= ~ST1_INTM;
+            s->pc = ra;
+            return 0;
+        }
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call and special instructions.
              * Some F4xx instructions are 1-word (FRET, FRETE, RETE, TRAP, NOP, etc.)
@@ -766,6 +774,13 @@ static int c54x_exec_one(C54xState *s)
                     return consumed + s->lk_used;
                 }
             }
+                        /* F4Bx: RSBX -- reset bit in ST0 (bit 9=0, bit 8=0).
+             * Per tic54x-opc.c: RSBX 0xF4B0 mask 0xFDF0. */
+            if ((op & 0xFFF0) == 0xF4B0) {
+                int bit = op & 0x0F;
+                s->st0 &= ~(1 << bit);
+                return consumed + s->lk_used;
+            }
             /* Remaining F4xx: unhandled — treat as 1-word NOP */
             C54_LOG("F4xx unhandled: 0x%04x PC=0x%04x", op, s->pc);
             return consumed + s->lk_used;
@@ -791,22 +806,22 @@ static int c54x_exec_one(C54xState *s)
                 s->a = sext40((int64_t)sum << 16);
                 return consumed + s->lk_used;
             }
-            /* F073: RET — near return, pop PC only (matches CALL) */
+            /* F073: B pmad — unconditional branch (2-word).
+             * Per tic54x-opc.c: 0xF073 mask 0xFFFF. */
             if (op == 0xF073) {
-                uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->pc = ra; return 0;
+                op2 = prog_fetch(s, s->pc + 1);
+                s->pc = op2;
+                return 0;
             }
-            /* F074: RETE — return from interrupt.
-             * APTS=1: pop XPC then PC (matches IRQ entry push order).
-             * APTS=0: pop PC only. Always clear INTM. */
+            /* F074: CALL pmad — unconditional call (2-word).
+             * Per tic54x-opc.c: 0xF074 mask 0xFFFF.
+             * Push PC+2 (return address), branch to pmad. */
             if (op == 0xF074) {
-                if (s->pmst & PMST_APTS) {
-                    s->xpc = data_read(s, s->sp); s->sp++;
-                    if (s->xpc > 3) s->xpc &= 3;
-                }
-                uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->st1 &= ~ST1_INTM;
-                s->pc = ra; return 0;
+                op2 = prog_fetch(s, s->pc + 1);
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                s->pc = op2;
+                return 0;
             }
 
 
@@ -815,24 +830,42 @@ static int c54x_exec_one(C54xState *s)
 
 
 
-            /* F072: FRET — far return. ALWAYS 2 pops per SPRU172C p.4-61:
-             * (TOS) → XPC, SP+1, (TOS) → PC, SP+1 */
+            /* F072: RPTB pmad — block repeat (2-word, non-delayed).
+             * Per tic54x-opc.c: 0xF072 mask 0xFFFF.
+             * RSA = PC+2, REA = pmad. */
             if (op == 0xF072) {
-                s->xpc = data_read(s, s->sp); s->sp++;
-                if (s->xpc > 3) s->xpc &= 3;
-                uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->pc = ra; return 0;
+                op2 = prog_fetch(s, s->pc + 1);
+                consumed = 2;
+                s->rea = op2;
+                s->rsa = (uint16_t)(s->pc + 2);
+                s->rptb_active = true;
+                s->st1 |= ST1_BRAF;
+                return consumed + s->lk_used;
             }
-            /* F07x: other control flow — all 1 pop with APTS=0 */
+            /* F07x: RPT/RPTZ/misc (F072-F074 handled above) */
+            if (op == 0xF070) {
+                /* F070: RPT #lku — repeat next instruction lku+1 times (2-word) */
+                op2 = prog_fetch(s, s->pc + 1);
+                consumed = 2;
+                s->rpt_count = op2;
+                s->rpt_active = true;
+                s->pc += 2;
+                return 0;
+            }
+            if (op == 0xF071) {
+                /* F071: RPTZ dst, #lku — zero accumulator and repeat (2-word) */
+                op2 = prog_fetch(s, s->pc + 1);
+                consumed = 2;
+                int dst = (op >> 8) & 1; /* bit 8 via FEFF mask */
+                if (dst) s->b = 0; else s->a = 0;
+                s->rpt_count = op2;
+                s->rpt_active = true;
+                s->pc += 2;
+                return 0;
+            }
             if ((op & 0xFFF0) == 0xF070) {
-                /* APTS=1 variants would pop XPC too, but APTS=0 → 1 pop */
-                if ((s->pmst & PMST_APTS) && (op == 0xF077 || op == 0xF076)) {
-                    s->xpc = data_read(s, s->sp); s->sp++;
-                    if (s->xpc > 3) s->xpc &= 3;
-                }
-                uint16_t ra = data_read(s, s->sp); s->sp++;
-                if (op == 0xF076) s->st1 &= ~ST1_INTM; /* RETED */
-                s->pc = ra; return 0;
+                /* F075-F07F: undefined, treat as 1-word NOP */
+                return consumed + s->lk_used;
             }
             /* F0Bx/F1Bx: RSBX/SSBX */
             if ((op & 0x00F0) == 0x00B0) {
@@ -843,19 +876,92 @@ static int c54x_exec_one(C54xState *s)
                 else         { if (set) s->st1 |= (1<<bit); else s->st1 &= ~(1<<bit); }
                 return consumed + s->lk_used;
             }
-            /* F0xx: READA Smem — Read program memory addressed by accumulator A.
-             * Per SPRU172C p.4-136: A → PAR, Pmem[PAR] → Smem.
-             * When repeated: PAR auto-increments. A is NOT modified. */
-            if ((op & 0xFF00) == 0xF000) {
-                addr = resolve_smem(s, op, &ind);
-                if (!s->par_set) {
-                    s->par = (uint16_t)(s->a & 0xFFFF);
-                    s->par_set = true;
+            /* F0xx/F1xx ALU with #lk immediate (2-word).
+             * Per tic54x-opc.c: bits 7:4 = op (0=ADD,1=SUB,2=LD,3=AND,4=OR,5=XOR),
+             * bit 8 = SRC (ADD/SUB/AND/OR/XOR) or DST (LD), bit 9 = DST,
+             * bits 3:0 = shift. Second word = lk. */
+            {
+                uint8_t alu_op = (op >> 4) & 0xF;
+                if (alu_op <= 5) {
+                    op2 = prog_fetch(s, s->pc + 1);
+                    consumed = 2;
+                    int shift = op & 0xF;
+                    int src_sel = (op >> 8) & 1;
+                    int dst_sel = (op >> 9) & 1;
+                    int64_t src_val = src_sel ? s->b : s->a;
+                    int64_t *dst = (alu_op == 2)
+                        ? (src_sel ? &s->b : &s->a)
+                        : (dst_sel ? &s->b : &s->a);
+                    int64_t lk_val;
+                    if (alu_op <= 2)
+                        lk_val = (int64_t)(int16_t)op2 << shift;
+                    else
+                        lk_val = (int64_t)(uint16_t)op2 << shift;
+                    switch (alu_op) {
+                    case 0: *dst = sext40(src_val + lk_val); break; /* ADD */
+                    case 1: *dst = sext40(src_val - lk_val); break; /* SUB */
+                    case 2: *dst = sext40(lk_val); break;           /* LD  */
+                    case 3: *dst = src_val & lk_val; break;         /* AND */
+                    case 4: *dst = src_val | lk_val; break;         /* OR  */
+                    case 5: *dst = src_val ^ lk_val; break;         /* XOR */
+                    }
+                    return consumed + s->lk_used;
                 }
-                uint16_t val = prog_read(s, s->par);
-                data_write(s, addr, val);
-                s->par++;
-                return consumed + s->lk_used;
+                if (alu_op == 6) {
+                    /* F06x: ADD/SUB/LD/AND/OR/XOR #lk,16 + MPY/MAC #lk */
+                    uint8_t sub6 = op & 0xF;
+                    op2 = prog_fetch(s, s->pc + 1);
+                    consumed = 2;
+                    int src_sel = (op >> 8) & 1;
+                    int dst_sel = (op >> 9) & 1;
+                    int64_t src_val = src_sel ? s->b : s->a;
+                    int64_t *dst = dst_sel ? &s->b : &s->a;
+                    switch (sub6) {
+                    case 0: *dst = sext40(src_val + ((int64_t)(int16_t)op2 << 16)); break;
+                    case 1: *dst = sext40(src_val - ((int64_t)(int16_t)op2 << 16)); break;
+                    case 2: dst = src_sel ? &s->b : &s->a;
+                            *dst = sext40((int64_t)(int16_t)op2 << 16); break;
+                    case 3: *dst = src_val & ((int64_t)(uint16_t)op2 << 16); break;
+                    case 4: *dst = src_val | ((int64_t)(uint16_t)op2 << 16); break;
+                    case 5: *dst = src_val ^ ((int64_t)(uint16_t)op2 << 16); break;
+                    case 6: /* MPY #lk, dst */
+                            dst = src_sel ? &s->b : &s->a;
+                            { int64_t p = (int64_t)(int16_t)s->t * (int64_t)(int16_t)op2;
+                              if (s->st1 & ST1_FRCT) p <<= 1;
+                              *dst = sext40(p); } break;
+                    case 7: /* MAC #lk, src[,dst] */
+                            { int64_t p = (int64_t)(int16_t)s->t * (int64_t)(int16_t)op2;
+                              if (s->st1 & ST1_FRCT) p <<= 1;
+                              *dst = sext40(src_val + p); } break;
+                    default: break;
+                    }
+                    return consumed + s->lk_used;
+                }
+                if (alu_op >= 8) {
+                    /* F08x-F0Fx: accumulator-to-accumulator ops (1-word).
+                     * bits 7:5 = op (100=AND,101=OR,110=XOR,111=SFTL)
+                     * bits 4:0 = shift (signed 5-bit), bits 9:8 = src,dst */
+                    int src_sel = (op >> 8) & 1;
+                    int dst_sel = (op >> 9) & 1;
+                    int64_t sv = src_sel ? s->b : s->a;
+                    int64_t *dst = dst_sel ? &s->b : &s->a;
+                    int shift = op & 0x1F;
+                    if (shift > 15) shift -= 32;
+                    uint8_t aop = (op >> 5) & 0x7;
+                    int64_t shifted;
+                    if (shift >= 0) shifted = sv << shift;
+                    else            shifted = sv >> (-shift);
+                    switch (aop) {
+                    case 4: *dst = sext40(sv) & sext40(shifted); break;
+                    case 5: *dst = sext40(sv) | sext40(shifted); break;
+                    case 6: *dst = sext40(sv) ^ sext40(shifted); break;
+                    case 7: { uint64_t uv = (uint64_t)(sv & 0xFFFFFFFFFFULL);
+                              if (shift >= 0) uv <<= shift; else uv >>= (-shift);
+                              *dst = sext40(uv & 0xFFFFFFFFFFULL); } break;
+                    default: break;
+                    }
+                    return consumed + s->lk_used;
+                }
             }
             goto unimpl;
         }
@@ -873,11 +979,12 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (op == 0xF274) {
-            /* CALLD pmad — delayed call (2 words) */
+            /* CALLD pmad — delayed call (2 words, 2 delay slots).
+             * Push PC+4 (past CALLD + 2 delay slots), branch to pmad. */
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
             s->sp--;
-            data_write(s, s->sp, (uint16_t)(s->pc + 2));
+            data_write(s, s->sp, (uint16_t)(s->pc + 4));
             s->pc = op2;
             return 0;
         }
@@ -921,10 +1028,18 @@ static int c54x_exec_one(C54xState *s)
         }
         if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
         if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
-        if (op == 0xF4E4) {
+        if ((op & 0xFCFF) == 0xF4E1) {
             /* IDLE */
             s->idle = true;
-            return consumed + s->lk_used;  /* Advance PC past IDLE */
+            return 0;  /* PC stays on IDLE; wake code advances PC */
+        }
+        if (op == 0xF4E4) {
+            /* FRET — far return */
+            s->xpc = data_read(s, s->sp); s->sp++;
+            if (s->xpc > 3) s->xpc &= 3;
+            uint16_t ra = data_read(s, s->sp); s->sp++;
+            s->pc = ra;
+            return 0;
         }
         /* FXXX short immediates and misc */
         if (hi8 == 0xF0 || hi8 == 0xF1) {
@@ -964,22 +1079,18 @@ static int c54x_exec_one(C54xState *s)
                 /* F07x: misc control */
                 uint8_t sub = op & 0x0F;
                 if (sub == 0x3) {
-                    /* RET */
-                    uint16_t ret_addr = data_read(s, s->sp);
-                    s->sp++;
-                    s->pc = ret_addr;
+                    /* F073: B pmad — unconditional branch (2-word) */
+                    op2 = prog_fetch(s, s->pc + 1);
+                    s->pc = op2;
                     return 0;
                 }
                 if (sub == 0x4) {
-                    /* RETE (return from interrupt) */
-                    if (s->pmst & PMST_APTS) {
-                        s->xpc = data_read(s, s->sp); s->sp++;
-                        if (s->xpc > 3) s->xpc &= 3;
-                    }
-                    uint16_t ret_addr = data_read(s, s->sp);
-                    s->sp++;
-                    s->st1 &= ~ST1_INTM;
-                    s->pc = ret_addr;
+                    /* F074: CALL pmad — unconditional call (2-word).
+                     * Push PC+2, branch to pmad. */
+                    op2 = prog_fetch(s, s->pc + 1);
+                    s->sp--;
+                    data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                    s->pc = op2;
                     return 0;
                 }
 
@@ -1122,12 +1233,12 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             if (op == 0xF274) {
-                /* CALLD pmad — delayed call (2 words).
-                 * Push PC+2, branch to pmad. */
+                /* CALLD pmad — delayed call (2 words, 2 delay slots).
+                 * Push PC+4 (past CALLD + 2 delay slots), branch to pmad. */
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
                 s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                data_write(s, s->sp, (uint16_t)(s->pc + 4));
                 s->pc = op2;
                 return 0;
             }
@@ -1197,6 +1308,13 @@ static int c54x_exec_one(C54xState *s)
                 if (dst) s->b = s->a; else s->a = s->b;
                 return consumed + s->lk_used;
             }
+            if (sub == 0xB) {
+                /* F6Bx: RSBX -- reset bit in ST1 (bit 9=1, bit 8=0).
+                 * Per tic54x-opc.c: RSBX 0xF4B0 mask 0xFDF0 covers F6Bx. */
+                int bit = op & 0x0F;
+                s->st1 &= ~(1 << bit);
+                return consumed + s->lk_used;
+            }
             if (sub >= 0x8) {
                 /* F68x-F6Fx: MVDD Xmem, Ymem — dual data-memory operand move
                  * Encoding: 1111 0110 XXXX YYYY
@@ -1237,8 +1355,15 @@ static int c54x_exec_one(C54xState *s)
             }
             return consumed + s->lk_used;
         }
-        /* F5xx: RPT #k (short immediate, k in low byte) */
+        /* F5xx: SSBX or RPT #k */
         if (hi8 == 0xF5) {
+            /* F5Bx: SSBX -- set bit in ST0 (bit 9=0, bit 8=1).
+             * Per tic54x-opc.c: SSBX 0xF5B0 mask 0xFDF0. */
+            if ((op & 0xFFF0) == 0xF5B0) {
+                int bit = op & 0x0F;
+                s->st0 |= (1 << bit);
+                return consumed + s->lk_used;
+            }
             /* RPT #k (short immediate) — advance PC past RPT now,
              * the NEXT instruction at PC+1 will be repeated. */
             s->rpt_count = op & 0xFF;
@@ -1279,7 +1404,9 @@ static int c54x_exec_one(C54xState *s)
                 s->st0 = (s->st0 & ~ST0_DP_MASK) | (k & ST0_DP_MASK); break;
             case 0xA: /* F7Ax: LD #k8, ARP */
                 s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
-            case 0xB: s->ar[7] = k; break;
+            case 0xB: /* F7Bx: SSBX -- set bit in ST1 (bit 9=1, bit 8=1).
+                       * Per tic54x-opc.c: SSBX 0xF5B0 mask 0xFDF0 covers F7Bx. */
+                s->st1 |= (1 << (op & 0x0F)); break;
             case 0xC: s->bk = k; break;
             case 0xD: s->sp = k; break;
             case 0xE: /* F7Ex: LD #k8, BRC */
@@ -1337,10 +1464,45 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         /* FCxx: LD #k, 16, B */
+        /* FCxx: RC cond / RET -- return conditional (1-word).
+         * Per tic54x-opc.c: RET=0xFC00, RC=0xFC00 mask 0xFF00. */
         if (hi8 == 0xFC) {
-            int8_t k = (int8_t)(op & 0xFF);
-            int64_t v = (int64_t)k << 16;
-            s->b = sext40(v);
+            uint8_t cc = op & 0xFF;
+            bool cond = false;
+            /* Evaluate condition per tic54x-opc.c encoding:
+             * CC1=0x40: accumulator test, CCB=0x08: use B (else A)
+             * EQ=0x05, NEQ=0x04, LT=0x03, LEQ=0x07, GT=0x06, GEQ=0x02
+             * OV=0x70, NOV=0x60, TC=0x30, NTC=0x20, C=0x0C, NC=0x08 */
+            if (cc == 0x00) cond = true; /* UNC */
+            else if (cc & 0x40) {
+                /* Accumulator condition */
+                int64_t acc = (cc & 0x08) ? sext40(s->b) : sext40(s->a);
+                uint8_t test = cc & 0x07;
+                bool ov = (cc & 0x08) ? (s->st0 & (1<<9)/*OVB*/) : (s->st0 & (1<<8)/*OVA*/);
+                if ((cc & 0x70) == 0x70) cond = ov;        /* AOV/BOV */
+                else if ((cc & 0x70) == 0x60) cond = !ov;  /* ANOV/BNOV */
+                else {
+                    switch (test) {
+                    case 0x05: cond = (acc == 0); break;  /* EQ */
+                    case 0x04: cond = (acc != 0); break;  /* NEQ */
+                    case 0x03: cond = (acc < 0); break;   /* LT */
+                    case 0x07: cond = (acc <= 0); break;  /* LEQ */
+                    case 0x06: cond = (acc > 0); break;   /* GT */
+                    case 0x02: cond = (acc >= 0); break;  /* GEQ */
+                    default: cond = true; break;
+                    }
+                }
+            }
+            else if ((cc & 0x30) == 0x30) cond = (s->st0 & ST0_TC) != 0; /* TC */
+            else if ((cc & 0x30) == 0x20) cond = !(s->st0 & ST0_TC);     /* NTC */
+            else if ((cc & 0x0C) == 0x0C) cond = (s->st0 & ST0_C) != 0;  /* C */
+            else if ((cc & 0x0C) == 0x08) cond = !(s->st0 & ST0_C);      /* NC */
+            else cond = true; /* unknown: take it */
+            if (cond) {
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->pc = ra;
+                return 0;
+            }
             return consumed + s->lk_used;
         }
         /* FDxx: LD #k, A (no shift) */
@@ -1349,10 +1511,46 @@ static int c54x_exec_one(C54xState *s)
             s->a = sext40((int64_t)k);
             return consumed + s->lk_used;
         }
-        /* FExx: LD #k, B (no shift) */
+        /* FExx: RCD cond / RETD -- return conditional delayed (1-word).
+         * Per tic54x-opc.c: RETD=0xFE00, RCD=0xFE00 mask 0xFF00.
+         * Simplified: immediate return (delay slots skipped). */
         if (hi8 == 0xFE) {
-            int8_t k = (int8_t)(op & 0xFF);
-            s->b = sext40((int64_t)k);
+            uint8_t cc = op & 0xFF;
+            bool cond = false;
+            /* Evaluate condition per tic54x-opc.c encoding:
+             * CC1=0x40: accumulator test, CCB=0x08: use B (else A)
+             * EQ=0x05, NEQ=0x04, LT=0x03, LEQ=0x07, GT=0x06, GEQ=0x02
+             * OV=0x70, NOV=0x60, TC=0x30, NTC=0x20, C=0x0C, NC=0x08 */
+            if (cc == 0x00) cond = true; /* UNC */
+            else if (cc & 0x40) {
+                /* Accumulator condition */
+                int64_t acc = (cc & 0x08) ? sext40(s->b) : sext40(s->a);
+                uint8_t test = cc & 0x07;
+                bool ov = (cc & 0x08) ? (s->st0 & (1<<9)/*OVB*/) : (s->st0 & (1<<8)/*OVA*/);
+                if ((cc & 0x70) == 0x70) cond = ov;        /* AOV/BOV */
+                else if ((cc & 0x70) == 0x60) cond = !ov;  /* ANOV/BNOV */
+                else {
+                    switch (test) {
+                    case 0x05: cond = (acc == 0); break;  /* EQ */
+                    case 0x04: cond = (acc != 0); break;  /* NEQ */
+                    case 0x03: cond = (acc < 0); break;   /* LT */
+                    case 0x07: cond = (acc <= 0); break;  /* LEQ */
+                    case 0x06: cond = (acc > 0); break;   /* GT */
+                    case 0x02: cond = (acc >= 0); break;  /* GEQ */
+                    default: cond = true; break;
+                    }
+                }
+            }
+            else if ((cc & 0x30) == 0x30) cond = (s->st0 & ST0_TC) != 0; /* TC */
+            else if ((cc & 0x30) == 0x20) cond = !(s->st0 & ST0_TC);     /* NTC */
+            else if ((cc & 0x0C) == 0x0C) cond = (s->st0 & ST0_C) != 0;  /* C */
+            else if ((cc & 0x0C) == 0x08) cond = !(s->st0 & ST0_C);      /* NC */
+            else cond = true; /* unknown: take it */
+            if (cond) {
+                uint16_t ra = data_read(s, s->sp); s->sp++;
+                s->pc = ra;
+                return 0;
+            }
             return consumed + s->lk_used;
         }
         /* FFxx: ADD/SUB short immediate */
@@ -2896,10 +3094,10 @@ void c54x_reset(C54xState *s)
      * call boot ROM routines. The handler at 0x8A07 expects B(high) = SP
      * (restored via STH B,SP at 0x8A46 after RETE). Stub: LDM SP,B; RET */
     for (int i = 0; i < 0x80; i++)
-        s->prog[i] = 0xF073;  /* RET */
+        s->prog[i] = 0xFC00;  /* RET (per tic54x-opc.c) */
     /* Entry point 0x0000: save SP into B for the SINT17 handler */
     s->prog[0x0000] = 0xBA18;  /* LDMM SP, B — read MMR 0x18(SP) into B(high) */
-    s->prog[0x0001] = 0xF073;  /* RET */
+    s->prog[0x0001] = 0xFC00;  /* RET (per tic54x-opc.c) */
 
     /* Reset vector: IPTR * 0x80 */
     uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SESSION="calypso"
-QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
+QEMU="/root/qemu/build/qemu-system-arm"
 FW="/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
 BRIDGE="/opt/GSM/qemu-src/sercomm_udp.py"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
@@ -65,6 +65,9 @@ tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
 #tmux send-keys -t "$SESSION:ccch" "sleep 5 && ccch_scan -i 127.0.0.1 -a 514 -s $L1CTL_SOCK" C-m
 tmux new-window -t "$SESSION" -n mobile
 tmux send-keys -t "$SESSION:mobile" "sleep 5 && mobile -c /root/.osmocom/bb/mobile_group1.cfg" C-m
+
+tmux new-window -t "$SESSION" -n grgsm
+tmux send-keys -t "$SESSION:grgsm" "echo 'grgsm_decode ready — run: grgsm_decode -c /tmp/gsm_burst.cfile -m BCCH_SDCCH4 -v'" C-m
 
 tmux new-window -t "$SESSION" -n shell
 
