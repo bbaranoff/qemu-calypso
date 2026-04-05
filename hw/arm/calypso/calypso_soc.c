@@ -17,8 +17,9 @@
 #include "hw/arm/calypso/calypso_soc.h"
 #include "hw/arm/calypso/calypso_trx.h"
 
-/* Global reference for TDMA tick to kick UART RX */
+/* Global references for TDMA tick to kick UARTs */
 CalypsoUARTState *g_uart_modem;
+CalypsoUARTState *g_uart_irda;
 #include "chardev/char-fe.h"
 #include "chardev/char.h"
 #include "qemu/error-report.h"
@@ -35,6 +36,8 @@ CalypsoUARTState *g_uart_modem;
 #define CALYPSO_SPI_BASE      0xFFFE3000
 #define CALYPSO_KEYPAD_BASE   0xFFFE4800
 
+/* Firmware perspective: UART_IRDA=0 → 0xFFFF5000, UART_MODEM=1 → 0xFFFF5800.
+ * Sercomm (L1CTL) is on UART_MODEM (0xFFFF5800). */
 #define CALYPSO_UART_IRDA     0xFFFF5000
 #define CALYPSO_UART_MODEM    0xFFFF5800
 
@@ -221,7 +224,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
                            INTH_IRQ(IRQ_UART_MODEM));
         g_uart_modem = &s->uart_modem;
 
-        /* L1CTL socket: sercomm↔L1CTL relay for OsmocomBB mobile */
+        /* L1CTL socket: sercomm↔L1CTL relay — firmware binds sercomm to MODEM UART */
         {
             const char *l1ctl_path = getenv("L1CTL_SOCK");
             l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2_1");
@@ -247,6 +250,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_irda), 0, CALYPSO_UART_IRDA);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_irda), 0,
                            INTH_IRQ(IRQ_UART_IRDA));
+        g_uart_irda = &s->uart_irda;
     }
 
     /* ---- TRX bridge (pure hardware) ---- */

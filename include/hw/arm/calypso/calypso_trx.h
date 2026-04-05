@@ -83,8 +83,8 @@
 #define ULPD_GAUGING_CTRL     0x24
 #define ULPD_GSM_TIMER        0x28
 
-/* GSM timing — 10x slower for emulation */
-#define GSM_TDMA_NS           46150000
+/* GSM timing — real TDMA frame period: 13MHz / 60000 ≈ 4.615ms */
+#define GSM_TDMA_NS           4615000
 #define GSM_HYPERFRAME        2715648
 
 /* DSP boot */
@@ -97,10 +97,11 @@
 #define DSP_API_VERSION       0x3606
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
-void calypso_fw_patch_apply(void);
+void calypso_stub_console(void);
 
 /* Sercomm burst transport (DLCI 4) — called by UART hardware */
 void calypso_trx_rx_burst(const uint8_t *data, int len);
+bool calypso_trx_burst_ready(void);
 void calypso_trx_tx_burst_poll(void);
 
 #endif /* CALYPSO_TRX_H */

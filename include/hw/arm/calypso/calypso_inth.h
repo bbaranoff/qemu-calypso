@@ -33,6 +33,9 @@ struct CalypsoINTHState {
     uint16_t ilr[CALYPSO_INTH_NUM_IRQS];
 
     uint16_t ith_v;        /* Current highest-priority active IRQ number */
+    int irq_in_service;    /* IRQ being serviced (-1 = none). Set on IRQ_NUM read,
+                            * cleared on IRQ_CTRL write. Prevents ith_v update
+                            * so IRQ_CTRL acks the correct interrupt. */
     uint32_t levels;       /* Bitmask of current input levels (level-sensitive) */
     uint32_t mask;         /* Bitmask: 1 = masked (disabled) */
 };
