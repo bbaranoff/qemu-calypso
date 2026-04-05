@@ -548,16 +548,6 @@ static int c54x_exec_one(C54xState *s)
             }
 
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
             switch (sub) {
@@ -853,16 +843,6 @@ static int c54x_exec_one(C54xState *s)
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             if (sub == 0x2) {
                 /* F82x: RPTB pmad */
                 op2 = prog_fetch(s, s->pc + 1);
@@ -996,35 +976,14 @@ static int c54x_exec_one(C54xState *s)
         }
         /* F3xx: various */
         if (hi8 == 0xF3) {
-            uint8_t sub3 = (op >> 5) & 0x07;
-            if (sub3 == 0) {
-                /* F300-F31F: INTR k — software interrupt (branch to vector k) */
-                int vec = op & 0x1F;
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 1));
-                s->st1 |= ST1_INTM;
-                uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-                s->pc = (iptr * 0x80) + vec * 4;
-                return 0;
-            }
-            /* F320+: LD #k9, DP */
-            uint16_t k9 = op & 0x01FF;
+            /* LD #k9, DP or LD #k9, ARP etc */
+            uint16_t k9 = op & 0x1FF;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
             return consumed + s->lk_used;
         }
         /* F6xx: various — LD/ST acc-acc, ABDST, SACCD, etc. */
         if (hi8 == 0xF6) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             if (sub == 0x2) {
                 /* F62x: LD A, dst_shift, B or LD B, dst_shift, A */
                 int dst = op & 1;
@@ -1089,16 +1048,6 @@ static int c54x_exec_one(C54xState *s)
         /* F7xx: LD/ST #k to various registers */
         if (hi8 == 0xF7) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             uint16_t k = op & 0xFF;
             switch (sub) {
             case 0x0: /* F70x: LD #k8, ASM */

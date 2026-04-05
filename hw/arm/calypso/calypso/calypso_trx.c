@@ -308,6 +308,12 @@ skip_sint17:
     if (s->dsp && s->dsp->running && !s->dsp->idle && !dsp_should_run) {
         dsp_should_run = true;
     }
+    /* Detect first IDLE → DSP init complete */
+    if (s->dsp && s->dsp->idle && !s->dsp_init_done) {
+        s->dsp_init_done = true;
+        TRX_LOG("DSP init complete (first IDLE) fn=%u PC=0x%04x SP=0x%04x IMR=0x%04x",
+                s->fn, s->dsp->pc, s->dsp->sp, s->dsp->imr);
+    }
 
     if (dsp_should_run && s->dsp) {
 
@@ -315,7 +321,7 @@ skip_sint17:
          * Real C54x @ 100 MHz ≈ 461K insn per 4.615ms frame.
          * During init (before first IDLE), give unlimited budget.
          * After init, use 500K per frame. */
-        int budget = 5000000;  /* 5M for init */
+        int budget = s->dsp_init_done ? 500000 : 5000000;  /* 5M for init */
         int ran = 0, chunk;
         while (!s->dsp->idle && ran < budget) {
             chunk = c54x_run(s->dsp, 100000);
@@ -392,18 +398,6 @@ skip_sint17:
         }
     }
 
-    /* Detect first IDLE → DSP init complete. Clean up corrupted
-     * registers so SINT17 handler works with proper stack. */
-    if (s->dsp && s->dsp->idle && !s->dsp_init_done) {
-        s->dsp_init_done = true;
-        /* Reset SP and PMST corrupted by init RPTB sweep */
-        s->dsp->sp = 0x5AC8;
-        s->dsp->pmst = 0xFFA8;
-        s->dsp->imr = 0x0000;
-        s->dsp->ifr = 0x0000;
-        TRX_LOG("DSP init complete (first IDLE) fn=%u PC=0x%04x SP=0x%04x IMR=0x%04x",
-                s->fn, s->dsp->pc, s->dsp->sp, s->dsp->imr);
-    }
     /* 4. API IRQ (IRQ15) — only when DSP actually processed a frame.
      * Lower first (edge-like), raise only if DSP ran this tick. */
     qemu_irq_lower(s->irqs[CALYPSO_IRQ_API]);
