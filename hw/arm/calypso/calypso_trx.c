@@ -123,13 +123,15 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
-    /* Log ALL writes to d_dsp_page offset (0x01A8), any value */
+    /* Sync d_dsp_page writes to DSP API RAM immediately */
     if (offset == 0x01A8) {
         static int page_wr_log = 0;
         if (page_wr_log < 20) {
             TRX_LOG("d_dsp_page WR = 0x%04x (sz=%d fn=%u)", (unsigned)value, size, s->fn);
             page_wr_log++;
         }
+        if (s->dsp && s->dsp->api_ram)
+            s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
     }
     /* DSP bootloader protocol (BL_CMD_STATUS at offset 0x0FFE)
      * The real bootloader lives in DSP internal ROM (not in our dump).
@@ -501,6 +503,11 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
         }
         c54x_bsp_load(s->dsp, samples, nbits);
 
+        /* Fire BRINT0 — BSP receive complete (vec 21, IMR bit 5)
+         * Only after init — during boot the DSP doesn't expect bursts */
+        if (s->dsp_init_done)
+            c54x_interrupt_ex(s->dsp, 21, 5);
+
         /* Write to DARAM at multiple candidate addresses */
         /* Address from pointer at 0x00B9 */
         uint16_t ptr = s->dsp->data[0x00B9];
@@ -633,7 +640,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             if (c54x_load_rom(s->dsp, rom_path) == 0) {
                 /* Don't reset/boot yet — wait for ARM to write DSP_DL_STATUS_READY */
                 s->dsp->running = false;
-                TRX_LOG("BUILD 2026-04-05T16:18:30 F4EB=RETE IMR_keep");
+                TRX_LOG("BUILD 2026-04-05T17:25:53 F4EB=RETE IMR_keep");
                 TRX_LOG("C54x DSP loaded from %s (waiting for ARM)", rom_path);
             } else {
                 TRX_LOG("C54x DSP ROM not found at %s", rom_path);
