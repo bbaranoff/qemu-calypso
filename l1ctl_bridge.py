@@ -1,245 +1,230 @@
 #!/usr/bin/env python3
 """
-l1ctl_bridge.py — Pure relay + timing translator between fake_trx and QEMU.
+l1ctl_bridge.py — Bridge between mobile (layer23) and QEMU firmware via sercomm.
 
-No L1 implementation — firmware handles everything.
+Firmware-first mode: all L1CTL messages forwarded to firmware.
+Only RESET_REQ and PM_REQ are handled synthetically (firmware can't handle them).
+The firmware handles FBSB, CCCH, RACH, DM_EST, DATA, etc. via its real DSP/TPU.
 
-Relay:  fake_trx(6700-6702) ↔ bridge(6800-6802/7700-7702) ↔ QEMU(7800-7802)
-L1CTL:  mobile ↔ QEMU firmware (sercomm over chardev socket)
-Clock:  bridge free-runs, syncs from fake_trx CLK, sends CLK to QEMU
+Air socket: receives DL bursts from fake_trx, decodes CCCH, sends DATA_IND to mobile.
+(Used when QEMU has trx_port=0 and doesn't talk to fake_trx directly.)
+
+Architecture:
+  mobile <-> /tmp/osmocom_l2 (L1CTL) <-> this bridge <-> PTY (sercomm) <-> QEMU firmware
+                                              |
+                                         air socket (DL bursts from fake_trx)
 
 Usage:
-  python3 l1ctl_bridge.py <uart-sock> [l1ctl-sock] [--print-bursts] [ft-base] [qe-base]
+  BRIDGE_AIR_PORT=6702 python3 l1ctl_bridge.py /dev/pts/X [/tmp/osmocom_l2_ms]
 """
 
-import errno, fcntl, os, select, signal, socket, struct, sys, termios, threading, time
+import errno
+import fcntl
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+import termios
+import time
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-GSM_HYPERFRAME = 2715648
-GSM_FRAME_US = 4615.0
+DLCI_L1CTL   = 5
+DLCI_LOADER  = 9
+DLCI_DEBUG   = 4
+DLCI_CONSOLE = 10
+CTRL         = 0x03
+FLAG         = 0x7E
+ESCAPE       = 0x7D
+ESCAPE_XOR   = 0x20
+
 L1CTL_SOCK = "/tmp/osmocom_l2"
-SERCOMM_FLAG = 0x7E; SERCOMM_ESCAPE = 0x7D; SERCOMM_XOR = 0x20
-DLCI_L1CTL = 5
+
+L1CTL_NAMES = {
+    0x01: "FBSB_REQ",      0x02: "FBSB_CONF",     0x03: "DATA_IND",
+    0x04: "RACH_REQ",      0x05: "RACH_CONF",      0x06: "DATA_REQ",
+    0x07: "RESET_IND",     0x08: "PM_REQ",         0x09: "PM_CONF",
+    0x0A: "ECHO_REQ",      0x0B: "ECHO_CONF",      0x0C: "DATA_CONF",
+    0x0D: "RESET_REQ",     0x0E: "RESET_CONF",
+    0x10: "CCCH_MODE_REQ", 0x11: "CCCH_MODE_CONF",
+    0x14: "DM_EST_REQ",    0x15: "DM_FREQ_REQ",    0x16: "DM_REL_REQ",
+    0x1D: "TCH_MODE_REQ",  0x1E: "TCH_MODE_CONF",
+    0x21: "TRAFFIC_REQ",   0x22: "TRAFFIC_CONF",   0x23: "TRAFFIC_IND",
+}
+
+MSG_RESET_IND  = 0x07
+MSG_PM_REQ     = 0x08
+MSG_PM_CONF    = 0x09
+MSG_RESET_REQ  = 0x0D
+MSG_RESET_CONF = 0x0E
+MSG_DATA_IND   = 0x03
+
+TARGET_ARFCN = 514
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GSM channel decoding (for air socket CCCH decode)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def decode_ccch_block(bursts_data):
+    """Decode 4-burst CCCH block using libosmocoding."""
+    import ctypes
+    try:
+        lib = ctypes.CDLL("/usr/local/lib/libosmocoding.so")
+    except Exception:
+        return None
+
+    iB = (ctypes.c_int8 * (4 * 116))()
+    for i in range(4):
+        for j in range(57):
+            iB[i * 116 + j] = -127 if bursts_data[i][j] else 127
+        iB[i * 116 + 57] = 0
+        iB[i * 116 + 58] = 0
+        for j in range(57):
+            iB[i * 116 + 59 + j] = -127 if bursts_data[i][57 + j] else 127
+
+    l2 = (ctypes.c_uint8 * 23)()
+    n_err = ctypes.c_int(0)
+    n_bits = ctypes.c_int(0)
+    lib.gsm0503_xcch_decode(l2, iB, ctypes.byref(n_err), ctypes.byref(n_bits))
+    return bytes(l2)
+
+
+def extract_burst_data(bits_148):
+    """Extract 114 coded bits from 148-bit normal burst."""
+    raw = list(bits_148[:148])
+    if len(raw) < 148:
+        raw.extend([0] * (148 - len(raw)))
+    if max(raw) > 1:
+        hard = [1 if b > 127 else 0 for b in raw]
+    else:
+        hard = raw
+    return hard[3:60] + hard[88:145]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sercomm framing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sercomm_escape(data):
+    out = bytearray()
+    for b in data:
+        if b in (FLAG, ESCAPE):
+            out.append(ESCAPE)
+            out.append(b ^ ESCAPE_XOR)
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def sercomm_unescape(data):
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        if data[i] == ESCAPE:
+            i += 1
+            if i < len(data):
+                out.append(data[i] ^ ESCAPE_XOR)
+        else:
+            out.append(data[i])
+        i += 1
+    return bytes(out)
+
+
+def sercomm_wrap(dlci, payload):
+    inner = bytes([dlci, CTRL]) + payload
+    return bytes([FLAG]) + sercomm_escape(inner) + bytes([FLAG])
+
+
+class SercommParser:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf.extend(data)
+        frames = []
+        while True:
+            try:
+                start = self.buf.index(FLAG)
+            except ValueError:
+                self.buf.clear()
+                break
+            if start > 0:
+                del self.buf[:start]
+            try:
+                end = self.buf.index(FLAG, 1)
+            except ValueError:
+                break
+            raw = bytes(self.buf[1:end])
+            del self.buf[:end + 1]
+            if not raw:
+                continue
+            frame = sercomm_unescape(raw)
+            if len(frame) < 2:
+                continue
+            frames.append((frame[0], frame[2:]))
+        return frames
+
+
+class LengthPrefixReader:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf.extend(data)
+        msgs = []
+        while len(self.buf) >= 2:
+            msglen = struct.unpack(">H", self.buf[:2])[0]
+            if len(self.buf) < 2 + msglen:
+                break
+            msgs.append(bytes(self.buf[2:2 + msglen]))
+            del self.buf[:2 + msglen]
+        return msgs
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def udp_bind(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", port)); s.setblocking(False); return s
+def hexdump(data, maxlen=32):
+    h = " ".join(f"{b:02x}" for b in data[:maxlen])
+    if len(data) > maxlen:
+        h += f" ... ({len(data)} bytes)"
+    return h
 
-def udp_bind_connect(bind_port, dst_addr, dst_port):
-    """Bind + connect UDP socket (like osmo-bts-trx: ESTAB in ss)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", bind_port))
-    s.connect((dst_addr, dst_port))
-    s.setblocking(False); return s
 
-def sercomm_wrap(dlci, payload):
-    out = bytearray([SERCOMM_FLAG])
-    for b in bytes([dlci, 0x03]) + payload:
-        if b in (SERCOMM_FLAG, SERCOMM_ESCAPE):
-            out.append(SERCOMM_ESCAPE); out.append(b ^ SERCOMM_XOR)
-        else: out.append(b)
-    out.append(SERCOMM_FLAG); return bytes(out)
+def set_raw(fd):
+    attrs = termios.tcgetattr(fd)
+    attrs[0] = 0
+    attrs[1] = 0
+    attrs[2] &= ~(termios.PARENB | termios.CSTOPB | termios.CSIZE)
+    attrs[2] |= termios.CS8 | termios.CLOCAL | termios.CREAD
+    attrs[3] = 0
+    attrs[4] = termios.B115200
+    attrs[5] = termios.B115200
+    attrs[6][termios.VMIN] = 1
+    attrs[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
-class SercommParser:
-    def __init__(self): self.buf = bytearray()
-    def feed(self, data):
-        self.buf.extend(data); frames = []
-        while True:
-            try: s = self.buf.index(SERCOMM_FLAG)
-            except ValueError: self.buf.clear(); break
-            if s > 0: del self.buf[:s]
-            try: e = self.buf.index(SERCOMM_FLAG, 1)
-            except ValueError: break
-            raw = bytes(self.buf[1:e]); del self.buf[:e+1]
-            if not raw: continue
-            # unescape
-            out = bytearray(); i = 0
-            while i < len(raw):
-                if raw[i] == SERCOMM_ESCAPE: i += 1; out.append(raw[i] ^ SERCOMM_XOR) if i < len(raw) else None
-                else: out.append(raw[i])
-                i += 1
-            if len(out) >= 2: frames.append((out[0], bytes(out[2:])))
-        return frames
 
-class LPReader:
-    def __init__(self): self.buf = bytearray()
-    def feed(self, data):
-        self.buf.extend(data); msgs = []
-        while len(self.buf) >= 2:
-            ml = struct.unpack(">H", self.buf[:2])[0]
-            if len(self.buf) < 2 + ml: break
-            msgs.append(bytes(self.buf[2:2+ml])); del self.buf[:2+ml]
-        return msgs
+def set_nonblock(fd):
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Clock
-# ═══════════════════════════════════════════════════════════════════════════════
 
-class BridgeClock:
-    """Clock + TRXD buffer: receives bursts from fake_trx, replays to QEMU at 4.615ms/frame."""
+def l1ctl_send(client, msg_type, payload=b""):
+    hdr = struct.pack("BBxx", msg_type, 0)
+    msg = hdr + payload
+    frame = struct.pack(">H", len(msg)) + msg
+    try:
+        client.sendall(frame)
+    except Exception:
+        pass
 
-    def __init__(self, clk_sock, trxd_sock, ind_period=102):
-        self.clk_sock = clk_sock; self.trxd_sock = trxd_sock
-        self.ind_period = ind_period; self.fn = 0
-        self.synced = False
-        self._lock = threading.Lock()
-        self._stop = threading.Event(); self._thread = None
-        # TRXD FIFO: bursts in order, one frame (8 TS) per tick
-        from collections import deque
-        self._trxd_fifo = deque(maxlen=2000)
-        self._last_sent_fn = -1
-
-    def sync(self, fn):
-        with self._lock:
-            if not self.synced:
-                print(f"clock: sync FN={fn}", flush=True)
-                self.synced = True
-            self.fn = fn
-
-    def buffer_trxd(self, data):
-        """Buffer a DL TRXD packet from fake_trx (FIFO order)."""
-        self._trxd_fifo.append(data)
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread: self._thread.join(timeout=2)
-
-    def _run(self):
-        tick_ns = int(GSM_FRAME_US * 1000)
-        t_next = time.monotonic_ns()
-        while not self._stop.is_set():
-            t_next += tick_ns
-            dt = t_next - time.monotonic_ns()
-            if dt < 0: t_next = time.monotonic_ns(); dt = 0
-            if dt > 0: time.sleep(dt / 1e9)
-
-            with self._lock:
-                fn = self.fn
-                self.fn = (self.fn + 1) % GSM_HYPERFRAME
-
-            # Send CLK to QEMU
-            if fn % self.ind_period == 0:
-                self.clk_sock.send(f"IND CLOCK {fn}\0".encode())
-
-            # Send TRXD from FIFO — 1 packet per tick (matches QEMU speed)
-            if self._trxd_fifo:
-                pkt = self._trxd_fifo.popleft()
-                try: self.trxd_sock.send(pkt)
-                except: pass
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TRX Relay (pure forward, no L1)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TRXRelay:
-    def __init__(self, ft_base=6700, qe_base=8700, print_bursts=False):
-        # 6 sockets: bind+connect, each does RX+TX
-        self.ft_clk  = udp_bind_connect(ft_base + 100, "127.0.0.1", ft_base)      # 6800↔6700
-        self.ft_trxc = udp_bind_connect(ft_base + 101, "127.0.0.1", ft_base + 1)  # 6801↔6701
-        self.ft_trxd = udp_bind_connect(ft_base + 102, "127.0.0.1", ft_base + 2)  # 6802↔6702
-        self.qe_clk  = udp_bind_connect(qe_base,     "127.0.0.1", qe_base + 100)  # 8700↔8800
-        self.qe_trxc = udp_bind_connect(qe_base + 1, "127.0.0.1", qe_base + 101)  # 8701↔8801
-        self.qe_trxd = udp_bind_connect(qe_base + 2, "127.0.0.1", qe_base + 102)  # 8702↔8802
-
-        self.print_bursts = print_bursts
-        self.stats = {"dl": 0, "ul": 0}
-
-        # Dedicated TX socket for buffered TRXD (not in select, avoids loop)
-        self.qe_trxd_buf_tx = udp_bind_connect(8712, "127.0.0.1", 8802)  # 8712→8802
-        self.clock = BridgeClock(self.qe_clk, self.qe_trxd_buf_tx)  # sends CLK+TRXD to QEMU
-        self.clock.start()
-
-        # Init fake_trx MS (bridge configures the connection, not QEMU)
-        self._init_faketrx_ms()
-
-        print(f"relay: ft({ft_base}) ↔ bridge({ft_base+100}/{qe_base}) ↔ qe({qe_base+100})", flush=True)
-
-    def _init_faketrx_ms(self):
-        """Configure fake_trx MS transceiver via TRXC."""
-        import time as _t
-        cmds = [b"CMD SETFORMAT 0\0", b"CMD RXTUNE 1805600\0",
-                b"CMD TXTUNE 1710600\0", b"CMD POWERON\0"]
-        for cmd in cmds:
-            self.ft_trxc.send(cmd)
-            _t.sleep(0.2)
-            try:
-                rsp = self.ft_trxc.recv(256)
-                NUL = b'\x00'
-                print(f"  [init] {cmd.strip(NUL).decode()} → {rsp.strip(NUL).decode()}", flush=True)
-            except: pass
-
-    def sockets(self):
-        return [self.ft_clk, self.ft_trxc, self.ft_trxd,
-                self.qe_clk, self.qe_trxc, self.qe_trxd]
-
-    def process(self, readable):
-        # DL: fake_trx → QEMU
-        for sock, peer, ch in [
-            (self.ft_clk,  self.qe_clk,  "CLK"),
-            (self.ft_trxc, self.qe_trxc, "TRXC"),
-            (self.ft_trxd, None,         "TRXD"),
-        ]:
-            if sock in readable:
-                try: data = sock.recv(4096)
-                except OSError: continue
-                if not data: continue
-                if ch == "TRXD":
-                    self.clock.buffer_trxd(data)
-                elif peer:
-                    peer.send(data)
-                self.stats["dl"] += 1
-                if ch == "CLK":
-                    try:
-                        txt = data.strip(b'\x00').decode()
-                        if txt.startswith("IND CLOCK "):
-                            self.clock.sync(int(txt.split()[2]))
-                    except: pass
-                if self.print_bursts and ch == "TRXD" and len(data) >= 8:
-                    tn = data[0] & 7; fn = struct.unpack(">I", data[1:5])[0]
-                    nz = sum(1 for b in data[8:156] if b not in (0, 128))
-                    print(f"  [DL] TN={tn} FN={fn} nz={nz}", flush=True)
-
-        # UL: QEMU → fake_trx
-        for sock, peer, ch in [
-            (self.qe_clk,  self.ft_clk,  "CLK"),
-            (self.qe_trxc, self.ft_trxc, "TRXC"),
-            (self.qe_trxd, self.ft_trxd, "TRXD"),
-        ]:
-            if sock in readable:
-                try: data = sock.recv(4096)
-                except OSError: continue
-                if not data: continue
-                peer.send(data)
-                self.stats["ul"] += 1
-                if ch == "TRXC":
-                    txt = data.strip(b'\x00').decode(errors='replace')
-                    if self.stats["ul"] <= 20:
-                        print(f"  [UL] TRXC: {txt}", flush=True)
-                if self.print_bursts and ch == "TRXD" and len(data) >= 6:
-                    tn = data[0] & 7; fn = struct.unpack(">I", data[1:5])[0]
-                    print(f"  [UL] TN={tn} FN={fn}", flush=True)
-
-        if self.stats["dl"] % 10000 == 0 and self.stats["dl"] > 0:
-            print(f"  [stats] DL={self.stats['dl']} UL={self.stats['ul']}", flush=True)
-
-    def close(self):
-        self.clock.stop()
-        for s in self.sockets():
-            try: s.close()
-            except: pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
@@ -247,118 +232,296 @@ class TRXRelay:
 
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <uart-sock> [l1ctl-sock] [--print-bursts] [ft-base] [qe-base]")
+        print(f"Usage: {sys.argv[0]} <pty-path> [socket-path]", file=sys.stderr)
         sys.exit(1)
 
     pty_path = sys.argv[1]
-    global L1CTL_SOCK
-    if len(sys.argv) > 2 and not sys.argv[2].startswith("-"):
+    if len(sys.argv) > 2:
+        global L1CTL_SOCK
         L1CTL_SOCK = sys.argv[2]
 
-    args = sys.argv[2:]
-    print_bursts = "--print-bursts" in args
-    nums = [a for a in args if a.isdigit()]
-    ft_base = int(nums[0]) if len(nums) > 0 else 6700
-    qe_base = int(nums[1]) if len(nums) > 1 else 7700
+    try:
+        os.unlink(L1CTL_SOCK)
+    except FileNotFoundError:
+        pass
 
-    try: os.unlink(L1CTL_SOCK)
-    except FileNotFoundError: pass
+    # ── Open PTY to QEMU ──
+    pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
+    set_raw(pty_fd)
+    set_nonblock(pty_fd)
 
-    # QEMU uart
-    import stat as stat_mod
-    qemu_sock = None
-    if os.path.exists(pty_path) and stat_mod.S_ISSOCK(os.stat(pty_path).st_mode):
-        qemu_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        qemu_sock.connect(pty_path); qemu_sock.setblocking(False)
-        pty_fd = qemu_sock.fileno()
-    else:
-        pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
-        attrs = termios.tcgetattr(pty_fd)
-        attrs[0] = attrs[1] = attrs[3] = 0
-        attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
-        attrs[4] = attrs[5] = termios.B115200
-        attrs[6][termios.VMIN] = 1; attrs[6][termios.VTIME] = 0
-        termios.tcsetattr(pty_fd, termios.TCSANOW, attrs)
-        fl = fcntl.fcntl(pty_fd, fcntl.F_GETFL)
-        fcntl.fcntl(pty_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-    # L1CTL server
+    # ── L1CTL server socket ──
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(L1CTL_SOCK); srv.listen(1); srv.setblocking(False)
+    srv.bind(L1CTL_SOCK)
+    srv.listen(1)
+    srv.setblocking(False)
 
-    # TRX relay
-    trx = TRXRelay(ft_base, qe_base, print_bursts)
+    # ── Air UDP socket (DL bursts from fake_trx for CCCH decode) ──
+    AIR_PORT = int(os.environ.get("BRIDGE_AIR_PORT", "0"))
+    air_sock = None
+    if AIR_PORT > 0:
+        air_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        air_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            air_sock.bind(("0.0.0.0", AIR_PORT + 100))
+            air_sock.setblocking(False)
+            print(f"l1ctl-bridge: air UDP on port {AIR_PORT + 100}", flush=True)
+        except OSError:
+            air_sock = None
+            print(f"l1ctl-bridge: air UDP port {AIR_PORT + 100} busy", flush=True)
 
-    print(f"bridge: uart={pty_path} l1ctl={L1CTL_SOCK}", flush=True)
+    print(f"l1ctl-bridge: PTY={pty_path} socket={L1CTL_SOCK}", flush=True)
+    print(f"l1ctl-bridge: firmware-first mode (synth: RESET, PM only)", flush=True)
+    print(f"l1ctl-bridge: TARGET_ARFCN={TARGET_ARFCN}", flush=True)
 
-    parser = SercommParser(); lp = LPReader()
-    client = None; running = True
-    stats = {"tx": 0, "rx": 0}
+    parser = SercommParser()
+    lp = LengthPrefixReader()
+    client = None
+    running = True
+    stats = {"tx": 0, "rx": 0, "console": 0, "burst": 0, "decoded": 0}
 
-    def shutdown(s, f): nonlocal running; running = False
-    signal.signal(signal.SIGINT, shutdown); signal.signal(signal.SIGTERM, shutdown)
+    # Burst accumulator for CCCH decoding
+    burst_buf = {}
+
+    def shutdown(_sig, _frame):
+        nonlocal running
+        running = False
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
     try:
         while running:
-            rlist = [srv, pty_fd] + trx.sockets()
-            if client: rlist.append(client)
-            try: readable, _, _ = select.select(rlist, [], [], 0.5)
-            except (OSError, ValueError): break
+            rlist = [srv, pty_fd]
+            if air_sock:
+                rlist.append(air_sock)
+            if client is not None:
+                rlist.append(client)
 
-            trx.process(readable)
+            try:
+                readable, _, _ = select.select(rlist, [], [], 0.5)
+            except (OSError, ValueError):
+                break
 
-            # Accept mobile
+            # ── Accept new mobile connection ──
             if srv in readable:
-                conn, _ = srv.accept(); conn.setblocking(False)
-                if client:
-                    try: client.close()
-                    except: pass
-                client = conn; lp = LPReader()
-                print("mobile connected", flush=True)
+                conn, _ = srv.accept()
+                conn.setblocking(False)
+                if client is not None:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                client = conn
+                lp = LengthPrefixReader()
+                print("l1ctl-bridge: mobile connected", flush=True)
 
-            # L1CTL: mobile → firmware (pure forward)
-            if client and client in readable:
-                try: raw = client.recv(4096)
-                except BlockingIOError: raw = b""
+            # ══════════════════════════════════════════════════════════════
+            # mobile -> firmware
+            # ══════════════════════════════════════════════════════════════
+            if client is not None and client in readable:
+                try:
+                    raw = client.recv(4096)
+                except BlockingIOError:
+                    raw = b""
+
                 if not raw:
-                    print("mobile disconnected", flush=True)
-                    try: client.close()
-                    except: pass
+                    print("l1ctl-bridge: mobile disconnected", flush=True)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
                     client = None
                 else:
                     for payload in lp.feed(raw):
                         stats["tx"] += 1
-                        frame = sercomm_wrap(DLCI_L1CTL, payload)
-                        try: os.write(pty_fd, frame)
-                        except OSError as e:
-                            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK): raise
-                        if stats["tx"] <= 10 or stats["tx"] % 50 == 0:
-                            mt = payload[0] if payload else 0xFF
-                            print(f"  [mobile→fw] #{stats['tx']} type=0x{mt:02x}", flush=True)
+                        msg_type = payload[0] if payload else 0xFF
+                        name = L1CTL_NAMES.get(msg_type, f"0x{msg_type:02x}")
 
-            # L1CTL: firmware → mobile (pure forward)
+                        # ── RESET_REQ — synthetic (firmware can't handle) ──
+                        if msg_type == MSG_RESET_REQ:
+                            reset_type = payload[4] if len(payload) > 4 else 1
+                            l1ctl_send(client, MSG_RESET_CONF,
+                                       struct.pack("Bxxx", reset_type))
+                            print(f"  [synth] RESET_REQ type={reset_type} -> RESET_CONF",
+                                  flush=True)
+                            continue  # don't forward
+
+                        # ── PM_REQ — synthetic (firmware causes msgb exhaustion) ──
+                        if msg_type == MSG_PM_REQ and len(payload) >= 12:
+                            arfcn_from = (payload[8] << 8) | payload[9]
+                            arfcn_to = (payload[10] << 8) | payload[11]
+                            entries = []
+                            for a in range(arfcn_from, arfcn_to + 1):
+                                rxlev = 0x30 if a == TARGET_ARFCN else 0x00
+                                entries.append(struct.pack(">HBB", a, rxlev, rxlev))
+
+                            batch_size = 50
+                            for i in range(0, len(entries), batch_size):
+                                batch = entries[i:i + batch_size]
+                                is_last = (i + batch_size >= len(entries))
+                                hdr = bytes([MSG_PM_CONF,
+                                             0x01 if is_last else 0x00,
+                                             0x00, 0x00])
+                                pm_data = hdr + b"".join(batch)
+                                msg = struct.pack(">H", len(pm_data)) + pm_data
+                                try:
+                                    client.sendall(msg)
+                                except (BrokenPipeError, OSError):
+                                    pass
+                            print(f"  [synth] PM_REQ {arfcn_from}-{arfcn_to} -> PM_CONF",
+                                  flush=True)
+                            continue  # don't forward
+
+                        # ── Everything else -> forward to firmware ──
+                        frame = sercomm_wrap(DLCI_L1CTL, payload)
+                        try:
+                            os.write(pty_fd, frame)
+                        except OSError as e:
+                            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                                raise
+
+                        if stats["tx"] <= 10 or stats["tx"] % 50 == 0:
+                            print(f"  [mobile->fw] #{stats['tx']} {name} "
+                                  f"len={len(payload)} {hexdump(payload, 16)}",
+                                  flush=True)
+
+            # ══════════════════════════════════════════════════════════════
+            # air bursts -> CCCH decode -> DATA_IND to mobile
+            # ══════════════════════════════════════════════════════════════
+            if air_sock and air_sock in readable:
+                try:
+                    data, addr = air_sock.recvfrom(512)
+                except OSError:
+                    data = b""
+                if len(data) >= 9 and client is not None:
+                    tn = data[0] & 0x07
+                    fn = struct.unpack(">I", data[1:5])[0]
+                    soft_bits = data[8:]
+                    stats["burst"] += 1
+
+                    if tn != 0:
+                        pass  # only TS0 for BCCH/CCCH
+                    else:
+                        coded = extract_burst_data(soft_bits)
+                        fn51 = fn % 51
+                        bcch_ccch_starts = [2, 6, 12, 16]
+                        block_id = None
+                        burst_idx = None
+                        chan_nr = 0x80
+
+                        for start in bcch_ccch_starts:
+                            if start <= fn51 < start + 4:
+                                burst_idx = fn51 - start
+                                block_id = (fn // 51, start)
+                                chan_nr = 0x80 if start == 2 else 0x90
+                                break
+
+                        if block_id is not None and burst_idx is not None:
+                            if block_id not in burst_buf:
+                                burst_buf[block_id] = [None] * 4
+                            burst_buf[block_id][burst_idx] = coded
+
+                            if all(b is not None for b in burst_buf[block_id]):
+                                l2 = decode_ccch_block(burst_buf[block_id])
+                                del burst_buf[block_id]
+
+                                if l2 and len(l2) == 23:
+                                    hdr = struct.pack("BBxx", MSG_DATA_IND, 0)
+                                    info_dl = struct.pack(">BBHIBBBB",
+                                        chan_nr, 0, TARGET_ARFCN, fn, 48, 20, 0, 0)
+                                    msg = hdr + info_dl + l2
+                                    frame = struct.pack(">H", len(msg)) + msg
+                                    try:
+                                        client.sendall(frame)
+                                    except (BrokenPipeError, OSError):
+                                        pass
+                                    stats["decoded"] += 1
+                                    if stats["decoded"] <= 10 or stats["decoded"] % 200 == 0:
+                                        print(f"  [air->mobile] DATA_IND #{stats['decoded']} "
+                                              f"FN={fn} ch=0x{chan_nr:02x} {l2.hex()[:46]}",
+                                              flush=True)
+
+                        # Clean stale blocks
+                        stale = [k for k in burst_buf if fn - k[0] * 51 > 200]
+                        for k in stale:
+                            del burst_buf[k]
+
+            # ══════════════════════════════════════════════════════════════
+            # firmware -> mobile
+            # ══════════════════════════════════════════════════════════════
             if pty_fd in readable:
-                try: raw = os.read(pty_fd, 4096)
+                try:
+                    raw = os.read(pty_fd, 4096)
                 except OSError as e:
-                    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK): continue
+                    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        continue
                     raise
-                if not raw: break
+
+                if not raw:
+                    print("l1ctl-bridge: PTY closed", flush=True)
+                    break
+
                 for dlci, payload in parser.feed(raw):
-                    if dlci == DLCI_L1CTL and client:
+                    if dlci == DLCI_L1CTL:
                         stats["rx"] += 1
-                        try: client.sendall(struct.pack(">H", len(payload)) + payload)
-                        except: client = None
+
+                        # Forward ALL firmware L1CTL to mobile
+                        if client is not None:
+                            msg = struct.pack(">H", len(payload)) + payload
+                            try:
+                                client.sendall(msg)
+                            except (BrokenPipeError, OSError):
+                                print("l1ctl-bridge: mobile send error", flush=True)
+                                try:
+                                    client.close()
+                                except OSError:
+                                    pass
+                                client = None
+
                         if stats["rx"] <= 10 or stats["rx"] % 100 == 0:
-                            mt = payload[0] if payload else 0xFF
-                            print(f"  [fw→mobile] #{stats['rx']} type=0x{mt:02x}", flush=True)
+                            msg_type = payload[0] if payload else 0xFF
+                            rx_name = L1CTL_NAMES.get(msg_type, f"0x{msg_type:02x}")
+                            extra = ""
+                            if msg_type == 0x02 and len(payload) >= 20:
+                                extra = f" result={payload[18]} bsic={payload[19]}"
+                            print(f"  [fw->mobile] #{stats['rx']} {rx_name} "
+                                  f"len={len(payload)}{extra} {hexdump(payload, 20)}",
+                                  flush=True)
+
+                    elif dlci == DLCI_CONSOLE:
+                        stats["console"] += 1
+                        text_bytes = payload
+                        if text_bytes and text_bytes[0] == 0x03:
+                            text_bytes = text_bytes[1:]
+                        try:
+                            sys.stderr.write(
+                                text_bytes.decode("ascii", errors="replace"))
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
+
+                    elif dlci == DLCI_LOADER:
+                        pass
+
     finally:
-        if client: client.close()
-        srv.close(); trx.close()
-        if qemu_sock: qemu_sock.close()
-        else: os.close(pty_fd)
-        try: os.unlink(L1CTL_SOCK)
-        except: pass
-        print(f"done (l1ctl tx={stats['tx']} rx={stats['rx']} trx dl={trx.stats['dl']} ul={trx.stats['ul']})", flush=True)
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+        srv.close()
+        try:
+            os.close(pty_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(L1CTL_SOCK)
+        except OSError:
+            pass
+        print(f"l1ctl-bridge: done (tx={stats['tx']} rx={stats['rx']} "
+              f"decoded={stats['decoded']} console={stats['console']})",
+              flush=True)
+
 
 if __name__ == "__main__":
     main()

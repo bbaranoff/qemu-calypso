@@ -169,12 +169,12 @@ static void calypso_uart_update_irq(CalypsoUARTState *s)
 
     s->iir = iir;
 
-    /* Level-sensitive: assert/deassert IRQ based on current state.
-     * The INTH tracks input levels directly. */
+    /* Force edge transition so INTH always sees the change.
+     * After IRQ_CTRL ack clears levels[n], a steady-high line
+     * needs a low→high pulse to re-register in the INTH. */
+    qemu_irq_lower(s->irq);
     if (want) {
         qemu_irq_raise(s->irq);
-    } else {
-        qemu_irq_lower(s->irq);
     }
 }
 
@@ -194,9 +194,25 @@ void calypso_uart_poll_backend(CalypsoUARTState *s)
 
 void calypso_uart_kick_tx(CalypsoUARTState *s)
 {
-    /* Do nothing — TX is driven by the firmware's sercomm_drv_start_tx.
-     * Forcing IER/pending from here causes an IER write storm. */
-    (void)s;
+    /* Re-check TX interrupt state — if THR is empty and IER TX enabled,
+     * fire the interrupt so firmware can write next byte. */
+    calypso_uart_update_irq(s);
+}
+
+void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int len)
+{
+    if (!s) return;
+    for (int i = 0; i < len; i++) {
+        if (s->rx_count < CALYPSO_UART_RX_FIFO_SIZE) {
+            int idx = (s->rx_head + s->rx_count) % CALYPSO_UART_RX_FIFO_SIZE;
+            s->rx_fifo[idx] = buf[i];
+            s->rx_count++;
+        }
+    }
+    if (s->rx_count > 0) {
+        s->lsr |= LSR_DR;
+        calypso_uart_update_irq(s);
+    }
 }
 
 void calypso_uart_force_init(CalypsoUARTState *s)
@@ -235,7 +251,7 @@ static void calypso_uart_rx_poll(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
 }
 
-/* ---- Char backend callbacks ---- */
+/* ---- Control PTY callbacks ---- */
 
 int calypso_uart_can_receive(void *opaque)
 {
@@ -296,29 +312,44 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         return;
     }
 
-    /* Sercomm DLCI routing on modem UART RX:
-     * DLCI 4 (burst data) -> calypso_trx DSP RAM injection
-     * Everything else -> FIFO for firmware */
-    if (s->label && !strcmp(s->label, "modem")) {
+    /* Modem UART: parse sercomm, route by DLCI.
+     * DLCI 5 (L1CTL) → FIFO (firmware processes it)
+     * DLCI 4 (bursts) → calypso_trx_rx_burst (TRX filters timing)
+     * Other → FIFO (firmware handles) */
+    {
         static uint8_t sc_buf[512];
         static int sc_len = 0;
-        static int sc_state = 0;
+        static int sc_state = 0; /* 0=idle, 1=in_frame, 2=escape */
+
         for (int i = 0; i < size; i++) {
             uint8_t b = buf[i];
             if (sc_state == 0) {
                 if (b == 0x7E) { sc_state = 1; sc_len = 0; }
-                else { fifo_push(s, b); }
+                else { fifo_push(s, b); } /* pre-sercomm bytes → FIFO */
             } else if (sc_state == 2) {
                 if (sc_len < (int)sizeof(sc_buf)) sc_buf[sc_len++] = b ^ 0x20;
                 sc_state = 1;
             } else {
                 if (b == 0x7E) {
-                    if (sc_len >= 2 && sc_buf[0] == 4) {
-                        calypso_trx_rx_burst(&sc_buf[2], sc_len - 2);
-                    } else if (sc_len > 0) {
-                        fifo_push(s, 0x7E);
-                        for (int j = 0; j < sc_len; j++) fifo_push(s, sc_buf[j]);
-                        fifo_push(s, 0x7E);
+                    if (sc_len >= 2) {
+                        uint8_t dlci = sc_buf[0];
+                        if (dlci == 4) {
+                            /* Bursts → DSP via BSP (not FIFO) */
+                            calypso_trx_rx_burst(&sc_buf[2], sc_len - 2);
+                        } else {
+                            /* L1CTL + others → re-wrap and push to FIFO */
+                            fifo_push(s, 0x7E);
+                            for (int j = 0; j < sc_len; j++) {
+                                uint8_t c = sc_buf[j];
+                                if (c == 0x7E || c == 0x7D) {
+                                    fifo_push(s, 0x7D);
+                                    fifo_push(s, c ^ 0x20);
+                                } else {
+                                    fifo_push(s, c);
+                                }
+                            }
+                            fifo_push(s, 0x7E);
+                        }
                     }
                     sc_len = 0;
                 } else if (b == 0x7D) {
@@ -328,8 +359,6 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
                 }
             }
         }
-    } else {
-        for (int i = 0; i < size; i++) { fifo_push(s, buf[i]); }
     }
 
     if (s->rx_count > 0) {
@@ -566,9 +595,8 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
 
     case REG_MDR1:
         s->mdr1 = value;
-        /* MDR1 write is one of the earliest firmware UART accesses.
-         * Trigger firmware patches now (before any cons_puts call). */
-        calypso_fw_patch_apply();
+        /* MDR1 write — UART mode select. Stub console functions. */
+        calypso_stub_console();
         fprintf(stderr, "[UART:%s] MDR1=0x%02x\n",
                 s->label ? s->label : "?",
                 (unsigned)value);
@@ -635,6 +663,7 @@ static void calypso_uart_realize(DeviceState *dev, Error **errp)
         timer_mod(s->rx_poll_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
     }
+
 }
 
 static void calypso_uart_reset_state(DeviceState *dev)

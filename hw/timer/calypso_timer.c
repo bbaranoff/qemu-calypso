@@ -37,7 +37,7 @@ static void calypso_timer_tick(void *opaque)
     if (s->count == 0) {
         /* Fire IRQ if enabled */
         if (s->ctrl & TIMER_CTRL_IRQ_EN) {
-            qemu_irq_pulse(s->irq);
+            qemu_irq_raise(s->irq);
         }
         /* Auto-reload or stop */
         if (s->ctrl & TIMER_CTRL_RELOAD) {
