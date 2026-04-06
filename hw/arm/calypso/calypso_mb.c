@@ -25,6 +25,7 @@
 #include "sysemu/reset.h"
 
 #include "hw/arm/calypso/calypso_soc.h"
+#include "hw/arm/calypso/sercomm_gate.h"
 
 #define CALYPSO_XRAM_BASE     0x01000000
 #define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
@@ -197,6 +198,7 @@ static void calypso_machine_init(MachineState *machine)
 
     }
 
+    sercomm_gate_init(6700);
     fprintf(stderr, "[MB] === Machine ready ===\n");
     fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",
             CALYPSO_FLASH_BASE,

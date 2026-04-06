@@ -174,6 +174,13 @@ static void sercomm_frame_complete(L1CTLSock *s)
             uint8_t mt = payload[0];
             const char *name = (mt < 0x19) ? l1ctl_names[mt] : "UNKNOWN";
             L1CTL_LOG("TX→mobile: %s (0x%02x) len=%d", name, mt, plen);
+            {
+                char hex[3*64+8] = {0};
+                int n = plen < 64 ? plen : 64;
+                for (int i = 0; i < n; i++)
+                    snprintf(hex + i*3, 4, "%02x ", payload[i]);
+                L1CTL_LOG("  RAW [%d]: %s%s", plen, hex, plen > 64 ? "..." : "");
+            }
 
             /* Decode specific messages */
             if (mt == 0x09 && plen >= 8) { /* PM_CONF */
@@ -181,11 +188,15 @@ static void sercomm_frame_complete(L1CTLSock *s)
                 int16_t pm = (int16_t)(payload[6] | (payload[7] << 8));
                 L1CTL_LOG("  PM_CONF: arfcn=%u pm=%d", arfcn & 0x3FF, pm);
             }
-            if (mt == 0x02 && plen >= 8) { /* FBSB_CONF */
-                int16_t snr = (int16_t)(payload[4] | (payload[5] << 8));
-                uint8_t result = payload[6];
-                uint8_t bsic = payload[7];
-                L1CTL_LOG("  FBSB_CONF: snr=%d result=%u bsic=%u", snr, result, bsic);
+            if (mt == 0x02 && plen >= 20) { /* FBSB_CONF */
+                /* layout: hdr(4) + l1ctl_info_dl(12) + l1ctl_fbsb_conf(4) */
+                uint16_t arfcn = payload[6] | (payload[7] << 8);
+                int8_t   snr   = (int8_t)payload[13];
+                int16_t  ferr  = (int16_t)(payload[16] | (payload[17] << 8));
+                uint8_t  result = payload[18];
+                uint8_t  bsic   = payload[19];
+                L1CTL_LOG("  FBSB_CONF: arfcn=%u snr=%d ferr=%d result=%u bsic=%u",
+                          arfcn & 0x3FFF, snr, ferr, result, bsic);
             }
         }
         l1ctl_send_to_mobile(s, payload, plen);

@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+#include "hw/arm/calypso/calypso_iota.h"
 
 #define BSP_LOG(fmt, ...) \
     do { fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
@@ -31,8 +32,10 @@ static struct {
     C54xState *dsp;
     uint16_t   daram_addr;   /* word address in DSP data space; 0 = unset */
     uint16_t   daram_len;    /* max words to copy per burst */
+    uint16_t   bypass_bdlena;/* 1 = ignore BDLENA gate (debug only) */
     uint64_t   bursts_seen;
     uint64_t   bursts_written;
+    uint64_t   bursts_dropped_no_window;
 } bsp;
 
 static uint16_t parse_uint_env(const char *name, uint16_t def)
@@ -45,13 +48,15 @@ static uint16_t parse_uint_env(const char *name, uint16_t def)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp        = dsp;
-    bsp.daram_addr = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0);
-    bsp.daram_len  = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  1184);
+    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0);
+    bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  1184);
+    bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
     bsp.bursts_written = 0;
-    BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s",
+    BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",
             (void *)dsp, bsp.daram_addr, bsp.daram_len,
-            bsp.daram_addr ? "" : "  (DISCOVERY mode — no DMA)");
+            bsp.daram_addr ? "" : "  (DISCOVERY mode — no DMA)",
+            bsp.bypass_bdlena ? "  (BDLENA gate BYPASSED — debug)" : "");
 }
 
 void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
@@ -70,6 +75,21 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         if (bsp.bursts_seen <= 5) {
             BSP_LOG("rx_burst fn=%u tn=%u n=%d (target unset, sample[0]=%d sample[1]=%d)",
                     fn, tn, n_int16, iq[0], n_int16 > 1 ? iq[1] : 0);
+        }
+        return;
+    }
+
+    /* On real hw the BSP serial link only carries samples while IOTA's
+     * BDLENA pin is asserted. Mirror that: only commit a burst into DARAM
+     * if the firmware has issued a BDLENA rising edge that hasn't yet been
+     * consumed by an earlier burst. */
+    if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn)) {
+        bsp.bursts_dropped_no_window++;
+        if (bsp.bursts_dropped_no_window <= 5 ||
+            (bsp.bursts_dropped_no_window % 1000) == 0) {
+            BSP_LOG("DROP fn=%u tn=%u (no BDLENA window, dropped=%llu)",
+                    fn, tn,
+                    (unsigned long long)bsp.bursts_dropped_no_window);
         }
         return;
     }

@@ -1,70 +1,110 @@
 #!/bin/bash
-# run_tmp.sh — Lance fake_trx + BTS + QEMU + POWERON + mobile en tmux
-set -e
+# run_tmp.sh — Calypso QEMU pipeline, but TRXD bursts come from a cfile
+# played by inject_cfile.py instead of osmo-bts-trx + bridge TRXD relay.
+#
+#   QEMU (-serial pty) ← bridge.py → PTY (sercomm L1CTL DLCI 5)
+#                      ← bridge.py → /tmp/osmocom_l2_1 (mobile)
+#   inject_cfile.py → UDP 6702 → QEMU sercomm_gate → BSP DMA → DSP DARAM
+#
+# osmo-bts-trx is NOT started here. bridge.py still runs because it owns
+# the L1CTL unix socket; the BTS-side TRXD path is just left idle.
+set -uo pipefail
 
-SESSION="osmocom"
-TMUX_SOCKET="/tmp/osmocom_tmux"
+SESSION="calypso"
+QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
+FW="/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
+BRIDGE="/opt/GSM/qemu-src/bridge.py"
+INJECT="/opt/GSM/qemu-src/inject_cfile.py"
+CFILE="/root/out_arfcn_100.cfile"
+CFILE_RATE="${CFILE_RATE:-1024000}"
+MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
+L1CTL_SOCK="/tmp/osmocom_l2_1"
+QEMU_LOG="/tmp/qemu.log"
+BRIDGE_LOG="/tmp/bridge.log"
+INJECT_LOG="/tmp/inject.log"
+MOBILE_LOG="/tmp/mobile.log"
+VENV="/root/.env"
 
-echo "=== [1] Kill old processes ==="
-pkill -9 qemu-system-arm 2>/dev/null || true
-pkill -9 mobile 2>/dev/null || true
-pkill -f l1ctl_bridge 2>/dev/null || true
-pkill -9 -f fake_trx 2>/dev/null || true
-systemctl stop osmo-bts-trx 2>/dev/null || true
-tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-sleep 1
-rm -f /tmp/osmocom_l2* /tmp/qemu-calypso-mon*.sock /tmp/osmocom_tmux
-
-echo "=== [2] Create tmux ==="
-tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" -n faketrx
-tmux -S "$TMUX_SOCKET" new-window -t "$SESSION" -n qemu0
-tmux -S "$TMUX_SOCKET" new-window -t "$SESSION" -n ue_g1
-
-echo "=== [3] Start fake_trx ==="
-tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:faketrx" \
-  "python3 /opt/GSM/osmocom-bb/src/target/trx_toolkit/fake_trx.py" C-m
-sleep 3
-
-echo "=== [4] Start osmo-bts-trx ==="
-systemctl start osmo-bts-trx
-sleep 5
-
-echo "=== [5] Send RXTUNE+TXTUNE+POWERON to fake_trx MS (6701) ==="
-echo -ne 'CMD RXTUNE 1805600\0' | socat - UDP:127.0.0.1:6701
-echo -ne 'CMD TXTUNE 1710600\0' | socat - UDP:127.0.0.1:6701
-echo -ne 'CMD POWERON\0' | socat - UDP:127.0.0.1:6701
-sleep 1
-
-echo "=== [6] Start QEMU ==="
-tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:qemu0" \
-  "CALYPSO_TRX_PORT=0 /opt/GSM/qemu/build/qemu-system-arm -M calypso -cpu arm946 -display none -serial pty -serial pty -monitor unix:/tmp/qemu-calypso-mon-ms1.sock,server,nowait -kernel /opt/GSM/firmware/board/compal_e88/layer1.highram.elf 2>&1 | tee /var/log/osmocom/qemu.log" C-m
-sleep 5
-
-echo "=== [6b] Detect PTY and start l1ctl_bridge ==="
-PTY=$(grep -o '/dev/pts/[0-9]*' /var/log/osmocom/qemu.log 2>/dev/null | head -1)
-if [ -z "$PTY" ]; then
-  echo "ERROR: no PTY detected"
-else
-  echo "PTY=$PTY"
-  # Send cont to QEMU monitor
-  printf 'cont\n' | socat - UNIX-CONNECT:/tmp/qemu-calypso-mon-ms1.sock 2>/dev/null || true
-  sleep 2
-  tmux -S "$TMUX_SOCKET" new-window -t "$SESSION" -n bridge
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:bridge" \
-    "cd /opt/GSM/qemu && BRIDGE_AIR_PORT=6702 python3 l1ctl_bridge.py $PTY /tmp/osmocom_l2_1" C-m
+if [ -f "$VENV/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source "$VENV/bin/activate"
 fi
-sleep 10
 
-echo "=== [7] Start mobile ==="
-tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:ue_g1" \
-  "mobile -c /root/.osmocom/bb/mobile_group1.cfg" C-m
+# ── Cleanup ──
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+pkill -9 -x qemu-system-arm  2>/dev/null || true
+pkill -9 -f 'bridge\.py'     2>/dev/null || true
+pkill -9 -f 'inject_cfile'   2>/dev/null || true
+pkill -9 -x osmo-bts-trx     2>/dev/null || true
+pkill -9 -x mobile           2>/dev/null || true
+systemctl stop osmo-bts-trx  2>/dev/null || true
+rm -f "$L1CTL_SOCK" "$QEMU_LOG" "$BRIDGE_LOG" "$INJECT_LOG" "$MOBILE_LOG"
+read -p "Press ENTER to start cfile-injection run... " _
+sleep 1
 
-echo ""
-echo "╔════════════════════════════════════════════════════╗"
-echo "║  Attach: tmux -S $TMUX_SOCKET attach               ║"
-echo "║  Windows: faketrx | qemu0 | ue_g1                 ║"
-echo "║  QEMU log:   /tmp/qemu-bridge.log                 ║"
-echo "║  Bridge log: /var/log/osmocom/bridge.log           ║"
-echo "║                                                    ║"
-echo "║  tail -f /tmp/qemu-bridge.log  (dans un autre term)║"
-echo "╚════════════════════════════════════════════════════╝"
+# ── Sanity ──
+[ -x "$QEMU" ]      || { echo "FATAL: $QEMU not found";   exit 1; }
+[ -f "$FW" ]        || { echo "FATAL: $FW not found";     exit 1; }
+[ -f "$BRIDGE" ]    || { echo "FATAL: $BRIDGE not found"; exit 1; }
+[ -f "$INJECT" ]    || { echo "FATAL: $INJECT not found"; exit 1; }
+[ -f "$CFILE" ]     || { echo "FATAL: $CFILE not found";  exit 1; }
+[ -f "$MOBILE_CFG" ]|| echo "WARN: $MOBILE_CFG not found"
+
+# ── QEMU ──
+CALYPSO_BSP_DARAM_ADDR=0x62 CALYPSO_BSP_DARAM_LEN=128 $QEMU -M calypso \
+  -kernel "$FW" \
+  -serial pty \
+  -display none \
+  > "$QEMU_LOG" 2>&1 &
+QEMU_PID=$!
+
+PTY=""
+for i in $(seq 1 20); do
+    sleep 0.25
+    PTY=$(grep -o "/dev/pts/[0-9]*" "$QEMU_LOG" 2>/dev/null | head -1)
+    [ -n "$PTY" ] && break
+done
+if [ -z "$PTY" ]; then
+    echo "FATAL: QEMU did not allocate a PTY"
+    cat "$QEMU_LOG"
+    kill -9 "$QEMU_PID" 2>/dev/null
+    exit 1
+fi
+echo "QEMU PID=$QEMU_PID PTY=$PTY"
+
+# ── Bridge (still needed for L1CTL unix socket; TRXD relay sits idle) ──
+python3 "$BRIDGE" "$PTY" --sock "$L1CTL_SOCK" \
+        > "$BRIDGE_LOG" 2>&1 &
+BRIDGE_PID=$!
+
+echo -n "Waiting for L1CTL socket..."
+for i in $(seq 1 30); do
+    [ -S "$L1CTL_SOCK" ] && break
+    sleep 0.25; echo -n "."
+done
+[ -S "$L1CTL_SOCK" ] && echo " OK" || { echo " TIMEOUT"; cat "$BRIDGE_LOG"; }
+
+# Give the gate a moment to bind UDP 6702 before injection starts.
+sleep 1
+
+# ── tmux ──
+ACT="source $VENV/bin/activate"
+
+tmux new-session -d -s "$SESSION" -n qemu
+tmux send-keys -t "$SESSION:qemu"  "$ACT && tail -F $QEMU_LOG" C-m
+
+tmux new-window -t "$SESSION" -n bridge
+tmux send-keys -t "$SESSION:bridge" "$ACT && tail -F $BRIDGE_LOG" C-m
+
+tmux new-window -t "$SESSION" -n inject
+tmux send-keys -t "$SESSION:inject" \
+    "$ACT && python3 $INJECT $CFILE --rate $CFILE_RATE --loop 2>&1 | tee $INJECT_LOG" C-m
+
+tmux new-window -t "$SESSION" -n mobile
+tmux send-keys -t "$SESSION:mobile" "$ACT && sleep 5 && mobile -c $MOBILE_CFG 2>&1 | tee $MOBILE_LOG" C-m
+
+tmux new-window -t "$SESSION" -n shell
+tmux send-keys -t "$SESSION:shell" "$ACT" C-m
+
+tmux select-window -t "$SESSION:qemu"
+exec tmux attach -t "$SESSION"

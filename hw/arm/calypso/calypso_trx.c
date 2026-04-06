@@ -14,6 +14,7 @@
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_bsp.h"
+#include "hw/arm/calypso/calypso_iota.h"
 #include "calypso_tint0.h"
 void calypso_tint0_do_tick(uint32_t fn);
 #include "chardev/char-fe.h"
@@ -123,6 +124,28 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     if (size == 2) s->dsp_ram[offset/2] = value;
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
+
+    /* Mirror every ARM write into the DSP-side api_ram at the same word
+     * offset. The Calypso API RAM (W/R pages, NDB, PARAM) is physically
+     * shared between ARM and DSP — they see the same SRAM cells via two
+     * different bus addresses. Without this mirror the DSP can never see
+     * d_task_md or any other command the L1 ARM posts. */
+    if (s->dsp && s->dsp->api_ram) {
+        unsigned woff = offset / 2;
+        if (size == 2) {
+            if (woff < C54X_API_SIZE)
+                s->dsp->api_ram[woff] = (uint16_t)value;
+        } else if (size == 4) {
+            if (woff + 1 < C54X_API_SIZE) {
+                s->dsp->api_ram[woff]     = (uint16_t)value;
+                s->dsp->api_ram[woff + 1] = (uint16_t)(value >> 16);
+            }
+        } else {
+            /* byte write — refresh the containing word */
+            if (woff < C54X_API_SIZE)
+                s->dsp->api_ram[woff] = s->dsp_ram[woff];
+        }
+    }
 
     /* Sync d_dsp_page writes to DSP API RAM immediately */
     if (offset == 0x01A8) {
@@ -236,6 +259,112 @@ static const MemoryRegionOps calypso_dsp_ops = {
 /* ---- TPU ---- */
 /* calypso_tint0_start() is in calypso_tint0.c */
 
+/* TPU instruction opcodes — match osmocom-bb include/calypso/tpu.h */
+#define TPU_OP_SLEEP    (0u << 13)
+#define TPU_OP_AT       (1u << 13)
+#define TPU_OP_OFFSET   (2u << 13)
+#define TPU_OP_SYNCHRO  (3u << 13)
+#define TPU_OP_MOVE     (4u << 13)
+#define TPU_OP_WAIT     (5u << 13)
+#define TPU_OP_MASK     (7u << 13)
+
+/* TPU MOVE target addresses — match osmocom-bb include/calypso/tpu.h */
+#define TPUI_TSP_CTRL1  0x00
+#define TPUI_TSP_CTRL2  0x01
+#define TPUI_TX_3       0x02
+#define TPUI_TX_2       0x03
+#define TPUI_TX_1       0x04
+#define TPUI_TX_4       0x05
+
+#define TPUI_CTRL2_RD   (1u << 0)
+#define TPUI_CTRL2_WR   (1u << 1)
+
+/*
+ * Walk the TPU script starting at TPU RAM offset 0, decode each instruction,
+ * model the embedded TSP write state machine, and dispatch device-bound TSP
+ * writes (currently only TWL3025 / IOTA, dev_idx 0). Time-related ops
+ * (AT/WAIT/OFFSET/SYNCHRO) are honored as control flow but not as wall-clock
+ * delays — each script invocation runs in zero virtual time, which is
+ * sufficient to track IOTA's per-frame BDLENA windows.
+ */
+/* Layer1 timing constants — straight from osmocom-bb tpu_window.c /
+ * abb/twl3025.c. Used to derive the GSM timeslot the L1 has armed
+ * BDLENA for, from the AT instruction qbit value preceding the
+ * BDLON|BDLENA TSP MOVE in the TPU script. */
+#define L1_BURST_LENGTH_Q   625        /* qbits per burst slot */
+#define L1_TDMA_LENGTH_Q    5000       /* qbits per TDMA frame */
+#define DSP_SETUP_TIME      66         /* qbit at which TS0 receive starts */
+#define TWL3025_TSP_DELAY   6          /* TSP_DELAY in twl3025.c */
+
+/* Convert the qbit value of the AT instruction immediately preceding a
+ * MOVE BDLON|BDLENA into the GSM TN the L1 expects samples from.
+ *
+ * twl3025_downlink(1, at) computes  bdl_ena = at - TSP_DELAY - 6
+ * and the call site uses  at = DSP_SETUP_TIME + L1_BURST_LENGTH_Q * tn_ofs.
+ *
+ * So  qbit_at_BDLENA = bdl_ena = DSP_SETUP_TIME - TSP_DELAY - 6 + 625*tn
+ *                              = 66 - 6 - 6 + 625*tn = 54 + 625*tn.
+ */
+static uint8_t qbit_to_tn(uint16_t qbit)
+{
+    int q = (int)qbit - (DSP_SETUP_TIME - TWL3025_TSP_DELAY - 6);
+    if (q < 0) q += L1_TDMA_LENGTH_Q;
+    int tn = (q + L1_BURST_LENGTH_Q / 2) / L1_BURST_LENGTH_Q; /* nearest */
+    return (uint8_t)(tn & 0x7);
+}
+
+static void calypso_tpu_run_script(CalypsoTRX *s)
+{
+    uint8_t  tx[4]    = {0, 0, 0, 0};   /* accumulated TSP TX bytes */
+    uint8_t  dev_idx  = 0;
+    uint8_t  bitlen   = 0; (void)bitlen;
+    uint16_t last_at  = DSP_SETUP_TIME - TWL3025_TSP_DELAY - 6; /* default tn=0 */
+    int      max = CALYPSO_TPU_RAM_SIZE / 2;
+
+    for (int i = 0; i < max; i++) {
+        uint16_t instr = s->tpu_ram[i];
+        uint16_t op    = instr & TPU_OP_MASK;
+
+        if (op == TPU_OP_SLEEP) {
+            break;
+        }
+        if (op == TPU_OP_AT) {
+            /* AT operand is the qbit time, low 13 bits */
+            last_at = instr & 0x1FFF;
+            continue;
+        }
+        if (op != TPU_OP_MOVE) {
+            continue;                          /* WAIT/OFFSET/SYNCHRO */
+        }
+
+        uint8_t addr = instr & 0x1f;
+        uint8_t data = (instr >> 5) & 0xff;
+
+        switch (addr) {
+        case TPUI_TX_1: tx[0] = data; break;
+        case TPUI_TX_2: tx[1] = data; break;
+        case TPUI_TX_3: tx[2] = data; break;
+        case TPUI_TX_4: tx[3] = data; break;
+        case TPUI_TSP_CTRL1:
+            dev_idx = (data >> 5) & 0x7;
+            bitlen  = (data & 0x1f) + 1;
+            break;
+        case TPUI_TSP_CTRL2:
+            if (data & TPUI_CTRL2_WR) {
+                if (dev_idx == 0 /* TWL3025_TSP_DEV_IDX */) {
+                    /* The expected timeslot for this BDLENA window is
+                     * derived from the most recent AT instruction. */
+                    uint8_t tn = qbit_to_tn(last_at);
+                    calypso_iota_tsp_write(tx[0], tn);
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static uint64_t calypso_tpu_read(void *o, hwaddr off, unsigned sz) {
     CalypsoTRX *s=o; if (off==TPU_IT_DSP_PG) return s->dsp_page;
     return (off/2<CALYPSO_TPU_SIZE/2)?s->tpu_regs[off/2]:0;
@@ -250,8 +379,12 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
             s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_IDLE;
             calypso_tint0_tpu_en();
             l1ctl_set_burst_mode(true);
-            static int tpu_en_log = 0;
-            if (tpu_en_log < 10) { TRX_LOG("TPU_CTRL_EN fn=%u", s->fn); tpu_en_log++; }
+            static unsigned tpu_run_count = 0;
+            tpu_run_count++;
+            calypso_tpu_run_script(s);
+            if (tpu_run_count <= 20 || (tpu_run_count % 200) == 0) {
+                TRX_LOG("TPU_CTRL_EN #%u fn=%u", tpu_run_count, s->fn);
+            }
         }
         /* DSP_EN handled by dsp_done via SINT17 */
     }
@@ -673,6 +806,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
                 s->dsp->running = false;
                 /* Hand the DSP off to the BSP DMA module */
                 calypso_bsp_init(s->dsp);
+                calypso_iota_init();
                 TRX_LOG("BUILD 2026-04-05T20:30:16 F4EB=RETE IMR_keep");
                 TRX_LOG("C54x DSP loaded from %s (waiting for ARM)", rom_path);
             } else {

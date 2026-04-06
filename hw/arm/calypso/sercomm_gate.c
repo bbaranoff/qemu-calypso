@@ -67,17 +67,17 @@ static enum gate_rx_state sc_state;
 static void gate_push_to_fifo(CalypsoUARTState *s,
                               const uint8_t *frame, int len)
 {
-    calypso_uart_fifo_push(s, SERCOMM_FLAG);
+    { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
     for (int i = 0; i < len; i++) {
         uint8_t c = frame[i];
         if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE || c == 0x00) {
-            calypso_uart_fifo_push(s, SERCOMM_ESCAPE);
-            calypso_uart_fifo_push(s, c ^ SERCOMM_XOR);
+            { uint8_t _e = SERCOMM_ESCAPE; calypso_uart_inject_raw(s, &_e, 1); }
+            { uint8_t _x = c ^ SERCOMM_XOR; calypso_uart_inject_raw(s, &_x, 1); }
         } else {
-            calypso_uart_fifo_push(s, c);
+            calypso_uart_inject_raw(s, &c, 1);
         }
     }
-    calypso_uart_fifo_push(s, SERCOMM_FLAG);
+    { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
 }
 
 void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
@@ -92,7 +92,7 @@ void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
                 sc_len = 0;
             } else {
                 /* Pre-sercomm raw bytes pass through (loader/console). */
-                calypso_uart_fifo_push(s, b);
+                calypso_uart_inject_raw(s, &b, 1);
             }
             break;
 

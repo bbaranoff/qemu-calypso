@@ -32,8 +32,8 @@
 #define TINT0_TCR_ADDR      0x0026       /* Timer control */
 
 /* C54x IFR/IMR bit for TINT0 */
-#define TINT0_IFR_BIT       3            /* IFR/IMR bit 4 */
-#define TINT0_VEC           19           /* Interrupt vector 20 (offset 0x50) */
+#define TINT0_IFR_BIT       4            /* IFR/IMR bit 4 */
+#define TINT0_VEC           20           /* Interrupt vector 20 (offset 0x50) */
 
 /* Start the master clock */
 void calypso_tint0_start(void);

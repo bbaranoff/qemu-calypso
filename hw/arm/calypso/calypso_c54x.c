@@ -66,19 +66,58 @@ static inline int asm_shift(C54xState *s)
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     /* === BSP discovery: trace data reads in FB-det handler ===
-     * FCCH detection lives in PROM0 0x7730..0x7990 (project_dsp_fb_det).
-     * Logging the addresses touched there reveals where BSP must DMA. */
-    if (s->pc >= 0x7730 && s->pc <= 0x7990) {
+     * Wide range over the PROM0 user-code area: handler PCs observed in
+     * timeout traces cluster around 0x7e92..0x7eb8 (the FB-det inner
+     * loop), so we widen the catch zone to 0x7000..0x7fff. */
+    /* FB-det / dispatcher subroutine trace.
+     * The 0x7e80..0x7eb8 wrapper CALLS into 0x81a5/0x81c8 with AR5=0x0e4c
+     * (the FB sample buffer). Cover both ranges to catch both wrapper
+     * polls and inner correlator reads. Skip the boot init phase. */
+    /* Generic DARAM-read profiler. With the decoder fixed, the L1 now
+     * schedules PM and FB tasks but we don't yet know which DARAM
+     * addresses each task reads samples from. Log the first occurrence
+     * of every (PC, addr) pair where the DSP reads from low DARAM
+     * (<0x4000) so we can map sample buffers per task. Capped to 200
+     * unique entries; uses a tiny open-addressing dedup table. */
+    if (addr < 0x4000 && s->insn_count > 5000000 && s->pc >= 0x0010) {
+        /* Bitmap dedup keyed on addr only — log first read of each
+         * unique DARAM cell. 0x4000 cells = 0x800 bytes bitmap. */
+        static uint8_t seen_bm[0x800];
+        static int seen_n = 0;
+        if (!(seen_bm[addr >> 3] & (1 << (addr & 7)))) {
+            seen_bm[addr >> 3] |= (1 << (addr & 7));
+            seen_n++;
+            C54_LOG("DARAM-RD #%d [0x%04x] PC=0x%04x AR2=%04x AR3=%04x "
+                    "AR5=%04x insn=%u",
+                    seen_n, addr, s->pc, s->ar[2], s->ar[3], s->ar[5],
+                    s->insn_count);
+        }
+    }
+    if ((s->pc >= 0x7700 && s->pc <= 0x7990) ||
+        (s->pc >= 0x7e80 && s->pc <= 0x7ec0) ||
+        (s->pc >= 0x81a0 && s->pc <= 0x82ff)) {
         static int fbdet_rd_log = 0;
-        if (fbdet_rd_log < 200) {
+        if (s->insn_count > 100000000 && fbdet_rd_log < 10000) {
             uint16_t v;
             if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
                 v = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0;
             else
                 v = s->data[addr];
-            C54_LOG("FBDET RD [0x%04x]=0x%04x PC=0x%04x insn=%u",
-                    addr, v, s->pc, s->insn_count);
+            C54_LOG("FBDET RD [0x%04x]=0x%04x PC=0x%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
+                    addr, v, s->pc, s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
             fbdet_rd_log++;
+        }
+    }
+    /* Log AR0..AR7 when entering FB-det subroutines to understand
+     * what each AR points at (sample buffer? coeffs? status?). */
+    if ((s->pc == 0x81a5 || s->pc == 0x81c8) && s->insn_count > 50000000) {
+        static int ar_log = 0;
+        if (ar_log < 10) {
+            C54_LOG("FB-CALL PC=0x%04x AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                    "AR4=%04x AR5=%04x AR6=%04x AR7=%04x SP=%04x BK=%04x",
+                    s->pc, s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                    s->ar[4], s->ar[5], s->ar[6], s->ar[7], s->sp, s->bk);
+            ar_log++;
         }
     }
     /* d_spcx_rif (NDB word 2 = api 0xD6 = DSP data 0x08D6) */
@@ -177,6 +216,15 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* Trace writes to NDB d_fb_det / neighborhood (DSP 0x08F0..0x0900) */
+    if (addr >= 0x08F0 && addr <= 0x0900) {
+        static int ndb_wr_log = 0;
+        if (ndb_wr_log < 200) {
+            C54_LOG("NDB WR [0x%04x]=0x%04x PC=0x%04x A=0x%llx insn=%u",
+                    addr, val, s->pc, (unsigned long long)s->a, s->insn_count);
+            ndb_wr_log++;
+        }
+    }
     /* Timer registers (0x0024-0x0026) — before MMR check */
     if (addr == TCR_ADDR) {
         /* TRB: write 1 → reload TIM from PRD, PSC from TDDR */
@@ -226,8 +274,12 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             }
             s->pmst = val; return;
         case MMR_XPC:
-            /* Calypso DSP doesn't use extended program space.
-             * Some code writes arbitrary values here during block copies. */
+            {
+                static int xpc_log = 0;
+                if (xpc_log++ < 50)
+                    C54_LOG("MMR_XPC WR val=0x%04x (was %d) PC=0x%04x SP=0x%04x insn=%u",
+                            val, s->xpc, s->pc, s->sp, s->insn_count);
+            }
             s->xpc = val & 3;
             return;
         default: return;
@@ -238,14 +290,73 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
         if (s->api_ram)
             s->api_ram[addr - C54X_API_BASE] = val;
-        /* Always log writes to d_dsp_page (0x08D4) */
+        /* Writes to d_dsp_page (0x08D4) — valid values are only 0/2/3
+         * (page select bits). Anything else is a DSP-side bug: log every
+         * occurrence so we see when/where it happens. */
         if (addr == 0x08D4) {
-            C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u", val, s->pc, s->insn_count);
+            if (val > 3) {
+                C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u  *** CORRUPT (must not exist) ***",
+                        val, s->pc, s->insn_count);
+            } else {
+                C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u", val, s->pc, s->insn_count);
+            }
         }
         /* d_spcx_rif (NDB word 2 = DSP data 0x08D6) — BSP serial port config */
         if (addr == 0x08D6) {
-            C54_LOG("DSP WR d_spcx_rif = 0x%04x PC=0x%04x insn=%u",
-                    val, s->pc, s->insn_count);
+            static int rif_log = 0;
+            if (rif_log < 10) {
+                C54_LOG("DSP WR d_spcx_rif = 0x%04x PC=0x%04x insn=%u",
+                        val, s->pc, s->insn_count);
+                rif_log++;
+            }
+        }
+        /* d_fb_det (NDB word 36 = DSP data 0x08F8). Only legitimate
+         * values are 0 (clear) or 1 (FB found). Anything else is a bug
+         * — log every occurrence. */
+        /* Generic NDB-WRITE profiler: log first DSP write to each
+         * unique API/NDB cell so we can map where the PM task posts
+         * its result. Capped to 200 unique cells; insn_count gate keeps
+         * the boot init noise out. */
+        {
+            static uint8_t ndb_seen_bm[(C54X_API_SIZE + 7) / 8];
+            static int ndb_seen_n = 0;
+            int api_off = addr - C54X_API_BASE;
+            if (api_off >= 0 && api_off < C54X_API_SIZE &&
+                s->insn_count > 5000000 && ndb_seen_n < 500 &&
+                !(ndb_seen_bm[api_off >> 3] & (1 << (api_off & 7)))) {
+                ndb_seen_bm[api_off >> 3] |= (1 << (api_off & 7));
+                ndb_seen_n++;
+                C54_LOG("NDB-WR #%d [0x%04x]=0x%04x PC=0x%04x insn=%u",
+                        ndb_seen_n, addr, val, s->pc, s->insn_count);
+            }
+        }
+        if (addr == 0x08F8) {
+            if (val == 0 || val == 1) {
+                C54_LOG("DSP WR d_fb_det = %u PC=0x%04x insn=%u %s",
+                        val, s->pc, s->insn_count,
+                        val == 1 ? "*** FB DETECTED ***" : "(clear)");
+            } else {
+                C54_LOG("DSP WR d_fb_det = 0x%04x PC=0x%04x insn=%u  *** GARBAGE (must not exist) ***",
+                        val, s->pc, s->insn_count);
+            }
+        }
+    }
+
+    /* Watch the specific stack slot 0xEEB3 that the first runaway reads
+     * 0x0001 from. Any write here is logged unconditionally so we can
+     * see whether 0x0001 is pushed by a legitimate CALL or scribbled by
+     * something else. Also keep a wider range trace for context. */
+    if (addr == 0xEEB3 && s->insn_count > 5000000 && s->pc >= 0x0010) {
+        C54_LOG("STACK WR [0xEEB3] = 0x%04x PC=0x%04x SP=0x%04x insn=%u",
+                val, s->pc, s->sp, s->insn_count);
+    }
+    if (addr >= 0xEEB0 && addr <= 0xEEB6 && s->insn_count > 5000000 &&
+        s->pc >= 0x0010) {
+        static int stack_log = 0;
+        if (stack_log < 200) {
+            C54_LOG("STACK WR [0x%04x] = 0x%04x PC=0x%04x SP=0x%04x insn=%u",
+                    addr, val, s->pc, s->sp, s->insn_count);
+            stack_log++;
         }
     }
 
@@ -441,6 +552,14 @@ static int c54x_exec_one(C54xState *s)
             daram_log++;
         }
         prev_pc = s->pc;
+        /* DARAM 0x1100-0x1130 tracer: dump first 64 visits */
+        static int daram1110_log = 0;
+        if (s->pc >= 0x1100 && s->pc <= 0x1130 && daram1110_log < 64) {
+            C54_LOG("DARAM110x PC=0x%04x op=0x%04x A=%08x B=%08x AR2=%04x AR3=%04x AR4=%04x AR5=%04x BRC=%d",
+                    s->pc, op, (uint32_t)s->a, (uint32_t)s->b,
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->brc);
+            daram1110_log++;
+        }
     }
     if (s->pc >= 0xFE00 && s->pc <= 0xFFFF && op == 0x0000) {
         static int nop_slide = 0;
@@ -526,8 +645,24 @@ static int c54x_exec_one(C54xState *s)
         }
 
         /* F4E2 = RSBX INTM (enable interrupts), F4E3 = SSBX INTM (disable interrupts) */
-        if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
-        if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
+        /* F4E2 = BACC A, F5E2 = BACC B (per tic54x-opc.c, mask 0xFEFF) */
+        if (op == 0xF4E2) { s->pc = (uint16_t)(s->a & 0xFFFF); return 0; }
+        if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
+        /* F4E3 = CALA A, F5E3 = CALA B — push next-PC, jump to acc low 16 bits */
+        if (op == 0xF4E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->a & 0xFFFF);
+            return 0;
+        }
+        if (op == 0xF5E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->b & 0xFFFF);
+            return 0;
+        }
         /* F4E0-F4FF: RSBX/SSBX status bits — treat as NOP (most don't affect emulation) */
         if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
             return consumed + s->lk_used;
@@ -1049,90 +1184,28 @@ static int c54x_exec_one(C54xState *s)
             /* NOP */
             return consumed + s->lk_used;
         }
-        if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
-        if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
+        /* F4E2 = BACC A, F5E2 = BACC B (per tic54x-opc.c, mask 0xFEFF) */
+        if (op == 0xF4E2) { s->pc = (uint16_t)(s->a & 0xFFFF); return 0; }
+        if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
+        /* F4E3 = CALA A, F5E3 = CALA B — push next-PC, jump to acc low 16 bits */
+        if (op == 0xF4E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->a & 0xFFFF);
+            return 0;
+        }
+        if (op == 0xF5E3) {
+            uint16_t ret_pc = s->pc + 1;
+            s->sp = (s->sp - 1) & 0xFFFF;
+            data_write(s, s->sp, ret_pc);
+            s->pc = (uint16_t)(s->b & 0xFFFF);
+            return 0;
+        }
         if (op == 0xF4E4) {
             /* IDLE */
             s->idle = true;
             return consumed + s->lk_used;  /* Advance PC past IDLE */
-        }
-        /* FXXX short immediates and misc */
-        if (hi8 == 0xF0 || hi8 == 0xF1) {
-        /* FIRS Xmem, Ymem, pmad -- Symmetric FIR filter step (2 words)
-         * Encoding: 1111 0001 XXXX YYYY + pmad
-         * Execution: B = rnd(B + A(32-16) * prog[pmad])
-         *            A = (Xmem + Ymem) << 16
-         * Per SPRU172C p.4-59 */
-        if (hi8 == 0xF1 && (op & 0xFF00) == 0xF100) {
-            uint8_t xmod = (op >> 4) & 0xF;
-            uint8_t ymod = op & 0xF;
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            /* Resolve Xmem and Ymem via dual indirect addressing */
-            /* Xmem uses ARP, Ymem uses AR(ymod & 7) */
-            int xar = (op >> 4) & 0x07;
-            int yar = ymod & 0x07;
-            uint16_t xval = data_read(s, s->ar[xar]);
-            uint16_t yval = data_read(s, s->ar[yar]);
-            /* Post-modify: Xmem uses xmod, Ymem uses ymod */
-            if ((xmod & 0x1) == 0) s->ar[xar]++; else s->ar[xar]--;
-            if ((ymod & 0x8) == 0) s->ar[yar]++; else s->ar[yar]--;
-            /* Read coefficient from program memory */
-            int16_t coeff = (int16_t)prog_read(s, op2);
-            /* B += A(32-16) * coeff */
-            int16_t ah = (int16_t)((s->a >> 16) & 0xFFFF);
-            int64_t product = (int64_t)ah * (int64_t)coeff;
-            if (s->st1 & ST1_FRCT) product <<= 1;
-            s->b = sext40(s->b + product);
-            /* A = (Xmem + Ymem) << 16 */
-            int32_t sum = (int32_t)(int16_t)xval + (int32_t)(int16_t)yval;
-            s->a = sext40((int64_t)sum << 16);
-            return consumed + s->lk_used;
-        }
-            /* F0xx/F1xx: various - SSBX, RSBX, etc. */
-            if ((op & 0xFFF0) == 0xF070) {
-                /* F07x: misc control */
-                uint8_t sub = op & 0x0F;
-                if (sub == 0x3) {
-                    /* F073: B pmad — unconditional branch (2-word) */
-                    op2 = prog_fetch(s, s->pc + 1);
-                    s->pc = op2;
-                    return 0;
-                }
-                if (sub == 0x4) {
-                    /* F074: CALL pmad — unconditional call (2-word).
-                     * Push PC+2, branch to pmad. */
-                    op2 = prog_fetch(s, s->pc + 1);
-                    s->sp--;
-                    data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                    s->pc = op2;
-                    return 0;
-                }
-
-
-
-
-
-
-
-
-                goto unimpl;
-            }
-            /* F0Bx / F1Bx: RSBX/SSBX */
-            if ((op & 0xFE00) == 0xF000 && (op & 0x00F0) == 0x00B0) {
-                /* RSBX/SSBX bit in ST0/ST1 */
-                int bit = op & 0x0F;
-                int set = (op >> 8) & 1;
-                int st = (op >> 5) & 1;  /* 0=ST0, 1=ST1 */
-                if (st == 0) {
-                    if (set) s->st0 |= (1 << bit);
-                    else     s->st0 &= ~(1 << bit);
-                } else {
-                    if (set) s->st1 |= (1 << bit);
-                    else     s->st1 &= ~(1 << bit);
-                }
-                return consumed + s->lk_used;
-            }
         }
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
@@ -1330,19 +1403,41 @@ static int c54x_exec_one(C54xState *s)
                 s->st1 &= ~(1 << bit);
                 return consumed + s->lk_used;
             }
+            /* CMPR cond, ARx — Compare auxiliary register with AR0.
+             * Encoding (tic54x-opc.c): opcode 0xF4A8 mask 0xFCF8.
+             *   bits 9:8 = cond (00=EQ, 01=LT, 10=GT, 11=NEQ)
+             *   bits 2:0 = ARx
+             * Sets TC = (ARx <cond> AR0). Single word. */
+            if ((op & 0xFCF8) == 0xF4A8) {
+                int cond = (op >> 8) & 3;
+                int arx  = op & 7;
+                uint16_t a = s->ar[arx];
+                uint16_t b = s->ar[0];
+                bool tc;
+                switch (cond) {
+                case 0: tc = (a == b); break;
+                case 1: tc = (a <  b); break;
+                case 2: tc = (a >  b); break;
+                default: tc = (a != b); break;
+                }
+                if (tc) s->st0 |=  ST0_TC;
+                else    s->st0 &= ~ST0_TC;
+                return consumed + s->lk_used;
+            }
+            /* F68x-F6Fx: previously decoded as MVDD Xmem,Ymem with the
+             * encoding 1111 0110 XXXX YYYY. That decoding turned 0xF6A8
+             * into a write of data[AR[2]] into data[AR[0]] — and when
+             * AR[0]==0x18 (SP MMR address) it scribbled SP, causing the
+             * runaway at PC=0xf2cc. The actual C54x opcode in this slot
+             * (likely SACCD or similar) is not yet identified, so log
+             * once and treat as NOP rather than corrupt memory. */
             if (sub >= 0x8) {
-                /* F68x-F6Fx: MVDD Xmem, Ymem — dual data-memory operand move
-                 * Encoding: 1111 0110 XXXX YYYY
-                 *   bit 7   = Xmod (0=inc, 1=dec)
-                 *   bits 6:4 = Xar  (source AR register)
-                 *   bit 3   = Ymod (0=inc, 1=dec)
-                 *   bits 2:0 = Yar  (dest AR register) */
-                int xar = (op >> 4) & 0x07;
-                int yar = op & 0x07;
-                uint16_t val = data_read(s, s->ar[xar]);
-                data_write(s, s->ar[yar], val);
-                if ((op >> 7) & 1) s->ar[xar]--; else s->ar[xar]++;
-                if ((op >> 3) & 1) s->ar[yar]--; else s->ar[yar]++;
+                static int unk_log = 0;
+                if (unk_log < 10) {
+                    C54_LOG("UNIMPL F6 op=0x%04x PC=0x%04x insn=%u (treated as NOP)",
+                            op, s->pc, s->insn_count);
+                    unk_log++;
+                }
                 return consumed + s->lk_used;
             }
             /* Other F6xx: treat as NOP for now */
@@ -1379,8 +1474,16 @@ static int c54x_exec_one(C54xState *s)
                 s->st0 |= (1 << bit);
                 return consumed + s->lk_used;
             }
-            /* RPT #k (short immediate) — advance PC past RPT now,
-             * the NEXT instruction at PC+1 will be repeated. */
+            /* F5E2 = BACC B, F5E3 = CALA B (already handled above for F4 versions) */
+            if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
+            if (op == 0xF5E3) {
+                uint16_t ret_pc = s->pc + 1;
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, ret_pc);
+                s->pc = (uint16_t)(s->b & 0xFFFF);
+                return 0;
+            }
+            /* RPT #k (short immediate) — kept as fallback, must advance PC. */
             s->rpt_count = op & 0xFF;
             s->rpt_active = true;
             s->pc += 1;
@@ -1629,51 +1732,47 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0xEC) {
-            /* EC: BC pmad, cond (conditional branch, 2 words)
-             * Same condition table as CC (tic54x-dis.c cc2[]) */
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint8_t cond = op & 0xFF;
-            int64_t sa = sext40(s->a), sb = sext40(s->b);
-            bool take = false;
-            switch (cond) {
-            case 0x00: take = true; break;          /* UNC */
-            case 0x02: take = (sa >= 0); break;     /* AGEQ */
-            case 0x03: take = (sa < 0); break;      /* ALT */
-            case 0x04: take = (sa != 0); break;     /* ANEQ */
-            case 0x05: take = (sa == 0); break;     /* AEQ */
-            case 0x06: take = (sa > 0); break;      /* AGT */
-            case 0x07: take = (sa <= 0); break;     /* ALEQ */
-            case 0x0A: take = (sb >= 0); break;     /* BGEQ */
-            case 0x0B: take = (sb < 0); break;      /* BLT */
-            case 0x0C: take = (sb != 0); break;     /* BNEQ */
-            case 0x0D: take = (sb == 0); break;     /* BEQ */
-            case 0x0E: take = (sb > 0); break;      /* BGT */
-            case 0x0F: take = (sb <= 0); break;     /* BLEQ */
-            case 0x20: take = !(s->st0 & ST0_C); break;  /* NC */
-            case 0x21: take = (s->st0 & ST0_C) != 0; break; /* C */
-            case 0x30: take = !(s->st0 & ST0_TC); break; /* NTC */
-            case 0x31: take = (s->st0 & ST0_TC) != 0; break; /* TC */
-            case 0x60: take = !(s->st0 & ST0_OVA); break; /* ANOV */
-            case 0x61: take = (s->st0 & ST0_OVA) != 0; break; /* AOV */
-            case 0x68: take = !(s->st0 & ST0_OVB); break; /* BNOV */
-            case 0x69: take = (s->st0 & ST0_OVB) != 0; break; /* BOV */
-            default: take = true; break;  /* compound cond — take conservatively */
-            }
-            if (take) { s->pc = op2; return 0; }
-            return consumed + s->lk_used;
+            /* ECxx: RPT #k8u — repeat next instruction k8u+1 times.
+             * Per tic54x-opc.c: rpt 0xEC00 mask 0xFF00, single word.
+             * Must advance PC past RPT now and return 0 so the dispatcher
+             * re-executes the NEXT instruction (not RPT itself). */
+            s->rpt_count = op & 0xFF;
+            s->rpt_active = true;
+            s->pc += 1;
+            return 0;
         }
         if (hi8 == 0xE5) {
-            /* E5xx: MVMM mmr, mmr */
-            int src = (op >> 4) & 0xF;
-            int dst = op & 0xF;
-            uint16_t val;
-            if (src >= 0 && src <= 7) val = s->ar[src];
-            else if (src == 8) val = s->sp;
-            else val = data_read(s, src + 0x10);
-            if (dst >= 0 && dst <= 7) s->ar[dst] = val;
-            else if (dst == 8) s->sp = val;
-            else data_write(s, dst + 0x10, val);
+            /* E5xx: MVDD Xmem, Ymem  (per tic54x-opc.c, NOT MVMM)
+             * 1-word, 2-cycle dual-operand data-to-data move:
+             *   *Ymem = *Xmem
+             * Per tic54x.h:
+             *   XMEM = (op & 0xF0) >> 4
+             *   YMEM = op & 0x0F
+             *   XMOD/YMOD = (nibble & 0xC) >> 2  (0=*AR,1=*AR-,2=*AR+,3=*AR+0%)
+             *   XARX/YARX = (nibble & 0x3) + 2   (AR2..AR5 only) */
+            uint8_t xnib = (op >> 4) & 0xF;
+            uint8_t ynib = op & 0xF;
+            int xar = (xnib & 0x3) + 2;
+            int yar = (ynib & 0x3) + 2;
+            int xmod = (xnib & 0xC) >> 2;
+            int ymod = (ynib & 0xC) >> 2;
+            uint16_t xa = s->ar[xar];
+            uint16_t ya = s->ar[yar];
+            uint16_t v = data_read(s, xa);
+            data_write(s, ya, v);
+            /* Post-modify both ARs per their mod field */
+            switch (xmod) {
+                case 0: break;                        /* *AR     */
+                case 1: s->ar[xar] = xa - 1; break;   /* *AR-    */
+                case 2: s->ar[xar] = xa + 1; break;   /* *AR+    */
+                case 3: s->ar[xar] = xa + s->ar[0]; break; /* *AR+0% (no circular here) */
+            }
+            switch (ymod) {
+                case 0: break;
+                case 1: s->ar[yar] = ya - 1; break;
+                case 2: s->ar[yar] = ya + 1; break;
+                case 3: s->ar[yar] = ya + s->ar[0]; break;
+            }
             return consumed + s->lk_used;
         }
         if (hi8 == 0xE4) {
@@ -1686,56 +1785,35 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0xE7) {
-            /* E7xx: ST #k, Smem or LD #k,16, dst (short immediate) */
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, op2);
+            /* E7xx: MVMM mmrx, mmry  (per tic54x-opc.c)
+             * 1-word, 2-cycle, MMR-to-MMR move using a constrained set
+             * (MMRX/MMRY operand types). */
+            int src = (op >> 4) & 0xF;
+            int dst = op & 0xF;
+            uint16_t val;
+            if (src <= 7) val = s->ar[src];
+            else if (src == 8) val = s->sp;
+            else val = data_read(s, src + 0x10);
+            if (dst <= 7) s->ar[dst] = val;
+            else if (dst == 8) s->sp = val;
+            else data_write(s, dst + 0x10, val);
             return consumed + s->lk_used;
         }
-        if (hi8 == 0xE9) {
-            /* E9xx: CC pmad, cond (conditional call, 2 words)
-             * Condition codes per tic54x-dis.c cc2[] table (SPRU172C Table 3-3):
-             * 0x00=UNC, 0x02=AGEQ, 0x03=ALT, 0x04=ANEQ, 0x05=AEQ,
-             * 0x06=AGT, 0x07=ALEQ, 0x0A=BGEQ, 0x0B=BLT, 0x0C=BNEQ,
-             * 0x0D=BEQ, 0x0E=BGT, 0x0F=BLEQ,
-             * 0x20=NC, 0x21=C, 0x30=NTC, 0x31=TC,
-             * 0x40=NBIO, 0x60=ANOV, 0x61=AOV, 0x68=BNOV, 0x69=BOV */
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint8_t cond = op & 0xFF;
-            int64_t sa = sext40(s->a), sb = sext40(s->b);
-            bool take = false;
-            switch (cond) {
-            case 0x00: take = true; break;          /* UNC */
-            case 0x02: take = (sa >= 0); break;     /* AGEQ */
-            case 0x03: take = (sa < 0); break;      /* ALT */
-            case 0x04: take = (sa != 0); break;     /* ANEQ */
-            case 0x05: take = (sa == 0); break;     /* AEQ */
-            case 0x06: take = (sa > 0); break;      /* AGT */
-            case 0x07: take = (sa <= 0); break;     /* ALEQ */
-            case 0x0A: take = (sb >= 0); break;     /* BGEQ */
-            case 0x0B: take = (sb < 0); break;      /* BLT */
-            case 0x0C: take = (sb != 0); break;     /* BNEQ */
-            case 0x0D: take = (sb == 0); break;     /* BEQ */
-            case 0x0E: take = (sb > 0); break;      /* BGT */
-            case 0x0F: take = (sb <= 0); break;     /* BLEQ */
-            case 0x20: take = !(s->st0 & ST0_C); break;  /* NC */
-            case 0x21: take = (s->st0 & ST0_C) != 0; break; /* C */
-            case 0x30: take = !(s->st0 & ST0_TC); break; /* NTC */
-            case 0x31: take = (s->st0 & ST0_TC) != 0; break; /* TC */
-            case 0x60: take = !(s->st0 & ST0_OVA); break; /* ANOV */
-            case 0x61: take = (s->st0 & ST0_OVA) != 0; break; /* AOV */
-            case 0x68: take = !(s->st0 & ST0_OVB); break; /* BNOV */
-            case 0x69: take = (s->st0 & ST0_OVB) != 0; break; /* BOV */
-            default: take = true; break;  /* unknown compound cond — take conservatively */
-            }
-            if (take) {
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                s->pc = op2;
-                return 0;
-            }
+        /* E8xx / E9xx: LD #k8u, dst — load 8-bit unsigned immediate into
+         * accumulator. Per tic54x-opc.c: opcode 0xE800 mask 0xFE00.
+         * Bit 8 selects dst (0=A, 1=B); bits 7..0 = k8u.
+         *
+         * Previously this slot was decoded as CMPR (0xE8) and CC pmad,cond
+         * (0xE9). Both were wrong — the real CMPR is 0xF4A8 and the real
+         * CC is 0xF900. The bogus CC handler executed `data_write(SP-1,
+         * PC+2)` on every E9xx, and when SP happened to land in NDB it
+         * scribbled return-address-looking values into d_fb_det/d_dsp_page
+         * (e.g. d_fb_det = 0x75ec from PC=0x75ea). */
+        if (hi8 == 0xE8 || hi8 == 0xE9) {
+            uint16_t k8 = op & 0xFF;
+            int64_t v = (int64_t)k8;  /* unsigned 8-bit, zero-extended */
+            if (hi8 == 0xE9) s->b = v;
+            else             s->a = v;
             return consumed + s->lk_used;
         }
         if (hi8 == 0xE1) {
@@ -1842,34 +1920,55 @@ static int c54x_exec_one(C54xState *s)
             if (take) { s->pc = op2; return 0; }
             return consumed + s->lk_used;
         }
-        if (hi8 == 0xE8) {
-            /* E8xx: CMPR cond, ARn */
-            int cmp_cond = (op >> 4) & 3;
-            int n = arp(s);
-            bool result = false;
-            switch (cmp_cond) {
-            case 0: result = (s->ar[n] == s->ar[0]); break;
-            case 1: result = (s->ar[n] < s->ar[0]); break;
-            case 2: result = (s->ar[n] > s->ar[0]); break;
-            case 3: result = (s->ar[n] != s->ar[0]); break;
-            }
-            if (result) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
-            return consumed + s->lk_used;
-        }
+        /* E8 handled above as LD #k8u, A. The wrong "CMPR at E8" handler
+         * was removed — real CMPR is 0xF4A8 (handled in the F-prefix
+         * dispatch). */
         goto unimpl;
 
     case 0x6: case 0x7:
+        /* 7Exx: READA Smem — read prog[A_low] → data[Smem]
+         * Per tic54x-opc.c: reada 0x7E00 mask 0xFF00 (1 word).
+         * Under RPT, the prog address auto-increments each iteration;
+         * accumulator A is preserved (we mirror via mvpd_src state). */
+        if (hi8 == 0x7E) {
+            addr = resolve_smem(s, op, &ind);
+            uint16_t psrc = s->rpt_active ? s->mvpd_src : (uint16_t)(s->a & 0xFFFF);
+            uint16_t v = prog_read(s, psrc);
+            data_write(s, addr, v);
+            s->mvpd_src = psrc + 1;
+            { static int reada_log = 0; if (reada_log++ < 20)
+                C54_LOG("READA: prog[0x%04x]=0x%04x → data[0x%04x] PC=0x%04x rpt=%d insn=%u",
+                        psrc, v, addr, s->pc, s->rpt_count, s->insn_count); }
+            return consumed + s->lk_used;
+        }
+        /* 7Fxx: WRITA Smem — write data[Smem] → prog[A_low] (mirror of READA) */
+        if (hi8 == 0x7F) {
+            addr = resolve_smem(s, op, &ind);
+            uint16_t pdst = s->rpt_active ? s->mvpd_src : (uint16_t)(s->a & 0xFFFF);
+            prog_write(s, pdst, data_read(s, addr));
+            s->mvpd_src = pdst + 1;
+            return consumed + s->lk_used;
+        }
         /* 6Dxx: MAR Smem — modify address register (side effects only) */
         if (hi8 == 0x6D) {
             addr = resolve_smem(s, op, &ind);
             /* MAR only modifies AR via addressing mode, no data access */
             return consumed + s->lk_used;
         }
-        /* 76xx: LDM MMR, dst */
+        /* 76xx: ST #lk, Smem  (2 words) — per tic54x-opc.c
+         *   { "st", 2,2,2, 0x7600, 0xFF00, {OP_lk, OP_Smem} }
+         * Lower 8 bits = Smem field, second word = 16-bit immediate.
+         * Previously this slot was decoded as LDM MMR,dst (1 word) which
+         * is wrong: real LDM is 0x4800/mask 0xFE00. The bug made every
+         * ST #imm,Smem in PROM1 (e.g. the 14-entry table at 1f2a0..1f2c9)
+         * advance PC by 1 instead of 2, executing the immediates as
+         * stray opcodes and ultimately landing on f4e2 (BACC A) with
+         * A=0 → runaway to PC=0. */
         if (hi8 == 0x76) {
-            uint8_t mmr = op & 0x7F;
-            uint16_t val = data_read(s, mmr);
-            s->a = (int64_t)(int16_t)val << 16;
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, op2);
             return consumed + s->lk_used;
         }
         /* 77xx: STM #lk, MMR (2 words) */
@@ -2476,23 +2575,23 @@ static int c54x_exec_one(C54xState *s)
         }
 ba_handler:
         if (hi8 == 0xAA || hi8 == 0xAB) {
-            /* STLM src, MMR — AA=A, AB=B */
+            /* STLM src, MMR — AA=A, AB=B. MMR field is 7 bits (Smem). */
             int src_acc = (hi8 == 0xAB) ? 1 : 0;
-            uint16_t mmr = op & 0x1F;
+            uint16_t mmr = op & 0x7F;
             int64_t acc = src_acc ? s->b : s->a;
             data_write(s, mmr, (uint16_t)(acc & 0xFFFF));
             return consumed + s->lk_used;
         }
         if (hi8 == 0xBD) {
-            /* BDxx: POPM / delayed branch variants */
-            uint16_t mmr = op & 0x1F;
+            /* BDxx: POPM MMR. MMR field is 7 bits. */
+            uint16_t mmr = op & 0x7F;
             data_write(s, mmr, data_read(s, s->sp));
             s->sp++;
             return consumed + s->lk_used;
         }
         if (hi8 == 0xBA) {
-            /* LDMM MMR, dst */
-            uint16_t mmr = op & 0x1F;
+            /* LDMM MMR, dst. MMR field is 7 bits. */
+            uint16_t mmr = op & 0x7F;
             int dst = (op >> 4) & 1;
             int64_t v = (int64_t)(int16_t)data_read(s, mmr);
             if (dst) s->b = sext40(v << 16);
@@ -2835,6 +2934,161 @@ int c54x_run(C54xState *s, int n_insns)
         /* Record PC in ring buffer */
         pc_ring[pc_ring_idx & 255] = s->pc;
         pc_ring_idx++;
+
+        /* SP-out-of-range tracer. Legal stack window is roughly
+         * [0xEE00..0xEEFF] (init SP=0x5AC8 is the first push slot, then SP
+         * settles into 0xEExx after the boot prologue). Any transition that
+         * lands SP outside that window means a bad FRAME/STM/LD-to-SP or a
+         * misdecoded POPM/POPD — and is the root cause of the d_dsp_page
+         * = 0xdb25 corruption (CALL pushes PC+1 into NDB when SP is wedged
+         * at 0x08D3). */
+        {
+            static uint16_t prev_sp = 0xEEFF;
+            static int sp_oor_log = 0;
+            uint16_t cur_sp = s->sp;
+            bool cur_legal = (cur_sp >= 0xEE00 && cur_sp <= 0xEEFF) ||
+                             cur_sp == 0x5AC8;
+            bool prev_legal = (prev_sp >= 0xEE00 && prev_sp <= 0xEEFF) ||
+                              prev_sp == 0x5AC8;
+            if (s->insn_count > 1000000 && prev_legal && !cur_legal &&
+                sp_oor_log < 20) {
+                uint16_t ppc = pc_ring[(pc_ring_idx - 2) & 255];
+                C54_LOG("SP OOR  SP %04x -> %04x  PC=%04x op@prev=%04x "
+                        "insn=%u XPC=%d",
+                        prev_sp, cur_sp, s->pc,
+                        prog_fetch(s, ppc), s->insn_count, s->xpc);
+                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x "
+                        "%04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-17)&255], pc_ring[(pc_ring_idx-16)&255],
+                        pc_ring[(pc_ring_idx-15)&255], pc_ring[(pc_ring_idx-14)&255],
+                        pc_ring[(pc_ring_idx-13)&255], pc_ring[(pc_ring_idx-12)&255],
+                        pc_ring[(pc_ring_idx-11)&255], pc_ring[(pc_ring_idx-10)&255],
+                        pc_ring[(pc_ring_idx-9)&255],  pc_ring[(pc_ring_idx-8)&255],
+                        pc_ring[(pc_ring_idx-7)&255],  pc_ring[(pc_ring_idx-6)&255],
+                        pc_ring[(pc_ring_idx-5)&255],  pc_ring[(pc_ring_idx-4)&255],
+                        pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
+                sp_oor_log++;
+            }
+            /* CALL/RET balance tracer: log every SP delta in the
+             * deterministic runaway window so we can pinpoint the
+             * mis-decoded push or pop. */
+            if (s->insn_count >= 65391000 && s->insn_count <= 65392000 &&
+                cur_sp != prev_sp) {
+                int delta = (int16_t)(cur_sp - prev_sp);
+                uint16_t ppc = pc_ring[(pc_ring_idx - 2) & 255];
+                C54_LOG("SP%c%d  %04x->%04x  prev_PC=%04x op=%04x op+1=%04x "
+                        "cur_PC=%04x insn=%u",
+                        delta > 0 ? '+' : '-', delta > 0 ? delta : -delta,
+                        prev_sp, cur_sp, ppc,
+                        prog_fetch(s, ppc),
+                        prog_fetch(s, (ppc + 1) & 0xFFFF),
+                        s->pc, s->insn_count);
+            }
+            prev_sp = cur_sp;
+        }
+
+        /* Diagnose tight loops in 0xB5E0..0xB5FF — observed in PC HIST as
+         * a 2-insn idle wait at 0xB5EA/0xB5EC. Dump first entry, opcode
+         * and surrounding context, plus IMR/IFR/IDLE state. */
+        if (s->pc >= 0xB5E0 && s->pc <= 0xB5FF && s->insn_count > 5000000) {
+            static int b5_log = 0;
+            if (b5_log < 5) {
+                C54_LOG("B5xx ENTRY PC=0x%04x op=0x%04x op+1=0x%04x op+2=0x%04x "
+                        "IMR=0x%04x IFR=0x%04x INTM=%d SP=0x%04x XPC=%d insn=%u",
+                        s->pc,
+                        prog_fetch(s, s->pc),
+                        prog_fetch(s, (s->pc + 1) & 0xFFFF),
+                        prog_fetch(s, (s->pc + 2) & 0xFFFF),
+                        s->imr, s->ifr, (s->st1 >> 11) & 1,
+                        s->sp, s->xpc, s->insn_count);
+                C54_LOG("  prev: %04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-9)&255], pc_ring[(pc_ring_idx-8)&255],
+                        pc_ring[(pc_ring_idx-7)&255], pc_ring[(pc_ring_idx-6)&255],
+                        pc_ring[(pc_ring_idx-5)&255], pc_ring[(pc_ring_idx-4)&255],
+                        pc_ring[(pc_ring_idx-3)&255], pc_ring[(pc_ring_idx-2)&255]);
+                b5_log++;
+            }
+        }
+
+        /* Detect runaway: PC entering [0x0000..0x000F] (interrupt vectors)
+         * or [0xFFF0..0xFFFF] (top of program memory wrap) AFTER the boot
+         * phase. Boot legitimately executes 0x0000 once. After that,
+         * dump the previous PCs that led here so we can find the bad
+         * branch/return. */
+        if ((s->pc <= 0x000F || s->pc >= 0xFFF0) &&
+            s->insn_count > 5000000 && s->xpc == 0) {
+            static int runaway_log = 0;
+            static uint16_t prev_logged = 0xFFFF;
+            uint16_t prev = pc_ring[(pc_ring_idx - 2) & 255];
+            /* Only log when we *enter* the corrupt zone (transition) and
+             * not on every step within it. */
+            bool prev_in_corrupt = (prev <= 0x000F || prev >= 0xFFF0);
+            if (!prev_in_corrupt && runaway_log < 5 && s->pc != prev_logged) {
+                prev_logged = s->pc;
+                C54_LOG("RUNAWAY ENTRY → PC=0x%04x prev=0x%04x op@prev=0x%04x insn=%u SP=0x%04x XPC=%d",
+                        s->pc, prev, prog_fetch(s, prev), s->insn_count, s->sp, s->xpc);
+                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-17)&255], pc_ring[(pc_ring_idx-16)&255],
+                        pc_ring[(pc_ring_idx-15)&255], pc_ring[(pc_ring_idx-14)&255],
+                        pc_ring[(pc_ring_idx-13)&255], pc_ring[(pc_ring_idx-12)&255],
+                        pc_ring[(pc_ring_idx-11)&255], pc_ring[(pc_ring_idx-10)&255],
+                        pc_ring[(pc_ring_idx-9)&255],  pc_ring[(pc_ring_idx-8)&255],
+                        pc_ring[(pc_ring_idx-7)&255],  pc_ring[(pc_ring_idx-6)&255],
+                        pc_ring[(pc_ring_idx-5)&255],  pc_ring[(pc_ring_idx-4)&255],
+                        pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
+                runaway_log++;
+            }
+        }
+
+        /* CALA loop tracer: dump A and SP at PC=0xd24e and 0xd250 (first 40) */
+        if (s->pc == 0xd24e || s->pc == 0xd250) {
+            static int cala_log = 0;
+            if (cala_log++ < 40) {
+                C54_LOG("CALA-TRACE PC=0x%04x A=%08x SP=0x%04x BRC=%d AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
+                        s->pc, (uint32_t)(s->a & 0xFFFFFFFF), s->sp, s->brc,
+                        s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+            }
+        }
+
+        /* PC histogram: count visits per PC, dump top 20 every 2M insns */
+        {
+            static uint32_t pc_hist[0x10000];
+            static uint64_t hist_last_dump = 0;
+            pc_hist[s->pc]++;
+            if (s->insn_count - hist_last_dump >= 2000000) {
+                hist_last_dump = s->insn_count;
+                /* find top 20 */
+                uint32_t top_cnt[20] = {0};
+                uint16_t top_pc[20] = {0};
+                for (int i = 0; i < 0x10000; i++) {
+                    uint32_t c = pc_hist[i];
+                    if (c == 0) continue;
+                    for (int j = 0; j < 20; j++) {
+                        if (c > top_cnt[j]) {
+                            for (int k = 19; k > j; k--) {
+                                top_cnt[k] = top_cnt[k-1];
+                                top_pc[k] = top_pc[k-1];
+                            }
+                            top_cnt[j] = c;
+                            top_pc[j] = (uint16_t)i;
+                            break;
+                        }
+                    }
+                }
+                C54_LOG("PC HIST insn=%u top: %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
+                        s->insn_count,
+                        top_pc[0], top_cnt[0], top_pc[1], top_cnt[1], top_pc[2], top_cnt[2],
+                        top_pc[3], top_cnt[3], top_pc[4], top_cnt[4], top_pc[5], top_cnt[5],
+                        top_pc[6], top_cnt[6], top_pc[7], top_cnt[7], top_pc[8], top_cnt[8],
+                        top_pc[9], top_cnt[9]);
+                C54_LOG("PC HIST cont:        %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
+                        top_pc[10], top_cnt[10], top_pc[11], top_cnt[11], top_pc[12], top_cnt[12],
+                        top_pc[13], top_cnt[13], top_pc[14], top_cnt[14], top_pc[15], top_cnt[15],
+                        top_pc[16], top_cnt[16], top_pc[17], top_cnt[17], top_pc[18], top_cnt[18],
+                        top_pc[19], top_cnt[19]);
+                memset(pc_hist, 0, sizeof(pc_hist));
+            }
+        }
 
         /* Track SP changes inside RPTB loops */
         uint16_t sp_before = s->sp;
