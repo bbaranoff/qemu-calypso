@@ -1152,10 +1152,43 @@ static int c54x_exec_one(C54xState *s)
             s->pc = ra;
             return 0;
         }
-        /* LMS Xmem, Ymem — Least Mean Square step (1-word dual-operand)
-         * Encoding: 1111 001D XXXX YYYY
-         * Per SPRU172C: dst += T * Xmem; Ymem += rnd(AH * T); T = Xmem */
-        if (hi8 == 0xF2 || hi8 == 0xF3) {
+        /* SFTL src, SHIFT, dst — logical shift accumulator. Per
+         * tic54x-opc.c: opcode 0xF0E0 mask 0xFCE0. Variable bits:
+         *   bit 9 = src (0=A, 1=B)
+         *   bit 8 = dst (0=A, 1=B)
+         *   bits 4..0 = SHIFT (5-bit signed)
+         * 1 word, no memory access. */
+        if ((op & 0xFCE0) == 0xF0E0) {
+            int src_acc = (op >> 9) & 1;
+            int dst_acc = (op >> 8) & 1;
+            int shift = op & 0x1F;
+            if (shift & 0x10) shift -= 0x20;
+            uint64_t v = (uint64_t)(src_acc ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            if (shift >= 0) v <<= shift;
+            else            v >>= -shift;
+            int64_t r = sext40((int64_t)(v & 0xFFFFFFFFFFULL));
+            if (dst_acc) s->b = r; else s->a = r;
+            return consumed + s->lk_used;
+        }
+        /* SFTA src, SHIFT, dst — arithmetic shift. opcode 0xF460 mask 0xFCE0. */
+        if ((op & 0xFCE0) == 0xF460) {
+            int src_acc = (op >> 9) & 1;
+            int dst_acc = (op >> 8) & 1;
+            int shift = op & 0x1F;
+            if (shift & 0x10) shift -= 0x20;
+            int64_t v = sext40(src_acc ? s->b : s->a);
+            if (shift >= 0) v <<= shift;
+            else            v >>= -shift;
+            int64_t r = sext40(v);
+            if (dst_acc) s->b = r; else s->a = r;
+            return consumed + s->lk_used;
+        }
+        /* LMS Xmem, Ymem — Least Mean Square step (1-word dual-operand).
+         * Real LMS is opcode 0xE100 mask 0xFF00, NOT F2/F3. Keeping the
+         * old (wrong) F2/F3 handler here is harmful (it writes through
+         * AR-pointed addresses), so it's been removed. Real LMS at E100
+         * remains TODO. */
+        if (0 && (hi8 == 0xF2 || hi8 == 0xF3)) {
             int xar_l = (op >> 4) & 0x07;
             int yar_l = op & 0x07;
             uint16_t xval_l = data_read(s, s->ar[xar_l]);
@@ -2087,17 +2120,66 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if ((op & 0xFF00) == 0x6F00) {
-            /* 0x6F00: LD/STL/STH/ADD/SUB Smem, SHIFT, dst — second-word
-             * encoding selects the actual op. We don't fully decode it
-             * yet; treat as NOP-with-skip so we at least advance PC by 2
-             * instead of misexecuting the immediate. */
-            (void)prog_fetch(s, s->pc + 1);
+            /* 0x6F00: extended LD/STL/STH/ADD/SUB Smem, SHIFT, [src,] dst.
+             * Per tic54x-opc.c FL_EXT entries:
+             *   add: opcode2=0x0C00 mask2=0xFCE0  (SRC bit9, DST bit8, SHIFT 4..0)
+             *   sub: opcode2=0x0C20 mask2=0xFCE0  (SRC bit9, DST bit8, SHIFT 4..0)
+             *   ld : opcode2=0x0C40 mask2=0xFEE0  (DST bit8, SHIFT 4..0)
+             *   sth: opcode2=0x0C60 mask2=0xFEE0  (SRC bit8, SHIFT 4..0)
+             *   stl: opcode2=0x0C80 mask2=0xFEE0  (SRC bit8, SHIFT 4..0)
+             * Smem field in first word = lower 8 bits of op. */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            static int log = 0;
-            if (log < 10) {
-                C54_LOG("UNIMPL 6F op=0x%04x PC=0x%04x insn=%u (NOP+skip)",
-                        op, s->pc, s->insn_count);
-                log++;
+            int shift = op2 & 0x1F;
+            if (shift & 0x10) shift -= 0x20;  /* sign-extend 5-bit */
+
+            if ((op2 & 0xFCE0) == 0x0C00) {
+                /* ADD Smem,SHIFT,src,dst */
+                int src_acc = (op2 >> 9) & 1;
+                int dst_acc = (op2 >> 8) & 1;
+                int64_t v = (int64_t)(int16_t)data_read(s, addr);
+                if (shift >= 0) v <<= shift;
+                else            v >>= -shift;
+                int64_t r = (src_acc ? s->b : s->a) + v;
+                if (dst_acc) s->b = sext40(r); else s->a = sext40(r);
+            } else if ((op2 & 0xFCE0) == 0x0C20) {
+                /* SUB Smem,SHIFT,src,dst */
+                int src_acc = (op2 >> 9) & 1;
+                int dst_acc = (op2 >> 8) & 1;
+                int64_t v = (int64_t)(int16_t)data_read(s, addr);
+                if (shift >= 0) v <<= shift;
+                else            v >>= -shift;
+                int64_t r = (src_acc ? s->b : s->a) - v;
+                if (dst_acc) s->b = sext40(r); else s->a = sext40(r);
+            } else if ((op2 & 0xFEE0) == 0x0C40) {
+                /* LD Smem,SHIFT,dst */
+                int dst_acc = (op2 >> 8) & 1;
+                int64_t v = (int64_t)(int16_t)data_read(s, addr);
+                if (shift >= 0) v <<= shift;
+                else            v >>= -shift;
+                if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
+            } else if ((op2 & 0xFEE0) == 0x0C60) {
+                /* STH src,SHIFT,Smem */
+                int src_acc = (op2 >> 8) & 1;
+                int64_t v = src_acc ? s->b : s->a;
+                if (shift >= 0) v <<= shift;
+                else            v >>= -shift;
+                data_write(s, addr, (uint16_t)((v >> 16) & 0xFFFF));
+            } else if ((op2 & 0xFEE0) == 0x0C80) {
+                /* STL src,SHIFT,Smem */
+                int src_acc = (op2 >> 8) & 1;
+                int64_t v = src_acc ? s->b : s->a;
+                if (shift >= 0) v <<= shift;
+                else            v >>= -shift;
+                data_write(s, addr, (uint16_t)(v & 0xFFFF));
+            } else {
+                static int log = 0;
+                if (log < 10) {
+                    C54_LOG("UNIMPL 6F op=0x%04x op2=0x%04x PC=0x%04x insn=%u",
+                            op, op2, s->pc, s->insn_count);
+                    log++;
+                }
             }
             return consumed + s->lk_used;
         }
@@ -2972,20 +3054,34 @@ ba_handler:
             data_write(s, addr + 1, dval);
             return consumed + s->lk_used;
         }
-        /* 0xC8/0xC9: ST || LD parallel instruction (1 word, dual indirect)
-         * Store low acc to Ymem while loading Xmem to other acc */
-        if (hi8 == 0xC8 || hi8 == 0xC9) {
-            int s_acc = (hi8 == 0xC9) ? 1 : 0;
-            int xar = (op >> 4) & 0x07;
-            int yar = op & 0x07;
-            int64_t st_val = s_acc ? s->b : s->a;
-            data_write(s, s->ar[yar], (uint16_t)(st_val & 0xFFFF));
-            uint16_t ld_val = data_read(s, s->ar[xar]);
-            int d_acc = s_acc ? 0 : 1;
-            int64_t loaded = (int64_t)(int16_t)ld_val << 16;
-            if (d_acc) s->b = sext40(loaded); else s->a = sext40(loaded);
-            if ((op >> 7) & 1) s->ar[xar]--; else s->ar[xar]++;
-            if ((op & 0x08) == 0) s->ar[yar]++; else s->ar[yar]--;
+        /* 0xC800-0xCBFF: ST src, Ymem (parallel store form).
+         * Per tic54x-opc.c: opcode 0xC800 mask 0xFC00, FL_PAR.
+         * Operands: OP_SRC (acc) → OP_Ymem.
+         *
+         * C54x dual-data Xmem/Ymem encoding uses 4-bit fields that map
+         * to AR2..AR5 (NOT AR0..AR7) :
+         *   bits 5..4 = Xmod (00=*+, 01=*-, 10=*, 11=*+0%)
+         *   bits 3..2 = Xar  (00=AR2, 01=AR3, 10=AR4, 11=AR5)  ← Xmem
+         *   bits 1..0 = Yar  ← Ymem
+         * The Ymod for the parallel partner is in another bit elsewhere
+         * or implicit. We only model the ST half here (the binutils
+         * template lists only {OP_SRC, OP_Ymem}); a fabricated parallel
+         * LD half was previously hallucinated and writing into random
+         * AR-pointed addresses, including NDB cells (0xa0e7 →
+         * d_fb_det = 0xffff). */
+        if ((op & 0xFC00) == 0xC800) {
+            int src_acc = (op >> 9) & 1;  /* SRC bit */
+            int yar     = (op & 0x03) + 2;
+            int ymod    = (op >> 4) & 0x03;  /* same field shape as Xmod */
+            uint16_t addr_y = s->ar[yar];
+            int64_t v = src_acc ? s->b : s->a;
+            data_write(s, addr_y, (uint16_t)(v & 0xFFFF));
+            switch (ymod) {
+            case 0: s->ar[yar]++; break;        /* *Ymem+ */
+            case 1: s->ar[yar]--; break;        /* *Ymem- */
+            case 2: /* *Ymem (no modify) */     break;
+            case 3: s->ar[yar] += s->ar[0]; break; /* *Ymem+0% (simplified) */
+            }
             return consumed + s->lk_used;
         }
         goto unimpl;
