@@ -95,6 +95,19 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     }
     /* Trace DARAM addr range read by the active FB-det inner loop
      * (PROM0 0x9880..0x9890 RPTB+BANZD correlator). Min/max + count. */
+    /* DROM coeffs read tracer: log first 32 unique reads from 0x9000..0xdfff
+     * (the data ROM range) so we can confirm AR2=0xcc7e returns real coeffs. */
+    if (addr >= 0x9000 && addr <= 0xdfff) {
+        static uint8_t coeff_seen[0x5000 / 8];
+        static int coeff_n = 0;
+        unsigned i = addr - 0x9000;
+        if (coeff_n < 32 && !(coeff_seen[i >> 3] & (1 << (i & 7)))) {
+            coeff_seen[i >> 3] |= (1 << (i & 7));
+            coeff_n++;
+            C54_LOG("COEFF-RD #%d [0x%04x]=0x%04x PC=0x%04x AR2=%04x insn=%u",
+                    coeff_n, addr, s->data[addr], s->pc, s->ar[2], s->insn_count);
+        }
+    }
     if (((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
          (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
          (s->pc >= 0x8a00 && s->pc <= 0x8aff)) && addr < 0x4000) {
