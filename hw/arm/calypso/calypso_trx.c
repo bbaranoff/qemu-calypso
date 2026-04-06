@@ -13,6 +13,7 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+#include "hw/arm/calypso/calypso_bsp.h"
 #include "calypso_tint0.h"
 void calypso_tint0_do_tick(uint32_t fn);
 #include "chardev/char-fe.h"
@@ -132,6 +133,43 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         }
         if (s->dsp && s->dsp->api_ram)
             s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
+    }
+    /* d_task_md (page0=0xFFD00008, page1=0xFFD00030) — DL monitoring task.
+     * Log only non-zero writes + the very first few zeros for sanity. */
+    if (offset == 0x0008 || offset == 0x0030) {
+        static int tm_zero = 0, tm_nz = 0;
+        if (value != 0) {
+            if (tm_nz < 200) {
+                TRX_LOG("ARM WR d_task_md[p%d] = 0x%04x (NZ) fn=%u",
+                        offset == 0x0008 ? 0 : 1,
+                        (unsigned)value, s->fn);
+                tm_nz++;
+            }
+        } else if (tm_zero < 4) {
+            TRX_LOG("ARM WR d_task_md[p%d] = 0 (init) fn=%u",
+                    offset == 0x0008 ? 0 : 1, s->fn);
+            tm_zero++;
+        }
+    }
+    /* Also catch d_task_d (page0 word 0 = 0xFFD00000, page1 word 0 = 0xFFD00028)
+     * to confirm the scheduler is alive at all. */
+    if (offset == 0x0000 || offset == 0x0028) {
+        static int td_nz = 0;
+        if (value != 0 && td_nz < 60) {
+            TRX_LOG("ARM WR d_task_d[p%d] = 0x%04x (NZ) fn=%u",
+                    offset == 0x0000 ? 0 : 1,
+                    (unsigned)value, s->fn);
+            td_nz++;
+        }
+    }
+    /* d_spcx_rif (NDB word 2 = ARM 0xFFD001AC) — BSP serial port config */
+    if (offset == 0x01AC) {
+        static int spcx_arm_log = 0;
+        if (spcx_arm_log < 20) {
+            TRX_LOG("ARM WR d_spcx_rif = 0x%04x (sz=%d fn=%u)",
+                    (unsigned)value, size, s->fn);
+            spcx_arm_log++;
+        }
     }
     /* DSP bootloader protocol (BL_CMD_STATUS at offset 0x0FFE)
      * The real bootloader lives in DSP internal ROM (not in our dump).
@@ -329,9 +367,11 @@ void calypso_tint0_do_tick(uint32_t fn) {
 
         /* Run DSP until IDLE — budget allows init MVPD copies to complete.
          * Real C54x @ 100 MHz ≈ 461K insn per 4.615ms frame.
-         * During init (before first IDLE), give unlimited budget.
-         * After init, use 500K per frame. */
-        int budget = 5000000;  /* 5M for init */
+         * During init (before first IDLE), give a fat budget so the
+         * MVPD/RPTB sweeps can finish. After init, cap to ~1 frame so
+         * a busy-looping DSP cannot starve the ARM (which runs the
+         * L1S scheduler that posts d_task_md). */
+        int budget = s->dsp_init_done ? 500000 : 5000000;
         int ran = 0, chunk;
         while (!s->dsp->idle && ran < budget) {
             chunk = c54x_run(s->dsp, 100000);
@@ -400,7 +440,7 @@ void calypso_tint0_do_tick(uint32_t fn) {
         }
 
         static int done_log = 0;
-        if (done_log < 30) {
+        if (done_log < 200) {
             TRX_LOG("TINT0: fn=%u page=0x%04x ran=%d PC=0x%04x idle=%d IMR=0x%04x",
                     s->fn, s->dsp_ram[0x01A8/2], ran, s->dsp->pc,
                     s->dsp->idle, s->dsp->imr);
@@ -479,40 +519,36 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
     /* Sync FN */
     s->fn = fn % GSM_HYPERFRAME;
 
-    /* DL format: header(8) + GMSK I/Q samples (16-bit LE, 2 bytes each)
-     * Bridge sends: TN(1) FN(4) RSSI(1) TOA(2) + samples(N x int16_t) */
-    int nsamples = (len - 8) / 2;  /* 16-bit samples */
-    if (nsamples > 148) nsamples = 148;
-    if (nsamples < 0) nsamples = 0;
-    int nbits = nsamples;
+    /* DL format from gate (after gr-gsm modulation in bridge.py):
+     *   bytes 0..7  : TN(1) FN(4) RSSI(1) TOA(2)  -- legacy hdr from gate
+     *   bytes 8..   : N int16 LE samples, I and Q interleaved
+     * sps=4, 148 syms => 592 complex samples => 1184 int16. */
+    int nint16 = (len - 8) / 2;
+    if (nint16 < 0) nint16 = 0;
+    if (nint16 > 2000) nint16 = 2000;
 
-    /* RX_BURST logging removed */
-
-    /* Load GMSK I/Q samples into C54x DARAM + BSP buffer */
+    /* Load int16 stream into C54x BSP buffer (uint16_t reinterpreted). */
     if (s->dsp) {
-        uint16_t samples[160];
-        for (int i = 0; i < nbits; i++) {
-            /* Read 16-bit LE GMSK I/Q samples from bridge */
-            int16_t s16 = (int16_t)(data[8 + i*2] | (data[8 + i*2 + 1] << 8));
-            samples[i] = (uint16_t)s16;
+        static uint16_t samples[2048];
+        for (int i = 0; i < nint16; i++) {
+            int16_t v = (int16_t)(data[8 + i*2] | (data[8 + i*2 + 1] << 8));
+            samples[i] = (uint16_t)v;
         }
-        c54x_bsp_load(s->dsp, samples, nbits);
+        c54x_bsp_load(s->dsp, samples, nint16);
 
         /* Fire BRINT0 — BSP receive complete (vec 21, IMR bit 5)
          * Only after init — during boot the DSP doesn't expect bursts */
         if (s->dsp_init_done)
             c54x_interrupt_ex(s->dsp, 21, 5);
 
-        /* Write to DARAM at multiple candidate addresses */
-        /* Address from pointer at 0x00B9 */
+        /* Mirror first chunk into legacy DARAM scratch areas (firmware probes). */
+        int nm = nint16 < 296 ? nint16 : 296;  /* keep within DARAM page */
         uint16_t ptr = s->dsp->data[0x00B9];
-        if (ptr >= 0x0020 && ptr < 0x0800) {
-            for (int i = 0; i < nbits; i++)
+        if (ptr >= 0x0020 && ptr < 0x0800 - nm) {
+            for (int i = 0; i < nm; i++)
                 s->dsp->data[ptr + i] = samples[i];
         }
-        /* Also write at fixed addresses used by BSP DMA on Calypso:
-         * 0x03F0-0x04FF is a common DMA target area */
-        for (int i = 0; i < nbits; i++) {
+        for (int i = 0; i < nm; i++) {
             s->dsp->data[0x03F0 + i] = samples[i];
             s->dsp->data[0x04F0 + i] = samples[i];
         }
@@ -635,6 +671,8 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             if (c54x_load_rom(s->dsp, rom_path) == 0) {
                 /* Don't reset/boot yet — wait for ARM to write DSP_DL_STATUS_READY */
                 s->dsp->running = false;
+                /* Hand the DSP off to the BSP DMA module */
+                calypso_bsp_init(s->dsp);
                 TRX_LOG("BUILD 2026-04-05T20:30:16 F4EB=RETE IMR_keep");
                 TRX_LOG("C54x DSP loaded from %s (waiting for ARM)", rom_path);
             } else {

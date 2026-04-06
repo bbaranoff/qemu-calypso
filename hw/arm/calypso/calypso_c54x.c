@@ -65,6 +65,32 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* === BSP discovery: trace data reads in FB-det handler ===
+     * FCCH detection lives in PROM0 0x7730..0x7990 (project_dsp_fb_det).
+     * Logging the addresses touched there reveals where BSP must DMA. */
+    if (s->pc >= 0x7730 && s->pc <= 0x7990) {
+        static int fbdet_rd_log = 0;
+        if (fbdet_rd_log < 200) {
+            uint16_t v;
+            if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
+                v = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0;
+            else
+                v = s->data[addr];
+            C54_LOG("FBDET RD [0x%04x]=0x%04x PC=0x%04x insn=%u",
+                    addr, v, s->pc, s->insn_count);
+            fbdet_rd_log++;
+        }
+    }
+    /* d_spcx_rif (NDB word 2 = api 0xD6 = DSP data 0x08D6) */
+    if (addr == 0x08D6) {
+        static int spcx_rd = 0;
+        if (spcx_rd < 32) {
+            C54_LOG("d_spcx_rif RD = 0x%04x PC=0x%04x insn=%u",
+                    s->api_ram ? s->api_ram[0xD6] : s->data[addr],
+                    s->pc, s->insn_count);
+            spcx_rd++;
+        }
+    }
     /* Log reads from API RAM at 0x08D4 (d_dsp_page) */
     if (addr == 0x08D4) {
         static int dsp_page_log = 0;
@@ -215,6 +241,11 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         /* Always log writes to d_dsp_page (0x08D4) */
         if (addr == 0x08D4) {
             C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u", val, s->pc, s->insn_count);
+        }
+        /* d_spcx_rif (NDB word 2 = DSP data 0x08D6) — BSP serial port config */
+        if (addr == 0x08D6) {
+            C54_LOG("DSP WR d_spcx_rif = 0x%04x PC=0x%04x insn=%u",
+                    val, s->pc, s->insn_count);
         }
     }
 
@@ -391,7 +422,6 @@ static int c54x_exec_one(C54xState *s)
     int consumed = 1;
     s->lk_used = false;  /* reset before each instruction */
 
-
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
@@ -498,22 +528,8 @@ static int c54x_exec_one(C54xState *s)
         /* F4E2 = RSBX INTM (enable interrupts), F4E3 = SSBX INTM (disable interrupts) */
         if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
         if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
-        /* F4E1: IDLE — halt until interrupt.
-         * Per tic54x-opc.c: IDLE 0xF4E1 mask 0xFCFF. */
-        if ((op & 0xFCFF) == 0xF4E1) {
-            static int idle_log = 0;
-            if (idle_log < 20)
-                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u",
-                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count);
-            idle_log++;
-            if (s->pc >= 0x8000 && s->pc < 0x8020) {
-                return consumed + s->lk_used;
-            }
-            s->idle = true;
-            return 0;
-        }
-        /* F4E0-F4FF: misc F4Ex — treat as NOP (most don't affect emulation) */
-        if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4E5 && op != 0xF4EB) {
+        /* F4E0-F4FF: RSBX/SSBX status bits — treat as NOP (most don't affect emulation) */
+        if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
             return consumed + s->lk_used;
         }
         /* F4EB = RETE (return from interrupt, alternate encoding per tic54x-opc.c) */
@@ -526,26 +542,33 @@ static int c54x_exec_one(C54xState *s)
             s->st1 &= ~ST1_INTM;
             s->pc = ra; return 0;
         }
-        /* F4E4: FRET — far return.
-         * Per tic54x-opc.c: 0xF4E4 mask 0xFFFF.
-         * Pop XPC then PC from stack. */
         if (op == 0xF4E4) {
-            s->xpc = data_read(s, s->sp); s->sp++;
-            if (s->xpc > 3) s->xpc &= 3;
-            uint16_t ra = data_read(s, s->sp); s->sp++;
-            s->pc = ra;
-            return 0;
-        }
-        /* F4E5: FRETE — far return from interrupt.
-         * Pop XPC then PC, clear INTM. */
-        if (op == 0xF4E5) {
-            s->xpc = data_read(s, s->sp); s->sp++;
-            if (s->xpc > 3) s->xpc &= 3;
-            uint16_t ra = data_read(s, s->sp); s->sp++;
-            s->st1 &= ~ST1_INTM;
-            s->pc = ra;
-            return 0;
-        }
+            static int idle_log = 0;
+            if (idle_log < 20)
+                C54_LOG("IDLE @0x%04x INTM=%d IMR=0x%04x SP=0x%04x insns=%u XPC=%d",
+                        s->pc, !!(s->st1 & ST1_INTM), s->imr, s->sp, s->insn_count, s->xpc);
+            idle_log++;
+            /* TDMA slot table (0x8000-0x8020): skip IDLE, continue next slot.
+             * All other IDLEs: halt. Wake behavior decided by calypso_trx. */
+            if (s->pc >= 0x8000 && s->pc < 0x8020) {
+                return consumed + s->lk_used;
+            }
+            static int idle_total = 0;
+            idle_total++;
+            if (idle_total <= 10) {
+                C54_LOG("IDLE#%d @0x%04x SP=0x%04x stack=[0x%04x] insn=%u",
+                        idle_total, s->pc, s->sp, s->data[s->sp], s->insn_count);
+                /* Dump last 10 PCs before this IDLE */
+                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                        pc_ring[(pc_ring_idx-10)&15], pc_ring[(pc_ring_idx-9)&15],
+                        pc_ring[(pc_ring_idx-8)&15], pc_ring[(pc_ring_idx-7)&15],
+                        pc_ring[(pc_ring_idx-6)&15], pc_ring[(pc_ring_idx-5)&15],
+                        pc_ring[(pc_ring_idx-4)&15], pc_ring[(pc_ring_idx-3)&15],
+                        pc_ring[(pc_ring_idx-2)&15], pc_ring[(pc_ring_idx-1)&15]);
+            }
+            s->idle = true;
+            return 0;  /* PC stays on IDLE; wake code advances PC */
+        } /* IDLE */
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call and special instructions.
              * Some F4xx instructions are 1-word (FRET, FRETE, RETE, TRAP, NOP, etc.)
@@ -1028,18 +1051,10 @@ static int c54x_exec_one(C54xState *s)
         }
         if (op == 0xF4E2) { s->st1 &= ~ST1_INTM; return consumed + s->lk_used; }
         if (op == 0xF4E3) { s->st1 |= ST1_INTM; return consumed + s->lk_used; }
-        if ((op & 0xFCFF) == 0xF4E1) {
+        if (op == 0xF4E4) {
             /* IDLE */
             s->idle = true;
-            return 0;  /* PC stays on IDLE; wake code advances PC */
-        }
-        if (op == 0xF4E4) {
-            /* FRET — far return */
-            s->xpc = data_read(s, s->sp); s->sp++;
-            if (s->xpc > 3) s->xpc &= 3;
-            uint16_t ra = data_read(s, s->sp); s->sp++;
-            s->pc = ra;
-            return 0;
+            return consumed + s->lk_used;  /* Advance PC past IDLE */
         }
         /* FXXX short immediates and misc */
         if (hi8 == 0xF0 || hi8 == 0xF1) {
@@ -1500,6 +1515,13 @@ static int c54x_exec_one(C54xState *s)
             else cond = true; /* unknown: take it */
             if (cond) {
                 uint16_t ra = data_read(s, s->sp); s->sp++;
+                {
+                    static int rc_log = 0;
+                    if (rc_log < 50)
+                        C54_LOG("RC/RET PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x",
+                                s->pc, cc, ra, s->sp);
+                    rc_log++;
+                }
                 s->pc = ra;
                 return 0;
             }
@@ -1548,6 +1570,13 @@ static int c54x_exec_one(C54xState *s)
             else cond = true; /* unknown: take it */
             if (cond) {
                 uint16_t ra = data_read(s, s->sp); s->sp++;
+                {
+                    static int rcd_log = 0;
+                    if (rcd_log < 50)
+                        C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x",
+                                s->pc, cc, ra, s->sp);
+                    rcd_log++;
+                }
                 s->pc = ra;
                 return 0;
             }
@@ -2856,7 +2885,7 @@ int c54x_run(C54xState *s, int n_insns)
                 s->brc--;
                 s->pc = s->rsa;
             } else {
-                s->rptb_active = false; C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x", s->pc, s->rsa, s->rea, s->insn_count, s->sp);
+                s->rptb_active = false; { static int _re=0; if (_re<50) { C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x", s->pc, s->rsa, s->rea, s->insn_count, s->sp); _re++; } }
                 s->st1 &= ~ST1_BRAF;
             }
         }
@@ -3064,7 +3093,7 @@ void c54x_reset(C54xState *s)
     s->data[TIM_ADDR] = 0xFFFF;   /* TIM = max at reset */
     s->data[PRD_ADDR] = 0xFFFF;   /* PRD = max at reset */
     s->rpt_active = false;
-    s->rptb_active = false; C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x", s->pc, s->rsa, s->rea, s->insn_count, s->sp);
+    s->rptb_active = false; { static int _re=0; if (_re<50) { C54_LOG("RPTB EXIT PC=0x%04x RSA=0x%04x REA=0x%04x insn=%u SP=0x%04x", s->pc, s->rsa, s->rea, s->insn_count, s->sp); _re++; } }
     s->idle = false;
     s->running = true;
     s->cycles = 0;
@@ -3167,7 +3196,7 @@ void c54x_wake(C54xState *s)
 
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
 {
-    if (n > 160) n = 160;
+    if (n > 2048) n = 2048;
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;
     s->bsp_pos = 0;
