@@ -501,21 +501,24 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         case 0xB: /* *ARn+0% */
             s->ar[cur_arp] += s->ar[0];
             break;
-        case 0xC: /* *(lk) — absolute address from next word */
-            addr = prog_fetch(s, s->pc + 1);
-            s->lk_used = true;
-            break;
-        case 0xD: /* *+ARn(lk) — pre-add offset from next word */
+        /* MOD 12..15 use a long extension word (lk). Per binutils
+         * tic54x-dis.c sprint_indirect_address: */
+        case 0xC: /* *ARx(lk) — addr = AR + lk, AR unchanged */
             addr = s->ar[cur_arp] + prog_fetch(s, s->pc + 1);
             s->lk_used = true;
             break;
-        case 0xE: /* *ARn(lk) — post-add (addr=AR, then AR += lk) */
-            addr = s->ar[cur_arp];
+        case 0xD: /* *+ARx(lk) — pre-add: AR += lk, addr = AR */
             s->ar[cur_arp] += prog_fetch(s, s->pc + 1);
+            addr = s->ar[cur_arp];
             s->lk_used = true;
             break;
-        case 0xF: /* *+ARn(lk)% — circular with offset */
-            addr = s->ar[cur_arp] + prog_fetch(s, s->pc + 1);
+        case 0xE: /* *+ARx(lk)% — pre-add circular */
+            s->ar[cur_arp] += prog_fetch(s, s->pc + 1);
+            addr = s->ar[cur_arp];
+            s->lk_used = true;
+            break;
+        case 0xF: /* *(lk) — absolute address from extension word */
+            addr = prog_fetch(s, s->pc + 1);
             s->lk_used = true;
             break;
         }

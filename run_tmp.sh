@@ -51,7 +51,7 @@ sleep 1
 [ -f "$MOBILE_CFG" ]|| echo "WARN: $MOBILE_CFG not found"
 
 # ── QEMU ──
-CALYPSO_BSP_DARAM_ADDR=0x62 CALYPSO_BSP_DARAM_LEN=128 $QEMU -M calypso \
+CALYPSO_BSP_DARAM_ADDR=0x021f CALYPSO_BSP_DARAM_LEN=12000 CALYPSO_BSP_BYPASS_BDLENA=1 $QEMU -M calypso \
   -kernel "$FW" \
   -serial pty \
   -display none \
