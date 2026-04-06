@@ -46,7 +46,7 @@ static void tint0_tick_cb(void *opaque)
     }
 
     /* Kick ARM CPU to process pending IRQs */
-    qemu_notify_event();
+qemu_notify_event();
 }
 
 /* ---- Public API ---- */

@@ -22,4 +22,7 @@
  *   * (L1CTL, debug, console) → re-wrap → UART FIFO (firmware) */
 void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size);
 
+/* Bind UDP TRX endpoints (CLK/TRXC/TRXD) starting at base_port. */
+void sercomm_gate_init(int base_port);
+
 #endif /* SERCOMM_GATE_H */

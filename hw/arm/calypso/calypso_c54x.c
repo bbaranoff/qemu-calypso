@@ -1998,21 +1998,107 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
-        if ((op & 0xF800) == 0x6000) {
-            /* 60xx: LD Smem, dst */
-            int dst_acc = (op >> 9) & 1;
-            int shift = (op >> 8) & 1;
+        /* 0x60-0x6F dispatch — per tic54x-opc.c. The whole previous block
+         * was mis-labeled "LD Smem,dst / LD Smem,T". The real LD Smem,dst
+         * is at 0x1000 mask 0xFE00, NOT in the 0x6xxx range. */
+        if ((op & 0xFF00) == 0x6000) {
+            /* CMPM Smem, #lk — compare memory to immediate, set TC. 2 words. */
             addr = resolve_smem(s, op, &ind);
-            uint16_t val = data_read(s, addr);
-            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)val : val;
-            if (shift) v <<= 16;  /* LD Smem, 16, dst */
-            if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            uint16_t v = data_read(s, addr);
+            if (v == op2) s->st0 |=  ST0_TC;
+            else          s->st0 &= ~ST0_TC;
             return consumed + s->lk_used;
         }
-        if ((op & 0xF800) == 0x6800) {
-            /* 68xx: LD Smem, T */
+        if ((op & 0xFF00) == 0x6100) {
+            /* BITF Smem, #lk — test bits, set TC if any common bit set. 2 words. */
             addr = resolve_smem(s, op, &ind);
-            s->t = data_read(s, addr);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            uint16_t v = data_read(s, addr);
+            if ((v & op2) != 0) s->st0 |=  ST0_TC;
+            else                s->st0 &= ~ST0_TC;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFE00) == 0x6200) {
+            /* MPY Smem, #lk, dst — multiply Smem by 16-bit immediate. 2 words. */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            int dst_acc = op & 1;
+            int64_t prod = (int64_t)(int16_t)data_read(s, addr) *
+                           (int64_t)(int16_t)op2;
+            if (s->st1 & ST1_FRCT) prod <<= 1;
+            if (dst_acc) s->b = sext40(prod);
+            else         s->a = sext40(prod);
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6800) {
+            /* ANDM #lk, Smem — Smem &= #lk. 2 words. */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, data_read(s, addr) & op2);
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6900) {
+            /* ORM #lk, Smem */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, data_read(s, addr) | op2);
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6A00) {
+            /* XORM #lk, Smem */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, data_read(s, addr) ^ op2);
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6B00) {
+            /* ADDM #lk, Smem */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, addr, (uint16_t)(data_read(s, addr) + op2));
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6C00 || (op & 0xFF00) == 0x6E00) {
+            /* BANZ[D] pmad, Sind — branch if AR != 0, decrement after */
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            int n = arp(s);
+            if (s->ar[n] != 0) {
+                s->pc = op2;
+                s->ar[n]--;  /* post-decrement after branch decision */
+                return 0;
+            }
+            s->ar[n]--;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6D00) {
+            /* MAR Smem — modify auxiliary register; addressing side-effects only. */
+            addr = resolve_smem(s, op, &ind);
+            (void)addr;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6F00) {
+            /* 0x6F00: LD/STL/STH/ADD/SUB Smem, SHIFT, dst — second-word
+             * encoding selects the actual op. We don't fully decode it
+             * yet; treat as NOP-with-skip so we at least advance PC by 2
+             * instead of misexecuting the immediate. */
+            (void)prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            static int log = 0;
+            if (log < 10) {
+                C54_LOG("UNIMPL 6F op=0x%04x PC=0x%04x insn=%u (NOP+skip)",
+                        op, s->pc, s->insn_count);
+                log++;
+            }
             return consumed + s->lk_used;
         }
         goto unimpl;
