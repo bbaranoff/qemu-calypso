@@ -23,7 +23,7 @@ import numpy as np
 
 BURST_SAMPLES_OUT = 592       # 148 syms × 4 sps
 GSM_RATE_OUT      = 1083333   # 4 sps × 270.833 kHz
-SCALE             = 16384     # float [-1,1] → int16 [-16384,16384]
+SCALE             = 30000     # float [-1,1] → near int16 max
 
 
 def main():

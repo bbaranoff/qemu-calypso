@@ -96,9 +96,15 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
 
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
 
-    /* Direct word copy: DSP DARAM is 16-bit; samples are signed int16. */
+    /* Circular append: each successive burst writes at the previous
+     * write offset within [daram_addr .. daram_addr+daram_len), wrapping
+     * around. Models the BSP DMA filling a long FB sample buffer over
+     * many serial bursts before the DSP correlator sweeps it. */
+    static unsigned woff = 0;
     for (int i = 0; i < n; i++) {
-        bsp.dsp->data[(uint16_t)(bsp.daram_addr + i)] = (uint16_t)iq[i];
+        bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = (uint16_t)iq[i];
+        woff++;
+        if (woff >= bsp.daram_len) woff = 0;
     }
     bsp.bursts_written++;
 

@@ -93,6 +93,23 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
                     s->insn_count);
         }
     }
+    /* Trace DARAM addr range read by the active FB-det inner loop
+     * (PROM0 0x9880..0x9890 RPTB+BANZD correlator). Min/max + count. */
+    if (((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
+         (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
+         (s->pc >= 0x8a00 && s->pc <= 0x8aff)) && addr < 0x4000) {
+        static uint16_t fb_min = 0xFFFF, fb_max = 0;
+        static uint32_t fb_n = 0;
+        static uint32_t last_log = 0;
+        if (addr < fb_min) fb_min = addr;
+        if (addr > fb_max) fb_max = addr;
+        fb_n++;
+        if (fb_n <= 5 || fb_n - last_log >= 1000) {
+            last_log = fb_n;
+            C54_LOG("FBLOOP-RD n=%u range=[0x%04x..0x%04x] AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
+                    fb_n, fb_min, fb_max, s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
     if ((s->pc >= 0x7700 && s->pc <= 0x7990) ||
         (s->pc >= 0x7e80 && s->pc <= 0x7ec0) ||
         (s->pc >= 0x81a0 && s->pc <= 0x82ff)) {
@@ -2031,9 +2048,32 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
-        /* 0x60-0x6F dispatch — per tic54x-opc.c. The whole previous block
-         * was mis-labeled "LD Smem,dst / LD Smem,T". The real LD Smem,dst
-         * is at 0x1000 mask 0xFE00, NOT in the 0x6xxx range. */
+        /* LD Smem, dst — 0x1000 mask 0xFE00 (1 word).
+         * Loads sign-extended 16-bit Smem into A or B (bit9=dst). */
+        if ((op & 0xFE00) == 0x1000) {
+            int dst_acc = (op >> 9) & 1;
+            addr = resolve_smem(s, op, &ind);
+            int16_t v = (int16_t)data_read(s, addr);
+            int64_t r = sext40((int64_t)v);
+            if (dst_acc) s->b = r; else s->a = r;
+            return consumed + s->lk_used;
+        }
+        /* LD Smem, TS, dst — 0x1400 mask 0xFE00 (1 word). Shift by TREG bits 5:0
+         * (signed -16..+15 effective on C54x via two's complement of low 6 bits). */
+        if ((op & 0xFE00) == 0x1400) {
+            int dst_acc = (op >> 9) & 1;
+            addr = resolve_smem(s, op, &ind);
+            int16_t v = (int16_t)data_read(s, addr);
+            int sh = (int)(s->t & 0x3F);
+            if (sh & 0x20) sh -= 0x40;     /* sign-extend 6-bit */
+            int64_t r = (int64_t)v;
+            if (sh >= 0) r <<= sh;
+            else         r >>= -sh;
+            r = sext40(r);
+            if (dst_acc) s->b = r; else s->a = r;
+            return consumed + s->lk_used;
+        }
+        /* 0x60-0x6F dispatch — per tic54x-opc.c. */
         if ((op & 0xFF00) == 0x6000) {
             /* CMPM Smem, #lk — compare memory to immediate, set TC. 2 words. */
             addr = resolve_smem(s, op, &ind);
