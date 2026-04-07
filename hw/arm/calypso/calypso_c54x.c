@@ -95,17 +95,28 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     }
     /* Trace DARAM addr range read by the active FB-det inner loop
      * (PROM0 0x9880..0x9890 RPTB+BANZD correlator). Min/max + count. */
-    /* DROM coeffs read tracer: log first 32 unique reads from 0x9000..0xdfff
-     * (the data ROM range) so we can confirm AR2=0xcc7e returns real coeffs. */
-    if (addr >= 0x9000 && addr <= 0xdfff) {
+    /* DROM coeffs read tracer: log unique reads from 0x9000..0xdfff
+     * ONLY when PC is inside the active FB-det inner correlator loop
+     * (PROM0 0xa10d..0xa116). The previous version captured the init
+     * copy-DROM phase at PC=0xfd23 which did not represent what the
+     * correlator actually consumes. Cap at 256 unique addrs and also
+     * count total hits so we can tell whether AR2 sweeps or stays put. */
+    if (addr >= 0x9000 && addr <= 0xdfff &&
+        ((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
+         (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
+         (s->pc >= 0x8a00 && s->pc <= 0x8aff))) {
         static uint8_t coeff_seen[0x5000 / 8];
         static int coeff_n = 0;
+        static uint32_t coeff_hits = 0;
         unsigned i = addr - 0x9000;
-        if (coeff_n < 32 && !(coeff_seen[i >> 3] & (1 << (i & 7)))) {
+        coeff_hits++;
+        if (coeff_n < 256 && !(coeff_seen[i >> 3] & (1 << (i & 7)))) {
             coeff_seen[i >> 3] |= (1 << (i & 7));
             coeff_n++;
-            C54_LOG("COEFF-RD #%d [0x%04x]=0x%04x PC=0x%04x AR2=%04x insn=%u",
-                    coeff_n, addr, s->data[addr], s->pc, s->ar[2], s->insn_count);
+            C54_LOG("COEFF-RD #%d [0x%04x]=0x%04x PC=0x%04x AR2=%04x "
+                    "AR4=%04x hits=%u insn=%u",
+                    coeff_n, addr, s->data[addr], s->pc, s->ar[2],
+                    s->ar[4], coeff_hits, s->insn_count);
         }
     }
     if (((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
@@ -459,75 +470,90 @@ static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
 {
     if (opcode & 0x80) {
-        /* Indirect addressing */
+        /* Indirect addressing.
+         *
+         * Per binutils tic54x.h: ARF(OP) = OP & 0x7 selects AR0..AR7
+         * directly from opcode bits[2:0]. ARP is NOT used to pick the
+         * register in indirect mode (it's only the source for
+         * direct-mode-via-ARP and is updated as a side effect).
+         *
+         * BUG (pre-2026-04-07): this routine used s->ar[cur_arp]
+         * instead of s->ar[nar], so consecutive indirect accesses to
+         * different ARs misbehaved — the SECOND access would read the
+         * AR used by the previous access, not the one encoded in the
+         * opcode. This silently broke the FB-det inner correlator at
+         * PROM0 a0e5 (MAR *AR6) → a0e6 (MAS *AR4): the MAS used AR6
+         * (DROM coefficients walking down 0x9fff) instead of AR4
+         * (sample buffer in DARAM), so the FCCH match score was
+         * basically computed against the coefficient table itself.
+         */
         *indirect = true;
         int mod = (opcode >> 3) & 0x0F;
         int nar = opcode & 0x07;
-        int cur_arp = arp(s);
-        uint16_t addr = s->ar[cur_arp];
+        uint16_t addr = s->ar[nar];
 
         /* Post-modify */
         switch (mod) {
         case 0x0: /* *ARn */
             break;
         case 0x1: /* *ARn- */
-            s->ar[cur_arp]--;
+            s->ar[nar]--;
             break;
         case 0x2: /* *ARn+ */
-            s->ar[cur_arp]++;
+            s->ar[nar]++;
             break;
         case 0x3: /* *+ARn */
-            addr = ++s->ar[cur_arp];
+            addr = ++s->ar[nar];
             break;
         case 0x4: /* *ARn-0 */
-            s->ar[cur_arp] -= s->ar[0];
+            s->ar[nar] -= s->ar[0];
             break;
         case 0x5: /* *ARn+0 */
-            s->ar[cur_arp] += s->ar[0];
+            s->ar[nar] += s->ar[0];
             break;
         case 0x6: /* *ARn-0B (bit-reversed) */
             /* Simplified: just subtract */
-            s->ar[cur_arp] -= s->ar[0];
+            s->ar[nar] -= s->ar[0];
             break;
         case 0x7: /* *ARn+0B (bit-reversed) */
-            s->ar[cur_arp] += s->ar[0];
+            s->ar[nar] += s->ar[0];
             break;
         case 0x8: /* *ARn-% (circular) */
-            if (s->bk == 0) s->ar[cur_arp]--;
+            if (s->bk == 0) s->ar[nar]--;
             else {
-                uint16_t base = s->ar[cur_arp] - (s->ar[cur_arp] % s->bk);
-                s->ar[cur_arp]--;
-                if (s->ar[cur_arp] < base) s->ar[cur_arp] = base + s->bk - 1;
+                uint16_t base = s->ar[nar] - (s->ar[nar] % s->bk);
+                s->ar[nar]--;
+                if (s->ar[nar] < base) s->ar[nar] = base + s->bk - 1;
             }
             break;
         case 0x9: /* *ARn+% (circular) */
-            if (s->bk == 0) s->ar[cur_arp]++;
+            if (s->bk == 0) s->ar[nar]++;
             else {
-                uint16_t base = s->ar[cur_arp] - (s->ar[cur_arp] % s->bk);
-                s->ar[cur_arp]++;
-                if (s->ar[cur_arp] >= base + s->bk) s->ar[cur_arp] = base;
+                uint16_t base = s->ar[nar] - (s->ar[nar] % s->bk);
+                s->ar[nar]++;
+                if (s->ar[nar] >= base + s->bk) s->ar[nar] = base;
             }
             break;
         case 0xA: /* *ARn-0% */
-            s->ar[cur_arp] -= s->ar[0];
+            s->ar[nar] -= s->ar[0];
             break;
         case 0xB: /* *ARn+0% */
-            s->ar[cur_arp] += s->ar[0];
+            s->ar[nar] += s->ar[0];
             break;
         /* MOD 12..15 use a long extension word (lk). Per binutils
          * tic54x-dis.c sprint_indirect_address: */
         case 0xC: /* *ARx(lk) — addr = AR + lk, AR unchanged */
-            addr = s->ar[cur_arp] + prog_fetch(s, s->pc + 1);
+            addr = s->ar[nar] + prog_fetch(s, s->pc + 1);
             s->lk_used = true;
             break;
         case 0xD: /* *+ARx(lk) — pre-add: AR += lk, addr = AR */
-            s->ar[cur_arp] += prog_fetch(s, s->pc + 1);
-            addr = s->ar[cur_arp];
+            s->ar[nar] += prog_fetch(s, s->pc + 1);
+            addr = s->ar[nar];
             s->lk_used = true;
             break;
         case 0xE: /* *+ARx(lk)% — pre-add circular */
-            s->ar[cur_arp] += prog_fetch(s, s->pc + 1);
-            addr = s->ar[cur_arp];
+            s->ar[nar] += prog_fetch(s, s->pc + 1);
+            addr = s->ar[nar];
             s->lk_used = true;
             break;
         case 0xF: /* *(lk) — absolute address from extension word */
@@ -536,7 +562,7 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
             break;
         }
 
-        /* Update ARP */
+        /* Update ARP to the AR that was just used (C54x side effect). */
         s->st0 = (s->st0 & ~ST0_ARP_MASK) | (nar << ST0_ARP_SHIFT);
 
         return addr;
@@ -1432,7 +1458,13 @@ static int c54x_exec_one(C54xState *s)
                 s->pc = (iptr * 0x80) + vec * 4;
                 return 0;
             }
-            /* F320+: LD #k9, DP */
+            /* F320+: LD #k9, DP — undocumented C548-specific encoding?
+             * NOT in standard tic54x-opc.c (real LD #k9,DP is 0xEAxx).
+             * However observation shows F3xx fires at DSP init from
+             * PC=0x9ae8 / 0x9b0c (one-shot DP setup), and NOP-ing it
+             * sends the whole DSP into garbage AR state. So treat it
+             * as `LD #k9, DP` for now until we identify the real
+             * semantics. */
             uint16_t k9 = op & 0x01FF;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
             return consumed + s->lk_used;
