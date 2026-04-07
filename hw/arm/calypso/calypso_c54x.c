@@ -79,6 +79,20 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
      * of every (PC, addr) pair where the DSP reads from low DARAM
      * (<0x4000) so we can map sample buffers per task. Capped to 200
      * unique entries; uses a tiny open-addressing dedup table. */
+    /* Diagnostic: log first reads in the BSP DMA target window
+     * [0x021f..0x06be] = the configured sample buffer. If nothing
+     * fires, the DSP isn't reading from where we're injecting samples
+     * → BSP env vars need to be re-located post resolve_smem fix. */
+    if (addr >= 0x021f && addr <= 0x06be) {
+        static uint32_t bsp_rd_n = 0;
+        bsp_rd_n++;
+        if (bsp_rd_n <= 20 || (bsp_rd_n & 0xFFFF) == 0) {
+            C54_LOG("BSP-RD #%u [0x%04x] PC=0x%04x AR2=%04x AR3=%04x "
+                    "AR4=%04x AR5=%04x insn=%u",
+                    bsp_rd_n, addr, s->pc, s->ar[2], s->ar[3],
+                    s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
     if (addr < 0x4000 && s->insn_count > 5000000 && s->pc >= 0x0010) {
         /* Bitmap dedup keyed on addr only — log first read of each
          * unique DARAM cell. 0x4000 cells = 0x800 bytes bitmap. */
@@ -122,6 +136,52 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     if (((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
          (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
          (s->pc >= 0x8a00 && s->pc <= 0x8aff)) && addr < 0x4000) {
+        /* Per-addr COUNT: tally each DARAM cell read while inside the
+         * FB-det PC zones; dump top-30 every 100M insns. The HOT
+         * addrs are the inner correlator's sample buffer; COLD addrs
+         * are init/control reads. */
+        {
+            static uint16_t fb_cnt[0x4000];
+            static uint64_t fb_last_dump = 0;
+            fb_cnt[addr]++;
+            if (s->insn_count - fb_last_dump >= 100000000ULL) {
+                fb_last_dump = s->insn_count;
+                /* find top 30 */
+                uint16_t top_a[30] = {0};
+                uint16_t top_c[30] = {0};
+                for (int i = 0; i < 0x4000; i++) {
+                    uint16_t c = fb_cnt[i];
+                    if (c == 0) continue;
+                    for (int j = 0; j < 30; j++) {
+                        if (c > top_c[j]) {
+                            for (int k = 29; k > j; k--) {
+                                top_c[k] = top_c[k-1];
+                                top_a[k] = top_a[k-1];
+                            }
+                            top_c[j] = c;
+                            top_a[j] = i;
+                            break;
+                        }
+                    }
+                }
+                C54_LOG("FB-HOT@%u: %04x:%u %04x:%u %04x:%u %04x:%u "
+                        "%04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
+                        s->insn_count,
+                        top_a[0], top_c[0], top_a[1], top_c[1],
+                        top_a[2], top_c[2], top_a[3], top_c[3],
+                        top_a[4], top_c[4], top_a[5], top_c[5],
+                        top_a[6], top_c[6], top_a[7], top_c[7],
+                        top_a[8], top_c[8], top_a[9], top_c[9]);
+                C54_LOG("FB-HOT@%u cont: %04x:%u %04x:%u %04x:%u %04x:%u "
+                        "%04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
+                        s->insn_count,
+                        top_a[10], top_c[10], top_a[11], top_c[11],
+                        top_a[12], top_c[12], top_a[13], top_c[13],
+                        top_a[14], top_c[14], top_a[15], top_c[15],
+                        top_a[16], top_c[16], top_a[17], top_c[17],
+                        top_a[18], top_c[18], top_a[19], top_c[19]);
+            }
+        }
         static uint16_t fb_min = 0xFFFF, fb_max = 0;
         static uint32_t fb_n = 0;
         static uint32_t last_log = 0;
@@ -2067,8 +2127,15 @@ static int c54x_exec_one(C54xState *s)
          * stray opcodes and ultimately landing on f4e2 (BACC A) with
          * A=0 → runaway to PC=0. */
         if (hi8 == 0x76) {
+            /* When Smem mode is 12..15, resolve_smem already consumed
+             * a long-extension word at PC+1 (the AR offset). The
+             * immediate value to store then lives at PC+2, not PC+1.
+             * Without this offset, ST #lk,*ARx(lk) tables in PROM1
+             * (e.g. 0xc0f3 init sequence) overwrite their target with
+             * the AR offset word and never store the real immediate. */
             addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
+            int imm_off = 1 + (s->lk_used ? 1 : 0);
+            op2 = prog_fetch(s, s->pc + imm_off);
             consumed = 2;
             data_write(s, addr, op2);
             return consumed + s->lk_used;
@@ -3191,17 +3258,77 @@ ba_handler:
          * AR-pointed addresses, including NDB cells (0xa0e7 →
          * d_fb_det = 0xffff). */
         if ((op & 0xFC00) == 0xC800) {
-            int src_acc = (op >> 9) & 1;  /* SRC bit */
-            int yar     = (op & 0x03) + 2;
-            int ymod    = (op >> 4) & 0x03;  /* same field shape as Xmod */
+            /* Parallel: ST SRC, Ymem || LD Xmem, DST.
+             * Per tic54x-opc.c:
+             *   { "st",1,2,2,0xC800, 0xFC00, {OP_SRC,OP_Ymem}, FL_PAR,0,0,
+             *     "ld",                      {OP_Xmem,OP_DST} }
+             * Encoding (mask 0xFC00, base 0xC800):
+             *   bit 9   = SRC (0=A, 1=B) — store source
+             *   bit 8   = DST (0=A, 1=B) — load destination
+             *   bits 7:4 = XMEM field (load source)
+             *   bits 3:0 = YMEM field (store destination)
+             * Per binutils tic54x.h: each 4-bit dual-mem field is
+             *   MOD = (field & 0xC) >> 2  (bits 3:2)
+             *   AR  = (field & 0x3) + 2   → AR2..AR5
+             *
+             * Reads happen before writes per SPRU172C parallel ops:
+             * snapshot SRC and load value before writing the store. */
+            int src_acc = (op >> 9) & 1;
+            int dst_acc = (op >> 8) & 1;
+            int xmem    = (op >> 4) & 0x0F;
+            int ymem    =  op       & 0x0F;
+            int xar     = (xmem & 0x3) + 2;
+            int xmod    = (xmem >> 2) & 0x3;
+            int yar     = (ymem & 0x3) + 2;
+            int ymod    = (ymem >> 2) & 0x3;
+
+            uint16_t addr_x = s->ar[xar];
             uint16_t addr_y = s->ar[yar];
-            int64_t v = src_acc ? s->b : s->a;
-            data_write(s, addr_y, (uint16_t)(v & 0xFFFF));
+
+            /* Snapshot ST source BEFORE LD overwrites the (possibly
+             * shared) accumulator. */
+            int64_t st_src = src_acc ? s->b : s->a;
+            uint16_t ld_val = data_read(s, addr_x);
+
+            /* Perform the store. */
+            data_write(s, addr_y, (uint16_t)(st_src & 0xFFFF));
+
+            /* Perform the load (sign-extend 16→40 bits). */
+            int64_t loaded = sext40((int64_t)(int16_t)ld_val);
+            if (dst_acc) s->b = loaded;
+            else         s->a = loaded;
+
+            /* Diagnostic: log when LD writes 0 into the accumulator
+             * inside parallel st||ld (suspect cause of BACC A → PC=0
+             * runaway). One-shot per PC. */
+            if (loaded == 0) {
+                static uint8_t pc_seen[0x10000 / 8];
+                if (!(pc_seen[s->pc >> 3] & (1 << (s->pc & 7)))) {
+                    pc_seen[s->pc >> 3] |= (1 << (s->pc & 7));
+                    C54_LOG("C800-LD0 PC=0x%04x op=0x%04x xar=AR%d "
+                            "addr=0x%04x dst=%c insn=%u",
+                            s->pc, op, xar, addr_x, dst_acc ? 'B' : 'A',
+                            s->insn_count);
+                }
+            }
+
+            /* Post-modify Xmem AR.
+             * Dual-mem mod table per binutils tic54x-dis.c sprint_dual_address:
+             *   0 = *ARn      (no modify)
+             *   1 = *ARn-     (post-decrement)
+             *   2 = *ARn+     (post-increment)
+             *   3 = *ARn+0%   (post-add AR0 with circular) */
+            switch (xmod) {
+            case 0: break;
+            case 1: s->ar[xar]--; break;
+            case 2: s->ar[xar]++; break;
+            case 3: s->ar[xar] += s->ar[0]; break;
+            }
             switch (ymod) {
-            case 0: s->ar[yar]++; break;        /* *Ymem+ */
-            case 1: s->ar[yar]--; break;        /* *Ymem- */
-            case 2: /* *Ymem (no modify) */     break;
-            case 3: s->ar[yar] += s->ar[0]; break; /* *Ymem+0% (simplified) */
+            case 0: break;
+            case 1: s->ar[yar]--; break;
+            case 2: s->ar[yar]++; break;
+            case 3: s->ar[yar] += s->ar[0]; break;
             }
             return consumed + s->lk_used;
         }
