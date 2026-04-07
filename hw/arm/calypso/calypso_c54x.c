@@ -1373,12 +1373,13 @@ static int c54x_exec_one(C54xState *s)
              * Per SPRU172C + tic54x-opc.c: entire F8xx range is BANZ.
              * Smem determines AR post-modify; test AR(ARP) != 0 → branch. */
             if (sub <= 0x1) {
-                uint16_t ar_idx = arp(s);
+                /* AR from opcode bits[2:0] per binutils ARF, not ARP.
+                 * Test BEFORE the resolve_smem post-modify. */
+                int ar_idx = op & 0x07;
                 uint16_t old_ar = s->ar[ar_idx];
                 addr = resolve_smem(s, op, &ind);
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
-                s->ar[ar_idx]--; /* BANZ always decrements AR(ARP) */
                 if (old_ar != 0) {
                     s->pc = op2;
                     return 0;
@@ -1545,19 +1546,22 @@ static int c54x_exec_one(C54xState *s)
          * Per SPRU172C: modify AR per Smem addressing; if AR[ARP] != 0, branch to pmad
          * Encoding: 1111 1000 IAAA AAAA + pmad */
         if (hi8 == 0xF8) {
+            /* AR from opcode bits[2:0] per binutils ARF, not ARP.
+             * Test BEFORE resolve_smem post-modify. */
+            int n = op & 0x07;
+            uint16_t ar_val = s->ar[n];
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            uint16_t cur_arp_val = s->ar[arp(s)];
             {
                 static int banz_log = 0;
                 if (banz_log < 5)
-                    C54_LOG("BANZ PC=0x%04x ARP=%d AR[ARP]=0x%04x target=0x%04x %s",
-                            s->pc, arp(s), cur_arp_val, op2,
-                            cur_arp_val != 0 ? "TAKEN" : "NOT TAKEN");
+                    C54_LOG("BANZ PC=0x%04x AR%d=0x%04x target=0x%04x %s",
+                            s->pc, n, ar_val, op2,
+                            ar_val != 0 ? "TAKEN" : "NOT TAKEN");
                 banz_log++;
             }
-            if (cur_arp_val != 0) {
+            if (ar_val != 0) {
                 s->pc = op2;
                 return 0;
             }
@@ -2155,6 +2159,26 @@ static int c54x_exec_one(C54xState *s)
             else         s->a = sext40(prod);
             return consumed + s->lk_used;
         }
+        if ((op & 0xFC00) == 0x6400) {
+            /* MAC Smem, #lk, SRC, DST — multiply Smem by 16-bit
+             * immediate, accumulate into DST. 2 words.
+             * Per tic54x-opc.c: 0x6400 mask 0xFC00,
+             * {OP_Smem,OP_lk,OP_SRC,OPT|OP_DST}, FL_SMR.
+             * bit 9 = SRC (0=A,1=B), bit 8 = DST (0=A,1=B). */
+            int src_acc = (op >> 9) & 1;
+            int dst_acc = (op >> 8) & 1;
+            addr = resolve_smem(s, op, &ind);
+            op2  = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            int64_t prod = (int64_t)(int16_t)data_read(s, addr) *
+                           (int64_t)(int16_t)op2;
+            if (s->st1 & ST1_FRCT) prod <<= 1;
+            int64_t src_val = src_acc ? s->b : s->a;
+            int64_t result  = sext40(src_val + prod);
+            if (dst_acc) s->b = result;
+            else         s->a = result;
+            return consumed + s->lk_used;
+        }
         if ((op & 0xFF00) == 0x6800) {
             /* ANDM #lk, Smem — Smem &= #lk. 2 words. */
             addr = resolve_smem(s, op, &ind);
@@ -2188,17 +2212,26 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if ((op & 0xFF00) == 0x6C00 || (op & 0xFF00) == 0x6E00) {
-            /* BANZ[D] pmad, Sind — branch if AR != 0, decrement after */
+            /* BANZ[D] pmad, Sind — branch if AR != 0, decrement after.
+             * Per binutils tic54x.h ARF(OP)=OP&0x7: the AR is selected
+             * directly from opcode bits[2:0], NOT from ARP. Same fix
+             * pattern as resolve_smem (2026-04-07). The previous code
+             * read arp(s), which after a MAR/LD on a different AR would
+             * test/decrement the wrong register and trap the DSP in
+             * infinite loops at PROM0 0x9ac0..0x9ace. */
+            /* Per SPRU172C: BANZ tests AR BEFORE the addressing-mode
+             * post-modify. resolve_smem already applies the *ARn /
+             * *ARn- / *ARn+ post-modify per the Sind mod field — do
+             * NOT double-decrement here. */
+            int n = op & 0x07;
+            uint16_t old_ar = s->ar[n];
             addr = resolve_smem(s, op, &ind);
             op2  = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            int n = arp(s);
-            if (s->ar[n] != 0) {
+            if (old_ar != 0) {
                 s->pc = op2;
-                s->ar[n]--;  /* post-decrement after branch decision */
                 return 0;
             }
-            s->ar[n]--;
             return consumed + s->lk_used;
         }
         if ((op & 0xFF00) == 0x6D00) {
@@ -3317,6 +3350,26 @@ int c54x_run(C54xState *s, int n_insns)
                 C54_LOG("CALA-TRACE PC=0x%04x A=%08x SP=0x%04x BRC=%d AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
                         s->pc, (uint32_t)(s->a & 0xFFFFFFFF), s->sp, s->brc,
                         s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+            }
+        }
+
+        /* Spin-loop diagnostic at PROM0 0x9ac7 outer loop entry.
+         * Post resolve_smem fix the DSP wedges in 9ac7..9ace forever.
+         * Log AR0..AR7, A, B, BRC at first hit, then every 1M hits, so
+         * we can see whether AR4 (the BANZD counter) actually shrinks. */
+        if (s->pc == 0x9ac7) {
+            static uint64_t hits_9ac7 = 0;
+            hits_9ac7++;
+            if (hits_9ac7 <= 5 || (hits_9ac7 % 10000) == 0) {
+                C54_LOG("9AC7 hit=%llu AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                        "AR4=%04x AR5=%04x AR6=%04x AR7=%04x A=%010llx "
+                        "B=%010llx BRC=%d insn=%u",
+                        (unsigned long long)hits_9ac7,
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                        s->brc, s->insn_count);
             }
         }
 
