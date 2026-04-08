@@ -224,13 +224,12 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
                            INTH_IRQ(IRQ_UART_MODEM));
         g_uart_modem = &s->uart_modem;
 
-        /* L1CTL socket: DISABLED — bridge.py owns /tmp/osmocom_l2_1 via PTY.
-         * Having both QEMU and bridge.py write to the same socket interleaves
-         * bytes and corrupts L1CTL headers ("Short L1CTL message len=1"). */
-        /* {
-            const char *l1ctl_path = getenv("L1CTL_SOCK");
-            l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2_1");
-        } */
+        /* L1CTL socket DISABLED 2026-04-07 (revert):
+         * L1CTL now flows over PTY/sercomm DLCI 5 via bridge.py, the
+         * classical osmocon path. bridge.py owns /tmp/osmocom_l2_1
+         * and wraps L1CTL frames into sercomm; sercomm_gate.c on the
+         * QEMU side parses them and pushes into the firmware UART RX. */
+        /* l1ctl_sock_init(&s->uart_modem, "/tmp/osmocom_l2_1"); */
     }
 
     /* ---- UART IRDA ---- */

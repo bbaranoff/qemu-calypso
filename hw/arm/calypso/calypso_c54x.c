@@ -65,6 +65,40 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* === DARAM discovery histogram for the e25e..e27f loop ===
+     * The current FB-det loop runs in PROM1 around 0xe25e..0xe27f
+     * (RPTBD + MVDD copying samples). Histogram all DARAM reads
+     * issued from that PC range so we can see which cell the loop
+     * is actually pulling samples from, then set CALYPSO_BSP_DARAM_ADDR
+     * accordingly. Dumps top-16 every 50k reads. */
+    if (((s->pc >= 0x7700 && s->pc <= 0x79ff) ||
+         (s->pc >= 0xe25e && s->pc <= 0xe27f)) && addr < 0x8000) {
+        static unsigned hist[0x4000]; /* 16 KW DARAM */
+        static unsigned reads;
+        if (addr < 0x4000) {
+            hist[addr]++;
+            reads++;
+            if ((reads % 50000) == 0) {
+                /* find top-16 */
+                unsigned best[16] = {0}; uint16_t baddr[16] = {0};
+                for (uint16_t a = 0; a < 0x4000; a++) {
+                    unsigned c = hist[a];
+                    if (c <= best[15]) continue;
+                    int p = 15;
+                    while (p > 0 && best[p-1] < c) {
+                        best[p] = best[p-1]; baddr[p] = baddr[p-1]; p--;
+                    }
+                    best[p] = c; baddr[p] = a;
+                }
+                fprintf(stderr,
+                        "[c54x] DARAM RD HIST (FB-det, reads=%u): ",
+                        reads);
+                for (int i = 0; i < 16 && best[i]; i++)
+                    fprintf(stderr, "%04x:%u ", baddr[i], best[i]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     /* === BSP discovery: trace data reads in FB-det handler ===
      * Wide range over the PROM0 user-code area: handler PCs observed in
      * timeout traces cluster around 0x7e92..0x7eb8 (the FB-det inner
@@ -73,132 +107,10 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
      * The 0x7e80..0x7eb8 wrapper CALLS into 0x81a5/0x81c8 with AR5=0x0e4c
      * (the FB sample buffer). Cover both ranges to catch both wrapper
      * polls and inner correlator reads. Skip the boot init phase. */
-    /* Generic DARAM-read profiler. With the decoder fixed, the L1 now
-     * schedules PM and FB tasks but we don't yet know which DARAM
-     * addresses each task reads samples from. Log the first occurrence
-     * of every (PC, addr) pair where the DSP reads from low DARAM
-     * (<0x4000) so we can map sample buffers per task. Capped to 200
-     * unique entries; uses a tiny open-addressing dedup table. */
-    /* Diagnostic: log first reads in the BSP DMA target window
-     * [0x021f..0x06be] = the configured sample buffer. If nothing
-     * fires, the DSP isn't reading from where we're injecting samples
-     * → BSP env vars need to be re-located post resolve_smem fix. */
-    if (addr >= 0x021f && addr <= 0x06be) {
-        static uint32_t bsp_rd_n = 0;
-        bsp_rd_n++;
-        if (bsp_rd_n <= 20 || (bsp_rd_n & 0xFFFF) == 0) {
-            C54_LOG("BSP-RD #%u [0x%04x] PC=0x%04x AR2=%04x AR3=%04x "
-                    "AR4=%04x AR5=%04x insn=%u",
-                    bsp_rd_n, addr, s->pc, s->ar[2], s->ar[3],
-                    s->ar[4], s->ar[5], s->insn_count);
-        }
-    }
-    if (addr < 0x4000 && s->insn_count > 5000000 && s->pc >= 0x0010) {
-        /* Bitmap dedup keyed on addr only — log first read of each
-         * unique DARAM cell. 0x4000 cells = 0x800 bytes bitmap. */
-        static uint8_t seen_bm[0x800];
-        static int seen_n = 0;
-        if (!(seen_bm[addr >> 3] & (1 << (addr & 7)))) {
-            seen_bm[addr >> 3] |= (1 << (addr & 7));
-            seen_n++;
-            C54_LOG("DARAM-RD #%d [0x%04x] PC=0x%04x AR2=%04x AR3=%04x "
-                    "AR5=%04x insn=%u",
-                    seen_n, addr, s->pc, s->ar[2], s->ar[3], s->ar[5],
-                    s->insn_count);
-        }
-    }
-    /* Trace DARAM addr range read by the active FB-det inner loop
-     * (PROM0 0x9880..0x9890 RPTB+BANZD correlator). Min/max + count. */
-    /* DROM coeffs read tracer: log unique reads from 0x9000..0xdfff
-     * ONLY when PC is inside the active FB-det inner correlator loop
-     * (PROM0 0xa10d..0xa116). The previous version captured the init
-     * copy-DROM phase at PC=0xfd23 which did not represent what the
-     * correlator actually consumes. Cap at 256 unique addrs and also
-     * count total hits so we can tell whether AR2 sweeps or stays put. */
-    if (addr >= 0x9000 && addr <= 0xdfff &&
-        ((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
-         (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
-         (s->pc >= 0x8a00 && s->pc <= 0x8aff))) {
-        static uint8_t coeff_seen[0x5000 / 8];
-        static int coeff_n = 0;
-        static uint32_t coeff_hits = 0;
-        unsigned i = addr - 0x9000;
-        coeff_hits++;
-        if (coeff_n < 256 && !(coeff_seen[i >> 3] & (1 << (i & 7)))) {
-            coeff_seen[i >> 3] |= (1 << (i & 7));
-            coeff_n++;
-            C54_LOG("COEFF-RD #%d [0x%04x]=0x%04x PC=0x%04x AR2=%04x "
-                    "AR4=%04x hits=%u insn=%u",
-                    coeff_n, addr, s->data[addr], s->pc, s->ar[2],
-                    s->ar[4], coeff_hits, s->insn_count);
-        }
-    }
-    if (((s->pc >= 0x9880 && s->pc <= 0x9bff) ||
-         (s->pc >= 0xa000 && s->pc <= 0xa1ff) ||
-         (s->pc >= 0x8a00 && s->pc <= 0x8aff)) && addr < 0x4000) {
-        /* Per-addr COUNT: tally each DARAM cell read while inside the
-         * FB-det PC zones; dump top-30 every 100M insns. The HOT
-         * addrs are the inner correlator's sample buffer; COLD addrs
-         * are init/control reads. */
-        {
-            static uint16_t fb_cnt[0x4000];
-            static uint64_t fb_last_dump = 0;
-            fb_cnt[addr]++;
-            if (s->insn_count - fb_last_dump >= 100000000ULL) {
-                fb_last_dump = s->insn_count;
-                /* find top 30 */
-                uint16_t top_a[30] = {0};
-                uint16_t top_c[30] = {0};
-                for (int i = 0; i < 0x4000; i++) {
-                    uint16_t c = fb_cnt[i];
-                    if (c == 0) continue;
-                    for (int j = 0; j < 30; j++) {
-                        if (c > top_c[j]) {
-                            for (int k = 29; k > j; k--) {
-                                top_c[k] = top_c[k-1];
-                                top_a[k] = top_a[k-1];
-                            }
-                            top_c[j] = c;
-                            top_a[j] = i;
-                            break;
-                        }
-                    }
-                }
-                C54_LOG("FB-HOT@%u: %04x:%u %04x:%u %04x:%u %04x:%u "
-                        "%04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
-                        s->insn_count,
-                        top_a[0], top_c[0], top_a[1], top_c[1],
-                        top_a[2], top_c[2], top_a[3], top_c[3],
-                        top_a[4], top_c[4], top_a[5], top_c[5],
-                        top_a[6], top_c[6], top_a[7], top_c[7],
-                        top_a[8], top_c[8], top_a[9], top_c[9]);
-                C54_LOG("FB-HOT@%u cont: %04x:%u %04x:%u %04x:%u %04x:%u "
-                        "%04x:%u %04x:%u %04x:%u %04x:%u %04x:%u %04x:%u",
-                        s->insn_count,
-                        top_a[10], top_c[10], top_a[11], top_c[11],
-                        top_a[12], top_c[12], top_a[13], top_c[13],
-                        top_a[14], top_c[14], top_a[15], top_c[15],
-                        top_a[16], top_c[16], top_a[17], top_c[17],
-                        top_a[18], top_c[18], top_a[19], top_c[19]);
-            }
-        }
-        static uint16_t fb_min = 0xFFFF, fb_max = 0;
-        static uint32_t fb_n = 0;
-        static uint32_t last_log = 0;
-        if (addr < fb_min) fb_min = addr;
-        if (addr > fb_max) fb_max = addr;
-        fb_n++;
-        if (fb_n <= 5 || fb_n - last_log >= 1000) {
-            last_log = fb_n;
-            C54_LOG("FBLOOP-RD n=%u range=[0x%04x..0x%04x] AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
-                    fb_n, fb_min, fb_max, s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
-        }
-    }
-    if ((s->pc >= 0x7700 && s->pc <= 0x7990) ||
-        (s->pc >= 0x7e80 && s->pc <= 0x7ec0) ||
+    if ((s->pc >= 0x7e80 && s->pc <= 0x7ec0) ||
         (s->pc >= 0x81a0 && s->pc <= 0x82ff)) {
         static int fbdet_rd_log = 0;
-        if (s->insn_count > 100000000 && fbdet_rd_log < 10000) {
+        if (s->insn_count > 50000000 && fbdet_rd_log < 2000) {
             uint16_t v;
             if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
                 v = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0;
@@ -317,15 +229,6 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
-    /* Trace writes to NDB d_fb_det / neighborhood (DSP 0x08F0..0x0900) */
-    if (addr >= 0x08F0 && addr <= 0x0900) {
-        static int ndb_wr_log = 0;
-        if (ndb_wr_log < 200) {
-            C54_LOG("NDB WR [0x%04x]=0x%04x PC=0x%04x A=0x%llx insn=%u",
-                    addr, val, s->pc, (unsigned long long)s->a, s->insn_count);
-            ndb_wr_log++;
-        }
-    }
     /* Timer registers (0x0024-0x0026) — before MMR check */
     if (addr == TCR_ADDR) {
         /* TRB: write 1 → reload TIM from PRD, PSC from TDDR */
@@ -361,7 +264,16 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_AR0: case MMR_AR1: case MMR_AR2: case MMR_AR3:
         case MMR_AR4: case MMR_AR5: case MMR_AR6: case MMR_AR7:
             s->ar[addr - MMR_AR0] = val; return;
-        case MMR_SP:   s->sp = val; return;
+        case MMR_SP:
+            if (val >= 0x0800 && val < 0x0900) {
+                fprintf(stderr,
+                        "[c54x] SP-GUARD: refused MMR_SP write 0x%04x "
+                        "(API mailbox); keeping 0x%04x PC=0x%04x\n",
+                        val, s->sp, s->pc);
+                return;
+            }
+            s->sp = val;
+            return;
         case MMR_BK:   s->bk = val; return;
         case MMR_BRC:  s->brc = val; return;
         case MMR_RSA:  s->rsa = val; return;
@@ -389,75 +301,64 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
     /* API RAM (shared with ARM) */
     if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
+        uint16_t woff = addr - C54X_API_BASE;
         if (s->api_ram)
-            s->api_ram[addr - C54X_API_BASE] = val;
-        /* Writes to d_dsp_page (0x08D4) — valid values are only 0/2/3
-         * (page select bits). Anything else is a DSP-side bug: log every
-         * occurrence so we see when/where it happens. */
+            s->api_ram[woff] = val;
+        /* Notify the ARM-side mailbox watcher (calypso_trx) so it can
+         * pulse IRQ_API, mirror to dsp_ram, and run the d_fb_det hook.
+         * Without this, DSP writes to NDB cells are invisible to ARM. */
+        if (s->api_write_cb)
+            s->api_write_cb(s->api_write_cb_opaque, woff, val);
+        /* Stack-corruption watch: stack push landing in the NDB
+         * mailbox region [0x0800..0x08FF]. Only fires when SP has
+         * already been corrupted into that range. */
+        if (addr == s->sp && addr >= 0x0800 && addr < 0x0900) {
+            fprintf(stderr,
+                    "[c54x] STACK-IN-NDB addr=0x%04x val=0x%04x SP=0x%04x "
+                    "PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x\n",
+                    addr, val, s->sp, s->pc, s->insn_count,
+                    s->prog[(uint16_t)(s->pc - 2)],
+                    s->prog[(uint16_t)(s->pc - 1)],
+                    s->prog[s->pc],
+                    s->prog[(uint16_t)(s->pc + 1)]);
+        }
+        /* Always log writes to d_dsp_page (0x08D4) */
         if (addr == 0x08D4) {
-            if (val > 3) {
-                C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u  *** CORRUPT (must not exist) ***",
-                        val, s->pc, s->insn_count);
-            } else {
-                C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u", val, s->pc, s->insn_count);
-            }
+            C54_LOG("DSP WR d_dsp_page = 0x%04x PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x",
+                    val, s->pc, s->insn_count,
+                    s->prog[(uint16_t)(s->pc - 2)],
+                    s->prog[(uint16_t)(s->pc - 1)],
+                    s->prog[s->pc],
+                    s->prog[(uint16_t)(s->pc + 1)]);
         }
         /* d_spcx_rif (NDB word 2 = DSP data 0x08D6) — BSP serial port config */
         if (addr == 0x08D6) {
-            static int rif_log = 0;
-            if (rif_log < 10) {
-                C54_LOG("DSP WR d_spcx_rif = 0x%04x PC=0x%04x insn=%u",
-                        val, s->pc, s->insn_count);
-                rif_log++;
-            }
+            C54_LOG("DSP WR d_spcx_rif = 0x%04x PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x",
+                    val, s->pc, s->insn_count,
+                    s->prog[(uint16_t)(s->pc - 2)],
+                    s->prog[(uint16_t)(s->pc - 1)],
+                    s->prog[s->pc],
+                    s->prog[(uint16_t)(s->pc + 1)]);
         }
-        /* d_fb_det (NDB word 36 = DSP data 0x08F8). Only legitimate
-         * values are 0 (clear) or 1 (FB found). Anything else is a bug
-         * — log every occurrence. */
-        /* Generic NDB-WRITE profiler: log first DSP write to each
-         * unique API/NDB cell so we can map where the PM task posts
-         * its result. Capped to 200 unique cells; insn_count gate keeps
-         * the boot init noise out. */
-        {
-            static uint8_t ndb_seen_bm[(C54X_API_SIZE + 7) / 8];
-            static int ndb_seen_n = 0;
-            int api_off = addr - C54X_API_BASE;
-            if (api_off >= 0 && api_off < C54X_API_SIZE &&
-                s->insn_count > 5000000 && ndb_seen_n < 500 &&
-                !(ndb_seen_bm[api_off >> 3] & (1 << (api_off & 7)))) {
-                ndb_seen_bm[api_off >> 3] |= (1 << (api_off & 7));
-                ndb_seen_n++;
-                C54_LOG("NDB-WR #%d [0x%04x]=0x%04x PC=0x%04x insn=%u",
-                        ndb_seen_n, addr, val, s->pc, s->insn_count);
-            }
-        }
+        /* d_fb_det (NDB word 36 = DSP data 0x08F8). Real firmware writes
+         * a small unsigned value here (BSIC byte, status). Spurious writes
+         * caused by parallel/indirect store side-effects in nearby code
+         * can blast garbage like 0xC000 — only treat 1..0xFF as a real
+         * FB-detected event so we don't get false positives. */
         if (addr == 0x08F8) {
-            if (val == 0 || val == 1) {
-                C54_LOG("DSP WR d_fb_det = %u PC=0x%04x insn=%u %s",
+            static int fbd_log = 0;
+            bool plausible = (val >= 1 && val <= 0xFF);
+            if (plausible || fbd_log < 5) {
+                C54_LOG("DSP WR d_fb_det = 0x%04x PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x %s",
                         val, s->pc, s->insn_count,
-                        val == 1 ? "*** FB DETECTED ***" : "(clear)");
-            } else {
-                C54_LOG("DSP WR d_fb_det = 0x%04x PC=0x%04x insn=%u  *** GARBAGE (must not exist) ***",
-                        val, s->pc, s->insn_count);
+                        s->prog[(uint16_t)(s->pc - 2)],
+                        s->prog[(uint16_t)(s->pc - 1)],
+                        s->prog[s->pc],
+                        s->prog[(uint16_t)(s->pc + 1)],
+                        plausible ? "*** FB DETECTED ***" :
+                        (val == 0 ? "(clear)" : "(spurious, ignored)"));
+                fbd_log++;
             }
-        }
-    }
-
-    /* Watch the specific stack slot 0xEEB3 that the first runaway reads
-     * 0x0001 from. Any write here is logged unconditionally so we can
-     * see whether 0x0001 is pushed by a legitimate CALL or scribbled by
-     * something else. Also keep a wider range trace for context. */
-    if (addr == 0xEEB3 && s->insn_count > 5000000 && s->pc >= 0x0010) {
-        C54_LOG("STACK WR [0xEEB3] = 0x%04x PC=0x%04x SP=0x%04x insn=%u",
-                val, s->pc, s->sp, s->insn_count);
-    }
-    if (addr >= 0xEEB0 && addr <= 0xEEB6 && s->insn_count > 5000000 &&
-        s->pc >= 0x0010) {
-        static int stack_log = 0;
-        if (stack_log < 200) {
-            C54_LOG("STACK WR [0x%04x] = 0x%04x PC=0x%04x SP=0x%04x insn=%u",
-                    addr, val, s->pc, s->sp, s->insn_count);
-            stack_log++;
         }
     }
 
@@ -530,99 +431,81 @@ static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
 {
     if (opcode & 0x80) {
-        /* Indirect addressing.
-         *
-         * Per binutils tic54x.h: ARF(OP) = OP & 0x7 selects AR0..AR7
-         * directly from opcode bits[2:0]. ARP is NOT used to pick the
-         * register in indirect mode (it's only the source for
-         * direct-mode-via-ARP and is updated as a side effect).
-         *
-         * BUG (pre-2026-04-07): this routine used s->ar[cur_arp]
-         * instead of s->ar[nar], so consecutive indirect accesses to
-         * different ARs misbehaved — the SECOND access would read the
-         * AR used by the previous access, not the one encoded in the
-         * opcode. This silently broke the FB-det inner correlator at
-         * PROM0 a0e5 (MAR *AR6) → a0e6 (MAS *AR4): the MAS used AR6
-         * (DROM coefficients walking down 0x9fff) instead of AR4
-         * (sample buffer in DARAM), so the FCCH match score was
-         * basically computed against the coefficient table itself.
-         */
+        /* Indirect addressing */
         *indirect = true;
         int mod = (opcode >> 3) & 0x0F;
         int nar = opcode & 0x07;
-        uint16_t addr = s->ar[nar];
+        int cur_arp = arp(s);
+        uint16_t addr = s->ar[cur_arp];
 
         /* Post-modify */
         switch (mod) {
         case 0x0: /* *ARn */
             break;
         case 0x1: /* *ARn- */
-            s->ar[nar]--;
+            s->ar[cur_arp]--;
             break;
         case 0x2: /* *ARn+ */
-            s->ar[nar]++;
+            s->ar[cur_arp]++;
             break;
         case 0x3: /* *+ARn */
-            addr = ++s->ar[nar];
+            addr = ++s->ar[cur_arp];
             break;
         case 0x4: /* *ARn-0 */
-            s->ar[nar] -= s->ar[0];
+            s->ar[cur_arp] -= s->ar[0];
             break;
         case 0x5: /* *ARn+0 */
-            s->ar[nar] += s->ar[0];
+            s->ar[cur_arp] += s->ar[0];
             break;
         case 0x6: /* *ARn-0B (bit-reversed) */
             /* Simplified: just subtract */
-            s->ar[nar] -= s->ar[0];
+            s->ar[cur_arp] -= s->ar[0];
             break;
         case 0x7: /* *ARn+0B (bit-reversed) */
-            s->ar[nar] += s->ar[0];
+            s->ar[cur_arp] += s->ar[0];
             break;
         case 0x8: /* *ARn-% (circular) */
-            if (s->bk == 0) s->ar[nar]--;
+            if (s->bk == 0) s->ar[cur_arp]--;
             else {
-                uint16_t base = s->ar[nar] - (s->ar[nar] % s->bk);
-                s->ar[nar]--;
-                if (s->ar[nar] < base) s->ar[nar] = base + s->bk - 1;
+                uint16_t base = s->ar[cur_arp] - (s->ar[cur_arp] % s->bk);
+                s->ar[cur_arp]--;
+                if (s->ar[cur_arp] < base) s->ar[cur_arp] = base + s->bk - 1;
             }
             break;
         case 0x9: /* *ARn+% (circular) */
-            if (s->bk == 0) s->ar[nar]++;
+            if (s->bk == 0) s->ar[cur_arp]++;
             else {
-                uint16_t base = s->ar[nar] - (s->ar[nar] % s->bk);
-                s->ar[nar]++;
-                if (s->ar[nar] >= base + s->bk) s->ar[nar] = base;
+                uint16_t base = s->ar[cur_arp] - (s->ar[cur_arp] % s->bk);
+                s->ar[cur_arp]++;
+                if (s->ar[cur_arp] >= base + s->bk) s->ar[cur_arp] = base;
             }
             break;
         case 0xA: /* *ARn-0% */
-            s->ar[nar] -= s->ar[0];
+            s->ar[cur_arp] -= s->ar[0];
             break;
         case 0xB: /* *ARn+0% */
-            s->ar[nar] += s->ar[0];
+            s->ar[cur_arp] += s->ar[0];
             break;
-        /* MOD 12..15 use a long extension word (lk). Per binutils
-         * tic54x-dis.c sprint_indirect_address: */
-        case 0xC: /* *ARx(lk) — addr = AR + lk, AR unchanged */
-            addr = s->ar[nar] + prog_fetch(s, s->pc + 1);
-            s->lk_used = true;
-            break;
-        case 0xD: /* *+ARx(lk) — pre-add: AR += lk, addr = AR */
-            s->ar[nar] += prog_fetch(s, s->pc + 1);
-            addr = s->ar[nar];
-            s->lk_used = true;
-            break;
-        case 0xE: /* *+ARx(lk)% — pre-add circular */
-            s->ar[nar] += prog_fetch(s, s->pc + 1);
-            addr = s->ar[nar];
-            s->lk_used = true;
-            break;
-        case 0xF: /* *(lk) — absolute address from extension word */
+        case 0xC: /* *(lk) — absolute address from next word */
             addr = prog_fetch(s, s->pc + 1);
+            s->lk_used = true;
+            break;
+        case 0xD: /* *+ARn(lk) — pre-add offset from next word */
+            addr = s->ar[cur_arp] + prog_fetch(s, s->pc + 1);
+            s->lk_used = true;
+            break;
+        case 0xE: /* *ARn(lk) — post-add (addr=AR, then AR += lk) */
+            addr = s->ar[cur_arp];
+            s->ar[cur_arp] += prog_fetch(s, s->pc + 1);
+            s->lk_used = true;
+            break;
+        case 0xF: /* *+ARn(lk)% — circular with offset */
+            addr = s->ar[cur_arp] + prog_fetch(s, s->pc + 1);
             s->lk_used = true;
             break;
         }
 
-        /* Update ARP to the AR that was just used (C54x side effect). */
+        /* Update ARP */
         s->st0 = (s->st0 & ~ST0_ARP_MASK) | (nar << ST0_ARP_SHIFT);
 
         return addr;
@@ -1271,43 +1154,10 @@ static int c54x_exec_one(C54xState *s)
             s->pc = ra;
             return 0;
         }
-        /* SFTL src, SHIFT, dst — logical shift accumulator. Per
-         * tic54x-opc.c: opcode 0xF0E0 mask 0xFCE0. Variable bits:
-         *   bit 9 = src (0=A, 1=B)
-         *   bit 8 = dst (0=A, 1=B)
-         *   bits 4..0 = SHIFT (5-bit signed)
-         * 1 word, no memory access. */
-        if ((op & 0xFCE0) == 0xF0E0) {
-            int src_acc = (op >> 9) & 1;
-            int dst_acc = (op >> 8) & 1;
-            int shift = op & 0x1F;
-            if (shift & 0x10) shift -= 0x20;
-            uint64_t v = (uint64_t)(src_acc ? s->b : s->a) & 0xFFFFFFFFFFULL;
-            if (shift >= 0) v <<= shift;
-            else            v >>= -shift;
-            int64_t r = sext40((int64_t)(v & 0xFFFFFFFFFFULL));
-            if (dst_acc) s->b = r; else s->a = r;
-            return consumed + s->lk_used;
-        }
-        /* SFTA src, SHIFT, dst — arithmetic shift. opcode 0xF460 mask 0xFCE0. */
-        if ((op & 0xFCE0) == 0xF460) {
-            int src_acc = (op >> 9) & 1;
-            int dst_acc = (op >> 8) & 1;
-            int shift = op & 0x1F;
-            if (shift & 0x10) shift -= 0x20;
-            int64_t v = sext40(src_acc ? s->b : s->a);
-            if (shift >= 0) v <<= shift;
-            else            v >>= -shift;
-            int64_t r = sext40(v);
-            if (dst_acc) s->b = r; else s->a = r;
-            return consumed + s->lk_used;
-        }
-        /* LMS Xmem, Ymem — Least Mean Square step (1-word dual-operand).
-         * Real LMS is opcode 0xE100 mask 0xFF00, NOT F2/F3. Keeping the
-         * old (wrong) F2/F3 handler here is harmful (it writes through
-         * AR-pointed addresses), so it's been removed. Real LMS at E100
-         * remains TODO. */
-        if (0 && (hi8 == 0xF2 || hi8 == 0xF3)) {
+        /* LMS Xmem, Ymem — Least Mean Square step (1-word dual-operand)
+         * Encoding: 1111 001D XXXX YYYY
+         * Per SPRU172C: dst += T * Xmem; Ymem += rnd(AH * T); T = Xmem */
+        if (hi8 == 0xF2 || hi8 == 0xF3) {
             int xar_l = (op >> 4) & 0x07;
             int yar_l = op & 0x07;
             uint16_t xval_l = data_read(s, s->ar[xar_l]);
@@ -1433,13 +1283,12 @@ static int c54x_exec_one(C54xState *s)
              * Per SPRU172C + tic54x-opc.c: entire F8xx range is BANZ.
              * Smem determines AR post-modify; test AR(ARP) != 0 → branch. */
             if (sub <= 0x1) {
-                /* AR from opcode bits[2:0] per binutils ARF, not ARP.
-                 * Test BEFORE the resolve_smem post-modify. */
-                int ar_idx = op & 0x07;
+                uint16_t ar_idx = arp(s);
                 uint16_t old_ar = s->ar[ar_idx];
                 addr = resolve_smem(s, op, &ind);
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
+                s->ar[ar_idx]--; /* BANZ always decrements AR(ARP) */
                 if (old_ar != 0) {
                     s->pc = op2;
                     return 0;
@@ -1519,13 +1368,7 @@ static int c54x_exec_one(C54xState *s)
                 s->pc = (iptr * 0x80) + vec * 4;
                 return 0;
             }
-            /* F320+: LD #k9, DP — undocumented C548-specific encoding?
-             * NOT in standard tic54x-opc.c (real LD #k9,DP is 0xEAxx).
-             * However observation shows F3xx fires at DSP init from
-             * PC=0x9ae8 / 0x9b0c (one-shot DP setup), and NOP-ing it
-             * sends the whole DSP into garbage AR state. So treat it
-             * as `LD #k9, DP` for now until we identify the real
-             * semantics. */
+            /* F320+: LD #k9, DP */
             uint16_t k9 = op & 0x01FF;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
             return consumed + s->lk_used;
@@ -1562,41 +1405,19 @@ static int c54x_exec_one(C54xState *s)
                 s->st1 &= ~(1 << bit);
                 return consumed + s->lk_used;
             }
-            /* CMPR cond, ARx — Compare auxiliary register with AR0.
-             * Encoding (tic54x-opc.c): opcode 0xF4A8 mask 0xFCF8.
-             *   bits 9:8 = cond (00=EQ, 01=LT, 10=GT, 11=NEQ)
-             *   bits 2:0 = ARx
-             * Sets TC = (ARx <cond> AR0). Single word. */
-            if ((op & 0xFCF8) == 0xF4A8) {
-                int cond = (op >> 8) & 3;
-                int arx  = op & 7;
-                uint16_t a = s->ar[arx];
-                uint16_t b = s->ar[0];
-                bool tc;
-                switch (cond) {
-                case 0: tc = (a == b); break;
-                case 1: tc = (a <  b); break;
-                case 2: tc = (a >  b); break;
-                default: tc = (a != b); break;
-                }
-                if (tc) s->st0 |=  ST0_TC;
-                else    s->st0 &= ~ST0_TC;
-                return consumed + s->lk_used;
-            }
-            /* F68x-F6Fx: previously decoded as MVDD Xmem,Ymem with the
-             * encoding 1111 0110 XXXX YYYY. That decoding turned 0xF6A8
-             * into a write of data[AR[2]] into data[AR[0]] — and when
-             * AR[0]==0x18 (SP MMR address) it scribbled SP, causing the
-             * runaway at PC=0xf2cc. The actual C54x opcode in this slot
-             * (likely SACCD or similar) is not yet identified, so log
-             * once and treat as NOP rather than corrupt memory. */
             if (sub >= 0x8) {
-                static int unk_log = 0;
-                if (unk_log < 10) {
-                    C54_LOG("UNIMPL F6 op=0x%04x PC=0x%04x insn=%u (treated as NOP)",
-                            op, s->pc, s->insn_count);
-                    unk_log++;
-                }
+                /* F68x-F6Fx: MVDD Xmem, Ymem — dual data-memory operand move
+                 * Encoding: 1111 0110 XXXX YYYY
+                 *   bit 7   = Xmod (0=inc, 1=dec)
+                 *   bits 6:4 = Xar  (source AR register)
+                 *   bit 3   = Ymod (0=inc, 1=dec)
+                 *   bits 2:0 = Yar  (dest AR register) */
+                int xar = (op >> 4) & 0x07;
+                int yar = op & 0x07;
+                uint16_t val = data_read(s, s->ar[xar]);
+                data_write(s, s->ar[yar], val);
+                if ((op >> 7) & 1) s->ar[xar]--; else s->ar[xar]++;
+                if ((op >> 3) & 1) s->ar[yar]--; else s->ar[yar]++;
                 return consumed + s->lk_used;
             }
             /* Other F6xx: treat as NOP for now */
@@ -1606,22 +1427,19 @@ static int c54x_exec_one(C54xState *s)
          * Per SPRU172C: modify AR per Smem addressing; if AR[ARP] != 0, branch to pmad
          * Encoding: 1111 1000 IAAA AAAA + pmad */
         if (hi8 == 0xF8) {
-            /* AR from opcode bits[2:0] per binutils ARF, not ARP.
-             * Test BEFORE resolve_smem post-modify. */
-            int n = op & 0x07;
-            uint16_t ar_val = s->ar[n];
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
+            uint16_t cur_arp_val = s->ar[arp(s)];
             {
                 static int banz_log = 0;
                 if (banz_log < 5)
-                    C54_LOG("BANZ PC=0x%04x AR%d=0x%04x target=0x%04x %s",
-                            s->pc, n, ar_val, op2,
-                            ar_val != 0 ? "TAKEN" : "NOT TAKEN");
+                    C54_LOG("BANZ PC=0x%04x ARP=%d AR[ARP]=0x%04x target=0x%04x %s",
+                            s->pc, arp(s), cur_arp_val, op2,
+                            cur_arp_val != 0 ? "TAKEN" : "NOT TAKEN");
                 banz_log++;
             }
-            if (ar_val != 0) {
+            if (cur_arp_val != 0) {
                 s->pc = op2;
                 return 0;
             }
@@ -1961,21 +1779,49 @@ static int c54x_exec_one(C54xState *s)
             else data_write(s, dst + 0x10, val);
             return consumed + s->lk_used;
         }
-        /* E8xx / E9xx: LD #k8u, dst — load 8-bit unsigned immediate into
-         * accumulator. Per tic54x-opc.c: opcode 0xE800 mask 0xFE00.
-         * Bit 8 selects dst (0=A, 1=B); bits 7..0 = k8u.
-         *
-         * Previously this slot was decoded as CMPR (0xE8) and CC pmad,cond
-         * (0xE9). Both were wrong — the real CMPR is 0xF4A8 and the real
-         * CC is 0xF900. The bogus CC handler executed `data_write(SP-1,
-         * PC+2)` on every E9xx, and when SP happened to land in NDB it
-         * scribbled return-address-looking values into d_fb_det/d_dsp_page
-         * (e.g. d_fb_det = 0x75ec from PC=0x75ea). */
-        if (hi8 == 0xE8 || hi8 == 0xE9) {
-            uint16_t k8 = op & 0xFF;
-            int64_t v = (int64_t)k8;  /* unsigned 8-bit, zero-extended */
-            if (hi8 == 0xE9) s->b = v;
-            else             s->a = v;
+        if (hi8 == 0xE9) {
+            /* E9xx: CC pmad, cond (conditional call, 2 words)
+             * Condition codes per tic54x-dis.c cc2[] table (SPRU172C Table 3-3):
+             * 0x00=UNC, 0x02=AGEQ, 0x03=ALT, 0x04=ANEQ, 0x05=AEQ,
+             * 0x06=AGT, 0x07=ALEQ, 0x0A=BGEQ, 0x0B=BLT, 0x0C=BNEQ,
+             * 0x0D=BEQ, 0x0E=BGT, 0x0F=BLEQ,
+             * 0x20=NC, 0x21=C, 0x30=NTC, 0x31=TC,
+             * 0x40=NBIO, 0x60=ANOV, 0x61=AOV, 0x68=BNOV, 0x69=BOV */
+            op2 = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            uint8_t cond = op & 0xFF;
+            int64_t sa = sext40(s->a), sb = sext40(s->b);
+            bool take = false;
+            switch (cond) {
+            case 0x00: take = true; break;          /* UNC */
+            case 0x02: take = (sa >= 0); break;     /* AGEQ */
+            case 0x03: take = (sa < 0); break;      /* ALT */
+            case 0x04: take = (sa != 0); break;     /* ANEQ */
+            case 0x05: take = (sa == 0); break;     /* AEQ */
+            case 0x06: take = (sa > 0); break;      /* AGT */
+            case 0x07: take = (sa <= 0); break;     /* ALEQ */
+            case 0x0A: take = (sb >= 0); break;     /* BGEQ */
+            case 0x0B: take = (sb < 0); break;      /* BLT */
+            case 0x0C: take = (sb != 0); break;     /* BNEQ */
+            case 0x0D: take = (sb == 0); break;     /* BEQ */
+            case 0x0E: take = (sb > 0); break;      /* BGT */
+            case 0x0F: take = (sb <= 0); break;     /* BLEQ */
+            case 0x20: take = !(s->st0 & ST0_C); break;  /* NC */
+            case 0x21: take = (s->st0 & ST0_C) != 0; break; /* C */
+            case 0x30: take = !(s->st0 & ST0_TC); break; /* NTC */
+            case 0x31: take = (s->st0 & ST0_TC) != 0; break; /* TC */
+            case 0x60: take = !(s->st0 & ST0_OVA); break; /* ANOV */
+            case 0x61: take = (s->st0 & ST0_OVA) != 0; break; /* AOV */
+            case 0x68: take = !(s->st0 & ST0_OVB); break; /* BNOV */
+            case 0x69: take = (s->st0 & ST0_OVB) != 0; break; /* BOV */
+            default: take = true; break;  /* unknown compound cond — take conservatively */
+            }
+            if (take) {
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                s->pc = op2;
+                return 0;
+            }
             return consumed + s->lk_used;
         }
         if (hi8 == 0xE1) {
@@ -2082,9 +1928,20 @@ static int c54x_exec_one(C54xState *s)
             if (take) { s->pc = op2; return 0; }
             return consumed + s->lk_used;
         }
-        /* E8 handled above as LD #k8u, A. The wrong "CMPR at E8" handler
-         * was removed — real CMPR is 0xF4A8 (handled in the F-prefix
-         * dispatch). */
+        if (hi8 == 0xE8) {
+            /* E8xx: CMPR cond, ARn */
+            int cmp_cond = (op >> 4) & 3;
+            int n = arp(s);
+            bool result = false;
+            switch (cmp_cond) {
+            case 0: result = (s->ar[n] == s->ar[0]); break;
+            case 1: result = (s->ar[n] < s->ar[0]); break;
+            case 2: result = (s->ar[n] > s->ar[0]); break;
+            case 3: result = (s->ar[n] != s->ar[0]); break;
+            }
+            if (result) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
+            return consumed + s->lk_used;
+        }
         goto unimpl;
 
     case 0x6: case 0x7:
@@ -2117,27 +1974,11 @@ static int c54x_exec_one(C54xState *s)
             /* MAR only modifies AR via addressing mode, no data access */
             return consumed + s->lk_used;
         }
-        /* 76xx: ST #lk, Smem  (2 words) — per tic54x-opc.c
-         *   { "st", 2,2,2, 0x7600, 0xFF00, {OP_lk, OP_Smem} }
-         * Lower 8 bits = Smem field, second word = 16-bit immediate.
-         * Previously this slot was decoded as LDM MMR,dst (1 word) which
-         * is wrong: real LDM is 0x4800/mask 0xFE00. The bug made every
-         * ST #imm,Smem in PROM1 (e.g. the 14-entry table at 1f2a0..1f2c9)
-         * advance PC by 1 instead of 2, executing the immediates as
-         * stray opcodes and ultimately landing on f4e2 (BACC A) with
-         * A=0 → runaway to PC=0. */
+        /* 76xx: LDM MMR, dst */
         if (hi8 == 0x76) {
-            /* When Smem mode is 12..15, resolve_smem already consumed
-             * a long-extension word at PC+1 (the AR offset). The
-             * immediate value to store then lives at PC+2, not PC+1.
-             * Without this offset, ST #lk,*ARx(lk) tables in PROM1
-             * (e.g. 0xc0f3 init sequence) overwrite their target with
-             * the AR offset word and never store the real immediate. */
-            addr = resolve_smem(s, op, &ind);
-            int imm_off = 1 + (s->lk_used ? 1 : 0);
-            op2 = prog_fetch(s, s->pc + imm_off);
-            consumed = 2;
-            data_write(s, addr, op2);
+            uint8_t mmr = op & 0x7F;
+            uint16_t val = data_read(s, mmr);
+            s->a = (int64_t)(int16_t)val << 16;
             return consumed + s->lk_used;
         }
         /* 77xx: STM #lk, MMR (2 words) */
@@ -2167,208 +2008,21 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
-        /* LD Smem, dst — 0x1000 mask 0xFE00 (1 word).
-         * Loads sign-extended 16-bit Smem into A or B (bit9=dst). */
-        if ((op & 0xFE00) == 0x1000) {
+        if ((op & 0xF800) == 0x6000) {
+            /* 60xx: LD Smem, dst */
             int dst_acc = (op >> 9) & 1;
+            int shift = (op >> 8) & 1;
             addr = resolve_smem(s, op, &ind);
-            int16_t v = (int16_t)data_read(s, addr);
-            int64_t r = sext40((int64_t)v);
-            if (dst_acc) s->b = r; else s->a = r;
+            uint16_t val = data_read(s, addr);
+            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)val : val;
+            if (shift) v <<= 16;  /* LD Smem, 16, dst */
+            if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
             return consumed + s->lk_used;
         }
-        /* LD Smem, TS, dst — 0x1400 mask 0xFE00 (1 word). Shift by TREG bits 5:0
-         * (signed -16..+15 effective on C54x via two's complement of low 6 bits). */
-        if ((op & 0xFE00) == 0x1400) {
-            int dst_acc = (op >> 9) & 1;
+        if ((op & 0xF800) == 0x6800) {
+            /* 68xx: LD Smem, T */
             addr = resolve_smem(s, op, &ind);
-            int16_t v = (int16_t)data_read(s, addr);
-            int sh = (int)(s->t & 0x3F);
-            if (sh & 0x20) sh -= 0x40;     /* sign-extend 6-bit */
-            int64_t r = (int64_t)v;
-            if (sh >= 0) r <<= sh;
-            else         r >>= -sh;
-            r = sext40(r);
-            if (dst_acc) s->b = r; else s->a = r;
-            return consumed + s->lk_used;
-        }
-        /* 0x60-0x6F dispatch — per tic54x-opc.c. */
-        if ((op & 0xFF00) == 0x6000) {
-            /* CMPM Smem, #lk — compare memory to immediate, set TC. 2 words. */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t v = data_read(s, addr);
-            if (v == op2) s->st0 |=  ST0_TC;
-            else          s->st0 &= ~ST0_TC;
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6100) {
-            /* BITF Smem, #lk — test bits, set TC if any common bit set. 2 words. */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t v = data_read(s, addr);
-            if ((v & op2) != 0) s->st0 |=  ST0_TC;
-            else                s->st0 &= ~ST0_TC;
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFE00) == 0x6200) {
-            /* MPY Smem, #lk, dst — multiply Smem by 16-bit immediate. 2 words. */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            int dst_acc = op & 1;
-            int64_t prod = (int64_t)(int16_t)data_read(s, addr) *
-                           (int64_t)(int16_t)op2;
-            if (s->st1 & ST1_FRCT) prod <<= 1;
-            if (dst_acc) s->b = sext40(prod);
-            else         s->a = sext40(prod);
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFC00) == 0x6400) {
-            /* MAC Smem, #lk, SRC, DST — multiply Smem by 16-bit
-             * immediate, accumulate into DST. 2 words.
-             * Per tic54x-opc.c: 0x6400 mask 0xFC00,
-             * {OP_Smem,OP_lk,OP_SRC,OPT|OP_DST}, FL_SMR.
-             * bit 9 = SRC (0=A,1=B), bit 8 = DST (0=A,1=B). */
-            int src_acc = (op >> 9) & 1;
-            int dst_acc = (op >> 8) & 1;
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            int64_t prod = (int64_t)(int16_t)data_read(s, addr) *
-                           (int64_t)(int16_t)op2;
-            if (s->st1 & ST1_FRCT) prod <<= 1;
-            int64_t src_val = src_acc ? s->b : s->a;
-            int64_t result  = sext40(src_val + prod);
-            if (dst_acc) s->b = result;
-            else         s->a = result;
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6800) {
-            /* ANDM #lk, Smem — Smem &= #lk. 2 words. */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, data_read(s, addr) & op2);
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6900) {
-            /* ORM #lk, Smem */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, data_read(s, addr) | op2);
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6A00) {
-            /* XORM #lk, Smem */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, data_read(s, addr) ^ op2);
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6B00) {
-            /* ADDM #lk, Smem */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, (uint16_t)(data_read(s, addr) + op2));
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6C00 || (op & 0xFF00) == 0x6E00) {
-            /* BANZ[D] pmad, Sind — branch if AR != 0, decrement after.
-             * Per binutils tic54x.h ARF(OP)=OP&0x7: the AR is selected
-             * directly from opcode bits[2:0], NOT from ARP. Same fix
-             * pattern as resolve_smem (2026-04-07). The previous code
-             * read arp(s), which after a MAR/LD on a different AR would
-             * test/decrement the wrong register and trap the DSP in
-             * infinite loops at PROM0 0x9ac0..0x9ace. */
-            /* Per SPRU172C: BANZ tests AR BEFORE the addressing-mode
-             * post-modify. resolve_smem already applies the *ARn /
-             * *ARn- / *ARn+ post-modify per the Sind mod field — do
-             * NOT double-decrement here. */
-            int n = op & 0x07;
-            uint16_t old_ar = s->ar[n];
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            if (old_ar != 0) {
-                s->pc = op2;
-                return 0;
-            }
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6D00) {
-            /* MAR Smem — modify auxiliary register; addressing side-effects only. */
-            addr = resolve_smem(s, op, &ind);
-            (void)addr;
-            return consumed + s->lk_used;
-        }
-        if ((op & 0xFF00) == 0x6F00) {
-            /* 0x6F00: extended LD/STL/STH/ADD/SUB Smem, SHIFT, [src,] dst.
-             * Per tic54x-opc.c FL_EXT entries:
-             *   add: opcode2=0x0C00 mask2=0xFCE0  (SRC bit9, DST bit8, SHIFT 4..0)
-             *   sub: opcode2=0x0C20 mask2=0xFCE0  (SRC bit9, DST bit8, SHIFT 4..0)
-             *   ld : opcode2=0x0C40 mask2=0xFEE0  (DST bit8, SHIFT 4..0)
-             *   sth: opcode2=0x0C60 mask2=0xFEE0  (SRC bit8, SHIFT 4..0)
-             *   stl: opcode2=0x0C80 mask2=0xFEE0  (SRC bit8, SHIFT 4..0)
-             * Smem field in first word = lower 8 bits of op. */
-            addr = resolve_smem(s, op, &ind);
-            op2  = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            int shift = op2 & 0x1F;
-            if (shift & 0x10) shift -= 0x20;  /* sign-extend 5-bit */
-
-            if ((op2 & 0xFCE0) == 0x0C00) {
-                /* ADD Smem,SHIFT,src,dst */
-                int src_acc = (op2 >> 9) & 1;
-                int dst_acc = (op2 >> 8) & 1;
-                int64_t v = (int64_t)(int16_t)data_read(s, addr);
-                if (shift >= 0) v <<= shift;
-                else            v >>= -shift;
-                int64_t r = (src_acc ? s->b : s->a) + v;
-                if (dst_acc) s->b = sext40(r); else s->a = sext40(r);
-            } else if ((op2 & 0xFCE0) == 0x0C20) {
-                /* SUB Smem,SHIFT,src,dst */
-                int src_acc = (op2 >> 9) & 1;
-                int dst_acc = (op2 >> 8) & 1;
-                int64_t v = (int64_t)(int16_t)data_read(s, addr);
-                if (shift >= 0) v <<= shift;
-                else            v >>= -shift;
-                int64_t r = (src_acc ? s->b : s->a) - v;
-                if (dst_acc) s->b = sext40(r); else s->a = sext40(r);
-            } else if ((op2 & 0xFEE0) == 0x0C40) {
-                /* LD Smem,SHIFT,dst */
-                int dst_acc = (op2 >> 8) & 1;
-                int64_t v = (int64_t)(int16_t)data_read(s, addr);
-                if (shift >= 0) v <<= shift;
-                else            v >>= -shift;
-                if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
-            } else if ((op2 & 0xFEE0) == 0x0C60) {
-                /* STH src,SHIFT,Smem */
-                int src_acc = (op2 >> 8) & 1;
-                int64_t v = src_acc ? s->b : s->a;
-                if (shift >= 0) v <<= shift;
-                else            v >>= -shift;
-                data_write(s, addr, (uint16_t)((v >> 16) & 0xFFFF));
-            } else if ((op2 & 0xFEE0) == 0x0C80) {
-                /* STL src,SHIFT,Smem */
-                int src_acc = (op2 >> 8) & 1;
-                int64_t v = src_acc ? s->b : s->a;
-                if (shift >= 0) v <<= shift;
-                else            v >>= -shift;
-                data_write(s, addr, (uint16_t)(v & 0xFFFF));
-            } else {
-                static int log = 0;
-                if (log < 10) {
-                    C54_LOG("UNIMPL 6F op=0x%04x op2=0x%04x PC=0x%04x insn=%u",
-                            op, op2, s->pc, s->insn_count);
-                    log++;
-                }
-            }
+            s->t = data_read(s, addr);
             return consumed + s->lk_used;
         }
         goto unimpl;
@@ -2460,24 +2114,97 @@ static int c54x_exec_one(C54xState *s)
         }
 
     case 0x4:
-        /* 4xxx: AND, OR, XOR */
-        addr = resolve_smem(s, op, &ind);
+        /* 0x4xxx group — per binutils tic54x-opc.c:
+         *   0x40-0x43  SUB Smem,16,src[,dst]    (mask 0xFC00)
+         *   0x44-0x45  LD  Smem,16,dst          (mask 0xFE00)
+         *   0x4600     LD  Smem,DP              (mask 0xFF00)
+         *   0x4700     RPT Smem                 (mask 0xFF00)
+         *   0x48-0x49  LDM MMR,dst              (mask 0xFE00)
+         *   0x4A00     PSHM MMR                 (mask 0xFF00)
+         *   0x4B00     PSHD Smem                (mask 0xFF00)
+         *   0x4C00     LTD Smem                 (mask 0xFF00)
+         *   0x4D00     DELAY Smem               (mask 0xFF00)
+         *   0x4E-0x4F  DST src,Lmem             (mask 0xFE00) */
         {
-            int sub = (op >> 8) & 0xF;
-            uint16_t val = data_read(s, addr);
-            switch (sub & 0x3) {
-            case 0: /* AND */
-                if (sub & 4) s->b = (s->b & 0xFFFF0000) | (((uint16_t)s->b) & val);
-                else         s->a = (s->a & 0xFFFF0000) | (((uint16_t)s->a) & val);
-                break;
-            case 1: /* OR */
-                if (sub & 4) s->b |= val;
-                else         s->a |= val;
-                break;
-            case 2: /* XOR */
-                if (sub & 4) s->b ^= val;
-                else         s->a ^= val;
-                break;
+            uint8_t op8 = hi8;            /* (op >> 8) & 0xFF */
+            int dst_b = op8 & 0x01;        /* bit8 = src/dst select (A=0, B=1) */
+            int64_t *acc_dst = dst_b ? &s->b : &s->a;
+
+            if (op8 >= 0x40 && op8 <= 0x43) {
+                /* SUB Smem << 16, src, dst — sub of shifted Smem from acc */
+                addr = resolve_smem(s, op, &ind);
+                int64_t val = (int64_t)(int16_t)data_read(s, addr) << 16;
+                *acc_dst = sext40(*acc_dst - val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x44 || op8 == 0x45) {
+                /* LD Smem << 16, dst */
+                addr = resolve_smem(s, op, &ind);
+                int64_t val = (int64_t)(int16_t)data_read(s, addr) << 16;
+                *acc_dst = sext40(val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x46) {
+                /* LD Smem, DP — load DP from low 9 bits of Smem */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->st0 = (s->st0 & ~ST0_DP_MASK) | (val & ST0_DP_MASK);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x47) {
+                /* RPT Smem — load BRC from mem[Smem] */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->brc = val;
+                s->rpt_active = (val != 0);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x48 || op8 == 0x49) {
+                /* LDM MMR, dst — load accumulator from a memory-mapped reg */
+                int mmr = op & 0x7F;
+                uint16_t val = data_read(s, mmr);
+                *acc_dst = sext40((int16_t)val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4A) {
+                /* PSHM MMR — push memory-mapped reg onto stack */
+                int mmr = op & 0x7F;
+                uint16_t val = data_read(s, mmr);
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4B) {
+                /* PSHD Smem — push data memory onto stack */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4C) {
+                /* LTD Smem — T = mem[Smem]; mem[Smem+1] = mem[Smem] */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->t = val;
+                data_write(s, (addr + 1) & 0xFFFF, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4D) {
+                /* DELAY Smem — mem[Smem+1] = mem[Smem] (delay-line shift) */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                data_write(s, (addr + 1) & 0xFFFF, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4E || op8 == 0x4F) {
+                /* DST src, Lmem — store accumulator to long memory.
+                 * Lmem = even-aligned 32-bit pair: mem[L]=high, mem[L+1]=low */
+                addr = resolve_smem(s, op, &ind) & 0xFFFE;
+                int64_t v = *acc_dst;
+                data_write(s, addr,         (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, (addr+1)&0xFFFF, (uint16_t)(v & 0xFFFF));
+                return consumed + s->lk_used;
             }
         }
         return consumed + s->lk_used;
@@ -2931,23 +2658,23 @@ static int c54x_exec_one(C54xState *s)
         }
 ba_handler:
         if (hi8 == 0xAA || hi8 == 0xAB) {
-            /* STLM src, MMR — AA=A, AB=B. MMR field is 7 bits (Smem). */
+            /* STLM src, MMR — AA=A, AB=B */
             int src_acc = (hi8 == 0xAB) ? 1 : 0;
-            uint16_t mmr = op & 0x7F;
+            uint16_t mmr = op & 0x1F;
             int64_t acc = src_acc ? s->b : s->a;
             data_write(s, mmr, (uint16_t)(acc & 0xFFFF));
             return consumed + s->lk_used;
         }
         if (hi8 == 0xBD) {
-            /* BDxx: POPM MMR. MMR field is 7 bits. */
-            uint16_t mmr = op & 0x7F;
+            /* BDxx: POPM / delayed branch variants */
+            uint16_t mmr = op & 0x1F;
             data_write(s, mmr, data_read(s, s->sp));
             s->sp++;
             return consumed + s->lk_used;
         }
         if (hi8 == 0xBA) {
-            /* LDMM MMR, dst. MMR field is 7 bits. */
-            uint16_t mmr = op & 0x7F;
+            /* LDMM MMR, dst */
+            uint16_t mmr = op & 0x1F;
             int dst = (op >> 4) & 1;
             int64_t v = (int64_t)(int16_t)data_read(s, mmr);
             if (dst) s->b = sext40(v << 16);
@@ -3242,94 +2969,20 @@ ba_handler:
             data_write(s, addr + 1, dval);
             return consumed + s->lk_used;
         }
-        /* 0xC800-0xCBFF: ST src, Ymem (parallel store form).
-         * Per tic54x-opc.c: opcode 0xC800 mask 0xFC00, FL_PAR.
-         * Operands: OP_SRC (acc) → OP_Ymem.
-         *
-         * C54x dual-data Xmem/Ymem encoding uses 4-bit fields that map
-         * to AR2..AR5 (NOT AR0..AR7) :
-         *   bits 5..4 = Xmod (00=*+, 01=*-, 10=*, 11=*+0%)
-         *   bits 3..2 = Xar  (00=AR2, 01=AR3, 10=AR4, 11=AR5)  ← Xmem
-         *   bits 1..0 = Yar  ← Ymem
-         * The Ymod for the parallel partner is in another bit elsewhere
-         * or implicit. We only model the ST half here (the binutils
-         * template lists only {OP_SRC, OP_Ymem}); a fabricated parallel
-         * LD half was previously hallucinated and writing into random
-         * AR-pointed addresses, including NDB cells (0xa0e7 →
-         * d_fb_det = 0xffff). */
-        if ((op & 0xFC00) == 0xC800) {
-            /* Parallel: ST SRC, Ymem || LD Xmem, DST.
-             * Per tic54x-opc.c:
-             *   { "st",1,2,2,0xC800, 0xFC00, {OP_SRC,OP_Ymem}, FL_PAR,0,0,
-             *     "ld",                      {OP_Xmem,OP_DST} }
-             * Encoding (mask 0xFC00, base 0xC800):
-             *   bit 9   = SRC (0=A, 1=B) — store source
-             *   bit 8   = DST (0=A, 1=B) — load destination
-             *   bits 7:4 = XMEM field (load source)
-             *   bits 3:0 = YMEM field (store destination)
-             * Per binutils tic54x.h: each 4-bit dual-mem field is
-             *   MOD = (field & 0xC) >> 2  (bits 3:2)
-             *   AR  = (field & 0x3) + 2   → AR2..AR5
-             *
-             * Reads happen before writes per SPRU172C parallel ops:
-             * snapshot SRC and load value before writing the store. */
-            int src_acc = (op >> 9) & 1;
-            int dst_acc = (op >> 8) & 1;
-            int xmem    = (op >> 4) & 0x0F;
-            int ymem    =  op       & 0x0F;
-            int xar     = (xmem & 0x3) + 2;
-            int xmod    = (xmem >> 2) & 0x3;
-            int yar     = (ymem & 0x3) + 2;
-            int ymod    = (ymem >> 2) & 0x3;
-
-            uint16_t addr_x = s->ar[xar];
-            uint16_t addr_y = s->ar[yar];
-
-            /* Snapshot ST source BEFORE LD overwrites the (possibly
-             * shared) accumulator. */
-            int64_t st_src = src_acc ? s->b : s->a;
-            uint16_t ld_val = data_read(s, addr_x);
-
-            /* Perform the store. */
-            data_write(s, addr_y, (uint16_t)(st_src & 0xFFFF));
-
-            /* Perform the load (sign-extend 16→40 bits). */
-            int64_t loaded = sext40((int64_t)(int16_t)ld_val);
-            if (dst_acc) s->b = loaded;
-            else         s->a = loaded;
-
-            /* Diagnostic: log when LD writes 0 into the accumulator
-             * inside parallel st||ld (suspect cause of BACC A → PC=0
-             * runaway). One-shot per PC. */
-            if (loaded == 0) {
-                static uint8_t pc_seen[0x10000 / 8];
-                if (!(pc_seen[s->pc >> 3] & (1 << (s->pc & 7)))) {
-                    pc_seen[s->pc >> 3] |= (1 << (s->pc & 7));
-                    C54_LOG("C800-LD0 PC=0x%04x op=0x%04x xar=AR%d "
-                            "addr=0x%04x dst=%c insn=%u",
-                            s->pc, op, xar, addr_x, dst_acc ? 'B' : 'A',
-                            s->insn_count);
-                }
-            }
-
-            /* Post-modify Xmem AR.
-             * Dual-mem mod table per binutils tic54x-dis.c sprint_dual_address:
-             *   0 = *ARn      (no modify)
-             *   1 = *ARn-     (post-decrement)
-             *   2 = *ARn+     (post-increment)
-             *   3 = *ARn+0%   (post-add AR0 with circular) */
-            switch (xmod) {
-            case 0: break;
-            case 1: s->ar[xar]--; break;
-            case 2: s->ar[xar]++; break;
-            case 3: s->ar[xar] += s->ar[0]; break;
-            }
-            switch (ymod) {
-            case 0: break;
-            case 1: s->ar[yar]--; break;
-            case 2: s->ar[yar]++; break;
-            case 3: s->ar[yar] += s->ar[0]; break;
-            }
+        /* 0xC8/0xC9: ST || LD parallel instruction (1 word, dual indirect)
+         * Store low acc to Ymem while loading Xmem to other acc */
+        if (hi8 == 0xC8 || hi8 == 0xC9) {
+            int s_acc = (hi8 == 0xC9) ? 1 : 0;
+            int xar = (op >> 4) & 0x07;
+            int yar = op & 0x07;
+            int64_t st_val = s_acc ? s->b : s->a;
+            data_write(s, s->ar[yar], (uint16_t)(st_val & 0xFFFF));
+            uint16_t ld_val = data_read(s, s->ar[xar]);
+            int d_acc = s_acc ? 0 : 1;
+            int64_t loaded = (int64_t)(int16_t)ld_val << 16;
+            if (d_acc) s->b = sext40(loaded); else s->a = sext40(loaded);
+            if ((op >> 7) & 1) s->ar[xar]--; else s->ar[xar]++;
+            if ((op & 0x08) == 0) s->ar[yar]++; else s->ar[yar]--;
             return consumed + s->lk_used;
         }
         goto unimpl;
@@ -3365,108 +3018,43 @@ int c54x_run(C54xState *s, int n_insns)
         pc_ring[pc_ring_idx & 255] = s->pc;
         pc_ring_idx++;
 
-        /* SP-out-of-range tracer. Legal stack window is roughly
-         * [0xEE00..0xEEFF] (init SP=0x5AC8 is the first push slot, then SP
-         * settles into 0xEExx after the boot prologue). Any transition that
-         * lands SP outside that window means a bad FRAME/STM/LD-to-SP or a
-         * misdecoded POPM/POPD — and is the root cause of the d_dsp_page
-         * = 0xdb25 corruption (CALL pushes PC+1 into NDB when SP is wedged
-         * at 0x08D3). */
+        /* SP-WATCH: log every transition where SP enters / leaves the
+         * API mailbox region [0x0800..0x08FF]. This pinpoints the exact
+         * instruction that corrupts the stack pointer so we don't have
+         * to keep recoding to investigate. */
         {
-            static uint16_t prev_sp = 0xEEFF;
-            static int sp_oor_log = 0;
-            uint16_t cur_sp = s->sp;
-            bool cur_legal = (cur_sp >= 0xEE00 && cur_sp <= 0xEEFF) ||
-                             cur_sp == 0x5AC8;
-            bool prev_legal = (prev_sp >= 0xEE00 && prev_sp <= 0xEEFF) ||
-                              prev_sp == 0x5AC8;
-            if (s->insn_count > 1000000 && prev_legal && !cur_legal &&
-                sp_oor_log < 20) {
-                uint16_t ppc = pc_ring[(pc_ring_idx - 2) & 255];
-                C54_LOG("SP OOR  SP %04x -> %04x  PC=%04x op@prev=%04x "
-                        "insn=%u XPC=%d",
-                        prev_sp, cur_sp, s->pc,
-                        prog_fetch(s, ppc), s->insn_count, s->xpc);
-                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x "
-                        "%04x %04x %04x %04x %04x %04x %04x %04x",
-                        pc_ring[(pc_ring_idx-17)&255], pc_ring[(pc_ring_idx-16)&255],
-                        pc_ring[(pc_ring_idx-15)&255], pc_ring[(pc_ring_idx-14)&255],
-                        pc_ring[(pc_ring_idx-13)&255], pc_ring[(pc_ring_idx-12)&255],
-                        pc_ring[(pc_ring_idx-11)&255], pc_ring[(pc_ring_idx-10)&255],
-                        pc_ring[(pc_ring_idx-9)&255],  pc_ring[(pc_ring_idx-8)&255],
-                        pc_ring[(pc_ring_idx-7)&255],  pc_ring[(pc_ring_idx-6)&255],
-                        pc_ring[(pc_ring_idx-5)&255],  pc_ring[(pc_ring_idx-4)&255],
-                        pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
-                sp_oor_log++;
+            static uint16_t prev_sp = 0xFFFF;
+            bool was_in = (prev_sp >= 0x0800 && prev_sp < 0x0900);
+            bool is_in  = (s->sp  >= 0x0800 && s->sp  < 0x0900);
+            if (was_in != is_in) {
+                fprintf(stderr,
+                        "[c54x] SP-WATCH %s SP=0x%04x (prev=0x%04x) "
+                        "PC=0x%04x op=0x%04x insn=%u\n",
+                        is_in ? "ENTER api" : "LEAVE api",
+                        s->sp, prev_sp, s->pc, s->prog[s->pc], s->insn_count);
             }
-            /* CALL/RET balance tracer: log every SP delta in the
-             * deterministic runaway window so we can pinpoint the
-             * mis-decoded push or pop. */
-            if (s->insn_count >= 65391000 && s->insn_count <= 65392000 &&
-                cur_sp != prev_sp) {
-                int delta = (int16_t)(cur_sp - prev_sp);
-                uint16_t ppc = pc_ring[(pc_ring_idx - 2) & 255];
-                C54_LOG("SP%c%d  %04x->%04x  prev_PC=%04x op=%04x op+1=%04x "
-                        "cur_PC=%04x insn=%u",
-                        delta > 0 ? '+' : '-', delta > 0 ? delta : -delta,
-                        prev_sp, cur_sp, ppc,
-                        prog_fetch(s, ppc),
-                        prog_fetch(s, (ppc + 1) & 0xFFFF),
-                        s->pc, s->insn_count);
-            }
-            prev_sp = cur_sp;
+            prev_sp = s->sp;
         }
 
-        /* Diagnose tight loops in 0xB5E0..0xB5FF — observed in PC HIST as
-         * a 2-insn idle wait at 0xB5EA/0xB5EC. Dump first entry, opcode
-         * and surrounding context, plus IMR/IFR/IDLE state. */
-        if (s->pc >= 0xB5E0 && s->pc <= 0xB5FF && s->insn_count > 5000000) {
-            static int b5_log = 0;
-            if (b5_log < 5) {
-                C54_LOG("B5xx ENTRY PC=0x%04x op=0x%04x op+1=0x%04x op+2=0x%04x "
-                        "IMR=0x%04x IFR=0x%04x INTM=%d SP=0x%04x XPC=%d insn=%u",
-                        s->pc,
-                        prog_fetch(s, s->pc),
-                        prog_fetch(s, (s->pc + 1) & 0xFFFF),
-                        prog_fetch(s, (s->pc + 2) & 0xFFFF),
-                        s->imr, s->ifr, (s->st1 >> 11) & 1,
-                        s->sp, s->xpc, s->insn_count);
-                C54_LOG("  prev: %04x %04x %04x %04x %04x %04x %04x %04x",
-                        pc_ring[(pc_ring_idx-9)&255], pc_ring[(pc_ring_idx-8)&255],
-                        pc_ring[(pc_ring_idx-7)&255], pc_ring[(pc_ring_idx-6)&255],
-                        pc_ring[(pc_ring_idx-5)&255], pc_ring[(pc_ring_idx-4)&255],
-                        pc_ring[(pc_ring_idx-3)&255], pc_ring[(pc_ring_idx-2)&255]);
-                b5_log++;
-            }
-        }
-
-        /* Detect runaway: PC entering [0x0000..0x000F] (interrupt vectors)
-         * or [0xFFF0..0xFFFF] (top of program memory wrap) AFTER the boot
-         * phase. Boot legitimately executes 0x0000 once. After that,
-         * dump the previous PCs that led here so we can find the bad
-         * branch/return. */
-        if ((s->pc <= 0x000F || s->pc >= 0xFFF0) &&
-            s->insn_count > 5000000 && s->xpc == 0) {
-            static int runaway_log = 0;
-            static uint16_t prev_logged = 0xFFFF;
-            uint16_t prev = pc_ring[(pc_ring_idx - 2) & 255];
-            /* Only log when we *enter* the corrupt zone (transition) and
-             * not on every step within it. */
-            bool prev_in_corrupt = (prev <= 0x000F || prev >= 0xFFF0);
-            if (!prev_in_corrupt && runaway_log < 5 && s->pc != prev_logged) {
-                prev_logged = s->pc;
-                C54_LOG("RUNAWAY ENTRY → PC=0x%04x prev=0x%04x op@prev=0x%04x insn=%u SP=0x%04x XPC=%d",
-                        s->pc, prev, prog_fetch(s, prev), s->insn_count, s->sp, s->xpc);
-                C54_LOG("  trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
-                        pc_ring[(pc_ring_idx-17)&255], pc_ring[(pc_ring_idx-16)&255],
-                        pc_ring[(pc_ring_idx-15)&255], pc_ring[(pc_ring_idx-14)&255],
-                        pc_ring[(pc_ring_idx-13)&255], pc_ring[(pc_ring_idx-12)&255],
-                        pc_ring[(pc_ring_idx-11)&255], pc_ring[(pc_ring_idx-10)&255],
-                        pc_ring[(pc_ring_idx-9)&255],  pc_ring[(pc_ring_idx-8)&255],
-                        pc_ring[(pc_ring_idx-7)&255],  pc_ring[(pc_ring_idx-6)&255],
-                        pc_ring[(pc_ring_idx-5)&255],  pc_ring[(pc_ring_idx-4)&255],
-                        pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
-                runaway_log++;
+        /* TRACE: dump entry into 0xe260 loop (first 5 hits) */
+        if (s->pc == 0xe260 || s->pc == 0xe261) {
+            static int e260_log = 0;
+            if (e260_log < 5) {
+                e260_log++;
+                C54_LOG("E260-ENTRY #%d PC=0x%04x AR2=%04x AR5=%04x BRC=%d RSA=%04x REA=%04x rptb=%d IMR=%04x SP=%04x insn=%u",
+                        e260_log, s->pc, s->ar[2], s->ar[5], s->brc, s->rsa, s->rea, s->rptb_active, s->imr, s->sp, s->insn_count);
+                int idx = pc_ring_idx;
+                char buf[1024]; int o = 0;
+                for (int i = 50; i >= 1; i--) {
+                    o += snprintf(buf+o, sizeof(buf)-o, "%04x ", pc_ring[(idx-i)&255]);
+                }
+                C54_LOG("E260-PCRING (last 50): %s", buf);
+                /* Dump runtime opcodes 0xe255..0xe28f */
+                char ob[1024]; int oo = 0;
+                for (uint16_t a = 0xe255; a <= 0xe28f; a++) {
+                    oo += snprintf(ob+oo, sizeof(ob)-oo, "%04x ", s->prog[a]);
+                }
+                C54_LOG("E260-PROG[e255..e28f]: %s", ob);
             }
         }
 
@@ -3477,26 +3065,6 @@ int c54x_run(C54xState *s, int n_insns)
                 C54_LOG("CALA-TRACE PC=0x%04x A=%08x SP=0x%04x BRC=%d AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u",
                         s->pc, (uint32_t)(s->a & 0xFFFFFFFF), s->sp, s->brc,
                         s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
-            }
-        }
-
-        /* Spin-loop diagnostic at PROM0 0x9ac7 outer loop entry.
-         * Post resolve_smem fix the DSP wedges in 9ac7..9ace forever.
-         * Log AR0..AR7, A, B, BRC at first hit, then every 1M hits, so
-         * we can see whether AR4 (the BANZD counter) actually shrinks. */
-        if (s->pc == 0x9ac7) {
-            static uint64_t hits_9ac7 = 0;
-            hits_9ac7++;
-            if (hits_9ac7 <= 5 || (hits_9ac7 % 10000) == 0) {
-                C54_LOG("9AC7 hit=%llu AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
-                        "AR4=%04x AR5=%04x AR6=%04x AR7=%04x A=%010llx "
-                        "B=%010llx BRC=%d insn=%u",
-                        (unsigned long long)hits_9ac7,
-                        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
-                        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
-                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
-                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
-                        s->brc, s->insn_count);
             }
         }
 

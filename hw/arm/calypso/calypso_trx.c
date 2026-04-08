@@ -12,10 +12,29 @@
 #include "hw/irq.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
+#include "hw/arm/calypso/sercomm_gate.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "calypso_fbsb.h"
 #include "calypso_tint0.h"
+#include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
+
+/* prim_fbsb emulator-side state — driven both by ARM writes to
+ * d_task_md and by DSP writes to d_fb_det. Lazy-init on first use. */
+static CalypsoFbsb g_fbsb;
+static bool        g_fbsb_inited;
+
+/* Snapshot ARM PC + LR right now (current_cpu must be set, i.e. inside
+ * an MMIO callback fired by the running CPU). Returns 0 if unavailable. */
+static inline uint32_t arm_now_pc(uint32_t *lr_out)
+{
+    if (!current_cpu) { if (lr_out) *lr_out = 0; return 0; }
+    ARMCPU *acpu = ARM_CPU(current_cpu);
+    if (lr_out) *lr_out = acpu->env.regs[14];
+    return acpu->env.regs[15];
+}
 void calypso_tint0_do_tick(uint32_t fn);
 #include "chardev/char-fe.h"
 
@@ -27,6 +46,7 @@ extern CalypsoUARTState *g_uart_irda;
 
 #define DSP_API_W_PAGE0  0x0000
 #define DSP_API_W_PAGE1  0x0028
+
 #define DSP_API_NDB      0x01A8
 #define DB_W_D_TASK_D    0
 #define DB_W_D_TASK_U    2
@@ -125,28 +145,6 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
-    /* Mirror every ARM write into the DSP-side api_ram at the same word
-     * offset. The Calypso API RAM (W/R pages, NDB, PARAM) is physically
-     * shared between ARM and DSP — they see the same SRAM cells via two
-     * different bus addresses. Without this mirror the DSP can never see
-     * d_task_md or any other command the L1 ARM posts. */
-    if (s->dsp && s->dsp->api_ram) {
-        unsigned woff = offset / 2;
-        if (size == 2) {
-            if (woff < C54X_API_SIZE)
-                s->dsp->api_ram[woff] = (uint16_t)value;
-        } else if (size == 4) {
-            if (woff + 1 < C54X_API_SIZE) {
-                s->dsp->api_ram[woff]     = (uint16_t)value;
-                s->dsp->api_ram[woff + 1] = (uint16_t)(value >> 16);
-            }
-        } else {
-            /* byte write — refresh the containing word */
-            if (woff < C54X_API_SIZE)
-                s->dsp->api_ram[woff] = s->dsp_ram[woff];
-        }
-    }
-
     /* Sync d_dsp_page writes to DSP API RAM immediately */
     if (offset == 0x01A8) {
         static int page_wr_log = 0;
@@ -158,7 +156,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
     }
     /* d_task_md (page0=0xFFD00008, page1=0xFFD00030) — DL monitoring task.
-     * Log only non-zero writes + the very first few zeros for sanity. */
+     * Log only non-zero writes + the very first few zeros for sanity.
+     * Also drive calypso_fbsb's emulator-side state machine: when ARM
+     * writes DSP_TASK_FB / DSP_TASK_SB here it means "DSP, do FB/SB
+     * detection on the next frame". We mirror that into prim_fbsb so
+     * synthetic results land in NDB before the firmware polls. */
     if (offset == 0x0008 || offset == 0x0030) {
         static int tm_zero = 0, tm_nz = 0;
         if (value != 0) {
@@ -167,6 +169,22 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                         offset == 0x0008 ? 0 : 1,
                         (unsigned)value, s->fn);
                 tm_nz++;
+            }
+            if (!g_fbsb_inited && s->dsp_ram) {
+                calypso_fbsb_init(&g_fbsb, s->dsp_ram, 0x0800);
+                g_fbsb_inited = true;
+            }
+            if (g_fbsb_inited) {
+                uint32_t lr_before, pc_before = arm_now_pc(&lr_before);
+                calypso_fbsb_on_dsp_task_change(&g_fbsb,
+                                                (uint16_t)value,
+                                                (uint64_t)s->fn);
+                uint32_t lr_after, pc_after  = arm_now_pc(&lr_after);
+                TRX_LOG("FBSB-PUBLISH ctx fn=%u "
+                        "ARM PC before=0x%08x LR=0x%08x "
+                        "after=0x%08x LR=0x%08x value=0x%04x",
+                        s->fn, pc_before, lr_before, pc_after, lr_after,
+                        (unsigned)value);
             }
         } else if (tm_zero < 4) {
             TRX_LOG("ARM WR d_task_md[p%d] = 0 (init) fn=%u",
@@ -436,26 +454,27 @@ void calypso_tint0_do_tick(uint32_t fn) {
     if (!s) return;
     s->fn = fn;
 
-    /* TINT0: set IFR bit 4 on DSP (Timer 0 interrupt, vec 20).
-     * On real hardware this fires when TIM reaches 0.
-     * Here, QEMU timer replaces the per-instruction timer tick. */
-    if (s->dsp && s->dsp->running) {
-        c54x_interrupt_ex(s->dsp, TINT0_VEC, TINT0_IFR_BIT);
-    }
+    /* DSP TINT0 (IMR bit 4 vec 20) is masked by the firmware (observed
+     * IMR=0xFF88, bit 4 = 0). The DSP wakes ONLY on the TPU FRAME line
+     * (INT3 = bit 3 vec 19), which is fired below in the dsp_should_run
+     * block when ARM has called tpu_dsp_frameirq_enable(). Don't double-
+     * fire TINT0 here — it would just sit in IFR forever. */
 
     /* Lower previous frame IRQ — allows re-raise at end of this tick */
     qemu_irq_lower(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
 
-    /* 1. UART — poll backend + flush TX/RX (both UARTs) */
+    /* 1. UART — poll backend + kick RX only.
+     * kick_tx removed 2026-04-07: it called update_irq unconditionally
+     * which lowered+raised the IRQ line every frame tick → INTH IRQ 4
+     * storm (1000+ hits in seconds, swamping the FBSB chain). TX IRQ
+     * fires correctly on THR/IER writes; periodic re-pulse adds noise. */
     if (g_uart_modem) {
         calypso_uart_poll_backend(g_uart_modem);
         calypso_uart_kick_rx(g_uart_modem);
-        calypso_uart_kick_tx(g_uart_modem);
     }
     if (g_uart_irda) {
         calypso_uart_poll_backend(g_uart_irda);
         calypso_uart_kick_rx(g_uart_irda);
-        calypso_uart_kick_tx(g_uart_irda);
     }
 
     /* 2. UL burst poll */
@@ -465,10 +484,25 @@ void calypso_tint0_do_tick(uint32_t fn) {
     bool dsp_ran = false;
     bool dsp_should_run = false;
 
-    if (s->dsp && calypso_tint0_tpu_en_pending()) {
+    /* TPU is autonomous: once ARM sets TPU_CTRL_EN, the TPU emits a
+     * frame trigger to the DSP every TDMA frame on its own. Run the
+     * DSP frame path on EVERY tick while EN is set, not only on the
+     * one-shot pending flag set by the ARM TPU_CTRL write. ARM clears
+     * EN explicitly when it wants the TPU off. */
+    bool tpu_en_now = (s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_EN) != 0;
+    if (s->dsp && (tpu_en_now || calypso_tint0_tpu_en_pending())) {
         calypso_tint0_tpu_en_clear();
-        s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
 
+        /* ── TIC-TOC page toggle ──
+         * Real hw double-buffers d_dsp_page (NDB 0x01A8) every TDMA
+         * frame: ARM reads page N while DSP writes page N^1, then
+         * roles flip on the next TPU frame trigger. Without the
+         * toggle, the L1S firmware sees stale results forever and
+         * never enqueues the next task. We drive the toggle here on
+         * each TINT0 tick where TPU is enabled. */
+        s->dsp_ram[0x01A8/2] = (s->dsp_ram[0x01A8/2] ^ 1) & 1;
+        if (s->dsp && s->dsp->api_ram)
+            s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
 
         /* DMA: copy API write page to DSP DARAM */
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
@@ -486,9 +520,15 @@ void calypso_tint0_do_tick(uint32_t fn) {
         /* BSP: rewind position */
         s->dsp->bsp_pos = 0;
 
-        /* SINT17 — frame interrupt to DSP */
-        c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-        s->dsp->idle = false;  /* wake from IDLE for new frame */
+        /* SINT17 — frame interrupt to DSP. Only fire if DSP has reached
+         * IDLE at least once (init complete) AND is currently in IDLE.
+         * Pre-empting a running DSP (esp. during the boot RPTB sweep)
+         * corrupts SP at the ISR entry and locks the DSP at PC=0x010a
+         * with SP=0. Wait until the next idle window. */
+        if (s->dsp_init_done && s->dsp->idle) {
+            c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+            s->dsp->idle = false;
+        }
         dsp_should_run = true;
     }
     /* Also run DSP if still initializing (not yet reached first IDLE) */
@@ -513,12 +553,11 @@ void calypso_tint0_do_tick(uint32_t fn) {
             if (g_uart_modem) {
                 calypso_uart_poll_backend(g_uart_modem);
                 calypso_uart_kick_rx(g_uart_modem);
-                calypso_uart_kick_tx(g_uart_modem);
+                /* kick_tx removed — see comment above */
             }
             if (g_uart_irda) {
                 calypso_uart_poll_backend(g_uart_irda);
                 calypso_uart_kick_rx(g_uart_irda);
-                calypso_uart_kick_tx(g_uart_irda);
             }
         }
         /* If DSP didn't finish, dump last instructions for debugging */
@@ -544,39 +583,13 @@ void calypso_tint0_do_tick(uint32_t fn) {
         }
         dsp_ran = true;
 
-        /* Write PM/SNR results to API read page after DSP completes.
-         * The DSP should compute these from radio samples, but without
-         * real BSP data it writes 0. Override with realistic values
-         * so the firmware's PM measurement works. */
-        if (s->dsp->idle) {
-            uint16_t rpage = s->dsp_ram[0x01A8/2] & 1;
-            uint16_t *rp = rpage ?
-                &s->dsp_ram[0x0078/2] : &s->dsp_ram[0x0050/2];
-            /* Non-DSP33 layout: rp[8..10]=a_pm[3], rp[11..14]=a_serv_demod[4] */
-            rp[8]  = 4864;   /* a_pm[0] — PM strong signal */
-            rp[9]  = 4864;   /* a_pm[1] */
-            rp[10] = 4864;   /* a_pm[2] */
-            rp[11] = 0;      /* D_TOA */
-            rp[12] = 4864;   /* D_PM */
-            rp[13] = 0;      /* D_ANGLE */
-            rp[14] = 100;    /* D_SNR */
-            /* d_fb_det in NDB at ARM offset 0x01F0 = dsp_ram[0xF8]
-             * Set to 1 when burst mode active (firmware is searching for FB) */
-            if (l1ctl_burst_mode()) {
-                s->dsp_ram[0xF8] = 1;  /* d_fb_det = FOUND */
-                /* sync_demod: TOA, PM, ANGLE, SNR at 0x01F4-0x01FA */
-                s->dsp_ram[0xFA] = 0;     /* TOA */
-                s->dsp_ram[0xFB] = 4864;  /* PM */
-                s->dsp_ram[0xFC] = 0;     /* ANGLE */
-                s->dsp_ram[0xFD] = 100;   /* SNR */
-            }
-        }
-
         static int done_log = 0;
         if (done_log < 200) {
-            TRX_LOG("TINT0: fn=%u page=0x%04x ran=%d PC=0x%04x idle=%d IMR=0x%04x",
+            uint32_t lr_now, pc_now = arm_now_pc(&lr_now);
+            TRX_LOG("TINT0: fn=%u page=0x%04x ran=%d "
+                    "DSP_PC=0x%04x idle=%d IMR=0x%04x  ARM_PC=0x%08x LR=0x%08x",
                     s->fn, s->dsp_ram[0x01A8/2], ran, s->dsp->pc,
-                    s->dsp->idle, s->dsp->imr);
+                    s->dsp->idle, s->dsp->imr, pc_now, lr_now);
             done_log++;
         }
     }
@@ -687,71 +700,29 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
         }
     }
 
-    /* Update read page metadata */
-    uint16_t *rp = s->dsp_page ?
-        &s->dsp_ram[0x0078/2] : &s->dsp_ram[0x0050/2];
-    rp[1] = (uint16_t)(fn % 4);  /* d_burst_d */
-    rp[8]  = 0;                   /* TOA */
-    rp[9]  = 4864;                /* PM */
-    rp[10] = 0;                   /* ANGLE */
-    rp[11] = 100;                 /* SNR */
 }
 
-/* TX burst: send UL burst from DSP write page via UART TX as sercomm DLCI 4 */
+/* TX burst: send UL burst from DSP write page out via sercomm_gate UDP
+ * (symmetric to the DL on_dl_burst path). The chef closes the loop:
+ * ARM L1 writes d_task_u → DSP processes → DSP DARAM UL bits →
+ * sercomm_gate_send_ul_burst → UDP 6802 → bridge → osmo-bts-trx. */
 static void calypso_trx_send_ul_burst(CalypsoTRX *s, uint16_t task_u)
 {
-    if (!g_uart_modem || task_u == 0) return;
+    if (task_u == 0) return;
 
-    /* Read UL burst from write page.
-     * d_burst_u at word 3, burst data follows in NDB a_cu area. */
+    /* Read UL burst metadata from API write page (ARM L1 sets these). */
     uint16_t *wp = s->dsp_page ?
         &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
-
-    /* Build TRXD v0 UL packet: TN(1) FN(4) RSSI(1) TOA256(2) bits(148) = 156 */
-    uint8_t pkt[8 + 148];
-    uint8_t tn = wp[3] & 0x07;  /* d_burst_u has TN info */
+    uint8_t  tn = wp[3] & 0x07;
     uint32_t fn = s->fn;
 
-    pkt[0] = tn;
-    pkt[1] = (fn >> 24) & 0xFF;
-    pkt[2] = (fn >> 16) & 0xFF;
-    pkt[3] = (fn >> 8) & 0xFF;
-    pkt[4] = fn & 0xFF;
-    pkt[5] = (uint8_t)(-60);  /* RSSI */
-    pkt[6] = 0;  /* TOA256 high */
-    pkt[7] = 0;  /* TOA256 low */
-
-    /* Read burst bits from NDB UL area — for now send dummy burst */
-    memset(&pkt[8], 0, 148);
-
-    /* Wrap in sercomm DLCI 4 and send via UART TX */
-    uint8_t frame[512];
-    int pos = 0;
-    frame[pos++] = 0x7E;  /* FLAG */
-    /* Header: DLCI + CTRL, with escaping */
-    uint8_t hdr[2] = { 0x04, 0x03 };
-    for (int i = 0; i < 2; i++) {
-        if (hdr[i] == 0x7E || hdr[i] == 0x7D) {
-            frame[pos++] = 0x7D;
-            frame[pos++] = hdr[i] ^ 0x20;
-        } else {
-            frame[pos++] = hdr[i];
-        }
+    /* Symmetric to DL: BSP pulls bits from DSP DARAM UL buffer, then we
+     * hand them off to sercomm_gate which ships via UDP to the bridge.
+     * Both directions now flow through calypso_bsp_*_burst. */
+    uint8_t bits[148];
+    if (calypso_bsp_tx_burst(tn, fn, bits)) {
+        sercomm_gate_send_ul_burst(tn, fn, bits);
     }
-    /* Payload with escaping */
-    int pkt_len = 8 + 148;
-    for (int i = 0; i < pkt_len && pos < 500; i++) {
-        if (pkt[i] == 0x7E || pkt[i] == 0x7D) {
-            frame[pos++] = 0x7D;
-            frame[pos++] = pkt[i] ^ 0x20;
-        } else {
-            frame[pos++] = pkt[i];
-        }
-    }
-    frame[pos++] = 0x7E;  /* FLAG */
-
-    /* Write to UART chardev (goes to PTY → bridge reads it) */
-    qemu_chr_fe_write_all(&g_uart_modem->chr, frame, pos);
 }
 
 void calypso_trx_tx_burst_poll(void)
@@ -766,6 +737,108 @@ void calypso_trx_tx_burst_poll(void)
         calypso_trx_send_ul_burst(s, task_u);
         wp[DB_W_D_TASK_U] = 0;  /* clear after sending */
     }
+}
+
+/* DSP → ARM api_ram write notifier — called from c54x data_write
+ * whenever the DSP touches a shared mailbox cell. We pulse the API IRQ
+ * so the ARM L1 ISR can run prim_*_resp without waiting for next frame. */
+/* d_fb_det lives at DSP word addr 0x08F8 → ARM dsp_ram offset
+ * (0x08F8 - 0x0800) = 0xF8 words. When the DSP correlator decides "FB
+ * found" it writes a non-zero opcode-derived word here. The firmware
+ * (l1s_fbdet_resp) only checks "non-zero", but it also reads neighbour
+ * NDB cells (a_sync_demod TOA/PM/ANG/SNR). We override the raw write
+ * with a clean published "FB found" so prim_fbsb's poll sees consistent
+ * values and accepts the burst.                                          */
+#define NDB_OFF_D_FB_DET   0x00F8
+
+/* declared near top */
+
+static void trx_dsp_api_write_cb(void *opaque, uint16_t woff, uint16_t val)
+{
+    CalypsoTRX *s = opaque;
+    if (!s || !s->irqs) return;
+    qemu_irq_pulse(s->irqs[CALYPSO_IRQ_API]);
+
+    if (woff == NDB_OFF_D_FB_DET && val != 0) {
+        if (!g_fbsb_inited) {
+            calypso_fbsb_init(&g_fbsb, s->dsp_ram, 0x0800);
+            g_fbsb_inited = true;
+        }
+        TRX_LOG("FB-DET hook: DSP wrote d_fb_det=0x%04x — publishing clean FB",
+                val);
+        calypso_fbsb_publish_fb_found(&g_fbsb,
+                                      /* toa  */ 0,
+                                      /* pm   */ 80,
+                                      /* angle*/ 0,
+                                      /* snr  */ 100);
+    }
+}
+
+/* ============================================================
+ * Orchestrator I/O — chef pour les bursts
+ * ============================================================ */
+
+/* Write side: wrap an L1CTL message in sercomm DLCI 5 and push it to
+ * the modem PTY (toward bridge.py → mobile L23). */
+void calypso_trx_l23_write(const uint8_t *l1ctl, int len)
+{
+    if (!g_uart_modem || len <= 0) return;
+
+    uint8_t frame[1024];
+    int pos = 0;
+    frame[pos++] = 0x7E;
+    uint8_t hdr[2] = { 0x05, 0x03 };  /* DLCI 5 (L1A_L23), CTRL */
+    for (int i = 0; i < 2; i++) {
+        if (hdr[i] == 0x7E || hdr[i] == 0x7D) {
+            frame[pos++] = 0x7D; frame[pos++] = hdr[i] ^ 0x20;
+        } else {
+            frame[pos++] = hdr[i];
+        }
+    }
+    for (int i = 0; i < len && pos < (int)sizeof(frame) - 2; i++) {
+        uint8_t c = l1ctl[i];
+        if (c == 0x7E || c == 0x7D) {
+            frame[pos++] = 0x7D; frame[pos++] = c ^ 0x20;
+        } else {
+            frame[pos++] = c;
+        }
+    }
+    frame[pos++] = 0x7E;
+
+    fprintf(stderr, "[trx→L23] L1CTL %d bytes (sercomm framed=%d)\n", len, pos);
+    qemu_chr_fe_write_all(&g_uart_modem->chr, frame, pos);
+}
+
+/* Read side: a DL burst arrived from sercomm_gate (UDP TRXD).
+ * The chef decides what to do with it: route to BSP DMA so the DSP path
+ * processes it. Later this is where TDMA-window gating / fast-path
+ * L1CTL_DATA_IND would live. */
+void calypso_trx_on_dl_burst(uint8_t tn, uint32_t fn,
+                             const int16_t *iq, int nint16)
+{
+    (void)iq; (void)nint16;
+    static unsigned cnt;
+    if ((cnt++ % 100) == 0) {
+        TRX_LOG("on_dl_burst tn=%u fn=%u (#%u)", tn, fn, cnt);
+    }
+
+}
+
+/* UL hook — symmetric to on_dl_burst, called by calypso_bsp.c just
+ * before shipping a UL burst out via UDP. */
+void calypso_trx_on_ul_burst(uint8_t tn, uint32_t fn, const uint8_t *bits148)
+{
+    (void)bits148;
+    static unsigned cnt;
+    if ((cnt++ % 100) == 0) {
+        TRX_LOG("on_ul_burst tn=%u fn=%u (#%u)", tn, fn, cnt);
+    }
+}
+
+void calypso_trx_on_dl_l2(uint8_t tn, uint32_t fn,
+                          const uint8_t *l2, int len)
+{
+    (void)tn; (void)fn; (void)l2; (void)len;
 }
 
 /* ---- Init ---- */
@@ -801,6 +874,10 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
         s->dsp = c54x_init();
         if (s->dsp) {
             c54x_set_api_ram(s->dsp, s->dsp_ram);
+            /* DSP → ARM bidi: register notify callback so any DSP write
+             * to the API mailbox pulses CALYPSO_IRQ_API on the ARM side. */
+            s->dsp->api_write_cb = trx_dsp_api_write_cb;
+            s->dsp->api_write_cb_opaque = s;
             if (c54x_load_rom(s->dsp, rom_path) == 0) {
                 /* Don't reset/boot yet — wait for ARM to write DSP_DL_STATUS_READY */
                 s->dsp->running = false;

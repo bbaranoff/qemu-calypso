@@ -24,6 +24,7 @@
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
+#include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -36,8 +37,17 @@
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/sercomm_gate.h"
 
+/* TRXC handling is NOT done by QEMU. bridge.py answers TRXC commands
+ * locally (stub) on UDP 5701 — QEMU never sees them. The L1CTL/L23
+ * path on PTY DLCI 5 is the only thing the modem UART carries. */
+
 #define GATE_LOG(fmt, ...) \
     fprintf(stderr, "[gate] " fmt "\n", ##__VA_ARGS__)
+
+/* UART pointer captured on the first sercomm_gate_feed() call. The TRXC
+ * UDP callback uses it to push received sercomm-wrapped frames straight
+ * into the firmware UART RX FIFO. */
+static CalypsoUARTState *g_uart;
 
 /* ============================================================
  * 1. PTY side — sercomm HDLC parser (L1CTL only)
@@ -67,10 +77,19 @@ static enum gate_rx_state sc_state;
 static void gate_push_to_fifo(CalypsoUARTState *s,
                               const uint8_t *frame, int len)
 {
+    fprintf(stderr,
+            "[gate→fw-fifo] DLCI=%u CTRL=%02x payload=%d bytes (rx_count_before=%u)\n",
+            len > 0 ? frame[0] : 0xff,
+            len > 1 ? frame[1] : 0xff,
+            len > 2 ? len - 2 : 0,
+            (unsigned)s->rx_count);
     { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
     for (int i = 0; i < len; i++) {
         uint8_t c = frame[i];
-        if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE || c == 0x00) {
+        /* Standard sercomm: only escape FLAG and ESCAPE. Escaping
+         * 0x00 was a bug — the firmware sercomm parser doesn't
+         * expect it and would drop the frame. */
+        if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE) {
             { uint8_t _e = SERCOMM_ESCAPE; calypso_uart_inject_raw(s, &_e, 1); }
             { uint8_t _x = c ^ SERCOMM_XOR; calypso_uart_inject_raw(s, &_x, 1); }
         } else {
@@ -80,8 +99,89 @@ static void gate_push_to_fifo(CalypsoUARTState *s,
     { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
 }
 
+#define SERCOMM_DLCI_TRXC 4
+
+/* Wrap a payload in sercomm DLCI 4 (TRXC) and send it back via the
+ * chardev TX (→ PTY → bridge.py → osmo-bts-trx 5701). */
+static void gate_send_trxc_rsp(CalypsoUARTState *s,
+                                const uint8_t *payload, int plen)
+{
+    if (!s) return;
+    uint8_t frame[1024];
+    int pos = 0;
+    frame[pos++] = SERCOMM_FLAG;
+    uint8_t hdr[2] = { SERCOMM_DLCI_TRXC, 0x03 };
+    for (int i = 0; i < 2; i++) {
+        if (hdr[i] == SERCOMM_FLAG || hdr[i] == SERCOMM_ESCAPE) {
+            frame[pos++] = SERCOMM_ESCAPE;
+            frame[pos++] = hdr[i] ^ SERCOMM_XOR;
+        } else {
+            frame[pos++] = hdr[i];
+        }
+    }
+    for (int i = 0; i < plen && pos + 2 < (int)sizeof(frame); i++) {
+        uint8_t c = payload[i];
+        if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE) {
+            frame[pos++] = SERCOMM_ESCAPE;
+            frame[pos++] = c ^ SERCOMM_XOR;
+        } else {
+            frame[pos++] = c;
+        }
+    }
+    frame[pos++] = SERCOMM_FLAG;
+    qemu_chr_fe_write_all(&s->chr, frame, pos);
+    fprintf(stderr, "[gate-trxc] TX→bridge %d bytes (sercomm framed=%d)\n",
+            plen, pos);
+}
+
+/* Parse a TRXC CMD string and produce a RSP string.
+ * Mirrors bridge.py::trxc_response. Returns response length, or 0 if
+ * the command is not a CMD (silently ignored). */
+static int gate_trxc_handle(const uint8_t *cmd_buf, int cmd_len,
+                             char *rsp, int rsp_size)
+{
+    /* Strip trailing \0 and find verb/args */
+    int n = cmd_len;
+    while (n > 0 && (cmd_buf[n-1] == 0 || cmd_buf[n-1] == "\n"[0])) n--;
+    if (n < 4) return 0;
+    if (memcmp(cmd_buf, "CMD ", 4) != 0) return 0;
+
+    char tmp[512];
+    int  tn = n - 4 < (int)sizeof(tmp) - 1 ? n - 4 : (int)sizeof(tmp) - 1;
+    memcpy(tmp, cmd_buf + 4, tn);
+    tmp[tn] = 0;
+
+    /* Split verb and args */
+    char *verb = tmp;
+    char *args = strchr(tmp, " "[0]);
+    if (args) { *args = 0; args++; }
+    else args = (char *)"";
+
+    fprintf(stderr, "[gate-trxc] RX←bridge CMD %s args=%s\n", verb, args);
+
+    int rl;
+    if (strcmp(verb, "POWERON") == 0)
+        rl = snprintf(rsp, rsp_size, "RSP POWERON 0");
+    else if (strcmp(verb, "POWEROFF") == 0)
+        rl = snprintf(rsp, rsp_size, "RSP POWEROFF 0");
+    else if (strcmp(verb, "SETFORMAT") == 0)
+        rl = snprintf(rsp, rsp_size, "RSP SETFORMAT 0 %s", args[0] ? args : "0");
+    else if (strcmp(verb, "NOMTXPOWER") == 0)
+        rl = snprintf(rsp, rsp_size, "RSP NOMTXPOWER 0 50");
+    else if (strcmp(verb, "MEASURE") == 0)
+        rl = snprintf(rsp, rsp_size, "RSP MEASURE 0 %s -60", args[0] ? args : "0");
+    else if (args[0])
+        rl = snprintf(rsp, rsp_size, "RSP %s 0 %s", verb, args);
+    else
+        rl = snprintf(rsp, rsp_size, "RSP %s 0", verb);
+
+    if (rl > 0 && rl < rsp_size) rsp[rl++] = 0;  /* trailing NUL like bridge */
+    return rl;
+}
+
 void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
 {
+    if (!g_uart) g_uart = s;
     for (int i = 0; i < size; i++) {
         uint8_t b = buf[i];
 
@@ -105,9 +205,31 @@ void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
         case GATE_IN_FRAME:
             if (b == SERCOMM_FLAG) {
                 if (sc_len >= 2) {
-                    /* Forward EVERY DLCI to firmware FIFO — no burst path
-                     * on the PTY. The firmware ignores DLCIs it doesn't
-                     * have a callback for. */
+                    /* DLCI 5 = L1CTL from mobile (via bridge).
+                     * Trace, then push to firmware FIFO so the real
+                     * sercomm parser dispatches it. All other DLCIs
+                     * (console, debug, …) go straight to FIFO. */
+                    if (sc_buf[0] == SERCOMM_DLCI_TRXC && sc_len >= 2) {
+                        char rsp[512];
+                        int rl = gate_trxc_handle(sc_buf + 2, sc_len - 2,
+                                                   rsp, sizeof(rsp));
+                        if (rl > 0)
+                            gate_send_trxc_rsp(s, (uint8_t *)rsp, rl);
+                        sc_len = 0;
+                        break;
+                    }
+                    if (sc_buf[0] == 5) {
+                        int plen = sc_len - 2;
+                        uint8_t mt = plen > 0 ? sc_buf[2] : 0;
+                        fprintf(stderr,
+                                "[PTY-L1CTL] <<<RX %d bytes (mobile→fw) mt=0x%02x:",
+                                plen, mt);
+                        for (int j = 0; j < plen && j < 32; j++)
+                            fprintf(stderr, " %02x", sc_buf[2 + j]);
+                        if (plen > 32) fprintf(stderr, " ...");
+                        fprintf(stderr, "\n");
+
+                    }
                     gate_push_to_fifo(s, sc_buf, sc_len);
                 }
                 sc_len = 0;
@@ -180,87 +302,9 @@ static void clk_cb(void *opaque)
     }
 }
 
-/* ---------- TRXC ---------- */
-
-
-
-/* Generic ack: echoes args verbatim. Format: "RSP <cmd> <status> <args...>"
- * osmo-bts trx_if cmd_matches_rsp() does strict params check on SETSLOT
- * and SETFORMAT — must echo args identically. Other cmds are tolerant. */
-static void trxc_send_ack(const char *verb, const char *args, int status)
-{
-    if (gw.trxc_fd < 0 || !gw.trxc_remote_known) return;
-    char buf[256];
-    int len;
-    if (args && *args)
-        len = snprintf(buf, sizeof(buf), "RSP %s %d %s", verb, status, args);
-    else
-        len = snprintf(buf, sizeof(buf), "RSP %s %d", verb, status);
-    sendto(gw.trxc_fd, buf, len + 1, 0,
-           (struct sockaddr *)&gw.trxc_remote, sizeof(gw.trxc_remote));
-}
-
-static void trxc_handle(const char *cmd)
-{
-    if (strncmp(cmd, "CMD ", 4) != 0) return;
-    const char *verb_args = cmd + 4;
-
-    /* Split verb and args */
-    char vbuf[32] = {0};
-    int vlen = 0;
-    while (vlen < (int)sizeof(vbuf) - 1 && verb_args[vlen] && verb_args[vlen] != ' ') {
-        vbuf[vlen] = verb_args[vlen];
-        vlen++;
-    }
-    vbuf[vlen] = 0;
-    const char *args = verb_args[vlen] == ' ' ? verb_args + vlen + 1 : "";
-    /* Strip trailing whitespace/null from args */
-    char abuf[160] = {0};
-    int alen = 0;
-    while (args[alen] && args[alen] != '\0' && args[alen] != '\n' && args[alen] != '\r' && alen < (int)sizeof(abuf)-1) {
-        abuf[alen] = args[alen];
-        alen++;
-    }
-    while (alen > 0 && (abuf[alen-1] == ' ' || abuf[alen-1] == '\t')) abuf[--alen] = 0;
-
-    GATE_LOG("TRXC CMD %s args='%s'", vbuf, abuf);
-
-    /* NOMTXPOWER: append nominal output power "50" after status */
-    if (!strcmp(vbuf, "NOMTXPOWER")) {
-        trxc_send_ack(vbuf, "50", 0);
-        return;
-    }
-    /* MEASURE <freq>: append "<freq> -60" after status */
-    if (!strcmp(vbuf, "MEASURE")) {
-        char m[224]; snprintf(m, sizeof(m), "%s -60", abuf);
-        trxc_send_ack(vbuf, m, 0);
-        return;
-    }
-    /* All other commands: success, echo args verbatim. Covers
-     * POWERON/POWEROFF, RXTUNE/TXTUNE, SETSLOT, SETPOWER, ADJPOWER,
-     * SETMAXDLY, SETTSC, SETBSIC, RFMUTE, SETFORMAT,
-     * HANDOVER/NOHANDOVER, SETRXGAIN, NOMRXLEV, etc. */
-    trxc_send_ack(vbuf, abuf, 0);
-}
-
-static void trxc_cb(void *opaque)
-{
-    char buf[256];
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    ssize_t n = recvfrom(gw.trxc_fd, buf, sizeof(buf) - 1, 0,
-                         (struct sockaddr *)&src, &slen);
-    if (n <= 0) return;
-    buf[n] = '\0';
-
-    if (!gw.trxc_remote_known || gw.trxc_remote.sin_port != src.sin_port) {
-        gw.trxc_remote = src;
-        gw.trxc_remote_known = true;
-        GATE_LOG("TRXC remote %s:%u",
-                 inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    }
-    trxc_handle(buf);
-}
+/* ---------- TRXC ----------
+ * Removed: bridge.py answers TRXC commands locally on UDP 5701 (stub).
+ * QEMU never sees TRXC traffic. */
 
 /* ---------- TRXD ---------- */
 
@@ -281,7 +325,7 @@ static void trxc_cb(void *opaque)
 #define BURST_IQ_BYTES   (BURST_NSAMPLES * 2 * 2) /* 2368 */
 #define TRXD_PKT_BYTES   (6 + BURST_IQ_BYTES)    /* 2374 */
 
-static void trxd_cb(void *opaque)
+static void __attribute__((unused)) trxd_cb(void *opaque)
 {
     uint8_t buf[4096];
     struct sockaddr_in src;
@@ -318,13 +362,42 @@ static void trxd_cb(void *opaque)
         }
     }
 
-    /* Hand the int16 I/Q stream straight to the BSP DMA module — no more
-     * legacy header repackage, no NDB poking. The BSP either DMAs into
-     * the configured DARAM target or runs in DISCOVERY mode. */
+    /* Hand the burst to calypso_trx — the chef. It owns TDMA state and
+     * decides whether to forward to BSP DMA or fast-path L1CTL_DATA_IND. */
     uint8_t  tn = buf[0] & 0x07;
     uint32_t fn = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
                   ((uint32_t)buf[3] <<  8) |  (uint32_t)buf[4];
-    calypso_bsp_rx_burst(tn, fn, (const int16_t *)(buf + 6), nint16);
+    calypso_trx_on_dl_burst(tn, fn, (const int16_t *)(buf + 6), nint16);
+}
+
+/* ---------- UL burst send (BSP → bridge → BTS) ---------- */
+
+void sercomm_gate_send_ul_burst(uint8_t tn, uint32_t fn,
+                                const uint8_t *bits148)
+{
+    if (gw.trxd_fd < 0 || !bits148) return;
+
+    uint8_t pkt[8 + 148];
+    pkt[0] = tn & 0x07;
+    pkt[1] = (fn >> 24) & 0xff;
+    pkt[2] = (fn >> 16) & 0xff;
+    pkt[3] = (fn >>  8) & 0xff;
+    pkt[4] =  fn        & 0xff;
+    pkt[5] = (uint8_t)(-60);
+    pkt[6] = 0; pkt[7] = 0;
+    memcpy(&pkt[8], bits148, 148);
+
+    struct sockaddr_in dst = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port        = htons(6802),
+    };
+    ssize_t r = sendto(gw.trxd_fd, pkt, sizeof(pkt), 0,
+                       (struct sockaddr *)&dst, sizeof(dst));
+    static unsigned cnt;
+    if (r < 0 || (cnt++ % 100) == 0) {
+        GATE_LOG("UL→bridge tn=%u fn=%u r=%zd (#%u)", tn, fn, r, cnt);
+    }
 }
 
 /* ---------- init ---------- */
@@ -346,19 +419,14 @@ void sercomm_gate_init(int base_port)
         GATE_LOG("CLK  listening UDP %d", clk_port);
     }
 
-    gw.trxc_fd = udp_bind(trxc_port);
-    if (gw.trxc_fd < 0) {
-        GATE_LOG("TRXC bind %d failed: %s", trxc_port, strerror(errno));
-    } else {
-        qemu_set_fd_handler(gw.trxc_fd, trxc_cb, NULL, NULL);
-        GATE_LOG("TRXC listening UDP %d", trxc_port);
-    }
+    /* TRXC: not handled by QEMU. bridge.py answers locally on UDP 5701. */
+    gw.trxc_fd = -1;
+    (void)trxc_port;
+    GATE_LOG("TRXC: bridge.py local stub on :5701, QEMU not involved");
 
-    gw.trxd_fd = udp_bind(trxd_port);
-    if (gw.trxd_fd < 0) {
-        GATE_LOG("TRXD bind %d failed: %s", trxd_port, strerror(errno));
-    } else {
-        qemu_set_fd_handler(gw.trxd_fd, trxd_cb, NULL, NULL);
-        GATE_LOG("TRXD listening UDP %d", trxd_port);
-    }
+    /* TRXD UDP socket moved to calypso_bsp.c — BSP owns the transport
+     * for both DL recv and UL send (symmetric, single-port). */
+    gw.trxd_fd = -1;
+    (void)trxd_port;
+    GATE_LOG("TRXD: now owned by calypso_bsp.c on UDP 6702");
 }

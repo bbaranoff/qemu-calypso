@@ -60,9 +60,16 @@ void calypso_tint0_start(void)
     }
 
     tint0.running = true;
-    tint0.fn = 0;
-    TINT0_LOG("started (period=%.3f ms, IFR bit %d, vec %d)",
-              TINT0_PERIOD_NS / 1e6, TINT0_IFR_BIT, TINT0_VEC);
+    /* Do NOT force tint0.fn = 0 here. A real GSM BTS never restarts the
+     * frame counter at 0 — it only ever advances. Resetting on every
+     * TINT0 start makes the firmware believe it just synchronized to a
+     * fresh hyperframe each run, which is the "fn injection" hack the
+     * user flagged 2026-04-07 night. Whoever owns the master clock
+     * (calypso_tint0_set_fn from a network-derived source) should seed
+     * fn before calling start; otherwise it inherits whatever value the
+     * static struct holds (0 on first boot only). */
+    TINT0_LOG("started (period=%.3f ms, IFR bit %d, vec %d) fn=%u",
+              TINT0_PERIOD_NS / 1e6, TINT0_IFR_BIT, TINT0_VEC, tint0.fn);
     timer_mod_ns(tint0.timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TINT0_PERIOD_NS);
 }

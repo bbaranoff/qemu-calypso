@@ -120,8 +120,11 @@
  *                  Vec 23: DMAC0 (IMR bit 7)
  *                  Vec 24: DMAC1 (IMR bit 8)
  * Formula: vec = imr_bit + 16 */
-#define C54X_INT_FRAME_VEC   2   /* SINT17 (IMR bit 1) — enters boot code which dispatches frames */
-#define C54X_INT_FRAME_BIT   1   /* IMR bit 1 */
+/* Calypso DSP firmware enables IMR bits 3 + 7 + upper (observed IMR=0xFF88).
+ * Bit 3 = INT3 = vec 19 — this is the external frame-sync line from the TPU,
+ * the only "frame" interrupt the firmware actually unmasks. Use it. */
+#define C54X_INT_FRAME_VEC   19  /* INT3 = vec (3+16) */
+#define C54X_INT_FRAME_BIT   3   /* IMR bit 3 */
 #define C54X_NUM_INTS        16
 
 typedef struct C54xState {
@@ -169,12 +172,22 @@ typedef struct C54xState {
     /* RPTB state */
     bool     rptb_active;
 
+    /* Delayed-branch state (CALLD/RETD/BD/CCD/...): when set, the next
+     * `delay_slots` instructions execute normally, then PC is forced to
+     * `delayed_pc`. */
+    uint16_t delayed_pc;
+    uint8_t  delay_slots;
+
     /* Memory */
     uint16_t prog[C54X_PROG_SIZE];   /* Program memory */
     uint16_t data[C54X_DATA_SIZE];   /* Data memory */
 
     /* API RAM pointer (shared with ARM calypso_trx.c) */
     uint16_t *api_ram;  /* points into ARM's dsp_ram[] */
+
+    /* DSP → ARM notify hook: called whenever the DSP writes to api_ram. */
+    void (*api_write_cb)(void *opaque, uint16_t woff, uint16_t val);
+    void  *api_write_cb_opaque;
 
     /* State */
     bool     running;
