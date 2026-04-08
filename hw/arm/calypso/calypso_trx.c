@@ -702,10 +702,12 @@ void calypso_trx_rx_burst(const uint8_t *data, int len)
 
 }
 
-/* TX burst: send UL burst from DSP write page out via sercomm_gate UDP
- * (symmetric to the DL on_dl_burst path). The chef closes the loop:
- * ARM L1 writes d_task_u → DSP processes → DSP DARAM UL bits →
- * sercomm_gate_send_ul_burst → UDP 6802 → bridge → osmo-bts-trx. */
+/* TX burst: send UL burst from DSP write page.
+ *
+ * The chef closes the loop: ARM L1 writes d_task_u → DSP processes →
+ * DSP DARAM UL bits → calypso_bsp_tx_burst pulls 148 hard bits and
+ * ships them to bridge via UDP 6702 → osmo-bts-trx. The BSP module
+ * owns the UDP transport end-to-end now; we only forward metadata. */
 static void calypso_trx_send_ul_burst(CalypsoTRX *s, uint16_t task_u)
 {
     if (task_u == 0) return;
@@ -716,13 +718,8 @@ static void calypso_trx_send_ul_burst(CalypsoTRX *s, uint16_t task_u)
     uint8_t  tn = wp[3] & 0x07;
     uint32_t fn = s->fn;
 
-    /* Symmetric to DL: BSP pulls bits from DSP DARAM UL buffer, then we
-     * hand them off to sercomm_gate which ships via UDP to the bridge.
-     * Both directions now flow through calypso_bsp_*_burst. */
     uint8_t bits[148];
-    if (calypso_bsp_tx_burst(tn, fn, bits)) {
-        sercomm_gate_send_ul_burst(tn, fn, bits);
-    }
+    (void)calypso_bsp_tx_burst(tn, fn, bits);
 }
 
 void calypso_trx_tx_burst_poll(void)

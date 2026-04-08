@@ -13,9 +13,10 @@ Roles:
 
 Port layout:
   osmo-bts-trx local 5800/5801/5802 (binds), remote 5700/5701/5702 (sends to)
-  bridge BTS-side bind:  5700 (CLK out), 5701 (TRXC), 5702 (TRXD)
-  bridge BB-side  bind:  6802 (TRXD)  ← forwards bursts to gate at 6702
-  gate (QEMU)     bind:  6702 (TRXD only — TRXC/CLK no longer used in QEMU)
+  bridge BTS-side bind:  5700 (CLK out), 5701 (TRXC stub), 5702 (TRXD)
+  bridge BB-side  bind:  6702 (TRXD)  — receives UL from BSP; forwards DL to 6802
+  QEMU calypso_bsp bind: 6802 (TRXD)  — receives DL from bridge; UL sendto 6702
+  QEMU sercomm_gate bind: 6700 (CLK)  — drains IND CLOCK for logging only
 """
 
 import argparse

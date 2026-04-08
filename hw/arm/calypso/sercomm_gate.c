@@ -1,22 +1,23 @@
 /*
- * sercomm_gate.c — Sercomm DLCI router (PTY) + TRX UDP endpoint
+ * sercomm_gate.c — Sercomm DLCI router (PTY) + CLK UDP listener
  *
- * Two completely separate roles, matching real Calypso hardware:
+ * Two separate roles, matching the current QEMU split:
  *
  *   1. PTY (UART modem) — sercomm HDLC stream from host (mobile/ccch_scan).
  *      DLCIs are re-wrapped and pushed to the UART RX FIFO so the firmware's
- *      sercomm driver parses them via the real code path. L1CTL = DLCI 5.
+ *      sercomm driver parses them via the real code path. L1CTL = DLCI 5,
+ *      TRXC = DLCI 4 (intercepted here, stub responses wrapped back out).
  *      No DLCI on the PTY ever carries radio bursts.
  *
- *   2. UDP TRX endpoint — replaces fake_trx for the BSP path.
- *      Three loopback sockets (CLK / TRXC / TRXD) talk to osmo-bts-trx.
- *      Incoming TRXD bursts are converted (sbit_t → int16) and handed
- *      to calypso_trx_rx_burst(), which feeds the C54x BSP and fires BRINT0.
+ *   2. UDP CLK listener — just drains "IND CLOCK <fn>" on the baseband
+ *      side and logs it. calypso_trx owns its own FN counter; the CLK
+ *      packets are purely informational here.
  *
- * Port layout (base_port, default 6700, fake_trx convention):
- *   CLK : bind  base+100 (6800)  ← receive  "IND CLOCK <fn>"
- *   TRXC: bind  base+101 (6801)  ↔ ASCII   "CMD ..."/"RSP ..."
- *   TRXD: bind  base+102 (6802)  ↔ binary  v0 burst frames
+ *      TRXC traffic is stubbed locally by bridge.py on UDP 5701 — QEMU
+ *      never sees TRXC on UDP.
+ *
+ *      TRXD (burst) transport is owned by calypso_bsp.c: BSP binds
+ *      127.0.0.1:6802 for DL recv and sends UL to 127.0.0.1:6702.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -27,14 +28,10 @@
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 
 #include "hw/arm/calypso/calypso_uart.h"
-#include "hw/arm/calypso/calypso_trx.h"
-#include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/sercomm_gate.h"
 
 /* TRXC handling is NOT done by QEMU. bridge.py answers TRXC commands
@@ -245,26 +242,17 @@ void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
 }
 
 /* ============================================================
- * 2. UDP TRX endpoint — talks to osmo-bts-trx
- * ============================================================ */
+ * 2. UDP CLK listener — informational only
+ * ============================================================
+ *
+ * TRXC is stubbed by bridge.py on UDP 5701; QEMU never sees it.
+ * TRXD (bursts) is owned by calypso_bsp.c: bind 127.0.0.1:6802 for DL
+ * recv, sendto 127.0.0.1:6702 for UL. See calypso_bsp.c for details.
+ */
 
-#define GSM_BURST_BITS  148
-#define TRX_HDR_LEN_RX  6        /* TN(1)+FN(4)+RSSI(1)+TOA(2) */
+static int g_clk_fd = -1;
 
-typedef struct {
-    int  base_port;
-    int  clk_fd;
-    int  trxc_fd;
-    int  trxd_fd;
-    bool trxc_remote_known;
-    bool trxd_remote_known;
-    struct sockaddr_in trxc_remote;
-    struct sockaddr_in trxd_remote;
-} GateUDP;
-
-static GateUDP gw;
-
-static int udp_bind(int port)
+static int udp_bind_loopback(int port)
 {
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
@@ -284,15 +272,11 @@ static int udp_bind(int port)
     return fd;
 }
 
-/* ---------- CLK ---------- */
-
 static void clk_cb(void *opaque)
 {
+    (void)opaque;
     char buf[128];
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    ssize_t n = recvfrom(gw.clk_fd, buf, sizeof(buf) - 1, 0,
-                         (struct sockaddr *)&src, &slen);
+    ssize_t n = recv(g_clk_fd, buf, sizeof(buf) - 1, 0);
     if (n <= 0) return;
     buf[n] = '\0';
     /* Just log occasionally — calypso_trx owns its own FN counter. */
@@ -302,131 +286,22 @@ static void clk_cb(void *opaque)
     }
 }
 
-/* ---------- TRXC ----------
- * Removed: bridge.py answers TRXC commands locally on UDP 5701 (stub).
- * QEMU never sees TRXC traffic. */
-
-/* ---------- TRXD ---------- */
-
-/*
- * Wire format from bridge.py (post GMSK modulation):
- *   bytes 0..5   : DL TRXDv0 header (TN, FN×4 BE, ATT)
- *   bytes 6..   : 148 syms × 4 sps = 592 complex samples
- *                  encoded as int16 LE I,Q,I,Q,...   (=2368 bytes)
- *
- * Total burst size: 6 + 2368 = 2374 bytes.
- *
- * Re-package to the format calypso_trx_rx_burst() still expects:
- *   bytes 0..7  : TN(1) FN(4 BE) RSSI(1) TOA(2 BE)   (RSSI/TOA = 0 here)
- *   bytes 8..   : N int16 LE samples (I and Q interleaved)
- */
-#define GMSK_SPS         4
-#define BURST_NSAMPLES   (148 * GMSK_SPS)        /* 592 complex samples */
-#define BURST_IQ_BYTES   (BURST_NSAMPLES * 2 * 2) /* 2368 */
-#define TRXD_PKT_BYTES   (6 + BURST_IQ_BYTES)    /* 2374 */
-
-static void __attribute__((unused)) trxd_cb(void *opaque)
-{
-    uint8_t buf[4096];
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    ssize_t n = recvfrom(gw.trxd_fd, buf, sizeof(buf), 0,
-                         (struct sockaddr *)&src, &slen);
-    if (n < 6 + 2) return;  /* need at least header + 1 sample */
-
-    if (!gw.trxd_remote_known || gw.trxd_remote.sin_port != src.sin_port) {
-        gw.trxd_remote = src;
-        gw.trxd_remote_known = true;
-        GATE_LOG("TRXD remote %s:%u",
-                 inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    }
-
-    /* Body: int16 LE samples after the 6-byte header.
-     * nbytes_iq must be even; we count individual int16 (I and Q both). */
-    int nbytes_iq = (int)n - 6;
-    if (nbytes_iq < 0) nbytes_iq = 0;
-    int nint16 = nbytes_iq / 2;
-    if (nint16 > (int)(sizeof(buf) / 2)) nint16 = sizeof(buf) / 2;
-
-    {
-        uint8_t tn = buf[0] & 0x07;
-        uint32_t fn_ = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
-                       ((uint32_t)buf[3]<<8)|buf[4];
-        static int dbg = 0;
-        if (dbg < 5) {
-            int16_t s0 = (int16_t)(buf[6] | (buf[7]<<8));
-            int16_t s1 = (int16_t)(buf[8] | (buf[9]<<8));
-            GATE_LOG("TRXD n=%zd tn=%u fn=%u att=%u nint16=%d first=[%d,%d]",
-                     n, tn, fn_, buf[5], nint16, s0, s1);
-            dbg++;
-        }
-    }
-
-    /* Hand the burst to calypso_trx — the chef. It owns TDMA state and
-     * decides whether to forward to BSP DMA or fast-path L1CTL_DATA_IND. */
-    uint8_t  tn = buf[0] & 0x07;
-    uint32_t fn = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
-                  ((uint32_t)buf[3] <<  8) |  (uint32_t)buf[4];
-    calypso_trx_on_dl_burst(tn, fn, (const int16_t *)(buf + 6), nint16);
-}
-
-/* ---------- UL burst send (BSP → bridge → BTS) ---------- */
-
-void sercomm_gate_send_ul_burst(uint8_t tn, uint32_t fn,
-                                const uint8_t *bits148)
-{
-    if (gw.trxd_fd < 0 || !bits148) return;
-
-    uint8_t pkt[8 + 148];
-    pkt[0] = tn & 0x07;
-    pkt[1] = (fn >> 24) & 0xff;
-    pkt[2] = (fn >> 16) & 0xff;
-    pkt[3] = (fn >>  8) & 0xff;
-    pkt[4] =  fn        & 0xff;
-    pkt[5] = (uint8_t)(-60);
-    pkt[6] = 0; pkt[7] = 0;
-    memcpy(&pkt[8], bits148, 148);
-
-    struct sockaddr_in dst = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port        = htons(6802),
-    };
-    ssize_t r = sendto(gw.trxd_fd, pkt, sizeof(pkt), 0,
-                       (struct sockaddr *)&dst, sizeof(dst));
-    static unsigned cnt;
-    if (r < 0 || (cnt++ % 100) == 0) {
-        GATE_LOG("UL→bridge tn=%u fn=%u r=%zd (#%u)", tn, fn, r, cnt);
-    }
-}
-
 /* ---------- init ---------- */
 
 void sercomm_gate_init(int base_port)
 {
     if (base_port <= 0) base_port = 6700;
-    gw.base_port = base_port;
+    int clk_port = base_port + 0;
 
-    int clk_port  = base_port + 0;
-    int trxc_port = base_port + 1;
-    int trxd_port = base_port + 2;
-
-    gw.clk_fd = udp_bind(clk_port);
-    if (gw.clk_fd < 0) {
+    g_clk_fd = udp_bind_loopback(clk_port);
+    if (g_clk_fd < 0) {
         GATE_LOG("CLK bind %d failed: %s", clk_port, strerror(errno));
     } else {
-        qemu_set_fd_handler(gw.clk_fd, clk_cb, NULL, NULL);
+        qemu_set_fd_handler(g_clk_fd, clk_cb, NULL, NULL);
         GATE_LOG("CLK  listening UDP %d", clk_port);
     }
 
-    /* TRXC: not handled by QEMU. bridge.py answers locally on UDP 5701. */
-    gw.trxc_fd = -1;
-    (void)trxc_port;
     GATE_LOG("TRXC: bridge.py local stub on :5701, QEMU not involved");
-
-    /* TRXD UDP socket moved to calypso_bsp.c — BSP owns the transport
-     * for both DL recv and UL send (symmetric, single-port). */
-    gw.trxd_fd = -1;
-    (void)trxd_port;
-    GATE_LOG("TRXD: now owned by calypso_bsp.c on UDP 6702");
+    GATE_LOG("TRXD: owned by calypso_bsp.c "
+             "(bind 127.0.0.1:6802 DL / sendto 127.0.0.1:6702 UL)");
 }
