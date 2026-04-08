@@ -111,7 +111,7 @@ static void fifo_reset(CalypsoUARTState *s)
  *
  * Sets overrun error flag if FIFO is full.
  */
-void calypso_uart_fifo_push(CalypsoUARTState *s, uint8_t data)
+static void calypso_uart_fifo_push(CalypsoUARTState *s, uint8_t data)
 {
     if (s->rx_count >= CALYPSO_UART_RX_FIFO_SIZE) {
         s->lsr |= LSR_OE;
