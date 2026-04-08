@@ -104,4 +104,16 @@ void calypso_trx_rx_burst(const uint8_t *data, int len);
 bool calypso_trx_burst_ready(void);
 void calypso_trx_tx_burst_poll(void);
 
+/* DL/UL hooks invoked by calypso_bsp.c on each burst traversal. */
+void calypso_trx_on_dl_burst(uint8_t tn, uint32_t fn,
+                             const int16_t *iq, int nint16);
+void calypso_trx_on_ul_burst(uint8_t tn, uint32_t fn,
+                             const uint8_t *bits148);
+void calypso_trx_on_dl_l2(uint8_t tn, uint32_t fn,
+                          const uint8_t *l2, int len);
+
+/* L23 side-channel: wrap an L1CTL payload in sercomm DLCI 5 and ship it
+ * to the modem PTY (→ bridge.py → mobile). */
+void calypso_trx_l23_write(const uint8_t *l1ctl, int len);
+
 #endif /* CALYPSO_TRX_H */
