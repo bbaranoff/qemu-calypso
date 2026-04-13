@@ -53,10 +53,17 @@ Always verify against `tic54x-opc.c` (binutils) before changing any opcode:
 | MMR mask | & 0x1F | & 0x7F | STLM/POPM/PSHM wrong address |
 | PORTR PA | 0xF430 | 0x0034 | DSP read wrong BSP port |
 | 0xF4EB | — | RETE (correct) | The REAL rete opcode |
+| 0xF9xx | BC branch (no push) | CC conditional call (push) | Lost return addresses |
+| 0xFBxx | LD #k,16,A | CCD conditional call delayed (push) | Lost return addresses |
+| NORM L799 | NOP (dead) | — removed, real NORM at L832 | FB correlator broken |
 
 ## Current Bug
 
-**2nd PM_REQ not scheduled.** Mobile sends PM_REQ (type=0x08), firmware dequeues it from l23_rx_queue, but `l1s_pm_test()` is never called. GDB breakpoint on 0x825424 not hit. First PM works perfectly. Likely another opcode bug in the l1ctl_rx_pm_req → l1s_pm_test path, or a state corruption during 1st PM that prevents 2nd.
+**2nd PM_REQ not scheduled.** Mobile sends PM_REQ (type=0x08), firmware dequeues it from l23_rx_queue, but `l1s_pm_test()` is never called. GDB breakpoint on 0x825424 not hit. First PM works perfectly.
+
+**SP slow leak:** SP descends ~3 words per IDLE cycle (5AC7 → 5AC4). Introduced by F9xx CC fix (push now correct). Likely some CC calls in ROM where the callee doesn't RET properly — need to trace which CC target doesn't return.
+
+**27 duplicate opcode handlers** found in c54x_exec_one — dead code zone L1200-1500. No shadowing bugs but should be consolidated.
 
 ## Conventions
 
