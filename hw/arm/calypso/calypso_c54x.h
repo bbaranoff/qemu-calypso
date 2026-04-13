@@ -160,6 +160,12 @@ typedef struct C54xState {
     /* Timer0 prescale counter (PSC) — not memory-mapped directly */
     uint16_t timer_psc;
 
+    /* DMA sub-register bank (6 channels × 4 regs) */
+    uint16_t dma_subaddr;
+    uint16_t dma_subregs[24];
+    /* McBSP sub-register bank */
+    uint16_t spsa;
+
     /* RPT state */
     uint16_t rpt_count;  /* remaining RPT iterations */
     uint16_t rpt_pc;     /* PC of repeated instruction */
@@ -196,7 +202,7 @@ typedef struct C54xState {
     uint32_t insn_count;
 
     /* BSP (Baseband Serial Port) — burst sample buffer */
-    uint16_t bsp_buf[160];  /* burst samples from radio */
+    uint16_t bsp_buf[2048]; /* burst I/Q samples from radio */
     int      bsp_len;       /* number of samples */
     int      bsp_pos;       /* read position */
 

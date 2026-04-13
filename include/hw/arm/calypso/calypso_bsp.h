@@ -57,4 +57,8 @@ uint8_t  calypso_bsp_get_last_att(void);
 /* Send UL burst via UDP to BTS */
 void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148]);
 
+/* Deliver buffered DL bursts when BDLENA windows are available.
+ * Called each TDMA frame from calypso_tdma_tick(). */
+void calypso_bsp_deliver_buffered(void);
+
 #endif /* HW_ARM_CALYPSO_BSP_H */

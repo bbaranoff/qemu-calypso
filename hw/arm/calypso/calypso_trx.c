@@ -31,7 +31,9 @@ extern CalypsoUARTState *g_uart_modem;
 #define DSP_API_W_PAGE1  0x0028
 #define DSP_API_NDB      0x01A8
 #define DB_W_D_TASK_D    0
+#define DB_W_D_BURST_D   1
 #define DB_W_D_TASK_U    2
+#define DB_W_D_BURST_U   3
 #define DB_W_D_TASK_MD   4
 /* No PM/FB/SB stubs — the DSP handles everything via shared API RAM */
 
@@ -228,14 +230,37 @@ static void calypso_dsp_done(void *opaque) {
     /* Execute TPU RAM micro-instructions (TSP bus commands).
      * The firmware wrote a TPU scenario into TPU RAM. We scan it for
      * MOVE instructions that write to TSP registers. When we see
-     * TSP_CTRL2 with WR bit, we send the TX byte to IOTA. */
+     * TSP_CTRL2 with WR bit, we send the TX byte to IOTA.
+     *
+     * IMPORTANT: The Calypso Rhea bus is 16-bit wide, mapped to the
+     * 32-bit ARM bus at 2-byte stride. The firmware writes 16-bit TPU
+     * instructions at ARM offsets 0, 2, 4, ..., which end up in
+     * tpu_ram[0], tpu_ram[1], tpu_ram[2], ... However, the actual
+     * physical layout has zero-padding between instructions (ARM 32-bit
+     * alignment). We must skip zero words that are just bus padding,
+     * not real SLEEP instructions. A real SLEEP (0x0000) always comes
+     * after at least one non-zero instruction. */
     {
         uint8_t tsp_tx1 = 0;
         uint8_t tsp_ctrl1 = 0;
+        bool seen_any = false;
         for (int i = 0; i < CALYPSO_TPU_RAM_SIZE / 2; i++) {
             uint16_t insn = s->tpu_ram[i];
+            if (insn == 0x0000) {
+                /* Skip zero words: they are either Rhea bus padding
+                 * or the final SLEEP. Only break on SLEEP after we've
+                 * seen real instructions, and only if the NEXT word
+                 * is also zero (two consecutive zeros = real SLEEP). */
+                if (seen_any) {
+                    int next = i + 1;
+                    if (next >= CALYPSO_TPU_RAM_SIZE / 2 ||
+                        s->tpu_ram[next] == 0x0000)
+                        break;  /* real SLEEP — end of scenario */
+                }
+                continue;
+            }
+            seen_any = true;
             uint8_t opcode = (insn >> 13) & 0x7;
-            if (opcode == 0) break;  /* SLEEP — end of scenario */
             if (opcode == 4) {
                 /* MOVE: addr = bits 4:0, data = bits 12:5 */
                 uint8_t addr = insn & 0x1F;
@@ -394,6 +419,32 @@ static void calypso_tdma_tick(void *opaque) {
         /* Only pulse API IRQ when DSP naturally reaches IDLE. */
         if (!was_idle && s->dsp->idle) {
             qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
+        }
+    }
+
+    /* ── 6. Deliver buffered DL bursts to DSP ──
+     * Bursts from BTS arrive via UDP in real time, but BDLENA windows
+     * open in virtual time (faster). This step pulls buffered bursts
+     * and delivers them when BDLENA windows are available. */
+    calypso_bsp_deliver_buffered();
+
+    /* ── 6b. UL burst poll ──
+     * Check if the DSP wrote an UL task. If so, read bits from DSP
+     * DARAM 0x0900 and send via UDP to BTS. */
+    {
+        uint16_t *wp = s->dsp_page ?
+            &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
+        uint16_t task_u = wp[DB_W_D_TASK_U];
+        if (task_u != 0 && s->dsp) {
+            uint8_t tn = wp[DB_W_D_BURST_U] & 0x07;
+            uint8_t bits[148];
+            if (calypso_bsp_tx_burst(tn, s->fn, bits)) {
+                calypso_bsp_send_ul(tn, s->fn, bits);
+                static int ul_log = 0;
+                if (++ul_log <= 20)
+                    TRX_LOG("UL burst task=%u tn=%u fn=%u", task_u, tn, s->fn);
+            }
+            wp[DB_W_D_TASK_U] = 0;
         }
     }
 

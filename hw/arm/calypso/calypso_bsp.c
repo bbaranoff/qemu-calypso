@@ -33,6 +33,20 @@
 
 #define BSP_TRXD_PORT  6702   /* bridge forwards DL bursts here (5702 is bridge's own) */
 
+/* Per-TN burst buffer: store the latest DL burst from BTS for each timeslot.
+ * On real hardware, BSP DMA delivers samples synchronously within the TDMA
+ * frame. In QEMU, bursts arrive asynchronously via UDP (real-time) while
+ * BDLENA windows open in virtual time (faster). We buffer the latest burst
+ * per TN and deliver it when BDLENA fires, ensuring the DSP always sees
+ * samples regardless of UDP arrival timing. */
+#define BSP_RING_SIZE  8   /* one per TN */
+typedef struct {
+    int16_t  iq[296];  /* 148 I/Q pairs max */
+    int      n;        /* number of int16 values */
+    uint32_t fn;
+    bool     valid;
+} BspBurstSlot;
+
 static struct {
     C54xState *dsp;
     uint16_t   daram_addr;
@@ -45,6 +59,9 @@ static struct {
     struct sockaddr_in trxd_peer;  /* BTS address (for UL replies) */
     bool       trxd_peer_valid;
     uint8_t    last_att;           /* last DL attenuation byte */
+
+    /* Per-TN latest burst buffer */
+    BspBurstSlot  slot[BSP_RING_SIZE];
 } bsp;
 
 static uint16_t parse_uint_env(const char *name, uint16_t def)
@@ -110,20 +127,39 @@ static void bsp_trxd_readable(void *opaque)
     /* GMSK modulation: convert TRXDv0 hard bits to I/Q samples.
      * GMSK with h=0.5: each bit adds ±π/2 to the phase.
      * NRZ encoding: bit 0 → phase += π/2, bit 1 → phase -= π/2.
-     * I = cos(phase), Q = sin(phase), scaled to int16.
      *
-     * Since phase increments are exactly ±π/2, cos/sin cycle through
-     * {0, ±1} — we use a lookup table instead of floating point. */
-    int16_t iq[148];
-    static const int16_t cos_tab[4] = { 0x3FFF, 0, -0x3FFF, 0 };  /* cos(0,π/2,π,3π/2) */
-    int phase_idx = 0;  /* phase / (π/2), mod 4 */
+     * The Calypso IOTA chip delivers complex I/Q pairs to the BSP.
+     * Phase increments are exactly ±π/2, so I=cos(φ) and Q=sin(φ)
+     * cycle through {±1, 0}. We produce interleaved I,Q pairs.
+     *
+     * For FB (all-zero bits): phase advances π/2 per bit → pure tone.
+     * I/Q sequence: (1,0),(0,1),(-1,0),(0,-1),(1,0),... */
+    int16_t iq[296];  /* 148 I/Q pairs = 296 values */
+    static const int16_t cos_tab[4] = { 0x3FFF, 0, -0x3FFF, 0 };
+    static const int16_t sin_tab[4] = { 0, 0x3FFF, 0, -0x3FFF };
+    int phase_idx = 0;
+    int iq_count = 0;
     for (int i = 0; i < nbits; i++) {
-        /* NRZ: bit 0 → +1 (advance phase), bit 1 → -1 (retard phase) */
-        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;  /* +1 or -1 mod 4 */
-        iq[i] = cos_tab[phase_idx];  /* I component only (DSP reads magnitude) */
+        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
+        iq[iq_count++] = cos_tab[phase_idx];  /* I */
+        iq[iq_count++] = sin_tab[phase_idx];  /* Q */
     }
 
-    calypso_bsp_rx_burst(tn, fn, iq, nbits);
+    /* Buffer the burst for this TN. BDLENA will pull it later.
+     * QEMU virtual time runs faster than real time, so bursts arrive
+     * via UDP asynchronously. Buffering ensures the DSP sees samples
+     * whenever the firmware opens a BDLENA window. */
+    if (tn < BSP_RING_SIZE) {
+        BspBurstSlot *sl = &bsp.slot[tn];
+        memcpy(sl->iq, iq, iq_count * sizeof(int16_t));
+        sl->n = iq_count;  /* number of int16 values (I/Q pairs) */
+        sl->fn = fn;
+        sl->valid = true;
+    }
+
+    /* Delivery is handled exclusively by calypso_bsp_deliver_buffered()
+     * called from the TDMA tick. No immediate delivery — it would
+     * double-consume BDLENA pulses and race with the buffered path. */
 }
 
 /* ---- Init ---- */
@@ -132,7 +168,7 @@ void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
     bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fc0);
-    bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  64);
+    bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  296);
     bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
     bsp.bursts_written = 0;
@@ -251,6 +287,54 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5))) {
         c54x_interrupt_ex(bsp.dsp, 21, 5);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
+    }
+}
+
+/* ---- Deliver buffered burst when BDLENA fires ---- */
+/* Called from calypso_tdma_tick (calypso_trx.c) each frame.
+ * If BDLENA is pending for a TN and we have a buffered burst, deliver it. */
+void calypso_bsp_deliver_buffered(void)
+{
+    if (!bsp.dsp || bsp.daram_addr == 0) return;
+
+    /* For each TN with a pending BDLENA window and a buffered burst,
+     * deliver the samples to the DSP. This handles the case where
+     * BDLENA opened before the UDP burst arrived (timing mismatch). */
+    for (int tn = 0; tn < BSP_RING_SIZE; tn++) {
+        BspBurstSlot *sl = &bsp.slot[tn];
+        if (!sl->valid) continue;
+
+        /* Check if there's a BDLENA window for this TN */
+        if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn))
+            continue;
+
+        /* Deliver the buffered burst (I/Q pairs) */
+        int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;
+
+        uint16_t samples[296];
+        for (int i = 0; i < n && i < 296; i++)
+            samples[i] = (uint16_t)sl->iq[i];
+        c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
+
+        static unsigned woff = 0;
+        for (int i = 0; i < n; i++) {
+            bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = (uint16_t)sl->iq[i];
+            woff++;
+            if (woff >= bsp.daram_len) woff = 0;
+        }
+        bsp.bursts_written++;
+        sl->valid = false;  /* consumed */
+
+        if (bsp.bursts_written <= 10 || (bsp.bursts_written % 1000) == 0) {
+            BSP_LOG("BUFFERED DMA tn=%u fn=%u n=%d total=%llu",
+                    tn, sl->fn, n, (unsigned long long)bsp.bursts_written);
+        }
+
+        /* Fire BRINT0 */
+        if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5))) {
+            c54x_interrupt_ex(bsp.dsp, 21, 5);
+            if (bsp.dsp->idle) bsp.dsp->idle = false;
+        }
     }
 }
 

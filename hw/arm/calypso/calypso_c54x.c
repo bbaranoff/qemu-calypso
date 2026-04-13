@@ -65,14 +65,11 @@ static inline int asm_shift(C54xState *s)
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
-    /* === DARAM discovery histogram for the e25e..e27f loop ===
-     * The current FB-det loop runs in PROM1 around 0xe25e..0xe27f
-     * (RPTBD + MVDD copying samples). Histogram all DARAM reads
-     * issued from that PC range so we can see which cell the loop
-     * is actually pulling samples from, then set CALYPSO_BSP_DARAM_ADDR
-     * accordingly. Dumps top-16 every 50k reads. */
-    if (((s->pc >= 0x7700 && s->pc <= 0x79ff) ||
-         (s->pc >= 0xe25e && s->pc <= 0xe27f)) && addr < 0x8000) {
+    /* === DARAM discovery histogram ===
+     * Track ALL data reads from DARAM (addr < 0x4000) regardless of PC.
+     * The FB handler runs from both PROM0 (0xBD47) and DARAM overlay,
+     * so filtering by PC misses critical reads. */
+    if (addr < 0x4000 && addr >= 0x20) {  /* skip MMRs 0x00-0x1F */
         static unsigned hist[0x4000]; /* 16 KW DARAM */
         static unsigned reads;
         if (addr < 0x4000) {
@@ -297,6 +294,43 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             return;
         default: return;
         }
+    }
+
+    /* DMA sub-register bank (C54x DMA controller).
+     * DMSA (0x0054): sets the sub-register address.
+     * DMSDI (0x0055): writes sub-register data, auto-increments DMSA.
+     * DMSDN (0x0057): writes sub-register data, no auto-increment.
+     * DMA channel 0 sub-registers (BSP receive DMA):
+     *   sub 0x00=DMSRC0, 0x01=DMDST0, 0x02=DMCTR0, 0x03=DMMCR0 */
+    if (addr == 0x0054) {
+        s->dma_subaddr = val;
+        s->data[0x0054] = val;
+        return;
+    }
+    if (addr == 0x0055 || addr == 0x0057) {
+        uint16_t sa = s->dma_subaddr;
+        if (sa < 24) {  /* 6 channels × 4 regs */
+            s->dma_subregs[sa] = val;
+            int ch = sa / 4;
+            int reg = sa % 4;
+            static const char *rnames[] = {"SRC","DST","CTR","MCR"};
+            C54_LOG("DMA ch%d %s = 0x%04x (sub 0x%02x) PC=0x%04x",
+                    ch, rnames[reg], val, sa, s->pc);
+        }
+        s->data[addr] = val;
+        if (addr == 0x0055) s->dma_subaddr++;  /* auto-increment */
+        return;
+    }
+
+    /* McBSP sub-register bank (serial port extended config).
+     * SPSA (0x0038): sub-address. SPSD (0x0039): sub-data. */
+    if (addr == 0x0038 || addr == 0x0039) {
+        if (addr == 0x0038) s->spsa = val;
+        else {
+            C54_LOG("McBSP sub[0x%02x] = 0x%04x PC=0x%04x", s->spsa, val, s->pc);
+        }
+        s->data[addr] = val;
+        return;
     }
 
     /* API RAM (shared with ARM) */
