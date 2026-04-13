@@ -795,11 +795,7 @@ static int c54x_exec_one(C54xState *s)
                     s->t = (uint16_t)(int16_t)exp;
                     return consumed + s->lk_used;
                 }
-                /* F48F/F58F: NORM src[,dst] (mask FCFF, 1 word) */
-                if ((op & 0xFCFF) == 0xF48F) {
-                    /* Simplified: NOP (normalize uses T from EXP) */
-                    return consumed + s->lk_used;
-                }
+                /* F48F/F58F: NORM — handled below (real implementation, not NOP) */
                 /* F492/F592: MAX src (mask FEFF, 1 word) — keep max of A,B */
                 if ((op & 0xFEFF) == 0xF492) {
                     int64_t sa = sext40(s->a), sb = sext40(s->b);
@@ -1541,11 +1537,11 @@ static int c54x_exec_one(C54xState *s)
             }
             return consumed + s->lk_used;
         }
-        /* F9xx: RPT #lk (16-bit immediate) */
+        /* F9xx: CC pmad, cond — conditional CALL (2 words).
+         * Per tic54x-opc.c: cc 0xF900 mask 0xFF00.
+         * Like BC but PUSHES return address before branching.
+         * F980+ (mask FF80) = FCALL (far call) — handled same way. */
         if (hi8 == 0xF9) {
-            /* F9xx: BC pmad, cond — conditional branch (2 words)
-             * Per SPRU172C + tic54x-opc.c: F900 mask FF00 = BC.
-             * Encoding: 1111 1001 CCCC QQQQ pmad */
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
             uint8_t cond_code = (op >> 4) & 0xF;
@@ -1567,6 +1563,8 @@ static int c54x_exec_one(C54xState *s)
             default: take = true; break;
             }
             if (take) {
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 2));
                 s->pc = op2;
                 return 0;
             }
@@ -1582,10 +1580,37 @@ static int c54x_exec_one(C54xState *s)
             return 0;
         }
         /* FBxx: LD #k, 16, A/B (short immediate shift 16) */
+        /* FBxx: CCD pmad, cond — conditional CALL delayed (2 words).
+         * Per tic54x-opc.c: ccd 0xFB00 mask 0xFF00.
+         * Like CC but with 2 delay slots (execute PC+2, PC+3 before call).
+         * FB80+ (mask FF80) = FCALLD (far call delayed). */
         if (hi8 == 0xFB) {
-            int8_t k = (int8_t)(op & 0xFF);
-            int64_t v = (int64_t)k << 16;
-            s->a = sext40(v);
+            op2 = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            uint8_t cond_code = (op >> 4) & 0xF;
+            uint8_t qual = op & 0xF;
+            bool take = false;
+            int64_t acc = (qual & 0x8) ? s->b : s->a;
+            switch (cond_code) {
+            case 0x0: take = true; break;
+            case 0x1: take = (acc < 0); break;
+            case 0x2: take = (acc <= 0); break;
+            case 0x3: take = (acc != 0); break;
+            case 0x4: take = (acc == 0); break;
+            case 0x5: take = (acc >= 0); break;
+            case 0x6: take = (acc > 0); break;
+            case 0x8: take = !!(s->st0 & ST0_TC); break;
+            case 0x9: take = !(s->st0 & ST0_TC); break;
+            case 0xA: take = !!(s->st0 & ST0_C); break;
+            case 0xB: take = !(s->st0 & ST0_C); break;
+            default: take = true; break;
+            }
+            if (take) {
+                s->sp--;
+                data_write(s, s->sp, (uint16_t)(s->pc + 4)); /* past CCD + 2 delay slots */
+                s->pc = op2;
+                return 0;
+            }
             return consumed + s->lk_used;
         }
         /* FCxx: LD #k, 16, B */
@@ -1692,15 +1717,7 @@ static int c54x_exec_one(C54xState *s)
             }
             return consumed + s->lk_used;
         }
-        /* FFxx: ADD/SUB short immediate */
-        if (hi8 == 0xFF) {
-            int8_t k = (int8_t)(op & 0x7F);
-            int dst = (op >> 7) & 1;
-            /* Typically ADD #k, A or SUB */
-            if (dst) s->b = sext40(s->b + ((int64_t)k << 16));
-            else     s->a = sext40(s->a + ((int64_t)k << 16));
-            return consumed + s->lk_used;
-        }
+        /* FFxx is XC 2,cond — handled above with FDxx. No ADD here. */
         goto unimpl;
 
     case 0xE:
