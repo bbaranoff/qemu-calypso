@@ -114,8 +114,15 @@ class Bridge:
 
         tn = data[0] & 0x07
         fn = int.from_bytes(data[1:5], 'big')
-        if self.stats["dl"] <= 5 or self.stats["dl"] % 1000 == 0:
-            print(f"bridge: DL burst #{self.stats['dl']} TN={tn} FN={fn} len={len(data)}", flush=True)
+        # Log burst content: first 8 data bytes + check if FB (all zeros)
+        hdr_bytes = data[:8] if len(data) >= 8 else data
+        payload = data[8:] if len(data) > 8 else b''
+        is_fb = all(b == 0 for b in payload) if payload else False
+        if self.stats["dl"] <= 10 or self.stats["dl"] % 5000 == 0 or is_fb:
+            print(f"bridge: DL #{self.stats['dl']} TN={tn} FN={fn} len={len(data)} "
+                  f"hdr={hdr_bytes[:8].hex()} "
+                  f"bits[0:8]={list(payload[:8])} "
+                  f"{'*** FB ***' if is_fb else ''}", flush=True)
 
         try: self.trxd_sock.sendto(data, ("127.0.0.1", 6702))
         except OSError: pass

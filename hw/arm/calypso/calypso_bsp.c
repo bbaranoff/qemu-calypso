@@ -90,6 +90,23 @@ static void bsp_trxd_readable(void *opaque)
 
     const uint8_t *bits = buf + 8;
 
+    /* Log burst type: check if all-zero (FB) or mixed (NB/SB) */
+    {
+        int zeros = 0, ones = 0;
+        for (int i = 0; i < nbits; i++) {
+            if (bits[i] == 0) zeros++;
+            else ones++;
+        }
+        static int burst_log = 0;
+        if (burst_log < 20 || (burst_log % 10000) == 0) {
+            BSP_LOG("BURST fn=%u tn=%u zeros=%d ones=%d %s",
+                    fn, tn, zeros, ones,
+                    zeros == nbits ? "*** FB ***" :
+                    ones > 100 ? "DUMMY/NB" : "SB/OTHER");
+        }
+        burst_log++;
+    }
+
     /* GMSK modulation: convert TRXDv0 hard bits to I/Q samples.
      * GMSK with h=0.5: each bit adds ±π/2 to the phase.
      * NRZ encoding: bit 0 → phase += π/2, bit 1 → phase -= π/2.
@@ -202,6 +219,21 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     }
     bsp.bursts_written++;
 
+    /* Log DARAM content after write for FB bursts */
+    {
+        if (bsp.bursts_written <= 3) {
+            BSP_LOG("DARAM after write [0x%04x]: %d %d %d %d %d %d %d %d",
+                    bsp.daram_addr,
+                    n>0?(int16_t)bsp.dsp->data[bsp.daram_addr]:0,
+                    n>1?(int16_t)bsp.dsp->data[bsp.daram_addr+1]:0,
+                    n>2?(int16_t)bsp.dsp->data[bsp.daram_addr+2]:0,
+                    n>3?(int16_t)bsp.dsp->data[bsp.daram_addr+3]:0,
+                    n>4?(int16_t)bsp.dsp->data[bsp.daram_addr+4]:0,
+                    n>5?(int16_t)bsp.dsp->data[bsp.daram_addr+5]:0,
+                    n>6?(int16_t)bsp.dsp->data[bsp.daram_addr+6]:0,
+                    n>7?(int16_t)bsp.dsp->data[bsp.daram_addr+7]:0);
+        }
+    }
     if (bsp.bursts_written <= 5 || (bsp.bursts_written % 1000) == 0) {
         BSP_LOG("DMA fn=%u tn=%u n=%d → DARAM[0x%04x..0x%04x] total=%llu "
                 "iq[0..3]=%d,%d,%d,%d",
