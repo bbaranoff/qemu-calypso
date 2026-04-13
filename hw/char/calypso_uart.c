@@ -111,7 +111,7 @@ static void fifo_reset(CalypsoUARTState *s)
  *
  * Sets overrun error flag if FIFO is full.
  */
-G_GNUC_UNUSED static void fifo_push(CalypsoUARTState *s, uint8_t data)
+static void fifo_push(CalypsoUARTState *s, uint8_t data)
 {
     if (s->rx_count >= CALYPSO_UART_RX_FIFO_SIZE) {
         s->lsr |= LSR_OE;
@@ -204,11 +204,7 @@ void calypso_uart_inject_raw(CalypsoUARTState *s, const uint8_t *buf, int len)
 {
     if (!s) return;
     for (int i = 0; i < len; i++) {
-        if (s->rx_count < CALYPSO_UART_RX_FIFO_SIZE) {
-            int idx = (s->rx_head + s->rx_count) % CALYPSO_UART_RX_FIFO_SIZE;
-            s->rx_fifo[idx] = buf[i];
-            s->rx_count++;
-        }
+        fifo_push(s, buf[i]);
     }
     if (s->rx_count > 0) {
         s->lsr |= LSR_DR;
@@ -352,7 +348,15 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
                 s->lsr &= ~LSR_DR;
             }
 
-            /* RBR debug: too verbose for modem, skip */
+            /* RBR debug: log bytes read by firmware from modem UART */
+            if (s->label && !strcmp(s->label, "modem")) {
+                static int rbr_log = 0;
+                if (rbr_log < 200) {
+                    fprintf(stderr, "[UART-RBR] pop=0x%02x rx_count=%u\n",
+                            (unsigned)(val & 0xFF), (unsigned)s->rx_count);
+                    rbr_log++;
+                }
+            }
 
             calypso_uart_update_irq(s);
         }

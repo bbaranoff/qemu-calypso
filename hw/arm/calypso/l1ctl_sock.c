@@ -227,6 +227,14 @@ static void l1ctl_client_readable(void *opaque)
         if (flen > 0 && s->uart) {
             L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
                       msglen, payload[0], flen);
+            /* Hex dump of sercomm frame being injected */
+            {
+                fprintf(stderr, "[l1ctl-sock] INJECT %d bytes:", flen);
+                for (int j = 0; j < flen && j < 32; j++)
+                    fprintf(stderr, " %02x", frame[j]);
+                if (flen > 32) fprintf(stderr, " ...");
+                fprintf(stderr, "\n");
+            }
             calypso_uart_receive(s->uart, frame, flen);
         }
 
