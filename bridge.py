@@ -6,9 +6,9 @@ BTS side:  osmo-bts-trx (CLK/TRXC/TRXD on 5700-5702)
 QEMU side: BSP receives DL bursts on UDP 6702
            QEMU sends TDMA ticks on UDP 6700 (QEMU is clock master)
 
-The bridge has NO independent timer. It receives FN ticks from QEMU's
-TDMA timer and forwards CLK IND to the BTS. This ensures FN coherence
-between QEMU firmware, bridge, and BTS.
+The bridge tracks QEMU's FN but sends CLK IND to the BTS at wall-clock
+rate (~470ms = 102 frames). The BTS scheduler needs real-time CLK IND
+to avoid drift, but the FN must come from QEMU for coherence.
 
 Usage: bridge.py
 """
@@ -26,7 +26,6 @@ def udp_bind(port):
 
 class Bridge:
     def __init__(self, bts_base=5700):
-        # BTS TRX sockets
         self.clk_sock  = udp_bind(bts_base)
         self.trxc_sock = udp_bind(bts_base + 1)
         self.trxd_sock = udp_bind(bts_base + 2)
@@ -38,8 +37,12 @@ class Bridge:
         self._stop = False
         self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0, "tick": 0}
 
-        # QEMU CLK tick receiver — QEMU is clock master
+        # QEMU CLK tick receiver
         self.qemu_clk_sock = udp_bind(6700)
+
+        # Wall-clock timer for CLK IND to BTS
+        self.last_clk_time = 0.0
+        self.clk_interval = CLK_IND_PERIOD * 4.615e-3  # ~470ms
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} → BSP@6702", flush=True)
         print(f"bridge: QEMU CLK ticks on UDP 6700 (clock-slave mode)", flush=True)
@@ -60,14 +63,16 @@ class Bridge:
         if self.stats["tick"] <= 3 or self.stats["tick"] % 10000 == 0:
             print(f"bridge: QEMU tick #{self.stats['tick']} FN={self.fn}", flush=True)
 
-        # Forward CLK IND to BTS at every tick from QEMU.
-        # QEMU runs slower than real-time, so we can't wait for fn%102==0
-        # (that would take ~8s wall-clock and BTS would timeout).
-        # The BTS tolerates receiving CLK IND at any FN cadence.
-        if True:
+    def maybe_send_clk(self):
+        """Send CLK IND to BTS at wall-clock rate using QEMU's FN."""
+        now = time.monotonic()
+        if now - self.last_clk_time >= self.clk_interval:
+            self.last_clk_time = now
+            # Round FN to nearest multiple of CLK_IND_PERIOD
+            clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
             try:
                 self.clk_sock.sendto(
-                    f"IND CLOCK {self.fn}\0".encode(), self.bts_clk_addr)
+                    f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
                 self.stats["clk"] += 1
             except OSError:
                 pass
@@ -112,12 +117,10 @@ class Bridge:
         if self.stats["dl"] <= 5 or self.stats["dl"] % 1000 == 0:
             print(f"bridge: DL burst #{self.stats['dl']} TN={tn} FN={fn} len={len(data)}", flush=True)
 
-        # Forward raw TRXDv0 DL burst via UDP to BSP inside QEMU
         try: self.trxd_sock.sendto(data, ("127.0.0.1", 6702))
         except OSError: pass
 
     def run(self):
-        # No start_clock() — QEMU drives the clock
         running = True
         def shutdown(s, f):
             nonlocal running; running = False
@@ -127,7 +130,7 @@ class Bridge:
         while running:
             fds = [self.trxc_sock, self.trxd_sock, self.qemu_clk_sock]
             try:
-                readable, _, _ = select.select(fds, [], [], 0.5)
+                readable, _, _ = select.select(fds, [], [], 0.1)
             except (OSError, ValueError) as e:
                 print(f"bridge: select error: {e}", flush=True)
                 break
@@ -135,6 +138,9 @@ class Bridge:
             if self.qemu_clk_sock in readable: self.handle_qemu_tick()
             if self.trxc_sock in readable: self.handle_trxc()
             if self.trxd_sock in readable: self.handle_trxd_from_bts()
+
+            # Send CLK IND at wall-clock rate
+            self.maybe_send_clk()
 
             if self.stats["dl"] > 0 and self.stats["dl"] % 5000 == 0:
                 print(f"bridge: tick={self.stats['tick']} clk={self.stats['clk']} dl={self.stats['dl']} ul={self.stats['ul']}", flush=True)
