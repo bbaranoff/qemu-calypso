@@ -1565,6 +1565,23 @@ static int c54x_exec_one(C54xState *s)
             if (take) {
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
+                /* CC leak tracer */
+                {
+                    static uint32_t cc_targets[64];
+                    static uint32_t cc_counts[64];
+                    static int cc_n = 0;
+                    static uint32_t total_cc = 0;
+                    bool found = false;
+                    for (int i = 0; i < cc_n; i++) {
+                        if (cc_targets[i] == op2) { cc_counts[i]++; found = true; break; }
+                    }
+                    if (!found && cc_n < 64) { cc_targets[cc_n] = op2; cc_counts[cc_n++] = 1; }
+                    if ((++total_cc % 100) == 0) {
+                        C54_LOG("F9xx CC TOP TARGETS (SP=0x%04x total=%u):", s->sp, total_cc);
+                        for (int i = 0; i < cc_n && i < 10; i++)
+                            C54_LOG("  CC→0x%04x count=%u", cc_targets[i], cc_counts[i]);
+                    }
+                }
                 s->pc = op2;
                 return 0;
             }

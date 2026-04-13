@@ -176,7 +176,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn)) {
         bsp.bursts_dropped_no_window++;
         if (bsp.bursts_dropped_no_window <= 5 ||
-            (bsp.bursts_dropped_no_window % 1000) == 0) {
+            (bsp.bursts_dropped_no_window % 100000) == 0) {
             BSP_LOG("DROP fn=%u tn=%u (no BDLENA window, dropped=%llu)",
                     fn, tn,
                     (unsigned long long)bsp.bursts_dropped_no_window);
