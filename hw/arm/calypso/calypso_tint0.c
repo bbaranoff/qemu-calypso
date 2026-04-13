@@ -22,6 +22,7 @@
 
 /* calypso_trx.c implements the actual frame work (DSP run, IRQs, UART) */
 extern void calypso_tint0_do_tick(uint32_t fn);
+/* orch CLK→BTS is now driven from TINT0 (2× rate via internal half-tick). */
 
 /* ---- State ---- */
 static struct {
@@ -35,6 +36,10 @@ static struct {
 static void tint0_tick_cb(void *opaque)
 {
     tint0.fn = (tint0.fn + 1) % GSM_HYPERFRAME;
+
+    /* No forced page tic-toc here: the DSP itself writes d_dsp_page
+     * each frame (PC=0xf321 / 0xf5ec) — the trx api hook mirrors the
+     * value into ARM space. We let the firmware drive the toggle. */
 
     /* Delegate frame work to calypso_trx */
     calypso_tint0_do_tick(tint0.fn);

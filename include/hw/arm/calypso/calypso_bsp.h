@@ -42,15 +42,19 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
                           const int16_t *iq, int n_int16);
 
 /*
- * Pull 148 hard UL bits from the DSP's UL DARAM buffer and ship them
- * to bridge.py via the BSP-owned UDP socket (sendto 127.0.0.1:6702).
- * Always returns true when the DSP is attached — even an all-zero burst
- * is sent to keep the BTS TDMA cadence alive.
+ * Transmit an uplink burst — symmetric to rx_burst.
+ *
+ * Reads 148 hard bits from the DSP UL buffer (where the L1 firmware
+ * deposits encoded TX data) and fills bits[148]. Returns true if
+ * the burst is valid (any non-zero), false otherwise.
  */
 bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148]);
 
-/* Discovery helpers for the DARAM DMA target. */
 uint16_t calypso_bsp_get_daram_addr(void);
 uint16_t calypso_bsp_get_daram_len(void);
+uint8_t  calypso_bsp_get_last_att(void);
+
+/* Send UL burst via UDP to BTS */
+void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148]);
 
 #endif /* HW_ARM_CALYPSO_BSP_H */

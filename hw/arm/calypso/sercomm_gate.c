@@ -16,8 +16,7 @@
  *      TRXC traffic is stubbed locally by bridge.py on UDP 5701 — QEMU
  *      never sees TRXC on UDP.
  *
- *      TRXD (burst) transport is owned by calypso_bsp.c: BSP binds
- *      127.0.0.1:6802 for DL recv and sends UL to 127.0.0.1:6702.
+ *      TRXD (burst) transport is owned by calypso_bsp.c via calypso_orch.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -246,45 +245,11 @@ void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
  * ============================================================
  *
  * TRXC is stubbed by bridge.py on UDP 5701; QEMU never sees it.
- * TRXD (bursts) is owned by calypso_bsp.c: bind 127.0.0.1:6802 for DL
- * recv, sendto 127.0.0.1:6702 for UL. See calypso_bsp.c for details.
+ * TRXD (bursts) is owned by calypso_bsp.c via calypso_orch.
  */
 
+/* CLK UDP listener removed — QEMU sends ticks to bridge directly. */
 static int g_clk_fd = -1;
-
-static int udp_bind_loopback(int port)
-{
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-    if (fd < 0) return -1;
-
-    int reuse = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port        = htons(port),
-    };
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static void clk_cb(void *opaque)
-{
-    (void)opaque;
-    char buf[128];
-    ssize_t n = recv(g_clk_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return;
-    buf[n] = '\0';
-    /* Just log occasionally — calypso_trx owns its own FN counter. */
-    static unsigned cnt;
-    if ((cnt++ % 256) == 0) {
-        GATE_LOG("CLK %s", buf);
-    }
-}
 
 /* ---------- init ---------- */
 
@@ -293,15 +258,10 @@ void sercomm_gate_init(int base_port)
     if (base_port <= 0) base_port = 6700;
     int clk_port = base_port + 0;
 
-    g_clk_fd = udp_bind_loopback(clk_port);
-    if (g_clk_fd < 0) {
-        GATE_LOG("CLK bind %d failed: %s", clk_port, strerror(errno));
-    } else {
-        qemu_set_fd_handler(g_clk_fd, clk_cb, NULL, NULL);
-        GATE_LOG("CLK  listening UDP %d", clk_port);
-    }
-
-    GATE_LOG("TRXC: bridge.py local stub on :5701, QEMU not involved");
-    GATE_LOG("TRXD: owned by calypso_bsp.c "
-             "(bind 127.0.0.1:6802 DL / sendto 127.0.0.1:6702 UL)");
+    /* CLK UDP listener disabled — QEMU is now the clock master and sends
+     * ticks directly to the bridge via calypso_trx.c (port 6700).
+     * The gate no longer needs to receive CLK IND. */
+    (void)clk_port;
+    g_clk_fd = -1;
+    GATE_LOG("TRXD: owned by calypso_bsp.c via calypso_orch");
 }

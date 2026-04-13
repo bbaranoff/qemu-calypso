@@ -170,6 +170,8 @@ void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
     cell_wr(s, NDB_A_SYNC_DEMOD_ANG, (uint16_t)angle);
     cell_wr(s, NDB_A_SYNC_DEMOD_SNR, snr);
     cell_wr(s, NDB_D_FB_DET, 1);
+
+    (void)toa; (void)pm; (void)angle; (void)snr;
 }
 
 void calypso_fbsb_clear_fb(CalypsoFbsb *s)
@@ -222,6 +224,7 @@ void calypso_fbsb_publish_sb_found(CalypsoFbsb *s, uint8_t bsic)
         rp[18] = (uint16_t)(sb & 0xFFFF); /* a_sch[3] = sb low  */
         rp[19] = (uint16_t)(sb >> 16);    /* a_sch[4] = sb high */
     }
+
 }
 
 /* ---------------------------------------------------------------- */

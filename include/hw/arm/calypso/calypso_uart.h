@@ -25,7 +25,7 @@ typedef struct CalypsoUARTState {
     /* MMIO */
     MemoryRegion iomem;
 
-    /* QEMU backend — PTY control */
+    /* QEMU backend */
     CharBackend chr;
     qemu_irq irq;
 
@@ -97,8 +97,7 @@ void calypso_uart_force_init(CalypsoUARTState *s);
 /* L1CTL socket — sercomm↔L1CTL relay */
 void l1ctl_sock_init(CalypsoUARTState *uart, const char *path);
 void l1ctl_sock_uart_tx_byte(uint8_t byte);
+void l1ctl_sock_poll(void);
 bool l1ctl_client_active(void);
-bool l1ctl_burst_mode(void);
-void l1ctl_set_burst_mode(bool on);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */

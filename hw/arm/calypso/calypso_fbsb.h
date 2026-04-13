@@ -56,10 +56,14 @@
 #define NDB_A_SYNC_DEMOD_ANG 0x08FC
 #define NDB_A_SYNC_DEMOD_SNR 0x08FD
 
-/* d_task_md values used by the firmware (subset). */
+/* d_task_md values used by the firmware (subset).
+ * From osmocom-bb dsp_api.h — verified against l1s_pm_cmd / l1s_fbdet_cmd. */
 #define DSP_TASK_NONE       0
-#define DSP_TASK_FB         1   /* FB_DSP_TASK */
-#define DSP_TASK_SB         2   /* SB_DSP_TASK */
+#define DSP_TASK_PM         1   /* PM_DSP_TASK (power measurement, NOT FB) */
+#define DSP_TASK_FB         5   /* FB_DSP_TASK (frequency burst, idle) */
+#define DSP_TASK_SB         6   /* SB_DSP_TASK (sync burst, idle)      */
+#define DSP_TASK_TCH_FB     8   /* TCH_FB_DSP_TASK (dedicated) */
+#define DSP_TASK_TCH_SB     9   /* TCH_SB_DSP_TASK (dedicated) */
 
 /* FBSB orchestration state. One instance per Calypso. */
 typedef enum {

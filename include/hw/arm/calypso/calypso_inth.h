@@ -38,6 +38,7 @@ struct CalypsoINTHState {
                             * so IRQ_CTRL acks the correct interrupt. */
     uint32_t levels;       /* Bitmask of current input levels (level-sensitive) */
     uint32_t mask;         /* Bitmask: 1 = masked (disabled) */
+    int rr_start;          /* Round-robin: start scan from here next time */
 };
 
 #endif /* HW_INTC_CALYPSO_INTH_H */
