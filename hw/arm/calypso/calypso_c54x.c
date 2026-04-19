@@ -1241,46 +1241,9 @@ static int c54x_exec_one(C54xState *s)
             if ((op & 0x08) == 0) s->ar[yar_l]++; else s->ar[yar_l]--;
             return consumed + s->lk_used;
         }
-        if (op == 0xF495) {
-            /* NOP */
-            return consumed + s->lk_used;
-        }
-        /* F4E2 = BACC A, F5E2 = BACC B (per tic54x-opc.c, mask 0xFEFF) */
-        if (op == 0xF4E2) { s->pc = (uint16_t)(s->a & 0xFFFF); return 0; }
-        if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
-        /* F4E3 = CALA A, F5E3 = CALA B — push next-PC, jump to acc low 16 bits */
-        if (op == 0xF4E3) {
-            uint16_t ret_pc = s->pc + 1;
-            s->sp = (s->sp - 1) & 0xFFFF;
-            data_write(s, s->sp, ret_pc);
-            s->pc = (uint16_t)(s->a & 0xFFFF);
-            return 0;
-        }
-        if (op == 0xF5E3) {
-            uint16_t ret_pc = s->pc + 1;
-            s->sp = (s->sp - 1) & 0xFFFF;
-            data_write(s, s->sp, ret_pc);
-            s->pc = (uint16_t)(s->b & 0xFFFF);
-            return 0;
-        }
-        if (op == 0xF4E4) {
-            /* IDLE */
-            s->idle = true;
-            return consumed + s->lk_used;  /* Advance PC past IDLE */
-        }
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             if (sub == 0x2) {
                 /* F82x: RPTB pmad */
                 op2 = prog_fetch(s, s->pc + 1);
@@ -1382,16 +1345,6 @@ static int c54x_exec_one(C54xState *s)
         /* F6xx: various — LD/ST acc-acc, ABDST, SACCD, etc. */
         if (hi8 == 0xF6) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             if (sub == 0x2) {
                 /* F62x: LD A, dst_shift, B or LD B, dst_shift, A */
                 int dst = op & 1;
@@ -1438,15 +1391,8 @@ static int c54x_exec_one(C54xState *s)
                 s->st0 |= (1 << bit);
                 return consumed + s->lk_used;
             }
-            /* F5E2 = BACC B, F5E3 = CALA B (already handled above for F4 versions) */
-            if (op == 0xF5E2) { s->pc = (uint16_t)(s->b & 0xFFFF); return 0; }
-            if (op == 0xF5E3) {
-                uint16_t ret_pc = s->pc + 1;
-                s->sp = (s->sp - 1) & 0xFFFF;
-                data_write(s, s->sp, ret_pc);
-                s->pc = (uint16_t)(s->b & 0xFFFF);
-                return 0;
-            }
+            /* Note: 0xF5E2/F5E3 (BACC B / CALA B) are handled earlier alongside
+             * their F4 counterparts, so they never reach this F5xx block. */
             /* RPT #k (short immediate) — kept as fallback, must advance PC. */
             s->rpt_count = op & 0xFF;
             s->rpt_active = true;
@@ -1456,16 +1402,6 @@ static int c54x_exec_one(C54xState *s)
         /* F7xx: LD/ST #k to various registers */
         if (hi8 == 0xF7) {
             uint8_t sub = (op >> 4) & 0xF;
-            if (sub == 0x0) {
-                /* F600/F601: ABS src[,dst] — absolute value of accumulator */
-                int src = op & 1;
-                int64_t *acc = src ? &s->b : &s->a;
-                int64_t val = sext40(*acc);
-                if (val < 0) val = -val;
-                *acc = sext40(val);
-                /* Set C if input was -2^39 (saturate), clear OVx if OVM */
-                return consumed + s->lk_used;
-            }
             uint16_t k = op & 0xFF;
             switch (sub) {
             case 0x0: /* F70x: LD #k8, ASM */
