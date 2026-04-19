@@ -281,6 +281,27 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                 uint16_t new_iptr = (val >> PMST_IPTR_SHIFT) & 0x1FF;
                 C54_LOG("PMST change 0x%04x → 0x%04x (IPTR=0x%03x→0x%03x OVLY=%d) PC=0x%04x SP=0x%04x insn=%u",
                         s->pmst, val, old_iptr, new_iptr, !!(val & PMST_OVLY), s->pc, s->sp, s->insn_count);
+
+                static uint16_t last_dumped_iptr = 0xFFFF;
+                if (new_iptr != last_dumped_iptr) {
+                    last_dumped_iptr = new_iptr;
+                    uint32_t base = (uint32_t)new_iptr << 7;
+                    uint16_t saved_pmst = s->pmst;
+                    s->pmst = val;
+                    C54_LOG("VECDUMP IPTR=0x%03x base=0x%04x (32 vectors):",
+                            new_iptr, (uint16_t)base);
+                    for (int vec = 0; vec < 32; vec++) {
+                        uint32_t a = base + vec * 4;
+                        uint16_t w0 = prog_read(s, a + 0);
+                        uint16_t w1 = prog_read(s, a + 1);
+                        uint16_t w2 = prog_read(s, a + 2);
+                        uint16_t w3 = prog_read(s, a + 3);
+                        fprintf(stderr,
+                                "[c54x] vec %2d @ 0x%04x : %04x %04x %04x %04x\n",
+                                vec, (uint16_t)a, w0, w1, w2, w3);
+                    }
+                    s->pmst = saved_pmst;
+                }
             }
             s->pmst = val; return;
         case MMR_XPC:
