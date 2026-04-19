@@ -711,6 +711,14 @@ static int c54x_exec_one(C54xState *s)
             }
             uint16_t ra = data_read(s, s->sp); s->sp++;
             s->st1 &= ~ST1_INTM;
+            {
+                static uint64_t rete_count;
+                rete_count++;
+                if (rete_count <= 20 || (rete_count % 100) == 0)
+                    C54_LOG("RETE #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x",
+                            (unsigned long long)rete_count,
+                            s->pc, ra, s->sp);
+            }
             s->pc = ra; return 0;
         }
         if (op == 0xF4E4) {
@@ -3465,12 +3473,13 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->pc = (iptr * 0x80) + vec * 4;
     }
 
-    /* Log first few interrupts */
-    static int int_log_count = 0;
-    if (int_log_count < 5) {
-        C54_LOG("IRQ vec=%d bit=%d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
+    /* Log interrupts: first 20 + every 100th, so we can count them. */
+    static uint64_t int_log_count;
+    int_log_count++;
+    if (int_log_count <= 20 || (int_log_count % 100) == 0) {
+        C54_LOG("IRQ #%llu vec=%d bit=%d: INTM=%d IMR=0x%04x IFR=0x%04x idle=%d PC=0x%04x",
+                (unsigned long long)int_log_count,
                 vec, imr_bit, !!(s->st1 & ST1_INTM), s->imr, s->ifr, s->idle, s->pc);
-        int_log_count++;
     }
 }
 
