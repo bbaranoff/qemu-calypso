@@ -103,4 +103,8 @@ void calypso_fw_patch_apply(void);
 void calypso_trx_rx_burst(const uint8_t *data, int len);
 void calypso_trx_tx_burst_poll(void);
 
+/* Current TDMA frame number (0..GSM_HYPERFRAME-1). Used by BSP for
+ * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
+uint32_t calypso_trx_get_fn(void);
+
 #endif /* CALYPSO_TRX_H */

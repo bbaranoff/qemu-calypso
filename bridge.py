@@ -34,6 +34,11 @@ class Bridge:
         self.trxd_remote = None
         self.powered = False
         self.fn = 0
+        # BTS starts its own FN at 0 on POWERON — several seconds after QEMU
+        # has already advanced. Remember QEMU's FN at POWERON so we can re-
+        # anchor BTS-tagged bursts to QEMU's timeline on the way in.
+        self.fn_anchor = 0
+        self.anchored = False
         self._stop = False
         self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0, "tick": 0}
 
@@ -88,7 +93,10 @@ class Bridge:
         self.stats["trxc"] += 1
 
         if verb == "POWERON":
-            self.powered = True; print(f"BTS: POWERON", flush=True)
+            self.powered = True
+            self.fn_anchor = self.fn
+            self.anchored = True
+            print(f"BTS: POWERON (FN anchor = {self.fn_anchor})", flush=True)
             rsp = "RSP POWERON 0"
         elif verb == "POWEROFF":
             self.powered = False; rsp = "RSP POWEROFF 0"
@@ -113,18 +121,34 @@ class Bridge:
         self.stats["dl"] += 1
 
         tn = data[0] & 0x07
-        fn = int.from_bytes(data[1:5], 'big')
+        bts_fn = int.from_bytes(data[1:5], 'big')
+
+        # Re-anchor: BTS counts FN from 0 starting at POWERON, but QEMU had
+        # already advanced. Shift every BTS-tagged burst by fn_anchor so the
+        # BSP sees bursts aligned with QEMU's timeline.
+        if self.anchored:
+            fn = (bts_fn + self.fn_anchor) % GSM_HYPERFRAME
+        else:
+            fn = bts_fn
+
         # Log burst content: first 8 data bytes + check if FB (all zeros)
         hdr_bytes = data[:8] if len(data) >= 8 else data
         payload = data[8:] if len(data) > 8 else b''
         is_fb = all(b == 0 for b in payload) if payload else False
         if self.stats["dl"] <= 10 or self.stats["dl"] % 5000 == 0 or is_fb:
-            print(f"bridge: DL #{self.stats['dl']} TN={tn} FN={fn} len={len(data)} "
-                  f"hdr={hdr_bytes[:8].hex()} "
+            print(f"bridge: DL #{self.stats['dl']} TN={tn} "
+                  f"bts_fn={bts_fn} fn={fn} (anchor={self.fn_anchor}) "
+                  f"len={len(data)} hdr={hdr_bytes[:8].hex()} "
                   f"bits[0:8]={list(payload[:8])} "
                   f"{'*** FB ***' if is_fb else ''}", flush=True)
 
-        try: self.trxd_sock.sendto(data, ("127.0.0.1", 6702))
+        # Rewrite the FN in-place before forwarding.
+        out = bytearray(data)
+        out[1] = (fn >> 24) & 0xFF
+        out[2] = (fn >> 16) & 0xFF
+        out[3] = (fn >>  8) & 0xFF
+        out[4] =  fn        & 0xFF
+        try: self.trxd_sock.sendto(bytes(out), ("127.0.0.1", 6702))
         except OSError: pass
 
     def run(self):

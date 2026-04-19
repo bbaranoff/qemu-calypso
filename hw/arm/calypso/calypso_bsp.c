@@ -29,6 +29,10 @@
 #include "hw/arm/calypso/calypso_iota.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 
+/* Forward-declared here to avoid pulling in the full calypso_trx.h
+ * (which would drag in hw/irq.h and qemu internals not needed in this TU). */
+uint32_t calypso_trx_get_fn(void);
+
 #define BSP_LOG(fmt, ...) \
     do { fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -44,6 +48,11 @@
  * (→ d_fb_det stays 0 indefinitely). */
 #define BSP_NUM_TN     8                 /* one queue per timeslot */
 #define BSP_QUEUE_LEN  128               /* lookahead depth per TN */
+/* Match window: real BSP captures samples around BDLENA; exact FN match
+ * is a QEMU artefact. ±4 frames tolerates bridge/BTS CLK IND jitter and
+ * is narrow enough not to swap adjacent FCCH with non-FCCH in the 51-
+ * multiframe pattern (FCCH appears every 10 frames on the BCCH slot). */
+#define BSP_FN_MATCH_WINDOW  4
 
 typedef struct {
     int16_t  iq[296];  /* 148 I/Q pairs max */
@@ -125,23 +134,27 @@ static void bsp_enqueue(uint8_t tn, uint32_t fn, const int16_t *iq, int n)
     s->valid = true;
 }
 
-/* Purge stale entries (fn strictly in the past relative to current_fn) and
- * return the slot matching current_fn for this TN, or NULL if none. */
+/* Purge entries older than the match window and return the slot whose FN
+ * is closest to current_fn (within ±BSP_FN_MATCH_WINDOW) for this TN, or
+ * NULL if none. Future bursts beyond the window stay queued. */
 static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
 {
     if (tn >= BSP_NUM_TN) return NULL;
     BspBurstQueue *qq = &bsp.q[tn];
     BspBurstSlot *match = NULL;
+    int32_t best_abs = INT32_MAX;
 
     for (int i = 0; i < BSP_QUEUE_LEN; i++) {
         BspBurstSlot *s = &qq->slot[i];
         if (!s->valid) continue;
         int32_t d = bsp_fn_delta(s->fn, current_fn);
-        if (d == 0) {
-            match = s;
-        } else if (d < 0) {
+        int32_t ad = d < 0 ? -d : d;
+        if (d < -BSP_FN_MATCH_WINDOW) {
             s->valid = false;
             bsp.bursts_dropped_stale++;
+        } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
+            match = s;
+            best_abs = ad;
         }
     }
     return match;
@@ -205,6 +218,43 @@ static void bsp_trxd_readable(void *opaque)
                     ones > 100 ? "DUMMY/NB" : "SB/OTHER");
         }
         burst_log++;
+    }
+
+    /* FN-alignment instrumentation: measure burst arrival FN vs QEMU
+     * virtual FN. A persistent negative delta means BTS is lagging
+     * (bursts arrive for FNs that have already passed); a positive
+     * delta is normal lookahead. */
+    {
+        uint32_t cur_fn = calypso_trx_get_fn();
+        int32_t  delta  = bsp_fn_delta(fn, cur_fn);
+
+        static int rx_log = 0;
+        if (rx_log < 100 || (rx_log % 1000) == 0) {
+            BSP_LOG("RX tn=%u fn=%u cur_fn=%u delta=%d",
+                    tn, fn, cur_fn, delta);
+        }
+        rx_log++;
+
+        /* Rolling summary over last 500 samples: min/max/mean */
+        static int32_t  hist[500];
+        static unsigned hist_pos = 0;
+        static unsigned hist_seen = 0;
+        hist[hist_pos] = delta;
+        hist_pos = (hist_pos + 1) % 500;
+        hist_seen++;
+        if ((hist_seen % 500) == 0) {
+            unsigned n = hist_seen < 500 ? hist_seen : 500;
+            int32_t mn = INT32_MAX, mx = INT32_MIN;
+            int64_t sum = 0;
+            for (unsigned i = 0; i < n; i++) {
+                int32_t d = hist[i];
+                if (d < mn) mn = d;
+                if (d > mx) mx = d;
+                sum += d;
+            }
+            BSP_LOG("RX delta stats (last %u): min=%d max=%d mean=%lld",
+                    n, mn, mx, (long long)(sum / (int64_t)n));
+        }
     }
 
     /* GMSK modulation: convert TRXDv0 hard bits to I/Q samples.

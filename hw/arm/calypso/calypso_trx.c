@@ -104,6 +104,8 @@ static void calypso_fw_patch(CalypsoTRX *s)
 }
 void calypso_fw_patch_apply(void) { if (g_trx) calypso_fw_patch(g_trx); }
 
+uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
+
 /* ---- DSP API RAM ---- */
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
