@@ -59,11 +59,85 @@ Always verify against `tic54x-opc.c` (binutils) before changing any opcode:
 
 ## Current Bug
 
-**2nd PM_REQ not scheduled.** Mobile sends PM_REQ (type=0x08), firmware dequeues it from l23_rx_queue, but `l1s_pm_test()` is never called. GDB breakpoint on 0x825424 not hit. First PM works perfectly.
+**INTM=1 forever — DSP frame interrupts (INT3) never serviced.** This is the
+remaining blocker for FB/SB detection. `c54x_interrupt_ex(dsp, 19, 3)` is
+called ~1/frame (verified via uncapped IRQ log), TPU_FRAME wiring works,
+firmware writes `TPU_CTRL.DSP_EN` correctly. But `INTM=1` (ST1 bit 11) is
+never cleared, so every INT3 is rejected and `c54x_exec_one` continues in
+its tight RPTBD loop at PROM1-mirror PCs `0xeb04-0xeb0b` (= flat 0x18B04+),
+which is a dispatcher table.
+
+Consequences:
+- `RETE` count = 0 ever (no IRQ ever services, so no RETE ever returns)
+- `d_task_md=5` armed by ARM but DSP never dispatches FB correlator
+- `d_fb_det=0` permanent
+- Mobile loops FBSB_REQ → FBSB_CONF(result=255) → RESET_REQ until it gives
+  up; with `stick <arfcn>` in mobile config the retry is infinite
+
+The DSP ROM has 12 RSBX INTM (`0xf6bb`) instances at PROM0 page 0 addresses
+(0xa4d0, 0xa510, 0xa6c0, 0xc660, 0xd130, 0xd140, 0xd270, 0xd9e0, 0xdb40,
+0xdde0) and 2 in PROM1 page 1 (0x1aad0, 0x1ab40). The DSP currently runs
+in PROM1-mirror page 1, never branches across pages to reach any of them.
+
+A diagnostic hack that bypassed the INTM check in `c54x_interrupt_ex`
+(commit 306d6ec, reverted in f0dec53) caused massive NDB memory corruption
+(every word from 0x01AC to 0x03B0 became 0xb908) — confirming INTM=1 marks
+a critical section the DSP genuinely depends on. Don't bypass it.
+
+### Next session entry points
+
+1. **Disasm dispatcher at 0x18B00+** (PROM1 page 1, mirrored to 0xEB00) —
+   pattern `76f8 XXXX YYYY` repeating looks like an STM-based jump table.
+   Identify which entries lead anywhere useful and why none branch to the
+   PROM0 init sequence containing RSBX INTM.
+2. **Trace DSP boot from reset vector (0xFF80)** to the loop entry. There
+   is a conditional somewhere that bypasses the RSBX INTM init block; find
+   the condition.
+3. **Inspect what flag the dispatcher polls** that should change to break
+   it out of the loop. `d_dsp_page` cycles 0x0002↔0x0003 (= B_GSM_TASK |
+   w_page) but the DSP doesn't act on it.
+4. **Verify the `0x18B04` table entries point** to PROM1 (page-1 local) or
+   PROM0 (cross-page). If purely page-1-local, the DSP can never reach the
+   PROM0 RSBX INTM without an explicit XPC switch.
+
+### Branch state (claude/refactor-and-cleanup-RopS8)
+
+11 commits, all pushed:
+
+| Commit | Subject | Status |
+|--------|---------|--------|
+| a72266d | cleanup opcode duplicates + .bak | ✓ keep |
+| dab7925 | bsp: FN-indexed queue per TN (lookahead) | ✓ keep |
+| 558e55f | bsp: POWERON re-anchor + tolerance window + delta log | ✓ keep |
+| dbdff10 | bsp: rename shadowed local n→nh | ✓ keep |
+| b2255fd | bridge: CLK IND from QEMU FN, not wall-clock | ✓ keep |
+| a8218a8 | l1ctl_sock: sendmsg+iovec, no buf[514] hack | ✓ keep |
+| 2241e01 | bsp: bump GMSK amplitude to full Q15 (±0x7FFE) | ✓ keep |
+| 301f17c | bsp+c54x: instrument DARAM/PORTR/BSP-load | ✓ keep |
+| 306d6ec | c54x: TEMP debug accept IRQ with INTM=1 | ✗ reverted |
+| 82aee83 | c54x: uncap IRQ/RETE logs | ✓ keep |
+| f0dec53 | c54x: revert INTM-bypass hack | ✓ keep (the revert) |
+
+Live build at `/opt/GSM/qemu-src/` needs all `.c`/`.h` files from packaged
+repo `/opt/GSM/qemu-calypso/` to be re-copied + ninja rebuild after pulling
+the branch.
+
+### Run config that revealed the most signal
+
+```bash
+# Mobile config must have `stick <arfcn>` in `ms 1` block, otherwise
+# mobile abandons FBSB after 2 retries → d_task_md stays at 1.
+CALYPSO_BSP_DARAM_ADDR=0x3fb0 ./run.sh
+# DARAM 0x3fb0 covers the DSP-read range 0x3fb3-0x3fbf (verified via
+# DARAM RD HIST). 0x3fc0 was off by 16 words.
+```
+
+## Old bugs (resolved)
 
 **SP slow leak:** SP descends ~3 words per IDLE cycle (5AC7 → 5AC4). Introduced by F9xx CC fix (push now correct). Likely some CC calls in ROM where the callee doesn't RET properly — need to trace which CC target doesn't return.
 
-**27 duplicate opcode handlers** found in c54x_exec_one — dead code zone L1200-1500. No shadowing bugs but should be consolidated.
+**27 duplicate opcode handlers** in c54x_exec_one — consolidated in
+a72266d (-150 lines, no behavior change).
 
 ## Conventions
 
