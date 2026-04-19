@@ -1361,59 +1361,6 @@ static int c54x_exec_one(C54xState *s)
             s->pc += consumed;
             return 0;
         }
-        /* F2xx: NORM *ARn, dst — Normalize accumulator
-         * Per SPRU172C p.4-120: 1111 0q10 0111 D000
-         * Shifts accumulator left by 1 if MSBs match, decrements ARn.
-         * Simplified: treat as NOP for DSP signal processing. */
-        if (hi8 == 0xF2) {
-            /* F2xx: per tic54x-opc.c (GDB binutils):
-             * F272 = RPTBD pmad (repeat block delayed, 2 words)
-             * F274 = CALLD pmad (call delayed, 2 words)
-             * F273 = RETD (return delayed, 1 word) */
-            if (op == 0xF272) {
-                /* RPTBD pmad — delayed block repeat (2 words).
-                 * REA = pmad, RSA = PC+4 (2 delay slots). */
-                op2 = prog_fetch(s, s->pc + 1);
-                consumed = 2;
-                s->rea = op2;
-                s->rsa = (uint16_t)(s->pc + 4);
-                s->rptb_active = true;
-                s->st1 |= ST1_BRAF;
-                return consumed + s->lk_used;
-            }
-            if (op == 0xF274) {
-                /* CALLD pmad — delayed call (2 words, 2 delay slots).
-                 * Push PC+4 (past CALLD + 2 delay slots), branch to pmad. */
-                op2 = prog_fetch(s, s->pc + 1);
-                consumed = 2;
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 4));
-                s->pc = op2;
-                return 0;
-            }
-            if (op == 0xF273) {
-                /* RETD — delayed return (1 word). Pop PC. */
-                uint16_t ra = data_read(s, s->sp); s->sp++;
-                s->pc = ra;
-                return 0;
-            }
-            /* Other F27x: NORM *ARn, dst */
-            if ((op & 0xFFF0) == 0xF270) {
-                int dst = (op >> 3) & 1;
-                int64_t *acc = dst ? &s->b : &s->a;
-                int bit39 = (*acc >> 39) & 1;
-                int bit38 = (*acc >> 38) & 1;
-                if (bit39 == bit38) {
-                    *acc = sext40(*acc << 1);
-                    s->ar[arp(s)]--;
-                    s->st0 &= ~ST0_TC;
-                } else {
-                    s->st0 |= ST0_TC;
-                }
-                return consumed + s->lk_used;
-            }
-            goto unimpl;
-        }
         /* F3xx: various */
         if (hi8 == 0xF3) {
             uint8_t sub3 = (op >> 5) & 0x07;
@@ -1480,28 +1427,6 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             /* Other F6xx: treat as NOP for now */
-            return consumed + s->lk_used;
-        }
-        /* F8xx: BANZ pmad, Smem — Branch if AR not zero (2-word)
-         * Per SPRU172C: modify AR per Smem addressing; if AR[ARP] != 0, branch to pmad
-         * Encoding: 1111 1000 IAAA AAAA + pmad */
-        if (hi8 == 0xF8) {
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t cur_arp_val = s->ar[arp(s)];
-            {
-                static int banz_log = 0;
-                if (banz_log < 5)
-                    C54_LOG("BANZ PC=0x%04x ARP=%d AR[ARP]=0x%04x target=0x%04x %s",
-                            s->pc, arp(s), cur_arp_val, op2,
-                            cur_arp_val != 0 ? "TAKEN" : "NOT TAKEN");
-                banz_log++;
-            }
-            if (cur_arp_val != 0) {
-                s->pc = op2;
-                return 0;
-            }
             return consumed + s->lk_used;
         }
         /* F5xx: SSBX or RPT #k */
@@ -1886,42 +1811,6 @@ static int c54x_exec_one(C54xState *s)
             else     s->a = sext40(v << 16);
             return consumed + s->lk_used;
         }
-        if (0) { /* DEAD CODE — old CC handler, replaced by LD above */
-            uint8_t cond = op & 0xFF;
-            int64_t sa = sext40(s->a), sb = sext40(s->b);
-            bool take = false;
-            switch (cond) {
-            case 0x00: take = true; break;          /* UNC */
-            case 0x02: take = (sa >= 0); break;     /* AGEQ */
-            case 0x03: take = (sa < 0); break;      /* ALT */
-            case 0x04: take = (sa != 0); break;     /* ANEQ */
-            case 0x05: take = (sa == 0); break;     /* AEQ */
-            case 0x06: take = (sa > 0); break;      /* AGT */
-            case 0x07: take = (sa <= 0); break;     /* ALEQ */
-            case 0x0A: take = (sb >= 0); break;     /* BGEQ */
-            case 0x0B: take = (sb < 0); break;      /* BLT */
-            case 0x0C: take = (sb != 0); break;     /* BNEQ */
-            case 0x0D: take = (sb == 0); break;     /* BEQ */
-            case 0x0E: take = (sb > 0); break;      /* BGT */
-            case 0x0F: take = (sb <= 0); break;     /* BLEQ */
-            case 0x20: take = !(s->st0 & ST0_C); break;  /* NC */
-            case 0x21: take = (s->st0 & ST0_C) != 0; break; /* C */
-            case 0x30: take = !(s->st0 & ST0_TC); break; /* NTC */
-            case 0x31: take = (s->st0 & ST0_TC) != 0; break; /* TC */
-            case 0x60: take = !(s->st0 & ST0_OVA); break; /* ANOV */
-            case 0x61: take = (s->st0 & ST0_OVA) != 0; break; /* AOV */
-            case 0x68: take = !(s->st0 & ST0_OVB); break; /* BNOV */
-            case 0x69: take = (s->st0 & ST0_OVB) != 0; break; /* BOV */
-            default: take = true; break;  /* unknown compound cond — take conservatively */
-            }
-            if (take) {
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 2));
-                s->pc = op2;
-                return 0;
-            }
-            return consumed + s->lk_used;
-        }
         if (hi8 == 0xE1) {
             /* E1xx: single-word acc ops — NEG, ABS, CMPL, SAT, EXP, etc. */
             uint8_t sub = op & 0xFF;
@@ -2032,20 +1921,6 @@ static int c54x_exec_one(C54xState *s)
             else if (cond == 0x41) take = !(s->st0 & ST0_TC);
             else take = true;
             if (take) { s->pc = op2; return 0; }
-            return consumed + s->lk_used;
-        }
-        if (hi8 == 0xE8) {
-            /* E8xx: CMPR cond, ARn */
-            int cmp_cond = (op >> 4) & 3;
-            int n = arp(s);
-            bool result = false;
-            switch (cmp_cond) {
-            case 0: result = (s->ar[n] == s->ar[0]); break;
-            case 1: result = (s->ar[n] < s->ar[0]); break;
-            case 2: result = (s->ar[n] > s->ar[0]); break;
-            case 3: result = (s->ar[n] != s->ar[0]); break;
-            }
-            if (result) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
             return consumed + s->lk_used;
         }
         goto unimpl;
@@ -2466,14 +2341,6 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, op2, data_read(s, addr));
             return consumed + s->lk_used;
         }
-        if (hi8 == 0x9A) {
-            /* MVKD dmad, Smem */
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, data_read(s, op2));
-            return consumed + s->lk_used;
-        }
         if (hi8 == 0x88 || hi8 == 0x80) {
             /* MVDD Smem, Smem (data→data) — 2 address forms */
             addr = resolve_smem(s, op, &ind);
@@ -2627,16 +2494,8 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, data_read(s, op2));
             return consumed + s->lk_used;
         }
-        /* 95xx: ST #lk, Smem (another encoding) */
-        if (hi8 == 0x95) {
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, addr, op2);
-            return consumed + s->lk_used;
-        }
-        /* ST #lk, Smem (2-word) */
-        if (hi8 == 0x96 || hi8 == 0x97) {
+        /* 97xx: ST #lk, Smem (2-word). 0x96xx is caught above as MVDP. */
+        if (hi8 == 0x97) {
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
@@ -2763,13 +2622,6 @@ ba_handler:
             uint16_t mmr = op & 0x7F;
             int64_t acc = src_acc ? s->b : s->a;
             data_write(s, mmr, (uint16_t)(acc & 0xFFFF));
-            return consumed + s->lk_used;
-        }
-        if (hi8 == 0xBD) {
-            /* BDxx: POPM / delayed branch variants */
-            uint16_t mmr = op & 0x7F;
-            data_write(s, mmr, data_read(s, s->sp));
-            s->sp++;
             return consumed + s->lk_used;
         }
         if (hi8 == 0xBA) {
