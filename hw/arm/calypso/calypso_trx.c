@@ -426,7 +426,7 @@ static void calypso_tdma_tick(void *opaque) {
      * Bursts from BTS arrive via UDP in real time, but BDLENA windows
      * open in virtual time (faster). This step pulls buffered bursts
      * and delivers them when BDLENA windows are available. */
-    calypso_bsp_deliver_buffered();
+    calypso_bsp_deliver_buffered(s->fn);
 
     /* ── 6b. UL burst poll ──
      * Check if the DSP wrote an UL task. If so, read bits from DSP

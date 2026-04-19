@@ -27,25 +27,34 @@
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 
 #define BSP_LOG(fmt, ...) \
     do { fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 #define BSP_TRXD_PORT  6702   /* bridge forwards DL bursts here (5702 is bridge's own) */
 
-/* Per-TN burst buffer: store the latest DL burst from BTS for each timeslot.
- * On real hardware, BSP DMA delivers samples synchronously within the TDMA
- * frame. In QEMU, bursts arrive asynchronously via UDP (real-time) while
- * BDLENA windows open in virtual time (faster). We buffer the latest burst
- * per TN and deliver it when BDLENA fires, ensuring the DSP always sees
- * samples regardless of UDP arrival timing. */
-#define BSP_RING_SIZE  8   /* one per TN */
+/* Per-TN burst queue: FN-indexed ring so lookahead bursts from the BTS
+ * (osmo-bts-trx schedules up to ~92 frames ahead) are preserved until the
+ * QEMU virtual FN catches up to each burst's scheduled FN. On real hardware
+ * BSP DMA is synchronous within the TDMA frame; in QEMU bursts arrive over
+ * UDP from the bridge with their scheduled FN embedded in the TRXD header,
+ * and delivery must happen at the exact virtual FN or the DSP correlates
+ * samples against a frame boundary that does not match the modulator phase
+ * (→ d_fb_det stays 0 indefinitely). */
+#define BSP_NUM_TN     8                 /* one queue per timeslot */
+#define BSP_QUEUE_LEN  128               /* lookahead depth per TN */
+
 typedef struct {
     int16_t  iq[296];  /* 148 I/Q pairs max */
     int      n;        /* number of int16 values */
     uint32_t fn;
     bool     valid;
 } BspBurstSlot;
+
+typedef struct {
+    BspBurstSlot  slot[BSP_QUEUE_LEN];
+} BspBurstQueue;
 
 static struct {
     C54xState *dsp;
@@ -55,14 +64,88 @@ static struct {
     uint64_t   bursts_seen;
     uint64_t   bursts_written;
     uint64_t   bursts_dropped_no_window;
+    uint64_t   bursts_dropped_queue_full;
+    uint64_t   bursts_dropped_stale;
     int        trxd_fd;            /* UDP socket for TRXDv0 DL bursts */
     struct sockaddr_in trxd_peer;  /* BTS address (for UL replies) */
     bool       trxd_peer_valid;
     uint8_t    last_att;           /* last DL attenuation byte */
 
-    /* Per-TN latest burst buffer */
-    BspBurstSlot  slot[BSP_RING_SIZE];
+    /* FN-indexed queue per TN */
+    BspBurstQueue  q[BSP_NUM_TN];
 } bsp;
+
+/* Signed hyperframe distance (entry_fn - reference_fn) in (-H/2, H/2]. */
+static int32_t bsp_fn_delta(uint32_t entry_fn, uint32_t ref_fn)
+{
+    int32_t d = (int32_t)entry_fn - (int32_t)ref_fn;
+    if (d > (int32_t)(GSM_HYPERFRAME / 2))       d -= GSM_HYPERFRAME;
+    else if (d <= -(int32_t)(GSM_HYPERFRAME / 2)) d += GSM_HYPERFRAME;
+    return d;
+}
+
+/* Enqueue a burst into queue[tn]. If a slot already carries the same FN,
+ * overwrite it (duplicate retransmission from BTS). If the queue is full,
+ * drop the oldest entry (smallest fn_delta relative to enqueue). */
+static void bsp_enqueue(uint8_t tn, uint32_t fn, const int16_t *iq, int n)
+{
+    if (tn >= BSP_NUM_TN) return;
+    BspBurstQueue *qq = &bsp.q[tn];
+
+    int free_idx = -1;
+    int oldest_idx = 0;
+    int32_t oldest_delta = INT32_MAX;
+
+    for (int i = 0; i < BSP_QUEUE_LEN; i++) {
+        BspBurstSlot *s = &qq->slot[i];
+        if (s->valid && s->fn == fn) {
+            memcpy(s->iq, iq, n * sizeof(int16_t));
+            s->n = n;
+            return;
+        }
+        if (!s->valid) {
+            if (free_idx < 0) free_idx = i;
+        } else {
+            int32_t d = bsp_fn_delta(s->fn, fn);
+            if (d < oldest_delta) { oldest_delta = d; oldest_idx = i; }
+        }
+    }
+
+    int idx;
+    if (free_idx >= 0) {
+        idx = free_idx;
+    } else {
+        idx = oldest_idx;
+        bsp.bursts_dropped_queue_full++;
+    }
+    BspBurstSlot *s = &qq->slot[idx];
+    memcpy(s->iq, iq, n * sizeof(int16_t));
+    s->n = n;
+    s->fn = fn;
+    s->valid = true;
+}
+
+/* Purge stale entries (fn strictly in the past relative to current_fn) and
+ * return the slot matching current_fn for this TN, or NULL if none. */
+static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
+{
+    if (tn >= BSP_NUM_TN) return NULL;
+    BspBurstQueue *qq = &bsp.q[tn];
+    BspBurstSlot *match = NULL;
+
+    for (int i = 0; i < BSP_QUEUE_LEN; i++) {
+        BspBurstSlot *s = &qq->slot[i];
+        if (!s->valid) continue;
+        int32_t d = bsp_fn_delta(s->fn, current_fn);
+        if (d == 0) {
+            match = s;
+        } else if (d < 0) {
+            s->valid = false;
+            bsp.bursts_dropped_stale++;
+        }
+    }
+    return match;
+}
 
 static uint16_t parse_uint_env(const char *name, uint16_t def)
 {
@@ -145,17 +228,11 @@ static void bsp_trxd_readable(void *opaque)
         iq[iq_count++] = sin_tab[phase_idx];  /* Q */
     }
 
-    /* Buffer the burst for this TN. BDLENA will pull it later.
-     * QEMU virtual time runs faster than real time, so bursts arrive
-     * via UDP asynchronously. Buffering ensures the DSP sees samples
-     * whenever the firmware opens a BDLENA window. */
-    if (tn < BSP_RING_SIZE) {
-        BspBurstSlot *sl = &bsp.slot[tn];
-        memcpy(sl->iq, iq, iq_count * sizeof(int16_t));
-        sl->n = iq_count;  /* number of int16 values (I/Q pairs) */
-        sl->fn = fn;
-        sl->valid = true;
-    }
+    /* Enqueue the burst FN-indexed for this TN. With BTS lookahead of up
+     * to ~92 frames, several bursts are in flight at once; each must be
+     * delivered at the exact QEMU virtual FN it was scheduled for, or
+     * the DSP correlator runs against incoherent samples. */
+    bsp_enqueue(tn, fn, iq, iq_count);
 
     /* Delivery is handled exclusively by calypso_bsp_deliver_buffered()
      * called from the TDMA tick. No immediate delivery — it would
@@ -172,6 +249,10 @@ void calypso_bsp_init(C54xState *dsp)
     bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
     bsp.bursts_written = 0;
+    bsp.bursts_dropped_no_window = 0;
+    bsp.bursts_dropped_queue_full = 0;
+    bsp.bursts_dropped_stale = 0;
+    memset(bsp.q, 0, sizeof(bsp.q));
     bsp.trxd_fd = -1;
     bsp.trxd_peer_valid = false;
 
@@ -292,23 +373,19 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
 
 /* ---- Deliver buffered burst when BDLENA fires ---- */
 /* Called from calypso_tdma_tick (calypso_trx.c) each frame.
- * If BDLENA is pending for a TN and we have a buffered burst, deliver it. */
-void calypso_bsp_deliver_buffered(void)
+ * For each TN: purge stale entries, then if a queued burst matches the
+ * current QEMU virtual FN and a BDLENA pulse is pending, deliver it. */
+void calypso_bsp_deliver_buffered(uint32_t current_fn)
 {
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
-    /* For each TN with a pending BDLENA window and a buffered burst,
-     * deliver the samples to the DSP. This handles the case where
-     * BDLENA opened before the UDP burst arrived (timing mismatch). */
-    for (int tn = 0; tn < BSP_RING_SIZE; tn++) {
-        BspBurstSlot *sl = &bsp.slot[tn];
-        if (!sl->valid) continue;
+    for (int tn = 0; tn < BSP_NUM_TN; tn++) {
+        BspBurstSlot *sl = bsp_take_for_fn(tn, current_fn);
+        if (!sl) continue;
 
-        /* Check if there's a BDLENA window for this TN */
         if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn))
             continue;
 
-        /* Deliver the buffered burst (I/Q pairs) */
         int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;
 
         uint16_t samples[296];
@@ -326,8 +403,11 @@ void calypso_bsp_deliver_buffered(void)
         sl->valid = false;  /* consumed */
 
         if (bsp.bursts_written <= 10 || (bsp.bursts_written % 1000) == 0) {
-            BSP_LOG("BUFFERED DMA tn=%u fn=%u n=%d total=%llu",
-                    tn, sl->fn, n, (unsigned long long)bsp.bursts_written);
+            BSP_LOG("DMA tn=%u fn=%u n=%d total=%llu stale=%llu qfull=%llu",
+                    tn, sl->fn, n,
+                    (unsigned long long)bsp.bursts_written,
+                    (unsigned long long)bsp.bursts_dropped_stale,
+                    (unsigned long long)bsp.bursts_dropped_queue_full);
         }
 
         /* Fire BRINT0 */
