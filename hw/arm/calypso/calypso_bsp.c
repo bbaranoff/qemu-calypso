@@ -268,8 +268,10 @@ static void bsp_trxd_readable(void *opaque)
      * For FB (all-zero bits): phase advances π/2 per bit → pure tone.
      * I/Q sequence: (1,0),(0,1),(-1,0),(0,-1),(1,0),... */
     int16_t iq[296];  /* 148 I/Q pairs = 296 values */
-    static const int16_t cos_tab[4] = { 0x3FFF, 0, -0x3FFF, 0 };
-    static const int16_t sin_tab[4] = { 0, 0x3FFF, 0, -0x3FFF };
+    /* Q15 full-scale amplitude: real BSP/IOTA delivers near-full-range Q15
+     * samples. ±0x7FFE keeps one bit of headroom below INT16_MIN. */
+    static const int16_t cos_tab[4] = { 0x7FFE, 0, -0x7FFE, 0 };
+    static const int16_t sin_tab[4] = { 0, 0x7FFE, 0, -0x7FFE };
     int phase_idx = 0;
     int iq_count = 0;
     for (int i = 0; i < nbits; i++) {
