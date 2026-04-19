@@ -458,6 +458,20 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                     (unsigned long long)bsp.bursts_written,
                     (unsigned long long)bsp.bursts_dropped_stale,
                     (unsigned long long)bsp.bursts_dropped_queue_full);
+
+            /* Dump first 8 words written so we can verify the I/Q
+             * constellation actually landed in the DSP data memory at
+             * daram_addr — independent of any ARM-side mapping. */
+            BSP_LOG("DMA @0x%04x: %04x %04x %04x %04x %04x %04x %04x %04x",
+                    bsp.daram_addr,
+                    bsp.dsp->data[bsp.daram_addr + 0],
+                    bsp.dsp->data[bsp.daram_addr + 1],
+                    bsp.dsp->data[bsp.daram_addr + 2],
+                    bsp.dsp->data[bsp.daram_addr + 3],
+                    bsp.dsp->data[bsp.daram_addr + 4],
+                    bsp.dsp->data[bsp.daram_addr + 5],
+                    bsp.dsp->data[bsp.daram_addr + 6],
+                    bsp.dsp->data[bsp.daram_addr + 7]);
         }
 
         /* Fire BRINT0 */
