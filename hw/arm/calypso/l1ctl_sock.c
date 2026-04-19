@@ -105,18 +105,19 @@ static int sercomm_wrap(uint8_t dlci, const uint8_t *payload, int plen,
 
 static void l1ctl_send_to_mobile(L1CTLSock *s, const uint8_t *payload, int len)
 {
-    if (s->cli_fd < 0 || len <= 0 || len > 512) return;
+    if (s->cli_fd < 0 || len <= 0 || len > UINT16_MAX) return;
 
-    /* Single atomic write: length header + payload */
-    uint8_t buf[514];
-    buf[0] = (len >> 8) & 0xFF;
-    buf[1] = len & 0xFF;
-    memcpy(&buf[2], payload, len);
+    uint8_t hdr[2] = { (uint8_t)(len >> 8), (uint8_t)(len & 0xFF) };
+    struct iovec iov[2] = {
+        { .iov_base = hdr,                  .iov_len = sizeof(hdr) },
+        { .iov_base = (void *)payload,      .iov_len = (size_t)len },
+    };
+    struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
 
-    int total = 2 + len;
-    int sent = send(s->cli_fd, buf, total, MSG_NOSIGNAL);
+    int total = (int)sizeof(hdr) + len;
+    ssize_t sent = sendmsg(s->cli_fd, &msg, MSG_NOSIGNAL);
     if (sent != total) {
-        L1CTL_LOG("client send error (%d/%d), closing", sent, total);
+        L1CTL_LOG("client send error (%zd/%d), closing", sent, total);
         close(s->cli_fd);
         s->cli_fd = -1;
     }
