@@ -2377,18 +2377,44 @@ static int c54x_exec_one(C54xState *s)
             /* PA=0x0034: BSP RX data register — return next burst sample.
              * On real hardware, the BSP serial port delivers one I/Q sample
              * per PORTR. We serve from the BSP DMA buffer. */
+            uint16_t portr_val;
             if (op2 == 0x0034 && s->bsp_pos < s->bsp_len) {
-                data_write(s, addr, s->bsp_buf[s->bsp_pos++]);
+                portr_val = s->bsp_buf[s->bsp_pos++];
+                data_write(s, addr, portr_val);
             } else {
+                portr_val = 0;
                 data_write(s, addr, 0);
             }
-            /* Log PORTR calls */
+            /* Per-PA counters so we can see which I/O ports the DSP polls
+             * and how often. */
             {
+                static uint64_t portr_total[16];
+                static uint64_t portr_since_summary;
+                int pa_bucket = (op2 >> 4) & 0xF;
+                portr_total[pa_bucket]++;
+                portr_since_summary++;
+
                 static int portr_log = 0;
                 if (portr_log < 50) {
-                    C54_LOG("PORTR PA=0x%04x → [0x%04x] val=0x%04x PC=0x%04x",
-                            op2, addr, data_read(s, addr), s->pc);
+                    C54_LOG("PORTR PA=0x%04x → [0x%04x] val=0x%04x "
+                            "bsp_pos=%u/%u PC=0x%04x",
+                            op2, addr, portr_val,
+                            (unsigned)s->bsp_pos, (unsigned)s->bsp_len,
+                            s->pc);
                     portr_log++;
+                }
+                if ((portr_since_summary % 10000) == 0) {
+                    C54_LOG("PORTR summary (last 10000): "
+                            "PA0x=%llu 1x=%llu 2x=%llu 3x=%llu 4x=%llu "
+                            "5x=%llu 6x=%llu 7x=%llu",
+                            (unsigned long long)portr_total[0],
+                            (unsigned long long)portr_total[1],
+                            (unsigned long long)portr_total[2],
+                            (unsigned long long)portr_total[3],
+                            (unsigned long long)portr_total[4],
+                            (unsigned long long)portr_total[5],
+                            (unsigned long long)portr_total[6],
+                            (unsigned long long)portr_total[7]);
                 }
             }
             return consumed + s->lk_used;
@@ -3523,4 +3549,19 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;
     s->bsp_pos = 0;
+
+    /* Confirm what the PORTR PA=0x0034 serving path will hand the DSP,
+     * and also flag if the DSP consumed less than half of the previous
+     * batch before a new one arrived (would indicate correlator starvation
+     * or DSP never reading via PORTR at all). */
+    static uint64_t load_count;
+    load_count++;
+    if (load_count <= 10 || (load_count % 1000) == 0) {
+        C54_LOG("BSP LOAD #%llu n=%d: %04x %04x %04x %04x %04x %04x %04x %04x",
+                (unsigned long long)load_count, n,
+                n > 0 ? samples[0] : 0, n > 1 ? samples[1] : 0,
+                n > 2 ? samples[2] : 0, n > 3 ? samples[3] : 0,
+                n > 4 ? samples[4] : 0, n > 5 ? samples[5] : 0,
+                n > 6 ? samples[6] : 0, n > 7 ? samples[7] : 0);
+    }
 }
