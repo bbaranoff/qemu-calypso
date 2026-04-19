@@ -58,7 +58,10 @@ uint8_t  calypso_bsp_get_last_att(void);
 void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148]);
 
 /* Deliver buffered DL bursts when BDLENA windows are available.
- * Called each TDMA frame from calypso_tdma_tick(). */
-void calypso_bsp_deliver_buffered(void);
+ * Called each TDMA frame from calypso_tdma_tick().
+ * current_fn is the QEMU virtual FN — only bursts tagged with that FN
+ * (per TN) are delivered; stale bursts (fn < current_fn) are dropped,
+ * future bursts (fn > current_fn) are kept for later frames. */
+void calypso_bsp_deliver_buffered(uint32_t current_fn);
 
 #endif /* HW_ARM_CALYPSO_BSP_H */
