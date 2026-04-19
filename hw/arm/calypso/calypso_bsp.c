@@ -243,17 +243,17 @@ static void bsp_trxd_readable(void *opaque)
         hist_pos = (hist_pos + 1) % 500;
         hist_seen++;
         if ((hist_seen % 500) == 0) {
-            unsigned n = hist_seen < 500 ? hist_seen : 500;
+            unsigned nh = hist_seen < 500 ? hist_seen : 500;
             int32_t mn = INT32_MAX, mx = INT32_MIN;
             int64_t sum = 0;
-            for (unsigned i = 0; i < n; i++) {
+            for (unsigned i = 0; i < nh; i++) {
                 int32_t d = hist[i];
                 if (d < mn) mn = d;
                 if (d > mx) mx = d;
                 sum += d;
             }
             BSP_LOG("RX delta stats (last %u): min=%d max=%d mean=%lld",
-                    n, mn, mx, (long long)(sum / (int64_t)n));
+                    nh, mn, mx, (long long)(sum / (int64_t)nh));
         }
     }
 
