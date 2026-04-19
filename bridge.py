@@ -45,9 +45,12 @@ class Bridge:
         # QEMU CLK tick receiver
         self.qemu_clk_sock = udp_bind(6700)
 
-        # Wall-clock timer for CLK IND to BTS
-        self.last_clk_time = 0.0
-        self.clk_interval = CLK_IND_PERIOD * 4.615e-3  # ~470ms
+        # CLK IND is driven by QEMU FN advance, NOT wall-clock. Sending at
+        # wall-clock rate means BTS ticks ahead whenever QEMU emulation is
+        # slower than real-time — the symptom is a linear delta drift in the
+        # BSP arrival log. Track the last QEMU FN at which we sent a CLK
+        # IND and fire whenever QEMU has advanced CLK_IND_PERIOD frames.
+        self.last_clk_fn = None
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} → BSP@6702", flush=True)
         print(f"bridge: QEMU CLK ticks on UDP 6700 (clock-slave mode)", flush=True)
@@ -69,18 +72,34 @@ class Bridge:
             print(f"bridge: QEMU tick #{self.stats['tick']} FN={self.fn}", flush=True)
 
     def maybe_send_clk(self):
-        """Send CLK IND to BTS at wall-clock rate using QEMU's FN."""
-        now = time.monotonic()
-        if now - self.last_clk_time >= self.clk_interval:
-            self.last_clk_time = now
-            # Round FN to nearest multiple of CLK_IND_PERIOD
-            clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
-            try:
-                self.clk_sock.sendto(
-                    f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
-                self.stats["clk"] += 1
-            except OSError:
-                pass
+        """Send CLK IND to BTS every CLK_IND_PERIOD QEMU frames.
+
+        Decoupled from wall-clock: BTS's internal scheduler advances in
+        lockstep with QEMU's virtual time, so the FN embedded in each
+        downlink burst matches QEMU's current_fn when the burst arrives
+        (within normal lookahead). Without this, whenever QEMU emulation
+        is slower than real-time, BTS ticks ahead and every burst is
+        delta=+N with N growing linearly.
+        """
+        if not self.powered:
+            return
+        if self.last_clk_fn is None:
+            advanced = CLK_IND_PERIOD  # force first CLK IND after POWERON
+        else:
+            advanced = (self.fn - self.last_clk_fn) % GSM_HYPERFRAME
+            if advanced > GSM_HYPERFRAME // 2:
+                # Going backward across hyperframe wrap — wait for wrap
+                return
+        if advanced < CLK_IND_PERIOD:
+            return
+        clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+        self.last_clk_fn = clk_fn
+        try:
+            self.clk_sock.sendto(
+                f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
+            self.stats["clk"] += 1
+        except OSError:
+            pass
 
     def handle_trxc(self):
         try: data, addr = self.trxc_sock.recvfrom(256)
