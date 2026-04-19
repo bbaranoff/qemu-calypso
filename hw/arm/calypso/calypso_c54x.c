@@ -2970,6 +2970,37 @@ int c54x_run(C54xState *s, int n_insns)
     run_num++;
 
     while (executed < n_insns && s->running && !s->idle) {
+        /* Replay any interrupt that fired while INTM=1.
+         * c54x_interrupt_ex sets IFR but does nothing else when INTM=1;
+         * the real C54x re-evaluates pending interrupts every cycle, so
+         * as soon as INTM clears (via RETE or RSBX INTM) a pending
+         * BRINT0/TINT0/... must dispatch. Without this, a BRINT0 that
+         * arrived inside another ISR is lost and the FB correlator never
+         * receives its I/Q samples (d_fb_det stays 0). */
+        if (!(s->st1 & ST1_INTM)) {
+            uint16_t pending = s->ifr & s->imr;
+            if (pending) {
+                int imr_bit = __builtin_ctz(pending);
+                int vec = imr_bit + 16;
+                s->ifr &= ~(1 << imr_bit);
+                s->sp--;
+                data_write(s, s->sp, s->pc);
+                if (s->pmst & PMST_APTS) {
+                    s->sp--;
+                    data_write(s, s->sp, s->xpc);
+                }
+                s->st1 |= ST1_INTM;
+                uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+                s->pc = (iptr * 0x80) + vec * 4;
+                static int pending_log = 0;
+                if (pending_log < 20) {
+                    C54_LOG("PENDING IRQ replay vec=%d bit=%d PC->0x%04x SP=0x%04x insn=%u",
+                            vec, imr_bit, s->pc, s->sp, s->insn_count);
+                    pending_log++;
+                }
+            }
+        }
+
         /* Record PC in ring buffer */
         pc_ring[pc_ring_idx & 255] = s->pc;
         pc_ring_idx++;
