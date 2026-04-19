@@ -3515,8 +3515,13 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         if (!unmasked) {
             s->pc++;  /* resume at instruction after IDLE */
         }
-    } else if (!(s->st1 & ST1_INTM) && unmasked) {
-        /* Normal (non-IDLE) interrupt servicing */
+    } else if (unmasked) {
+        /* TEMPORARY DEBUG: accept IRQ even when INTM=1.
+         * Firmware appears to never execute RSBX INTM, leaving interrupts
+         * permanently masked. If d_fb_det flips after this hack, it
+         * confirms INTM=1 is the root blocker and we need to find why the
+         * firmware boot path skips the RSBX INTM that should happen at
+         * 0xa4d0/0xa510/0xa6c0/0xc660/etc. */
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
