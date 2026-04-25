@@ -279,6 +279,12 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_RSA:  s->rsa = val; return;
         case MMR_REA:  s->rea = val; return;
         case MMR_PMST:
+            {
+                static unsigned pmst_wr_attempts = 0;
+                if (pmst_wr_attempts++ < 100)
+                    C54_LOG("PMST WR attempt #%u: val=0x%04x cur=0x%04x PC=0x%04x insn=%u",
+                            pmst_wr_attempts, val, s->pmst, s->pc, s->insn_count);
+            }
             if (val != s->pmst) {
                 uint16_t old_iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 uint16_t new_iptr = (val >> PMST_IPTR_SHIFT) & 0x1FF;
@@ -3319,6 +3325,29 @@ int c54x_run(C54xState *s, int n_insns)
 
         s->cycles++;
         s->insn_count++;
+
+        /* One-shot diagnostic at boot+: dump 0xB900 vector table
+         * (the relocated table the firmware should use if it sets
+         * IPTR=0x172) plus DSP runtime state. Helps diagnose why the
+         * IPTR relocation never fires in some runs. */
+        if (s->insn_count == 100000) {
+            uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+            C54_LOG("BOOT+100k STATE: PMST=0x%04x IPTR=0x%03x IMR=0x%04x IFR=0x%04x ST0=0x%04x ST1=0x%04x INTM=%d PC=0x%04x SP=0x%04x XPC=%d",
+                    s->pmst, iptr, s->imr, s->ifr, s->st0, s->st1,
+                    !!(s->st1 & ST1_INTM), s->pc, s->sp, s->xpc);
+            C54_LOG("BOOT+100k VECDUMP-FORCED base=0xB900 (32 vectors, alt table @ IPTR=0x172):");
+            for (int vec = 0; vec < 32; vec++) {
+                uint32_t a = 0xB900 + vec * 4;
+                uint16_t w0 = prog_read(s, a + 0);
+                uint16_t w1 = prog_read(s, a + 1);
+                uint16_t w2 = prog_read(s, a + 2);
+                uint16_t w3 = prog_read(s, a + 3);
+                fprintf(stderr,
+                        "[c54x] alt vec %2d @ 0x%04x : %04x %04x %04x %04x\n",
+                        vec, (uint16_t)a, w0, w1, w2, w3);
+            }
+        }
+
         executed++;
     }
     return executed;
