@@ -63,6 +63,9 @@ static inline int asm_shift(C54xState *s)
  * Memory access
  * ================================================================ */
 
+/* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
+static uint16_t prog_read(C54xState *s, uint32_t addr);
+
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     /* === DARAM discovery histogram ===
