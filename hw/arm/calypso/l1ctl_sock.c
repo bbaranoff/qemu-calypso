@@ -62,45 +62,6 @@ typedef struct L1CTLSock {
 
 static L1CTLSock g_l1ctl;
 
-/* ---- Sercomm helpers ---- */
-
-static int sercomm_wrap(uint8_t dlci, const uint8_t *payload, int plen,
-                        uint8_t *out, int out_size)
-{
-    int pos = 0;
-    if (pos >= out_size) return -1;
-    out[pos++] = SERCOMM_FLAG;
-
-    /* DLCI + CTRL */
-    uint8_t hdr[2] = { dlci, 0x03 };
-    for (int i = 0; i < 2; i++) {
-        if (hdr[i] == SERCOMM_FLAG || hdr[i] == SERCOMM_ESCAPE) {
-            if (pos + 2 > out_size) return -1;
-            out[pos++] = SERCOMM_ESCAPE;
-            out[pos++] = hdr[i] ^ SERCOMM_ESCAPE_XOR;
-        } else {
-            if (pos + 1 > out_size) return -1;
-            out[pos++] = hdr[i];
-        }
-    }
-
-    /* Payload */
-    for (int i = 0; i < plen; i++) {
-        if (payload[i] == SERCOMM_FLAG || payload[i] == SERCOMM_ESCAPE) {
-            if (pos + 2 > out_size) return -1;
-            out[pos++] = SERCOMM_ESCAPE;
-            out[pos++] = payload[i] ^ SERCOMM_ESCAPE_XOR;
-        } else {
-            if (pos + 1 > out_size) return -1;
-            out[pos++] = payload[i];
-        }
-    }
-
-    if (pos >= out_size) return -1;
-    out[pos++] = SERCOMM_FLAG;
-    return pos;
-}
-
 /* ---- Send L1CTL message to mobile (length-prefix) ---- */
 
 static void l1ctl_send_to_mobile(L1CTLSock *s, const uint8_t *payload, int len)
@@ -221,23 +182,10 @@ static void l1ctl_client_readable(void *opaque)
 
         uint8_t *payload = &s->lp_buf[2];
 
-        /* Wrap in sercomm and inject into UART RX */
-        uint8_t frame[1024];
-        int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
-                                frame, sizeof(frame));
-        if (flen > 0 && s->uart) {
-            L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
-                      msglen, payload[0], flen);
-            /* Hex dump of sercomm frame being injected */
-            {
-                fprintf(stderr, "[l1ctl-sock] INJECT %d bytes:", flen);
-                for (int j = 0; j < flen && j < 32; j++)
-                    fprintf(stderr, " %02x", frame[j]);
-                if (flen > 32) fprintf(stderr, " ...");
-                fprintf(stderr, "\n");
-            }
-            calypso_uart_receive(s->uart, frame, flen);
-        }
+        /* This socket is the UART(write)→BTS(read) pipe, not the
+         * mobile↔L1 upstream. The mobile speaks to the firmware via
+         * the QEMU PTY backing the Calypso UART. Inbound is dropped. */
+        L1CTL_LOG("DROP RX←mobile: len=%d type=0x%02x", msglen, payload[0]);
 
         /* Consume from buffer */
         int consumed = 2 + msglen;

@@ -1,0 +1,55 @@
+# DIAGNOSTIC HACK: force-clear INTM at insn=$CALYPSO_FORCE_INTM_CLEAR_AT
+#
+# Purpose: discriminate the catch-22 hypothesis (DSP can't clear INTM
+# because the path that does is unreachable while INTM=1).
+#
+# Apply  : patch -p1 -d /home/nirvana/qemu-src      < hack.patch
+# Revert : patch -p1 -R -d /home/nirvana/qemu-src   < hack.patch
+#
+# After apply, set CALYPSO_FORCE_INTM_CLEAR_AT=<N> to enable. Disabled
+# by default (env var unset → no-op).
+#
+# Tracked in hw/arm/calypso/doc/TODO.md "DIAGNOSTIC HACK" section.
+# MUST be reverted once the real RSBX INTM path is identified.
+
+--- a/hw/arm/calypso/calypso_c54x.c
++++ b/hw/arm/calypso/calypso_c54x.c
+@@ -3905,6 +3905,38 @@
+         s->cycles++;
+         s->insn_count++;
+
++        /* === DIAGNOSTIC HACK — TEMPORARY — REMOVE ASAP ===
++         * Force-clear INTM at insn_count = $CALYPSO_FORCE_INTM_CLEAR_AT.
++         * Discriminates the catch-22 hypothesis: if clearing INTM here
++         * unblocks the FB-det path (RETED ≥1, d_fb_det written, FB1/FB2
++         * print), the root cause is "boot init never executes RSBX INTM";
++         * then we hunt the missing path (α/β/γ). If no change → INTM is
++         * not the only blocker.
++         *
++         * Documented in hw/arm/calypso/doc/TODO.md "DIAGNOSTIC HACK" —
++         * MUST BE REMOVED once the real RSBX path is identified.
++         * Disabled by default (env var unset). */
++        {
++            static int hack_at = -2;
++            static int hack_done = 0;
++            if (hack_at == -2) {
++                const char *e = getenv("CALYPSO_FORCE_INTM_CLEAR_AT");
++                hack_at = e ? atoi(e) : -1;
++                if (hack_at > 0)
++                    C54_LOG("DIAG-HACK armed: will clear INTM at insn=%d", hack_at);
++            }
++            if (hack_at > 0 && !hack_done && (uint32_t)hack_at == s->insn_count) {
++                if (s->st1 & ST1_INTM) {
++                    s->st1 &= ~ST1_INTM;
++                    C54_LOG("DIAG-HACK *** FORCE-INTM-CLEAR *** at insn=%u PC=0x%04x ST1=0x%04x (was INTM=1)",
++                            s->insn_count, s->pc, s->st1);
++                } else {
++                    C54_LOG("DIAG-HACK at insn=%u: INTM already 0, no-op", s->insn_count);
++                }
++                hack_done = 1;
++            }
++        }
++
+         /* One-shot diagnostic at boot+: dump 0xB900 vector table
+          * (the relocated table the firmware should use if it sets
+          * IPTR=0x172) plus DSP runtime state. Helps diagnose why the

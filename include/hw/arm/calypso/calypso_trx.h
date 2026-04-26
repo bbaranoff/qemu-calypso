@@ -97,7 +97,6 @@
 #define DSP_API_VERSION       0x3606
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
-void calypso_fw_patch_apply(void);
 
 /* Sercomm burst transport (DLCI 4) — called by UART hardware */
 void calypso_trx_rx_burst(const uint8_t *data, int len);

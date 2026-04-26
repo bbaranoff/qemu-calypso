@@ -52,7 +52,12 @@ uint32_t calypso_trx_get_fn(void);
  * is a QEMU artefact. ±4 frames tolerates bridge/BTS CLK IND jitter and
  * is narrow enough not to swap adjacent FCCH with non-FCCH in the 51-
  * multiframe pattern (FCCH appears every 10 frames on the BCCH slot). */
-#define BSP_FN_MATCH_WINDOW  4
+/* Was 4: too tight for BTS scheduler lookahead (observed delta=1..139 with
+ * mean ~50). 99 % of bursts went stale before the QEMU virtual FN caught up.
+ * 64 covers the typical lookahead and lets the queue drain fast enough that
+ * BDLENA pulses actually consume bursts. (Bumped to 1024 in diag 2026-04-26
+ * — confirmed not the bottleneck. Restored to 64.) */
+#define BSP_FN_MATCH_WINDOW  64
 
 typedef struct {
     int16_t  iq[296];  /* 148 I/Q pairs max */
@@ -155,6 +160,20 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
         } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
             match = s;
             best_abs = ad;
+        }
+    }
+    /* Periodic stale ratio summary: a runaway ratio (e.g. 7000:1) is the
+     * symptom of a stalled DSP — virtual fn isn't catching up to queued
+     * burst FNs before the match window expires. Report every 5000 stales
+     * so the spiral is visible without flooding the log. */
+    {
+        static uint64_t last_logged_stale;
+        if (bsp.bursts_dropped_stale - last_logged_stale >= 5000) {
+            last_logged_stale = bsp.bursts_dropped_stale;
+            BSP_LOG("STALE ratio: stale=%llu written=%llu (cur_fn=%u)",
+                    (unsigned long long)bsp.bursts_dropped_stale,
+                    (unsigned long long)bsp.bursts_written,
+                    current_fn);
         }
     }
     return match;
@@ -296,7 +315,10 @@ static void bsp_trxd_readable(void *opaque)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
-    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fc0);
+    /* DSP reads I/Q at DARAM 0x3fb3-0x3fbe (verified via DARAM RD HIST).
+     * 0x3fc0 was off by 13 words — DSP saw zeros and never advanced past
+     * the FB-det wait loop at PROM0 0x7700. */
+    bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fb0);
     bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  296);
     bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;

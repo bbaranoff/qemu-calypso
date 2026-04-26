@@ -2,13 +2,23 @@
  * calypso_timer.c — Calypso GP/Watchdog Timer
  *
  * 16-bit down-counter with auto-reload, prescaler, and IRQ.
- * Calypso base clock: 13 MHz. Effective rate = 13 MHz / (prescaler + 1).
+ * Calypso base clock: 13 MHz. The silicon has a fixed /32 hardware
+ * prescaler ahead of the user-visible PRESCALER field, so:
  *
- * Register map (16-bit, offsets from base):
- *   0x00  CNTL       Control (bit0=start, bit1=auto-reload, bit2=irq-enable)
- *   0x02  LOAD       Reload value (written before starting)
- *   0x04  READ       Current count (read-only)
- *   0x06  PRESCALER  Clock divider
+ *   tick_freq = 13 MHz / (32 << PRESCALER)
+ *
+ * With PRESCALER=0 the timer ticks at 13e6/32 ≈ 406.25 kHz, which is
+ * what osmocom-bb's check_lost_frame() expects (1875 ticks ≈ 4615 µs
+ * = one TDMA frame). Without the fixed /32 the firmware sees thousands
+ * of "LOST N!" because the timer wraps multiple times per frame.
+ *
+ * Register map (firmware uses byte access on CNTL, word access on LOAD/READ):
+ *   0x00  CNTL  bit 0    = START
+ *               bit 1    = AUTO_RELOAD
+ *               bits 4:2 = PRESCALER (0..7) → user divider
+ *               bit 5    = CLOCK_ENABLE   (timer ticks only when also START)
+ *   0x02  LOAD  Reload value (16-bit)
+ *   0x04  READ  Current count (16-bit, read-only)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -19,48 +29,92 @@
 #include "qemu/timer.h"
 #include "hw/arm/calypso/calypso_timer.h"
 
-#define TIMER_CTRL_START   (1 << 0)
-#define TIMER_CTRL_RELOAD  (1 << 1)
-#define TIMER_CTRL_IRQ_EN  (1 << 2)
+/* Layout matches osmocom-bb firmware (calypso/timer.c). The timer only
+ * ticks when both START and CLOCK_ENABLE are set; hwtimer_read() polls
+ * those exact bits before returning the count, so they MUST round-trip
+ * through readb/writeb intact — otherwise the firmware sees the timer
+ * as stopped and returns 0xFFFF, producing a constant "LOST 0!" stream
+ * every TDMA frame because diff = 0xFFFF - 0xFFFF = 0. */
+#define TIMER_CTRL_START         (1 << 0)
+#define TIMER_CTRL_RELOAD        (1 << 1)
+#define TIMER_CTRL_PRESCALER_SH  2
+#define TIMER_CTRL_PRESCALER_MSK (0x7 << 2)
+#define TIMER_CTRL_CLOCK_ENABLE  (1 << 5)
 
 #define CALYPSO_BASE_CLK   13000000LL  /* 13 MHz */
+
+static bool calypso_timer_should_run(CalypsoTimerState *s)
+{
+    return (s->ctrl & TIMER_CTRL_START) && (s->ctrl & TIMER_CTRL_CLOCK_ENABLE);
+}
+
+static void calypso_timer_recompute_tick(CalypsoTimerState *s)
+{
+    int prescaler = (s->ctrl & TIMER_CTRL_PRESCALER_MSK) >> TIMER_CTRL_PRESCALER_SH;
+    /* Silicon has a fixed /32 hardware prescaler in front of PRESCALER. */
+    int64_t divider = 32LL << prescaler;
+    int64_t freq = CALYPSO_BASE_CLK / divider;
+    if (freq <= 0) freq = 1;
+    s->tick_ns = NANOSECONDS_PER_SECOND / freq;
+}
+
+/* Compute current count by interpolating virtual time elapsed since the
+ * timer was (re)started — avoids scheduling one QEMU event per decrement,
+ * which would coalesce on the QEMU virtual clock granularity and make the
+ * effective tick rate roughly half of what the firmware expects. */
+static uint16_t calypso_timer_current_count(CalypsoTimerState *s)
+{
+    if (!s->running) return s->count;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t elapsed = now - s->epoch_ns;
+    if (elapsed < 0) elapsed = 0;
+    int64_t ticks = elapsed / s->tick_ns;
+    int64_t period = (int64_t)s->load + 1;
+    if (s->ctrl & TIMER_CTRL_RELOAD) {
+        ticks %= period;
+    } else if (ticks > s->load) {
+        return 0;
+    }
+    return (uint16_t)(s->load - ticks);
+}
+
+static void calypso_timer_schedule_wrap(CalypsoTimerState *s)
+{
+    /* Schedule the next IRQ at the moment count would reach 0 from the
+     * current virtual time. */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint16_t cur = calypso_timer_current_count(s);
+    int64_t ns_to_wrap = (int64_t)(cur + 1) * s->tick_ns;
+    timer_mod(s->timer, now + ns_to_wrap);
+}
 
 static void calypso_timer_tick(void *opaque)
 {
     CalypsoTimerState *s = CALYPSO_TIMER(opaque);
 
-    if (!s->running) {
-        return;
-    }
+    if (!s->running) return;
 
-    s->count--;
-    if (s->count == 0) {
-        /* Fire IRQ if enabled */
-        if (s->ctrl & TIMER_CTRL_IRQ_EN) {
-            qemu_irq_raise(s->irq);
-        }
-        /* Auto-reload or stop */
-        if (s->ctrl & TIMER_CTRL_RELOAD) {
-            s->count = s->load;
-        } else {
-            s->running = false;
-            return;
-        }
-    }
+    qemu_irq_raise(s->irq);
 
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
+    if (s->ctrl & TIMER_CTRL_RELOAD) {
+        /* Reanchor epoch to "now" so the next read sees count=load. */
+        s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->count = s->load;
+        timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
+    } else {
+        s->running = false;
+        s->count = 0;
+    }
 }
 
 static void calypso_timer_start(CalypsoTimerState *s)
 {
-    if (s->load == 0) {
-        return;
-    }
+    if (s->load == 0) return;
+    calypso_timer_recompute_tick(s);
     s->count = s->load;
     s->running = true;
-    int64_t freq = CALYPSO_BASE_CLK / (s->prescaler + 1);
-    s->tick_ns = NANOSECONDS_PER_SECOND / freq;
-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->tick_ns);
+    s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
 }
 
 /* ---- MMIO ---- */
@@ -72,8 +126,7 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
     switch (offset) {
     case 0x00: return s->ctrl;
     case 0x02: return s->load;
-    case 0x04: return s->count;
-    case 0x06: return s->prescaler;
+    case 0x04: return calypso_timer_current_count(s);
     default:   return 0;
     }
 }
@@ -84,20 +137,31 @@ static void calypso_timer_write(void *opaque, hwaddr offset, uint64_t value,
     CalypsoTimerState *s = CALYPSO_TIMER(opaque);
 
     switch (offset) {
-    case 0x00: /* CNTL */
-        s->ctrl = value & 0x07;
-        if (value & TIMER_CTRL_START) {
-            calypso_timer_start(s);
+    case 0x00: { /* CNTL — preserve all 8 bits the firmware writes */
+        bool was_running = s->running;
+        uint16_t old_ctrl = s->ctrl;
+        s->ctrl = value & 0xFF;
+        if (calypso_timer_should_run(s)) {
+            if (!was_running) {
+                calypso_timer_start(s);
+            } else if ((old_ctrl & TIMER_CTRL_PRESCALER_MSK) !=
+                       (s->ctrl & TIMER_CTRL_PRESCALER_MSK)) {
+                /* prescaler changed mid-run — re-anchor at current count */
+                s->count = calypso_timer_current_count(s);
+                calypso_timer_recompute_tick(s);
+                s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                              (int64_t)(s->load - s->count) * s->tick_ns;
+                calypso_timer_schedule_wrap(s);
+            }
         } else {
+            s->count = calypso_timer_current_count(s);
             s->running = false;
             timer_del(s->timer);
         }
         break;
+    }
     case 0x02: /* LOAD */
         s->load = value;
-        break;
-    case 0x06: /* PRESCALER */
-        s->prescaler = value;
         break;
     }
 }
@@ -106,7 +170,8 @@ static const MemoryRegionOps calypso_timer_ops = {
     .read = calypso_timer_read,
     .write = calypso_timer_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .impl = { .min_access_size = 2, .max_access_size = 2 },
+    .valid = { .min_access_size = 1, .max_access_size = 2 },
+    .impl  = { .min_access_size = 1, .max_access_size = 2 },
 };
 
 /* ---- QOM lifecycle ---- */

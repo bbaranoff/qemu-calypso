@@ -1,5 +1,14 @@
 # QEMU Calypso — Claude Code Context
 
+> **⚠️ PAS DE HACK — règle #1.**
+> Pas d'injection, pas de stub, pas de bypass, pas de "TEMPORARY", pas de
+> hardcode pour faire avancer un état. Le DSP exécute le vrai ROM, la BSP
+> est gated par TPU→TSP→IOTA, le mobile passe par la PTY QEMU. Si une
+> instruction/opcode/registre semble cassé : **vérifier contre `tic54x-opc.c`
+> et SPRU172C avant de patcher**, jamais contourner. Tout contournement
+> temporaire jugé inévitable doit être documenté dans `hw/arm/calypso/doc/TODO.md`
+> avec un critère de retrait.
+
 ## Architecture
 
 Dual-core GSM baseband emulator:

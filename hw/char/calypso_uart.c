@@ -250,6 +250,133 @@ static void calypso_uart_rx_poll(void *opaque)
 
 /* ---- Control PTY callbacks ---- */
 
+/* ---- Calypso romloader stub --------------------------------------------
+ *
+ * On real hardware the Compal/Calypso boots into a small ROM-resident
+ * "romloader" that speaks a simple framed protocol over UART:
+ *
+ *   <i  (0x3c 0x69)                     ident          → ack >i + param >p ...
+ *   <w  (0x3c 0x77) hdr(8B) data(N)     write block    → >w (or >W on err)
+ *   <c  (0x3c 0x63) chk(1B)             checksum       → >c (or >C)
+ *   <b  (0x3c 0x62) addr(4B BE)         branch         → >b → run firmware
+ *
+ * osmocon performs this handshake before it switches to bridging the
+ * mobile↔firmware sercomm channel. Our QEMU loads the firmware via -kernel
+ * and never runs the bootloader, so without this stub osmocon loops on
+ * "Waiting for handshake".
+ *
+ * The stub eats every modem-UART RX byte until the branch ack is sent,
+ * fakes the protocol responses (no actual download — the firmware is
+ * already in RAM), then enables passthrough so subsequent traffic flows
+ * to the firmware sercomm parser as usual.
+ *
+ * The param ack advertises a payload size of 1024 bytes, so each <w
+ * block is 8 (header continuation) + 1024 (data) bytes after the 0x77.
+ */
+
+typedef enum {
+    ROM_IDLE,        /* waiting for 0x3c lead-in */
+    ROM_AFTER_3C,    /* saw 0x3c, expecting cmd char */
+    ROM_BLOCK_DATA,  /* consuming write block payload */
+    ROM_CHK_DATA,    /* consuming 1-byte checksum */
+    ROM_BR_DATA,     /* consuming 4-byte branch address */
+    ROM_PASSTHROUGH, /* handshake complete — bytes go to sercomm */
+} RomloadState;
+
+static struct {
+    RomloadState state;
+    int          needed;        /* bytes still expected for current block */
+    uint16_t     payload_size;  /* what we advertised in param ack */
+} romload = {
+    .state = ROM_IDLE,
+    .payload_size = 1024,
+};
+
+/* Returns true when the byte was consumed by the stub (must NOT be
+ * forwarded to sercomm). Returns false when passthrough is active. */
+static bool romload_stub_eat(CalypsoUARTState *s, uint8_t b)
+{
+    if (romload.state == ROM_PASSTHROUGH) {
+        return false;
+    }
+
+    switch (romload.state) {
+    case ROM_IDLE:
+        if (b == 0x3c) {
+            romload.state = ROM_AFTER_3C;
+        }
+        /* discard pre-handshake noise */
+        return true;
+
+    case ROM_AFTER_3C: {
+        if (b == 0x69) {
+            /* <i ident → reply >i then >p (param ack with payload size LE) */
+            uint8_t ack[6] = {
+                0x3e, 0x69,                                   /* >i */
+                0x3e, 0x70,                                   /* >p */
+                (uint8_t)((romload.payload_size + 10) & 0xFF),
+                (uint8_t)(((romload.payload_size + 10) >> 8) & 0xFF),
+            };
+            qemu_chr_fe_write_all(&s->chr, ack, sizeof(ack));
+            fprintf(stderr, "[UART:modem] ROMLOAD STUB: ident → ack+param "
+                    "(payload_size=%u)\n", romload.payload_size);
+            romload.state = ROM_IDLE;
+        } else if (b == 0x77) {
+            /* <w block: 8 hdr-cont (idx, num+1, sz_msb, sz_lsb, addr×4)
+             * + payload_size data bytes still to read */
+            romload.state  = ROM_BLOCK_DATA;
+            romload.needed = 8 + romload.payload_size;
+        } else if (b == 0x63) {
+            romload.state  = ROM_CHK_DATA;
+            romload.needed = 1;
+        } else if (b == 0x62) {
+            romload.state  = ROM_BR_DATA;
+            romload.needed = 4;
+        } else {
+            /* unknown command — discard and resync */
+            romload.state = ROM_IDLE;
+        }
+        return true;
+    }
+
+    case ROM_BLOCK_DATA:
+        if (--romload.needed == 0) {
+            uint8_t ack[2] = { 0x3e, 0x77 };  /* >w */
+            qemu_chr_fe_write_all(&s->chr, ack, sizeof(ack));
+            romload.state = ROM_IDLE;
+        }
+        return true;
+
+    case ROM_CHK_DATA:
+        if (--romload.needed == 0) {
+            /* osmocon's handle_read_romload sets buf_used_len=3 in
+             * WAITING_CHECKSUM_ACK: it waits for ">c" + a trailing byte
+             * (used for the nack diagnostic). The 2-byte ack alone
+             * keeps it blocked. Echo the checksum byte we just got. */
+            uint8_t ack[3] = { 0x3e, 0x63, b };  /* >c <chk> */
+            qemu_chr_fe_write_all(&s->chr, ack, sizeof(ack));
+            fprintf(stderr, "[UART:modem] ROMLOAD STUB: checksum 0x%02x → ack\n",
+                    b);
+            romload.state = ROM_IDLE;
+        }
+        return true;
+
+    case ROM_BR_DATA:
+        if (--romload.needed == 0) {
+            uint8_t ack[2] = { 0x3e, 0x62 };  /* >b */
+            qemu_chr_fe_write_all(&s->chr, ack, sizeof(ack));
+            fprintf(stderr, "[UART:modem] ROMLOAD STUB: branch → ack — "
+                    "switching to sercomm passthrough\n");
+            romload.state = ROM_PASSTHROUGH;
+        }
+        return true;
+
+    case ROM_PASSTHROUGH:
+        return false;
+    }
+    return false;
+}
+
 int calypso_uart_can_receive(void *opaque)
 {
     CalypsoUARTState *s = (CalypsoUARTState *)opaque;
@@ -315,10 +442,26 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         return;
     }
 
-    /* Modem UART: parse sercomm and push every DLCI to the firmware
-     * UART RX FIFO (the firmware's own sercomm parser then dispatches
-     * by DLCI). TRXC is NOT handled here — bridge.py answers it
-     * locally on UDP 5701, QEMU never sees it. */
+    /* Modem UART: filter through the romloader stub first. While the
+     * stub is in handshake mode it eats every byte and replies on the
+     * same chardev to satisfy osmocon. Once branch ack has fired, the
+     * stub goes passthrough and the remaining bytes flow into the
+     * sercomm parser as before. */
+    if (s->label && !strcmp(s->label, "modem")) {
+        uint8_t passthrough[CALYPSO_UART_RX_FIFO_SIZE];
+        int     pt_len = 0;
+        for (int i = 0; i < size; i++) {
+            if (!romload_stub_eat(s, buf[i])) {
+                passthrough[pt_len++] = buf[i];
+            }
+        }
+        if (pt_len > 0) {
+            sercomm_gate_feed(s, passthrough, pt_len);
+        }
+        return;
+    }
+
+    /* Non-modem UARTs (irda is already handled above): pass directly. */
     sercomm_gate_feed(s, buf, size);
 
     if (s->rx_count > 0) {
@@ -571,9 +714,6 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
 
     case REG_MDR1:
         s->mdr1 = value;
-        /* MDR1 write is one of the earliest firmware UART accesses.
-         * Trigger firmware patches now (before any cons_puts call). */
-        calypso_fw_patch_apply();
         fprintf(stderr, "[UART:%s] MDR1=0x%02x\n",
                 s->label ? s->label : "?",
                 (unsigned)value);

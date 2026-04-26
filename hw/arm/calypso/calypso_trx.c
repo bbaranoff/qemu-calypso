@@ -15,6 +15,7 @@
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "hw/arm/calypso/calypso_sim.h"
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -54,15 +55,13 @@ typedef struct CalypsoTRX {
     uint16_t     ulpd_regs[CALYPSO_ULPD_SIZE / 2];
     uint32_t     ulpd_counter;
     MemoryRegion sim_iomem;
-    uint16_t     sim_regs[CALYPSO_SIM_SIZE / 2];
-    QEMUTimer   *sim_atr_timer;
+    CalypsoSim  *sim;
     QEMUTimer   *tdma_timer;
     QEMUTimer   *frame_irq_timer;
     QEMUTimer   *dsp_timer;
     uint32_t     fn;
     bool         tdma_running;
     uint8_t      sync_bsic;
-    bool         fw_patched;
 
     /* C54x DSP emulator */
     C54xState   *dsp;
@@ -75,34 +74,35 @@ typedef struct CalypsoTRX {
 
 static CalypsoTRX *g_trx;
 
-/* ---- FW patches ---- */
-static void calypso_fw_patch(CalypsoTRX *s)
-{
-    if (s->fw_patched) return;
-    s->fw_patched = true;
-    uint32_t val, bx_lr = 0xe12fff1e, nop = 0xe1a00000;
-    cpu_physical_memory_read(0x0082a1b0, &val, 4);
-    if (val && val != bx_lr) { cpu_physical_memory_write(0x0082a1b0, &bx_lr, 4); TRX_LOG("FW: cons_puts nop"); }
-    cpu_physical_memory_read(0x00829ea0, &val, 4);
-    if (val && val != bx_lr) { cpu_physical_memory_write(0x00829ea0, &bx_lr, 4); TRX_LOG("FW: puts nop"); }
-    static const hwaddr bl[] = {0x828914,0x828828,0x828830,0x828858,0x828880};
-    for (int i = 0; i < 5; i++) {
-        cpu_physical_memory_read(bl[i], &val, 4);
-        if ((val & 0x0F000000) == 0x0B000000) { cpu_physical_memory_write(bl[i], &nop, 4); TRX_LOG("FW: NOP @0x%lx", (unsigned long)bl[i]); }
-    }
-    cpu_physical_memory_read(0x0082c33c, &val, 4);
-    if (val == 0xe3530020) { uint32_t v = 0xe3530094; cpu_physical_memory_write(0x0082c33c, &v, 4); TRX_LOG("FW: talloc 32->148"); }
-    cpu_physical_memory_read(0x0082c350, &val, 4);
-    if (val == 0xeafffffe) { uint32_t p[2] = {0xe121f008, 0xeaffffdf}; cpu_physical_memory_write(0x0082c34c, p, 8); TRX_LOG("FW: talloc retry"); }
-    cpu_physical_memory_read(0x00821f98, &val, 4);
-    if (val == 0xeafffffe) { uint32_t v = 0xe321f000; cpu_physical_memory_write(0x00821f94, &v, 4); TRX_LOG("FW: abort irqs"); }
-    /* sim_handler (0x0082266c) blocks the main loop waiting for SIM
-     * responses that never come in our emulation. Patch it to return
-     * immediately (BX LR) so l1a_l23_handler() can process L1CTL. */
-    cpu_physical_memory_read(0x0082266c, &val, 4);
-    if (val && val != bx_lr) { cpu_physical_memory_write(0x0082266c, &bx_lr, 4); TRX_LOG("FW: sim_handler nop"); }
-}
-void calypso_fw_patch_apply(void) { if (g_trx) calypso_fw_patch(g_trx); }
+/* All firmware patches removed — verified that the layer1.highram.elf
+ * runs unmodified against the current QEMU emulation (PM scan, FBSB,
+ * RESET cycle stable for >1 minute with NO patches applied).
+ *
+ * History — patches removed and why each was actually unnecessary:
+ *   cons_puts NOP (0x82a1b0)  : function has a UART fall-through path
+ *                                taken when its LCD ctx flag is 0 (the
+ *                                default). printf_buffer is filled by
+ *                                vsnprintf upstream and read by the
+ *                                fw_console poller in fw_console.c.
+ *   puts NOP (0x829ea0)        : puts is a one-instruction tail call to
+ *                                sercomm_puts; it was never broken.
+ *   5x BL NOP in frame_irq     : these are bl printf / bl puts calls
+ *                                that became safe once cons_puts/puts
+ *                                were left alone.
+ *   talloc pool 32->148        : pool exhaustion never observed in the
+ *                                current run profile.
+ *   talloc retry loop          : same — never reached.
+ *   abort_irqs inf-loop fixup  : handle_abort never entered with the
+ *                                IRQ controller fixes from earlier
+ *                                sessions.
+ *   sim_handler -> BX LR       : l1a_l23_handler progresses through SIM
+ *                                polling without blocking under the
+ *                                current SIM register stub responses.
+ *
+ * If any of these regress, look first at the underlying QEMU subsystem
+ * (LCD MMIO, talloc memory pool, IRQ controller, SIM stub) rather than
+ * re-introducing a firmware patch.
+ */
 
 uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
 
@@ -138,6 +138,24 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
 
+    /* Mirror to DSP s->data[] so prog_fetch in OVLY mode sees ARM writes
+     * to the shared API/DARAM region. On real silicon dsp_ram and the DSP
+     * DARAM share one physical memory; without this mirror, ARM writes
+     * land in dsp_ram only and the DSP executes the stale (boot-time
+     * MVPD-copied) value via prog_fetch. */
+    if (s->dsp) {
+        uint16_t dsp_word = offset/2 + 0x0800;
+        if (size == 2) {
+            s->dsp->data[dsp_word] = (uint16_t)value;
+        } else if (size == 4) {
+            s->dsp->data[dsp_word]     = (uint16_t)value;
+            s->dsp->data[dsp_word + 1] = (uint16_t)(value >> 16);
+        }
+        /* size==1 byte: skip — sub-word writes to DSP data are unusual
+         * and would need careful endianness handling; falls back to the
+         * dsp_ram-only path which is fine for the sub-word case. */
+    }
+
     /* Debug: log task-related writes to write pages (d_task_d/u/md/ra) */
     if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
          offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
@@ -146,6 +164,27 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         if (++wp_log <= 100)
             TRX_LOG("DSP WR [0x%04x] = 0x%04x (sz=%d) fn=%u",
                     (unsigned)offset, (unsigned)value, size, s->fn);
+    }
+
+    /* DSP bootloader mailbox writes (osmocom-bb dsp.c BL_*).
+     * ARM byte → DSP word mapping (api_ram[w] ↔ ARM byte w*2):
+     *   ARM 0x0FF8 BL_ADDR_HI    ↔ DSP word 0x0FFC
+     *   ARM 0x0FFA BL_SIZE       ↔ DSP word 0x0FFD
+     *   ARM 0x0FFC BL_ADDR_LO    ↔ DSP word 0x0FFE  (BACC target)
+     *   ARM 0x0FFE BL_CMD_STATUS ↔ DSP word 0x0FFF  (poll value)
+     * Trace every write so we can confirm the handshake actually reaches
+     * the cells the bootloader at PROM0 0xb41c-0xb430 reads. */
+    if (offset == 0x0FF8 || offset == 0x0FFA ||
+        offset == 0x0FFC || offset == 0x0FFE) {
+        const char *name = (offset == 0x0FF8) ? "BL_ADDR_HI"   :
+                           (offset == 0x0FFA) ? "BL_SIZE"      :
+                           (offset == 0x0FFC) ? "BL_ADDR_LO"   :
+                                                "BL_CMD_STATUS";
+        static unsigned bl_log;
+        if (++bl_log <= 200)
+            TRX_LOG("BL ARM WR %s [arm=0x%04x dsp_word=0x%04x] = 0x%04x sz=%d fn=%u",
+                    name, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                    (unsigned)value, size, s->fn);
     }
 
     /* Log task writes for debugging — no interception, no faking.
@@ -320,6 +359,14 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
          * before the write page was fully populated. */
         calypso_dsp_done(s);
     }
+    if (off==TPU_INT_CTRL) {
+        static int ictrl_log = 0;
+        if (++ictrl_log <= 30)
+            TRX_LOG("INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u",
+                    (unsigned)val,
+                    !!(val&ICTRL_MCU_FRAME), !!(val&ICTRL_DSP_FRAME),
+                    !!(val&ICTRL_DSP_FRAME_FORCE), s->fn);
+    }
     if (off==TPU_INT_CTRL && !(val&ICTRL_MCU_FRAME) && !s->tdma_running) calypso_tdma_start(s);
     if (off==TPU_IT_DSP_PG) s->dsp_page=val&1;
 }
@@ -346,14 +393,24 @@ static uint64_t calypso_ulpd_read(void *o,hwaddr off,unsigned sz){
 static void calypso_ulpd_write(void *o,hwaddr off,uint64_t v,unsigned sz){CalypsoTRX*s=o;if(off>=0x20&&off<=0x40)return;if(off/2<CALYPSO_ULPD_SIZE/2)s->ulpd_regs[off/2]=v;}
 static const MemoryRegionOps calypso_ulpd_ops={.read=calypso_ulpd_read,.write=calypso_ulpd_write,.endianness=DEVICE_LITTLE_ENDIAN,.valid={.min_access_size=1,.max_access_size=2},.impl={.min_access_size=1,.max_access_size=2},};
 
-/* ---- SIM ---- */
-#define SIM_IT 0x08
-#define SIM_STAT 0x02
-#define SIM_MASKIT 0x0E
-static void calypso_sim_atr_cb(void *opaque){CalypsoTRX*s=opaque;uint32_t v=1;cpu_physical_memory_write(0x00830510,&v,4);s->sim_regs[SIM_IT/2]|=1;s->sim_regs[SIM_STAT/2]=1;TRX_LOG("SIM ATR");qemu_irq_pulse(s->irqs[CALYPSO_IRQ_SIM]);}
-static uint64_t calypso_sim_read(void *o,hwaddr off,unsigned sz){CalypsoTRX*s=o;uint16_t v=(off/2<CALYPSO_SIM_SIZE/2)?s->sim_regs[off/2]:0;if(off==SIM_IT)s->sim_regs[SIM_IT/2]=0;return v;}
-static void calypso_sim_write(void *o,hwaddr off,uint64_t v,unsigned sz){CalypsoTRX*s=o;if(off/2<CALYPSO_SIM_SIZE/2)s->sim_regs[off/2]=v;if(off==SIM_MASKIT)timer_mod_ns(s->sim_atr_timer,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+50000);}
-static const MemoryRegionOps calypso_sim_ops={.read=calypso_sim_read,.write=calypso_sim_write,.endianness=DEVICE_LITTLE_ENDIAN,.valid={.min_access_size=1,.max_access_size=4},.impl={.min_access_size=1,.max_access_size=4},};
+/* ---- SIM (forwarded to calypso_sim.c) ---- */
+static uint64_t calypso_sim_read(void *o, hwaddr off, unsigned sz)
+{
+    CalypsoTRX *s = o;
+    return calypso_sim_reg_read(s->sim, off);
+}
+static void calypso_sim_write(void *o, hwaddr off, uint64_t v, unsigned sz)
+{
+    CalypsoTRX *s = o;
+    calypso_sim_reg_write(s->sim, off, (uint16_t)v);
+}
+static const MemoryRegionOps calypso_sim_ops = {
+    .read = calypso_sim_read,
+    .write = calypso_sim_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+};
 
 /* ---- TDMA ---- */
 static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->irqs[CALYPSO_IRQ_TPU_FRAME]);}
@@ -398,14 +455,29 @@ static void calypso_tdma_tick(void *opaque) {
      * in l1s_compl() which runs in the IRQ4 handler AFTER this tick). */
 
     /* ── 4. DSP frame interrupt ──
-     * Send INT3 only when firmware requests it via TPU_CTRL_DSP_EN.
-     * Sending INT3 every frame causes stack overflow (CALLD loop). */
-    if (s->dsp && s->dsp->running && s->dsp_init_done) {
+     * Three conditions for periodic INT3 fire:
+     *   - INT_CTRL.ICTRL_DSP_FRAME (bit 2) = persistent enable at TPU,
+     *     polarity INVERTED (bit clear = enabled).
+     *   - DSP IMR bit 3 (C54X_INT_FRAME_BIT) = mask enable at DSP.
+     *     Empirically: firing INT3 while IMR bit 3 = 0 perturbs the
+     *     firmware boot path (DSP wakes from IDLE without expecting it,
+     *     takes wrong code path, never reaches IMR-init at PC=0x0810,
+     *     dead-locks). Respecting IMR matches the "hardware INT line
+     *     gated by IMR" model used on Calypso.
+     *   - TPU_CTRL.DSP_EN (bit 4) = one-shot force, alternative path.
+     *     Bypasses IMR (explicit hardware override). */
+    if (s->dsp && s->dsp->running) {
         bool was_idle = s->dsp->idle;
 
-        if (s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN) {
+        bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
+        bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
+        bool periodic_armed = tpu_armed && imr_armed;
+        bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
+        if (periodic_armed || force_pulse) {
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-            s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
+            if (force_pulse)
+                s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
+            /* periodic_armed: do NOT clear — hardware-persistent enable. */
         }
 
         /* ── 5. Run DSP ── */
@@ -587,9 +659,9 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     memory_region_add_subregion(sysmem,CALYPSO_TSP_BASE,&s->tsp_iomem);
     memory_region_init_io(&s->ulpd_iomem,NULL,&calypso_ulpd_ops,s,"calypso.ulpd",CALYPSO_ULPD_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_ULPD_BASE,&s->ulpd_iomem);
+    s->sim = calypso_sim_new(s->irqs[CALYPSO_IRQ_SIM]);
     memory_region_init_io(&s->sim_iomem,NULL,&calypso_sim_ops,s,"calypso.sim",CALYPSO_SIM_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_SIM_BASE,&s->sim_iomem);
-    s->sim_atr_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_sim_atr_cb,s);
 
     s->tdma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_tdma_tick,s);
     s->dsp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_dsp_done,s);

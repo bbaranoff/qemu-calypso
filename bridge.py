@@ -16,6 +16,7 @@ import errno, os, select, signal, socket, struct, sys, time
 
 GSM_HYPERFRAME = 2715648
 CLK_IND_PERIOD = 102
+CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000  # ~0.471 s real-time
 
 def udp_bind(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -72,28 +73,29 @@ class Bridge:
             print(f"bridge: QEMU tick #{self.stats['tick']} FN={self.fn}", flush=True)
 
     def maybe_send_clk(self):
-        """Send CLK IND to BTS every CLK_IND_PERIOD QEMU frames.
+        """Send CLK IND to BTS at WALL-CLOCK period (one CLK_IND_PERIOD
+        worth of GSM frames every ~471 ms wall-clock = 102 * 4.615 ms).
 
-        Decoupled from wall-clock: BTS's internal scheduler advances in
-        lockstep with QEMU's virtual time, so the FN embedded in each
-        downlink burst matches QEMU's current_fn when the burst arrives
-        (within normal lookahead). Without this, whenever QEMU emulation
-        is slower than real-time, BTS ticks ahead and every burst is
-        delta=+N with N growing linearly.
+        Earlier we drove CLK IND from QEMU FN advance, but osmo-bts-trx's
+        scheduler_trx.c monitors PC clock skew (real elapsed time between
+        CLK INDs vs the GSM time they advertise) and shuts down with
+        "PC clock skew too high" if QEMU runs slower than real-time.
+        Driving CLK IND from wall-clock keeps the BTS happy on the time
+        axis; the embedded FN still tracks QEMU so downlink bursts land
+        at the FN the BSP queue is matching against.
         """
         if not self.powered:
             return
-        if self.last_clk_fn is None:
-            advanced = CLK_IND_PERIOD  # force first CLK IND after POWERON
-        else:
-            advanced = (self.fn - self.last_clk_fn) % GSM_HYPERFRAME
-            if advanced > GSM_HYPERFRAME // 2:
-                # Going backward across hyperframe wrap — wait for wrap
-                return
-        if advanced < CLK_IND_PERIOD:
+        now = time.monotonic()
+        if not hasattr(self, '_last_clk_wall'):
+            self._last_clk_wall = now - CLK_IND_WALL_S  # force first send
+        if now - self._last_clk_wall < CLK_IND_WALL_S:
             return
+        self._last_clk_wall += CLK_IND_WALL_S
+        # Catch up if we slipped a long time (avoid runaway send burst)
+        if now - self._last_clk_wall > CLK_IND_WALL_S * 4:
+            self._last_clk_wall = now
         clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
-        self.last_clk_fn = clk_fn
         try:
             self.clk_sock.sendto(
                 f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
@@ -142,13 +144,14 @@ class Bridge:
         tn = data[0] & 0x07
         bts_fn = int.from_bytes(data[1:5], 'big')
 
-        # Re-anchor: BTS counts FN from 0 starting at POWERON, but QEMU had
-        # already advanced. Shift every BTS-tagged burst by fn_anchor so the
-        # BSP sees bursts aligned with QEMU's timeline.
-        if self.anchored:
-            fn = (bts_fn + self.fn_anchor) % GSM_HYPERFRAME
-        else:
-            fn = bts_fn
+        # osmo-bts-trx maintains its own continuous FN (wall-clock based)
+        # and locks onto our CLK_IND stream — so bts_fn is already on
+        # QEMU's timeline. The earlier "BTS counts from 0 at POWERON"
+        # assumption was wrong: it caused a constant +fn_anchor offset
+        # (~800 frames) that pushed every burst ~3.5 s into the future
+        # and starved the BSP match window (±4) → 0 bursts written.
+        # fn_anchor is now logged for telemetry only.
+        fn = bts_fn
 
         # Log burst content: first 8 data bytes + check if FB (all zeros)
         hdr_bytes = data[:8] if len(data) >= 8 else data

@@ -38,7 +38,17 @@ static int iota_pending_count(void)
 static void iota_pending_push(uint8_t tn)
 {
     if (iota_pending_count() >= IOTA_PENDING_MAX - 1) {
-        IOTA_LOG("WARN pending queue full, dropping oldest");
+        /* Saturation: BSP isn't consuming pulses fast enough (typically
+         * the DSP is stalled and the TDMA tick can't advance fn far enough
+         * to match queued bursts in calypso_bsp_deliver_buffered).
+         * Rate-limit the warning so it doesn't drown the log: first 5,
+         * then every 1000th drop, plus a periodic count summary. */
+        static uint64_t drops;
+        drops++;
+        if (drops <= 5 || (drops % 1000) == 0) {
+            IOTA_LOG("WARN pending queue full, dropping oldest "
+                     "(drops=%llu)", (unsigned long long)drops);
+        }
         iota.pending_head = (iota.pending_head + 1) % IOTA_PENDING_MAX;
     }
     iota.pending_tn[iota.pending_tail] = tn;

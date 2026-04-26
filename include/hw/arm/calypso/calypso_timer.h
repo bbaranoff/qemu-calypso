@@ -27,10 +27,11 @@ struct CalypsoTimerState {
     qemu_irq     irq;
 
     uint16_t load;        /* Reload value */
-    uint16_t count;       /* Current counter */
-    uint16_t ctrl;        /* Control: bit0=start, bit1=auto-reload, bit2=irq-en */
+    uint16_t count;       /* Current counter (frozen value, only used when stopped) */
+    uint16_t ctrl;        /* CNTL byte (firmware layout) */
     uint16_t prescaler;
     int64_t  tick_ns;     /* Nanoseconds per tick */
+    int64_t  epoch_ns;    /* Virtual time when count==load (lazy compute) */
     bool     running;
 };
 
