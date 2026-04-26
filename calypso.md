@@ -1,7 +1,7 @@
 ● Cartographie qemu-calypso — état post-session 2026-04-26                                                                                                                                                                                              
                                                                                                                                                                                                                                                         
-  1. Architecture pipeline complet                                                                                                                                                                                                                      
-                                                                                                                                                                                                                                                        
+  1. Architecture pipeline complet
+```mermaid                                                                                                                                                                                                                                                      
   flowchart TB                                                                                                                                                                                                                                          
       subgraph Container [Docker container 'trying']                                                                                                                                                                                                    
           subgraph QEMU [QEMU emulation]                                                                                                                                                                                                                
@@ -39,11 +39,12 @@
       style BTS fill:#9f9,color:#000                        
       style MOBILE fill:#9f9,color:#000                                                                                                                                                                                                                 
       style OSMOCON fill:#9f9,color:#000                                                                                                                                                                                                                
-   
+  ```
+ 
   Vert = fonctionnel. Orange = fonctionnel mais piégé en init loop sans le hack.                                                                                                                                                                        
                                                             
   2. Séquence de boot — état actuel avec hack                                                                                                                                                                                                           
-                                                            
+```mermaid                                                            
   sequenceDiagram                                                                                                                                                                                                                                       
       participant ARM                                       
       participant Mailbox as API RAM<br/>(BL_*, NDB)
@@ -83,6 +84,7 @@
       DSP-xDSP: PC=0x2FA5 (zone non chargée → NOP slide)                                                                                                                                                                                                
       DSP-xMailbox: vec IRQ → 0x0000-0x007F = stubs FRET<br/>(ISR vide → INTM stay 1)                                                                                                                                                                   
       end                                                                                                                                                                                                                                               
+```
                                                                                                                                                                                                                                                         
   3. Carte DSP memory + état des zones                                                                                                                                                                                                                  
                                          
