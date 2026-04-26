@@ -1,46 +1,46 @@
 ● Cartographie qemu-calypso — état post-session 2026-04-26                                                                                                                                                                                              
                                                                                                                                                                                                                                                         
   1. Architecture pipeline complet
-```mermaid                                                                                                                                                                                                                                                      
-  flowchart TB                                                                                                                                                                                                                                          
-      subgraph Container [Docker container trying]                                                                                                                                                                                                    
-          subgraph QEMU [QEMU emulation]                                                                                                                                                                                                                
-              ARM[ARM7TDMI<br/>layer1.highram.elf]                                                                                                                                                                                                      
-              DSP[TMS320C54x<br/>real ROM]                                                                                                                                                                                                              
-              APIRAM[(API RAM<br/>0x0800-0x27FF<br/>shared)]                                                                                                                                                                                            
-              BSP[BSP UDP RX<br/>port 6702]                                                                                                                                                                                                             
-              TPU[TPU + INT_CTRL<br/>+ TDMA tick]                                                                                                                                                                                                       
-              INTH[INTH<br/>IRQ ctrl]                                                                                                                                                                                                                   
-              ARM <--> APIRAM                                                                                                                                                                                                                           
-              DSP <--> APIRAM                                                                                                                                                                                                                           
-              ARM --> TPU                                                                                                                                                                                                                               
-              TPU --> DSP                                                                                                                                                                                                                               
-              BSP --> DSP                                   
-              ARM --> INTH                                                                                                                                                                                                                              
-          end
-          BRIDGE[bridge.py<br/>clock-slave]                                                                                                                                                                                                             
-          BTS[osmo-bts-trx]                                                                                                                                                                                                                             
-          MOBILE[mobile<br/>L23]                                                                                                                                                                                                                        
-          OSMOCON[osmocon<br/>romload]                                                                                                                                                                                                                  
-      end                                                                                                                                                                                                                                               
-                                                            
-      BTS -->|UDP 5702 DL| BRIDGE                                                                                                                                                                                                                       
-      BRIDGE -->|UDP 6702 TRXDv0| BSP                       
-      BRIDGE -->|UDP 5700 CLK IND| BTS                                                                                                                                                                                                                  
-      OSMOCON -->|PTY firmware| ARM                                                                                                                                                                                                                     
-      ARM -->|PTY L1CTL| MOBILE                                                                                                                                                                                                                         
-                                                                                                                                                                                                                                                        
-      style ARM fill:#9f9,color:#000                                                                                                                                                                                                                    
-      style DSP fill:#fa9,color:#000                        
-      style APIRAM fill:#9ff,color:#000                                                                                                                                                                                                                 
-      style BSP fill:#9f9,color:#000                                                                                                                                                                                                                    
-      style TPU fill:#9f9,color:#000
-      style BRIDGE fill:#9f9,color:#000                                                                                                                                                                                                                 
-      style BTS fill:#9f9,color:#000                        
-      style MOBILE fill:#9f9,color:#000                                                                                                                                                                                                                 
-      style OSMOCON fill:#9f9,color:#000                                                                                                                                                                                                                
-  ```
- 
+```mermaid
+flowchart TB
+    subgraph Container ["Docker container trying"]
+        subgraph QEMU ["QEMU emulation"]
+            ARM[ARM7TDMI<br/>layer1.highram.elf]
+            DSP[TMS320C54x<br/>real ROM]
+            APIRAM[(API RAM<br/>0x0800-0x27FF<br/>shared)]
+            BSP[BSP UDP RX<br/>port 6702]
+            TPU[TPU + INT_CTRL<br/>+ TDMA tick]
+            INTH[INTH<br/>IRQ ctrl]
+            ARM <--> APIRAM
+            DSP <--> APIRAM
+            ARM --> TPU
+            TPU --> DSP
+            BSP --> DSP
+            ARM --> INTH
+        end
+        BRIDGE[bridge.py<br/>clock-slave]
+        BTS[osmo-bts-trx]
+        MOBILE[mobile<br/>L23]
+        OSMOCON[osmocon<br/>romload]
+    end
+
+    BTS -->|UDP 5702 DL| BRIDGE
+    BRIDGE -->|UDP 6702 TRXDv0| BSP
+    BRIDGE -->|UDP 5700 CLK IND| BTS
+    OSMOCON -->|PTY firmware| ARM
+    ARM -->|PTY L1CTL| MOBILE
+
+    style ARM fill:#9f9,color:#000
+    style DSP fill:#fa9,color:#000
+    style APIRAM fill:#9ff,color:#000
+    style BSP fill:#9f9,color:#000
+    style TPU fill:#9f9,color:#000
+    style BRIDGE fill:#9f9,color:#000
+    style BTS fill:#9f9,color:#000
+    style MOBILE fill:#9f9,color:#000
+    style OSMOCON fill:#9f9,color:#000
+```
+
   Vert = fonctionnel. Orange = fonctionnel mais piégé en init loop sans le hack.                                                                                                                                                                        
                                                             
   2. Séquence de boot — état actuel avec hack                                                                                                                                                                                                           
