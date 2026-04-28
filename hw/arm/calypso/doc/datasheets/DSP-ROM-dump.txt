@@ -1,0 +1,29 @@
+A pair of little ad hoc programs has been been added to FreeCalypso host tools
+for the purpose of dumping the Calypso chip's internal DSP mask ROM.  These two
+programs are the dspdump target utility (see Target-utils) and the fc-dspromdump
+front end host tool built in the loadtools suite.  This addition is being
+documented here for the sake of completeness, but it is not expected that anyone
+will ever need to use these DSP ROM dump tools.  Instead our fc-dspromdump tool
+was written so it could be run exactly 3 times:
+
+* Our new tool was run once against a common DSP 3606 target to verify that it
+  produces exactly the same output as the old tool implemented a decade ago by
+  our political rivals over at OsmocomBB, the dsp-rom-3606-dump.txt output that
+  has been published on our FTP site since 2017.  The test result is yes, our
+  new tool produces exactly the same dump output when run against the same DSP
+  ROM version.
+
+* Our fc-dspromdump tool was then run two more times against less common DSP ROM
+  versions: it was run on a D-Sample C05 board and an FCDEV3B-751774 board,
+  producing our newly published dumps of Calypso DSP ROM versions 3311 and 3416,
+  respectively.
+
+We have now collected and published all 3 DSP ROM versions that are known to
+have been featured in the evolutionary history of our beloved Calypso chip:
+3311, 3416 and 3606.  Because our target-utils and loadtools frameworks are
+quite specific to Calypso and there are no other Calypso DSP ROM versions
+besides the 3 which we've already collected and published, it is unlikely that
+anyone else will need to run our DSP ROM dump tools as they stand.  But if
+anyone is interested in exploring some other TI DBB chips that came before or
+after Calypso and is prepared to do the necessary work, our DSP ROM dump tools
+might have some use as a starting point.

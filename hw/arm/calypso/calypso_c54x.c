@@ -4571,11 +4571,17 @@ void c54x_reset(C54xState *s)
     s->a = 0; s->b = 0;
     memset(s->ar, 0, sizeof(s->ar));
     s->t = 0; s->trn = 0;
-    s->sp = 0x5AC8; s->bk = 0;  /* SP init per Calypso boot ROM */
+    s->sp = 0x5AC8; s->bk = 0;  /* SP init per Calypso boot ROM
+                                 * NOTE: silicon dumps show SP=0x1100 post-handshake.
+                                 * 0x5AC8 is a shortcut anticipating osmocom firmware re-init.
+                                 * See doc/datasheets/README.md §3-4. */
     s->brc = 0; s->rsa = 0; s->rea = 0;
-    s->st0 = 0;
-    s->st1 = ST1_INTM;  /* interrupts disabled at reset */
-    s->pmst = 0xFFE0;   /* IPTR = 0x1FF, OVLY = 0 at reset */
+    /* MMR reset values aligned with Calypso silicon (3 FreeCalypso ROM dumps + local).
+     * Empirically validated 2026-04-28. See doc/datasheets/README.md §3.
+     * Previous QEMU values (st0=0, st1=ST1_INTM, pmst=0xFFE0) were partial. */
+    s->st0  = 0x181F;                              /* DP=0x01F per silicon */
+    s->st1  = ST1_INTM | ST1_SXM | ST1_XF;         /* 0x2900: INTM=1, SXM=1, XF=1 */
+    s->pmst = 0xFFA8;                              /* IPTR=0x1FF, MP_MC=1, OVLY=1, DROM=1 */
     s->imr = 0;
     s->ifr = 0;
     s->xpc = 0;
