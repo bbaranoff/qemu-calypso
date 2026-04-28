@@ -995,6 +995,270 @@ static int c54x_exec_one(C54xState *s)
             s->idle = true;
             return 0;
         }
+        /* ================================================================
+         * F[4-7]xx generic accumulator family — promoted from F4 block
+         * to handle F5/F6/F7 variants. Handlers use bits 8/9 for src/dst,
+         * with masks FCE0/FCFF/FEFF naturally covering all 4 combinations
+         * (A->A, B->A, A->B, B->B). The matching handler bodies remain
+         * inside the F4 block as dead code (never reached for arith ops
+         * because of the early return here). 2026-04-28.
+         * ================================================================ */
+            /* F483/F583: SAT src (mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF483) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t val = sext40(*acc);
+                if (val > 0x7FFFFFFFLL) *acc = sext40(0x7FFFFFFFLL);
+                else if (val < -0x80000000LL) *acc = sext40(-0x80000000LL);
+                return consumed + s->lk_used;
+            }
+
+            /* F484/F584: NEG src[,dst] (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF484) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t val = sext40(src ? s->b : s->a);
+                if (dst) s->b = sext40(-val); else s->a = sext40(-val);
+                return consumed + s->lk_used;
+            }
+
+            /* F485/F585: ABS src[,dst] (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF485) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t val = sext40(src ? s->b : s->a);
+                if (val < 0) val = -val;
+                if (dst) s->b = sext40(val); else s->a = sext40(val);
+                return consumed + s->lk_used;
+            }
+
+            /* F48C/F58C: MPYA dst (mask FEFF, 1 word)
+             * Multiply T * A(high), accumulate into dst */
+            if ((op & 0xFEFF) == 0xF48C) {
+                int dst = (op >> 8) & 1;
+                int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)((s->a >> 16) & 0xFFFF);
+                if (s->st1 & ST1_FRCT) prod <<= 1;
+                if (dst) s->b = sext40(s->b + prod); else s->a = sext40(s->a + prod);
+                return consumed + s->lk_used;
+            }
+
+            /* F48D/F58D: SQUR A,dst (mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF48D) {
+                int dst = (op >> 8) & 1;
+                int16_t ah = (int16_t)((s->a >> 16) & 0xFFFF);
+                int64_t prod = (int64_t)ah * (int64_t)ah;
+                if (s->st1 & ST1_FRCT) prod <<= 1;
+                if (dst) s->b = sext40(prod); else s->a = sext40(prod);
+                return consumed + s->lk_used;
+            }
+
+            /* F48E/F58E: EXP src (mask FEFF, 1 word)
+             * Count leading sign bits of accumulator, store in T */
+            if ((op & 0xFEFF) == 0xF48E) {
+                int src = (op >> 8) & 1;
+                int64_t val = sext40(src ? s->b : s->a);
+                int exp = 0;
+                if (val == 0 || val == -1) { exp = 31; }
+                else {
+                    uint64_t uv = (val < 0) ? ~val : val;
+                    uv &= 0xFFFFFFFFFFULL;
+                    /* Count leading zeros from bit 38 down */
+                    for (int i = 38; i >= 0; i--) {
+                        if (uv & (1ULL << i)) break;
+                        exp++;
+                    }
+                    exp -= 8; /* EXP = leading sign bits - 8 */
+                }
+                s->t = (uint16_t)(int16_t)exp;
+                return consumed + s->lk_used;
+            }
+
+            /* F492/F592: MAX src (mask FEFF, 1 word) — keep max of A,B */
+            if ((op & 0xFEFF) == 0xF492) {
+                int64_t sa = sext40(s->a), sb = sext40(s->b);
+                if (sa < sb) { s->a = s->b; s->st0 |= ST0_C; }
+                else { s->st0 &= ~ST0_C; }
+                return consumed + s->lk_used;
+            }
+
+            /* F493/F593: MIN src (mask FEFF, 1 word) — keep min of A,B */
+            if ((op & 0xFEFF) == 0xF493) {
+                int64_t sa = sext40(s->a), sb = sext40(s->b);
+                if (sa > sb) { s->a = s->b; s->st0 |= ST0_C; }
+                else { s->st0 &= ~ST0_C; }
+                return consumed + s->lk_used;
+            }
+
+            /* F49E/F59E: SUBC src (mask FEFF, 1 word) — conditional subtract for division */
+            if ((op & 0xFEFF) == 0xF49E) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t val = sext40(*acc);
+                if (val >= 0) { *acc = sext40((val << 1) + 1); }
+                else { *acc = sext40(val << 1); }
+                return consumed + s->lk_used;
+            }
+
+            /* F48F/F58F: NORM src[, dst] (mask FEFF, 1 word)
+             * Per SPRU172C p.4-118: if the two MSBs of src accumulator
+             * are different (not sign-extended), shift src left by 1
+             * and decrement T. Otherwise do nothing. Used by the FB-det
+             * correlator to normalize results; the loop exits when
+             * NORM stops shifting (MSBs match = value is normalized). */
+            if ((op & 0xFEFF) == 0xF48F) {
+                int src = (op >> 8) & 1;
+                int64_t val = sext40(src ? s->b : s->a);
+                /* Check bits 39 and 38 — if they differ, shift left */
+                int bit39 = (val >> 39) & 1;
+                int bit38 = (val >> 38) & 1;
+                if (bit39 != bit38) {
+                    val = sext40(val << 1);
+                    if (src) s->b = val; else s->a = val;
+                    s->t = (uint16_t)(s->t - 1);
+                }
+                /* TC flag: set if shift occurred */
+                if (bit39 != bit38)
+                    s->st0 |= ST0_TC;
+                else
+                    s->st0 &= ~ST0_TC;
+                return consumed + s->lk_used;
+            }
+
+            /* F490/F590: ROR src (mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF490) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                uint16_t c = (s->st0 >> 8) & 1; /* carry */
+                uint16_t lsb = *acc & 1;
+                *acc = sext40(((uint64_t)(*acc & 0xFFFFFFFFFFULL) >> 1) | ((uint64_t)c << 39));
+                if (lsb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
+                return consumed + s->lk_used;
+            }
+
+            /* F491/F591: ROL src (mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF491) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                uint16_t c = (s->st0 >> 8) & 1;
+                uint16_t msb = (*acc >> 39) & 1;
+                *acc = sext40(((*acc << 1) & 0xFFFFFFFFFFULL) | c);
+                if (msb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
+                return consumed + s->lk_used;
+            }
+
+            /* F488/F588: MACA T,src[,dst] (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF488) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)((src ? s->b : s->a) >> 16);
+                if (s->st1 & ST1_FRCT) prod <<= 1;
+                if (dst) s->b = sext40(s->b + prod); else s->a = sext40(s->a + prod);
+                return consumed + s->lk_used;
+            }
+
+            /* F486/F586: CMPL src (complement, mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF486) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                *acc = sext40(~(*acc) & 0xFFFFFFFFFFULL);
+                return consumed + s->lk_used;
+            }
+
+            /* F487/F587: RND src (round, mask FEFF, 1 word) */
+            if ((op & 0xFEFF) == 0xF487) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                *acc = sext40(*acc + 0x8000);
+                return consumed + s->lk_used;
+            }
+
+            /* F480/F580: ADD src,ASM,dst (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF480) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (dst) s->b = sext40(s->b + sv); else s->a = sext40(s->a + sv);
+                return consumed + s->lk_used;
+            }
+
+            /* F481/F581: SUB src,ASM,dst (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF481) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (dst) s->b = sext40(s->b - sv); else s->a = sext40(s->a - sv);
+                return consumed + s->lk_used;
+            }
+
+            /* F482/F582: LD src,ASM,dst (mask FCFF, 1 word) */
+            if ((op & 0xFCFF) == 0xF482) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (dst) s->b = sext40(sv); else s->a = sext40(sv);
+                return consumed + s->lk_used;
+            }
+
+            /* F4xx accumulator shift/load (1-word, mask FCE0):
+             * F400: ADD src,shift,dst  F420: SUB  F440: LD  F460: SFTA */
+            if ((op & 0xFCE0) == 0xF400) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (shift >= 0) sv <<= shift; else sv >>= (-shift);
+                if (dst) s->b = sext40(s->b + sv); else s->a = sext40(s->a + sv);
+                return consumed + s->lk_used;
+            }
+
+            if ((op & 0xFCE0) == 0xF420) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (shift >= 0) sv <<= shift; else sv >>= (-shift);
+                if (dst) s->b = sext40(s->b - sv); else s->a = sext40(s->a - sv);
+                return consumed + s->lk_used;
+            }
+
+            if ((op & 0xFCE0) == 0xF440) {
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (shift >= 0) sv <<= shift; else sv >>= (-shift);
+                if (dst) s->b = sext40(sv); else s->a = sext40(sv);
+                return consumed + s->lk_used;
+            }
+
+            if ((op & 0xFCE0) == 0xF460) {
+                /* SFTA src,shift,dst — arithmetic shift accumulator */
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                int64_t sv = sext40(src ? s->b : s->a);
+                if (shift >= 0) sv <<= shift; else sv >>= (-shift);
+                if (dst) s->b = sext40(sv); else s->a = sext40(sv);
+                return consumed + s->lk_used;
+            }
+
+            if ((op & 0xFCE0) == 0xF4A0) {
+                /* SFTL src,shift,dst — logical shift accumulator */
+                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
+                if (shift >= 0) uv <<= shift; else uv >>= (-shift);
+                uv &= 0xFFFFFFFFFFULL;
+                if (dst) s->b = sext40(uv); else s->a = sext40(uv);
+                return consumed + s->lk_used;
+            }
+
+        /* F494/F594: SFTC src (mask FEFF, 1 word).
+         * Per SPRU172C p.4-264: shift src left by 1 if src(31)==src(30)
+         * and src!=0. Used by FB-det normalisation around PC=0x10e5..0x10f4
+         * — without it the correlator sums never normalise. */
+        if ((op & 0xFEFF) == 0xF494) {
+            int src = (op >> 8) & 1;
+            int64_t *acc = src ? &s->b : &s->a;
+            int64_t val = sext40(*acc);
+            if (val != 0) {
+                int b31 = (val >> 31) & 1;
+                int b30 = (val >> 30) & 1;
+                if (b31 == b30) *acc = sext40(val << 1);
+            }
+            return consumed + s->lk_used;
+        }
+
         if (hi8 == 0xF4) {
             /* F4xx: unconditional branch/call and special instructions.
              * Some F4xx instructions are 1-word (FRET, FRETE, RETE, TRAP, NOP, etc.)
@@ -1848,6 +2112,33 @@ static int c54x_exec_one(C54xState *s)
             s->rpt_active = true;
             s->pc += 1;
             return 0;
+        }
+        /* DIAG: log F7xx executions before the (buggy) LD #k8 dispatch.
+         * Per tic54x-opc.c the F7xx range contains SSBX ST1 (0xF7Bx) and
+         * other instructions, NOT LD #k8 (which is at E800-E9FF).
+         * Caps at 5 per distinct sub-opcode to avoid spam. */
+        if (hi8 == 0xF7) {
+            static int f7xx_seen[256] = {0};
+            int sub_idx = op & 0xFF;
+            if (++f7xx_seen[sub_idx] <= 100 || (f7xx_seen[sub_idx] % 1000) == 0) {
+                C54_LOG("F7xx EXEC op=0x%04x PC=0x%04x XPC=%d insn=%u",
+                        op, s->pc, s->xpc, s->insn_count);
+            }
+        }
+        /* F7Bx: SSBX bit, ST1 (incl. SSBX INTM at F7BB).
+         * Per binutils tic54x-opc.c: opcode "ssbx" 0xF5B0 mask 0xFDF0,
+         * where bit 9 selects ST0 (0xF5Bx) vs ST1 (0xF7Bx).
+         * Symmetric counterpart of RSBX ST1 (F6Bx) handler above.
+         * MUST be tested before the F7xx LD #k8 dispatch (which is
+         * itself incorrect — per SPRU172C, LD #k8 lives at E800-E9FF). */
+        if ((op & 0xFFF0) == 0xF7B0) {
+            int bit = op & 0x0F;
+            bool is_intm = (bit == 11);
+            s->st1 |= (1 << bit);
+            if (is_intm)
+                C54_LOG("*** SSBX INTM (F7BB) *** PC=0x%04x ST1=0x%04x insn=%u",
+                        s->pc, s->st1, s->insn_count);
+            return consumed + s->lk_used;
         }
         /* F7xx: LD/ST #k to various registers */
         if (hi8 == 0xF7) {

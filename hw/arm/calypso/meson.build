@@ -11,4 +11,6 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: files(
   'l1ctl_sock.c',
   'sercomm_gate.c',
   'calypso_tint0.c',
+  'fw_console.c',
+  'calypso_sim.c',
 ))
