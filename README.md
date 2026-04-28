@@ -6,6 +6,39 @@ the [osmocom-bb](https://osmocom.org/projects/baseband/) `layer1.highram.elf` fi
 on the ARM side, with a Python bridge that connects to `osmo-bts-trx` for full
 GSM cell simulation.
 
+## Latest update — Session 2026-04-29
+
+Five structural opcode-dispatch fixes validated empirically. ~2530 firmware sites
+unblocked. DSP CPU emulation now silicon-aligned against binutils tic54x-opc.c +
+SPRU172C/131G + 3 FreeCalypso ROM dumps.
+
+| # | Fix | Impact |
+|---|---|---|
+| 1 | Silicon-aligned reset (PMST=0xFFA8, ST0=0x181F, ST1=0x2900) | DSP enters PROM1 init zone |
+| 2 | 0x6F00 ext dispatch | Wedge PC=0x8353 (2.2G iter) eliminated |
+| 3 | 0x68-0x6E handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) | 1563 sites unblocked |
+| 4 | APTS misnomer fix (bit 4 PMST = AVIS, no stack semantics) | Stack leak 1.96M events → 0 |
+| 5 | F3xx complete (AND/OR/XOR/SFTL + #lk variants) | 364 sites, wedge PC=0x8eb9 unblocked |
+
+**Final blocker:** INTM=1 forever (silicon mechanism for initial INTM clear not
+documented in public corpus). The diagnostic instrument
+`CALYPSO_FORCE_INTM_CLEAR_AT=N` is intentionally retained — see
+[`SESSION_20260429.md`](hw/arm/calypso/doc/SESSION_20260429.md) and
+[`datasheets/README.md`](hw/arm/calypso/doc/datasheets/README.md) for the full
+reasoning, evidence corpus (5 TI PDFs + 3 ROM dumps + Calypso overview), and
+suggested investigation paths.
+
+Specs traceable against binutils:
+- [`opcodes/0x68_0x6F.md`](hw/arm/calypso/doc/opcodes/0x68_0x6F.md) — verified v2 with `insn_template` struct
+- [`opcodes/0xF3.md`](hw/arm/calypso/doc/opcodes/0xF3.md) — verified v1 with bit-by-bit decoding
+
+PHY-side test tool: [`scripts/inject_fcch.py`](scripts/inject_fcch.py) — synthesizes
+FCCH bursts in 3 modes (bytes_zero / soft_neg127 / iq_raw) for independent
+DSP correlator testing.
+
+---
+
+
 This is a packaged snapshot of the Calypso-specific files extracted from a full QEMU
 source tree. The active development tree lives separately (see [Repository layout](#repository-layout)).
 

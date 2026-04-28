@@ -1,4 +1,12 @@
-● Cartographie qemu-calypso — état post-session 2026-04-26                                                                                                                                                                                              
+● Cartographie qemu-calypso — état post-session 2026-04-29
+
+  ## Status update 2026-04-29
+  5 structural fixes validated empirically (~2530 firmware sites unblocked):
+  silicon-aligned reset + 0x6F00 + 0x68-0x6E + APTS misnomer + F3xx.
+  Final blocker: INTM=1 forever (silicon mechanism not documented publicly).
+  See `hw/arm/calypso/doc/SESSION_20260429.md` for full report.
+
+  ## Cartographie originelle (post-2026-04-26)                                                                                                                                                                                              
                                                                                                                                                                                                                                                         
   1. Architecture pipeline complet
 ```mermaid

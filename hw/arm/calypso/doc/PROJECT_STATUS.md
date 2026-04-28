@@ -1,5 +1,30 @@
 # Calypso GSM Baseband Emulator — Project Status
 
+## Latest update — 2026-04-29 (see `SESSION_20260429.md` for full report)
+
+5 structural opcode-dispatch fixes validated empirically. ~2530 firmware sites unblocked.
+DSP CPU emulation, opcode dispatch, reset values, and ISR mechanism are all
+silicon-aligned (binutils tic54x-opc.c + SPRU172C/131G + 3 FreeCalypso ROM dumps).
+
+| # | Fix | Sites unblocked | Marker |
+|---|---|---|---|
+| 1 | Silicon-aligned reset (PMST=0xFFA8, ST0=0x181F, ST1=0x2900) | — | DSP enters PROM1 init zone |
+| 2 | 0x6F00 ext dispatch (ADD/SUB/LD/STH/STL Smem,SHIFT,DST) | 544 | Wedge PC=0x8353 → 0 |
+| 3 | 0x68-0x6E handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) | 1563 | DSP traverses init |
+| 4 | APTS misnomer fix (5 FAR opcodes always push/pop XPC) | — | Stack leak 1.96M → 0 |
+| 5 | F3xx complete dispatch (AND/OR/XOR/SFTL + #lk variants) | 364 | Wedge PC=0x8eb9 unblocked |
+
+**Final blocker:** INTM=1 forever (3 mesures empiriques, 100% strict). Mécanisme
+silicon de clear non documenté publiquement (TI Calypso DBB datasheet privée).
+Diagnostic instrument `CALYPSO_FORCE_INTM_CLEAR_AT=N` documenté comme tel,
+pas un workaround. Voir `SESSION_20260429.md` § "INTM=1 final blocker".
+
+**Files added this session:** `doc/datasheets/` (5 PDFs TI + Calypso overview FreeCalypso
++ 3 ROM dumps + README), `doc/opcodes/0x68_0x6F.md`, `doc/opcodes/0xF3.md`,
+`doc/SESSION_20260429.md`, `scripts/inject_fcch.py`.
+
+---
+
 ## Goal
 Run real OsmocomBB layer1.highram.elf firmware on emulated TI Calypso (ARM7 + TMS320C54x DSP) in QEMU. Connect to a real BTS via TRX protocol through a bridge. Mobile/ccch_scan sees the BTS and decodes BCCH/CCCH.
 

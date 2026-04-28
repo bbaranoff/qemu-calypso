@@ -1,6 +1,24 @@
 # TODO — chemin FBSB QEMU Calypso
 
-## ⚠️⚠️⚠️ DIAGNOSTIC HACK ACTIF — À RETIRER ⚠️⚠️⚠️
+## Status 2026-04-29 (see `SESSION_20260429.md`)
+
+5 structural fixes appliqués et validés empiriquement (cf. `PROJECT_STATUS.md` § Latest):
+- ✓ Silicon-aligned reset (PMST=0xFFA8, ST0=0x181F, ST1=0x2900)
+- ✓ 0x6F00 ext dispatch — wedge PC=0x8353 éliminé (2.2G iter → 0)
+- ✓ 0x68-0x6E handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) — 1563 sites
+- ✓ APTS misnomer fix (bit 4 PMST = AVIS, not APTS) — stack leak 1.96M → 0
+- ✓ F3xx complete dispatch — 364 sites, wedge PC=0x8eb9 unblocked
+
+**Bloqueur restant** : INTM=1 forever. Mécanisme silicon non identifié dans la
+doc publique (TI Calypso DBB datasheet privée). DIAG-HACK reframé comme
+**diagnostic instrumental documenté**, pas workaround.
+
+Pistes pour la prochaine session : voir `SESSION_20260429.md` §
+"Suggested investigation paths".
+
+---
+
+## ⚠️⚠️⚠️ DIAGNOSTIC INSTRUMENT — INTM CLEAR ⚠️⚠️⚠️
 
 **Fichier** : `hw/arm/calypso/calypso_c54x.c` (block "DIAGNOSTIC HACK" ~ligne 3908,
 après `insn_count++`).
