@@ -960,15 +960,19 @@ static int c54x_exec_one(C54xState *s)
             }
             s->pc = ra; return 0;
         }
-        /* 0xF4E4 = FRET (far return). Pop PC, pop XPC iff APTS=1.
-         * Symmetric with FCALL/FCALLD push (also APTS-gated). */
+        /* 0xF4E4 = FRET (far return). Pop PC + XPC unconditionally.
+         * Per binutils tic54x-opc.c (FL_FAR flag) and SPRU172C Table 2-15:
+         *   FRET[D]: XPC = TOS, ++SP, PC = TOS, ++SP
+         * Symmetric with FCALL/FCALLD push (also unconditional, see below).
+         * 2026-04-28 — fixed: was conditional on PMST_APTS (bit 4) which is
+         * actually AVIS (Address Visibility) per SPRU131G — has no stack
+         * semantics. The misnomer caused FRET to skip XPC pop when AVIS=0,
+         * leading to stack imbalance against FCALL FAR which always pushes 2. */
         if (op == 0xF4E4) {
             uint16_t ra = data_read(s, s->sp); s->sp++;
             uint16_t prev_xpc = s->xpc;
-            if (s->pmst & PMST_APTS) {
-                s->xpc = data_read(s, s->sp); s->sp++;
-                if (s->xpc > 3) s->xpc &= 3;
-            }
+            s->xpc = data_read(s, s->sp); s->sp++;
+            if (s->xpc > 3) s->xpc &= 3;
             {
                 static uint64_t fret_count;
                 fret_count++;
@@ -2032,11 +2036,10 @@ static int c54x_exec_one(C54xState *s)
             }
             if (op == 0xF6E4 || op == 0xF6E5) {
                 /* FRETD / FRETED — far return, delayed.
-                 * Pop XPC then PC. FRETED also clears INTM. */
-                if (s->pmst & PMST_APTS) {
-                    s->xpc = data_read(s, s->sp); s->sp++;
-                    if (s->xpc > 3) s->xpc &= 3;
-                }
+                 * Pop XPC + PC unconditionally (FL_FAR). FRETED also clears INTM.
+                 * 2026-04-28 — fixed: was APTS-gated (= AVIS, no stack semantics). */
+                s->xpc = data_read(s, s->sp); s->sp++;
+                if (s->xpc > 3) s->xpc &= 3;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 if (op == 0xF6E5) s->st1 &= ~ST1_INTM;
                 s->delayed_pc  = ra;
@@ -2065,10 +2068,10 @@ static int c54x_exec_one(C54xState *s)
                             is_call ? " FCALAD" : " FBACCD");
                 }
                 if (is_call) {
-                    if (s->pmst & PMST_APTS) {
-                        s->sp = (s->sp - 1) & 0xFFFF;
-                        data_write(s, s->sp, s->xpc);
-                    }
+                    /* FCALAD (F6E7): push XPC + return PC unconditionally (FL_FAR).
+                     * 2026-04-28 — fixed: was APTS-gated (= AVIS, no stack semantics). */
+                    s->sp = (s->sp - 1) & 0xFFFF;
+                    data_write(s, s->sp, s->xpc);
                     uint16_t ret_pc = (uint16_t)(s->pc + 3);
                     s->sp = (s->sp - 1) & 0xFFFF;
                     data_write(s, s->sp, ret_pc);
@@ -2180,24 +2183,24 @@ static int c54x_exec_one(C54xState *s)
         if (hi8 == 0xF9) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            /* FCALL FAR : push XPC (iff APTS=1) then return PC. Set new XPC
-             * and jump. With APTS=0, only PC is pushed — firmware manages
-             * XPC manually via STM/LDLM as needed. */
+            /* FCALL FAR : push XPC + return PC unconditionally (FL_FAR).
+             * Per binutils tic54x-opc.c (fcall 0xF980 mask 0xFF80, FL_FAR)
+             * and SPRU172C: FAR call always saves XPC for FRET to restore.
+             * 2026-04-28 — fixed: was APTS-gated (= AVIS, no stack semantics).
+             * Old behavior caused 281 firmware FCALL FAR sites to push only PC,
+             * imbalanced with 142 FRET pop expecting both PC + XPC. */
             if ((op & 0x80) != 0) {
                 uint8_t new_xpc = (op & 0x7F) & 0x03;
                 static uint64_t fcall_total;
                 fcall_total++;
-                if (s->pmst & PMST_APTS) {
-                    s->sp = (s->sp - 1) & 0xFFFF;
-                    data_write(s, s->sp, s->xpc);
-                }
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, s->xpc);
                 s->sp = (s->sp - 1) & 0xFFFF;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
                 if (fcall_total <= 30 || (fcall_total % 5000) == 0) {
-                    C54_LOG("FCALL FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x APTS=%d)",
+                    C54_LOG("FCALL FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x)",
                             (unsigned long long)fcall_total, s->pc,
-                            new_xpc, op2, s->xpc, s->sp,
-                            !!(s->pmst & PMST_APTS));
+                            new_xpc, op2, s->xpc, s->sp);
                 }
                 s->xpc = new_xpc;
                 s->pc  = op2;
@@ -2277,23 +2280,21 @@ static int c54x_exec_one(C54xState *s)
         if (hi8 == 0xFB) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
-            /* FCALLD FAR : push XPC (iff APTS=1), push return PC+4 (past
-             * delay slots), set new XPC, delayed branch to op2. */
+            /* FCALLD FAR : push XPC + return PC+4 unconditionally (FL_FAR delayed).
+             * Per binutils (fcalld 0xFB80 mask 0xFF80, FL_FAR|FL_DELAY).
+             * 2026-04-28 — fixed: was APTS-gated (= AVIS, no stack semantics). */
             if ((op & 0x80) != 0) {
                 uint8_t new_xpc = (op & 0x7F) & 0x03;
                 static uint64_t fcalld_total;
                 fcalld_total++;
-                if (s->pmst & PMST_APTS) {
-                    s->sp = (s->sp - 1) & 0xFFFF;
-                    data_write(s, s->sp, s->xpc);
-                }
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, s->xpc);
                 s->sp = (s->sp - 1) & 0xFFFF;
                 data_write(s, s->sp, (uint16_t)(s->pc + 4));
                 if (fcalld_total <= 30 || (fcalld_total % 5000) == 0) {
-                    C54_LOG("FCALLD FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x APTS=%d, delayed)",
+                    C54_LOG("FCALLD FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x (was XPC=%u SP=0x%04x, delayed)",
                             (unsigned long long)fcalld_total, s->pc,
-                            new_xpc, op2, s->xpc, s->sp,
-                            !!(s->pmst & PMST_APTS));
+                            new_xpc, op2, s->xpc, s->sp);
                 }
                 s->xpc = new_xpc;
                 s->delayed_pc  = op2;
