@@ -1906,11 +1906,29 @@ static int c54x_exec_one(C54xState *s)
             s->pc += consumed;
             return 0;
         }
-        /* F3xx: various */
+        /* F3xx: dispatch per binutils tic54x-opc.c (verified against
+         * insn_template struct include/opcode/tic54x.h:85-150).
+         *
+         * 8 sub-families:
+         *   F300-F31F  INTR k                                 1-word
+         *   F320-F32F  unmapped                               (NOP fallback)
+         *   F330-F35F  AND/OR/XOR #lk,SHIFT,SRC,DST  mask FCF0 2-word
+         *   F360-F367  ADD/SUB/AND/OR/XOR/MAC #lk var. FCFF   2-word
+         *   F368-F37F  unmapped                               (NOP fallback)
+         *   F380-F39F  AND  src,SHIFT,DST            mask FCE0 1-word
+         *   F3A0-F3BF  OR   src,SHIFT,DST            mask FCE0 1-word
+         *   F3C0-F3DF  XOR  src,SHIFT,DST            mask FCE0 1-word
+         *   F3E0-F3FF  SFTL src,SHIFT,DST            mask FCE0 1-word
+         *
+         * Dispatch order: most-specific masks first (FCFF → FCF0 → FCE0).
+         *
+         * 2026-04-29 — replaces previous "F320+ → LD #k9, DP" fallback
+         * which mass-mis-decoded 364 firmware sites. Wedge at PC=0x8eb9
+         * (0xF3E1 SFTL B,1,B) was directly tied to this bug.
+         * See doc/opcodes/0xF3.md for full spec. */
         if (hi8 == 0xF3) {
-            uint8_t sub3 = (op >> 5) & 0x07;
-            if (sub3 == 0) {
-                /* F300-F31F: INTR k — software interrupt (branch to vector k) */
+            /* F300-F31F: INTR k (preserve existing behavior) */
+            if ((op & 0xFFE0) == 0xF300) {
                 int vec = op & 0x1F;
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 1));
@@ -1919,19 +1937,116 @@ static int c54x_exec_one(C54xState *s)
                 s->pc = (iptr * 0x80) + vec * 4;
                 return 0;
             }
-            /* F320+: LD #k9, DP */
-            uint16_t k9 = op & 0x01FF;
-            uint16_t old_dp = s->st0 & ST0_DP_MASK;
-            s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
-            {
-                static uint64_t dpc;
-                dpc++;
-                if (dpc <= 80 || (dpc % 5000) == 0 || k9 == 0x83) {
-                    C54_LOG("DP-SET F32x #%llu PC=0x%04x DP 0x%03x → 0x%03x %s",
-                            (unsigned long long)dpc, s->pc,
-                            old_dp, k9,
-                            k9 == 0x83 ? "*** 0x83 (CALAD-zone base 0x4180) ***" : "");
+
+            /* F360-F367: 2-word with mask FCFF (#lk<<16 variants).
+             * Most-specific mask, check first. */
+            if ((op & 0xFCFF) == 0xF060 ||  /* ADD #lk<<16, src, [dst] */
+                (op & 0xFCFF) == 0xF061 ||  /* SUB */
+                (op & 0xFCFF) == 0xF063 ||  /* AND */
+                (op & 0xFCFF) == 0xF064 ||  /* OR  */
+                (op & 0xFCFF) == 0xF065 ||  /* XOR */
+                (op & 0xFCFF) == 0xF067) {  /* MAC #lk, src, [dst] */
+                op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+                consumed = 2;
+                int sub = op & 0x7;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = src;
+                switch (sub) {
+                case 0x0: result = src + ((int64_t)(int16_t)op2 << 16); break;
+                case 0x1: result = src - ((int64_t)(int16_t)op2 << 16); break;
+                case 0x3: result = src & (((int64_t)op2) << 16); break;
+                case 0x4: result = src | (((int64_t)op2) << 16); break;
+                case 0x5: result = src ^ (((int64_t)op2) << 16); break;
+                case 0x7: { /* MAC: dst = src + T * lk */
+                    int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)op2;
+                    if (s->st1 & ST1_FRCT) prod <<= 1;
+                    result = src + prod;
+                    break;
                 }
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+
+            /* F330-F35F: 2-word with mask FCF0 (#lk + 4-bit shift).
+             * AND (sub=3), OR (sub=4), XOR (sub=5).
+             * Note: ADD (sub=0) and SUB (sub=1) at F30x/F31x are caught
+             * by INTR handler above (those ranges are INTR semantically). */
+            if ((op & 0xFCF0) == 0xF030 ||  /* AND #lk, SHIFT, src, [dst] */
+                (op & 0xFCF0) == 0xF040 ||  /* OR */
+                (op & 0xFCF0) == 0xF050) {  /* XOR */
+                op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+                consumed = 2;
+                int subop = (op >> 4) & 0xF;
+                int shift_raw = op & 0xF;
+                int shift = (shift_raw & 0x8) ? (shift_raw - 16) : shift_raw;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t lk_signed = (int16_t)op2;
+                int64_t shifted = (shift >= 0) ? (lk_signed << shift)
+                                               : (lk_signed >> (-shift));
+                int64_t result = src;
+                switch (subop) {
+                case 0x3: result = src & shifted; break;  /* AND */
+                case 0x4: result = src | shifted; break;  /* OR  */
+                case 0x5: result = src ^ shifted; break;  /* XOR */
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+
+            /* F380-F3FF: 1-word AND/OR/XOR/SFTL src,SHIFT,DST (mask FCE0).
+             * Sub-opcode in bits 7-5: 100=AND, 101=OR, 110=XOR, 111=SFTL. */
+            if ((op & 0xFCE0) == 0xF080 ||  /* AND */
+                (op & 0xFCE0) == 0xF0A0 ||  /* OR  */
+                (op & 0xFCE0) == 0xF0C0 ||  /* XOR */
+                (op & 0xFCE0) == 0xF0E0) {  /* SFTL */
+                int sub = (op >> 5) & 0x7;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int shift_raw = op & 0x1F;
+                int shift = (shift_raw & 0x10) ? (shift_raw - 32) : shift_raw;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = src;
+                switch (sub) {
+                case 0x4: { /* AND src,SHIFT,DST: DST = SRC & (DST_in << shift) */
+                    int64_t dst_in = dst_b ? s->b : s->a;
+                    int64_t sh = (shift >= 0) ? (dst_in << shift) : (dst_in >> (-shift));
+                    result = src & sh;
+                    break;
+                }
+                case 0x5: { /* OR */
+                    int64_t dst_in = dst_b ? s->b : s->a;
+                    int64_t sh = (shift >= 0) ? (dst_in << shift) : (dst_in >> (-shift));
+                    result = src | sh;
+                    break;
+                }
+                case 0x6: { /* XOR */
+                    int64_t dst_in = dst_b ? s->b : s->a;
+                    int64_t sh = (shift >= 0) ? (dst_in << shift) : (dst_in >> (-shift));
+                    result = src ^ sh;
+                    break;
+                }
+                case 0x7: { /* SFTL src,SHIFT,DST: DST = SRC << shift (logical) */
+                    uint64_t usrc = (uint64_t)src & 0xFFFFFFFFFFULL;
+                    result = (int64_t)((shift >= 0) ? (usrc << shift) : (usrc >> (-shift)));
+                    break;
+                }
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+
+            /* F320-F32F + F368-F37F: unmapped per binutils. NOP fallback +
+             * log-once for diagnostic. 9 firmware sites total. */
+            {
+                static int unmapped_log = 0;
+                if (unmapped_log++ < 20)
+                    C54_LOG("F3xx unmapped op=0x%04x PC=0x%04x (NOP)",
+                            op, s->pc);
             }
             return consumed + s->lk_used;
         }
