@@ -2789,8 +2789,91 @@ static int c54x_exec_one(C54xState *s)
             if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
             return consumed + s->lk_used;
         }
+        /* 0x6F00-0x6FFF: Extended ADD/SUB/LD/STH/STL Smem, SHIFT, DST/SRC (2-word).
+         * Per binutils tic54x-opc.c (verified against insn_template struct
+         * include/opcode/tic54x.h:85-150):
+         *   word0 = 0x6F00 mask 0xFF00 (Smem in low 7 bits)
+         *   word1 = sub-opcode in bits 7:5, SRC=bit 9, DST/SRC1=bit 8,
+         *           SHIFT=signed 5-bit in bits 4:0
+         *     bits 7:5 = 000 → ADD Smem,SHIFT,SRC,[DST]
+         *     bits 7:5 = 001 → SUB Smem,SHIFT,SRC,[DST]
+         *     bits 7:5 = 010 → LD  Smem,SHIFT,DST
+         *     bits 7:5 = 011 → STH SRC1,SHIFT,Smem
+         *     bits 7:5 = 100 → STL SRC1,SHIFT,Smem
+         *
+         * Without this handler, the fallback at (op & 0xF800) == 0x6800 below
+         * mis-decodes 0x6Fxx as LD Smem,T (1-word), causing PC drift +1 word
+         * and the lk-side operand to be executed as parasitic instruction.
+         * 544 sites in firmware ROM. See doc/opcodes/0x68_0x6F.md for spec.
+         *
+         * 2026-04-28 — fix introduced for wedge at PC=0x8353 (CALAD A self-loop)
+         * caused by 0x6F07 0x0C41 mis-decoded → 0x0C41 executed as parasitic
+         * SUB Smem,TS,A → A_low=0xFFFA → A_low=0x8353 after subsequent ADD. */
+        if ((op & 0xFF00) == 0x6F00) {
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            int sub = (op2 >> 5) & 0x7;
+            int shift_raw = op2 & 0x1F;
+            int shift = (shift_raw & 0x10) ? (shift_raw - 32) : shift_raw;
+            int dst_b = (op2 >> 8) & 1;   /* bit 8 = DST/SRC1 */
+            int src_b = (op2 >> 9) & 1;   /* bit 9 = SRC (ADD/SUB only) */
+            consumed = 2;
+
+            switch (sub) {
+            case 0: { /* ADD Smem,SHIFT,SRC,[DST]: DST = SRC + (data[Smem]<<shift) */
+                uint16_t mv = data_read(s, addr);
+                int64_t v = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)mv : (int64_t)mv;
+                v = (shift >= 0) ? (v << shift) : (v >> (-shift));
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = sext40(src + v);
+                if (dst_b) s->b = result; else s->a = result;
+                break;
+            }
+            case 1: { /* SUB Smem,SHIFT,SRC,[DST]: DST = SRC - (data[Smem]<<shift) */
+                uint16_t mv = data_read(s, addr);
+                int64_t v = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)mv : (int64_t)mv;
+                v = (shift >= 0) ? (v << shift) : (v >> (-shift));
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = sext40(src - v);
+                if (dst_b) s->b = result; else s->a = result;
+                break;
+            }
+            case 2: { /* LD Smem,SHIFT,DST: DST = data[Smem] << shift (SXM-aware) */
+                uint16_t mv = data_read(s, addr);
+                int64_t v = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)mv : (int64_t)mv;
+                v = (shift >= 0) ? (v << shift) : (v >> (-shift));
+                if (dst_b) s->b = sext40(v); else s->a = sext40(v);
+                break;
+            }
+            case 3: { /* STH SRC1,SHIFT,Smem: data[Smem] = (SRC1 high 16) << shift */
+                int64_t src = dst_b ? s->b : s->a;
+                int16_t high = (int16_t)((src >> 16) & 0xFFFF);
+                int64_t shifted = (shift >= 0) ? ((int64_t)high << shift)
+                                               : ((int64_t)high >> (-shift));
+                data_write(s, addr, (uint16_t)(shifted & 0xFFFF));
+                break;
+            }
+            case 4: { /* STL SRC1,SHIFT,Smem: data[Smem] = (SRC1 low) << shift */
+                int64_t src = dst_b ? s->b : s->a;
+                int64_t shifted = (shift >= 0) ? (src << shift) : (src >> (-shift));
+                data_write(s, addr, (uint16_t)(shifted & 0xFFFF));
+                break;
+            }
+            default:
+                { static int unk6f = 0; if (unk6f++ < 10)
+                    C54_LOG("0x6F unknown sub=%d op=0x%04x op2=0x%04x PC=0x%04x",
+                            sub, op, op2, s->pc); }
+                break;
+            }
+            return consumed + s->lk_used;
+        }
         if ((op & 0xF800) == 0x6800) {
-            /* 68xx: LD Smem, T */
+            /* 68xx: LD Smem, T
+             * NOTE: 0x6F00-0x6FFF intercepted above by the extended-opcode
+             * handler. Other 0x68xx-0x6Exx ranges (ANDM/ORM/XORM/ADDM/BANZ/
+             * BANZD) currently still fall through here as LD Smem,T. They are
+             * also mis-decoded but require their own handlers — see
+             * doc/opcodes/0x68_0x6F.md for the full spec. */
             addr = resolve_smem(s, op, &ind);
             s->t = data_read(s, addr);
             return consumed + s->lk_used;
