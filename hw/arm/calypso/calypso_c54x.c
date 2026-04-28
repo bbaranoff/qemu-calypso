@@ -2789,6 +2789,89 @@ static int c54x_exec_one(C54xState *s)
             if (dst_acc) s->b = sext40(v); else s->a = sext40(v);
             return consumed + s->lk_used;
         }
+        /* 0x6800-0x6BFF + 0x6Cxx + 0x6Exx: companion to the 0x6F00 fix below.
+         * Per binutils tic54x-opc.c (verified against insn_template struct):
+         *   0x6800 ANDM  #lk, Smem      data[Smem] = data[Smem] & lk     (2-word)
+         *   0x6900 ORM   #lk, Smem      data[Smem] = data[Smem] | lk     (2-word)
+         *   0x6A00 XORM  #lku, Smem     data[Smem] = data[Smem] ^ lku    (2-word)
+         *   0x6B00 ADDM  #lk, Smem      data[Smem] = data[Smem] + lk     (2-word)
+         *   0x6C00 BANZ  pmad, Sind     if (ARx != 0) PC = pmad          (2-word)
+         *   0x6E00 BANZD pmad, Sind     same as BANZ but with 2 delay slots
+         *
+         * Without these, the fallback at (op & 0xF800) == 0x6800 below
+         * mis-decodes them all as LD Smem,T (1-word), causing PC drift +1
+         * word and the lk/pmad operand executing as parasitic instruction.
+         * 1259 (ANDM/ORM/XORM/ADDM) + 304 (BANZ/BANZD) = 1563 sites in ROM.
+         *
+         * 2026-04-28 — companion fix to 0x6F00 already inserted below.
+         * See doc/opcodes/0x68_0x6F.md for spec. */
+        if ((op & 0xFF00) == 0x6800) {
+            /* ANDM #lk, Smem */
+            addr = resolve_smem(s, op, &ind);
+            uint16_t lk = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            uint16_t v = data_read(s, addr);
+            data_write(s, addr, v & lk);
+            consumed = 2;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6900) {
+            /* ORM #lk, Smem */
+            addr = resolve_smem(s, op, &ind);
+            uint16_t lk = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            uint16_t v = data_read(s, addr);
+            data_write(s, addr, v | lk);
+            consumed = 2;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6A00) {
+            /* XORM #lku, Smem */
+            addr = resolve_smem(s, op, &ind);
+            uint16_t lku = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            uint16_t v = data_read(s, addr);
+            data_write(s, addr, v ^ lku);
+            consumed = 2;
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6B00) {
+            /* ADDM #lk, Smem — add signed lk to memory (wrap mod 2^16) */
+            addr = resolve_smem(s, op, &ind);
+            int16_t lk = (int16_t)prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            uint16_t v = data_read(s, addr);
+            data_write(s, addr, (uint16_t)((int16_t)v + lk));
+            consumed = 2;
+            /* TODO: TC/OVM/SXM flag effects per SPRU172C (verify) */
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6C00) {
+            /* BANZ pmad, Sind — branch if ARx != 0 after indirect-mode applied.
+             * Per SPRU172C p.4-15: resolve_smem applies the indirect mode (may
+             * modify ARx pre/post depending on mode); BANZ tests resulting
+             * ARx and branches to pmad if non-zero, else falls through. */
+            int arp = (s->st0 >> ST0_ARP_SHIFT) & 0x7;
+            resolve_smem(s, op, &ind);  /* side-effect on s->ar[arp] */
+            uint16_t pmad = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            consumed = 2;
+            if (s->ar[arp] != 0) {
+                s->pc = pmad;
+                return 0;  /* PC set directly */
+            }
+            return consumed + s->lk_used;
+        }
+        if ((op & 0xFF00) == 0x6E00) {
+            /* BANZD pmad, Sind — delayed BANZ (2 slots after the 2-word op).
+             * Reuses the existing delayed_pc/delay_slots machinery (same one
+             * CALAD/CALLD/RPTBD use) so the 2 delay slots run before PC
+             * commits to pmad. */
+            int arp = (s->st0 >> ST0_ARP_SHIFT) & 0x7;
+            resolve_smem(s, op, &ind);
+            uint16_t pmad = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            consumed = 2;
+            if (s->ar[arp] != 0) {
+                s->delayed_pc  = pmad;
+                s->delay_slots = 2;
+            }
+            return consumed + s->lk_used;
+        }
         /* 0x6F00-0x6FFF: Extended ADD/SUB/LD/STH/STL Smem, SHIFT, DST/SRC (2-word).
          * Per binutils tic54x-opc.c (verified against insn_template struct
          * include/opcode/tic54x.h:85-150):
@@ -2868,12 +2951,15 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if ((op & 0xF800) == 0x6800) {
-            /* 68xx: LD Smem, T
-             * NOTE: 0x6F00-0x6FFF intercepted above by the extended-opcode
-             * handler. Other 0x68xx-0x6Exx ranges (ANDM/ORM/XORM/ADDM/BANZ/
-             * BANZD) currently still fall through here as LD Smem,T. They are
-             * also mis-decoded but require their own handlers — see
-             * doc/opcodes/0x68_0x6F.md for the full spec. */
+            /* DEAD CODE since 2026-04-28: all 0x68xx-0x6Fxx now intercepted
+             * by specific handlers above (ANDM/ORM/XORM/ADDM/BANZ/BANZD/
+             * extended-0x6F00) plus the existing 0x6Dxx MAR. This generic
+             * "LD Smem, T" fallback was the source of the 2107-site mass
+             * mis-dispatch that caused PC drift on every 0x68xx-0x6Fxx
+             * encounter. Kept here for safety in case a previously unseen
+             * sub-encoding slips through; if you ever see this trigger,
+             * the new handler above for the matching 0xNN00 prefix is
+             * incomplete. See doc/opcodes/0x68_0x6F.md. */
             addr = resolve_smem(s, op, &ind);
             s->t = data_read(s, addr);
             return consumed + s->lk_used;
