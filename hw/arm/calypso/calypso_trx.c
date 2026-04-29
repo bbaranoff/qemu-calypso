@@ -525,6 +525,8 @@ static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->ir
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
     int64_t entry_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t t_clk = 0, t_uart = 0, t_dspboot = 0, t_dspirq = 0,
+            t_bsp = 0, t_ul = 0;
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
 
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
@@ -537,12 +539,14 @@ static void calypso_tdma_tick(void *opaque) {
         sendto(s->clk_fd, pkt, 4, 0,
                (struct sockaddr *)&s->clk_peer, sizeof(s->clk_peer));
     }
+    t_clk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 1. UART poll: deliver pending chardev bytes to firmware ── */
     if (g_uart_modem) {
         calypso_uart_poll_backend(g_uart_modem);
         calypso_uart_kick_rx(g_uart_modem);
     }
+    t_uart = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 2. DSP boot phase ── */
     if (s->dsp && s->dsp->running && !s->dsp_init_done) {
@@ -553,6 +557,7 @@ static void calypso_tdma_tick(void *opaque) {
             TRX_LOG("DSP init complete (first IDLE reached)");
         }
     }
+    t_dspboot = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 3. DMA is NOT done here ──
      * On real Calypso, the TPU scenario triggers the DMA when the
@@ -603,12 +608,14 @@ static void calypso_tdma_tick(void *opaque) {
             qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
         }
     }
+    t_dspirq = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 6. Deliver buffered DL bursts to DSP ──
      * Bursts from BTS arrive via UDP in real time, but BDLENA windows
      * open in virtual time (faster). This step pulls buffered bursts
      * and delivers them when BDLENA windows are available. */
     calypso_bsp_deliver_buffered(s->fn);
+    t_bsp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 6b. UL burst poll ──
      * Check if the DSP wrote an UL task. If so, read bits from DSP
@@ -629,6 +636,7 @@ static void calypso_tdma_tick(void *opaque) {
             wp[DB_W_D_TASK_U] = 0;
         }
     }
+    t_ul = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 7. TPU FRAME IRQ → ARM L1 scheduler ── */
     {
@@ -703,6 +711,33 @@ static void calypso_tdma_tick(void *opaque) {
                         " work_dt=%" PRId64 " fn=%u #%d\n",
                         entry_t, exit_t, (exit_t - entry_t), s->fn, tick_count);
                 tick_count++;
+            }
+        }
+    }
+
+    /* Profile per sub-block: identifie quelle section consomme work_dt. */
+    {
+        static FILE *prof_log = NULL;
+        static int prof_count = 0;
+        if (prof_count < 200) {
+            if (!prof_log) prof_log = fopen("/tmp/tdma_profile.log", "w");
+            if (prof_log) {
+                int64_t exit_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                fprintf(prof_log, "[prof] fn=%u clk=%" PRId64 " uart=%" PRId64
+                        " dspboot=%" PRId64 " dspirq=%" PRId64 " bsp=%" PRId64
+                        " ul=%" PRId64 " irq=%" PRId64 " total=%" PRId64
+                        " #%d\n",
+                        s->fn,
+                        t_clk - entry_t,
+                        t_uart - t_clk,
+                        t_dspboot - t_uart,
+                        t_dspirq - t_dspboot,
+                        t_bsp - t_dspirq,
+                        t_ul - t_bsp,
+                        exit_t - t_ul,
+                        exit_t - entry_t,
+                        prof_count);
+                prof_count++;
             }
         }
     }
