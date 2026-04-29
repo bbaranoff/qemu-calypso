@@ -74,6 +74,9 @@ void calypso_fbsb_reset(CalypsoFbsb *s)
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn)
 {
+    fprintf(stderr, "[calypso-fbsb] on_dsp_task_change task=%u fn=%lu state=%d\n",
+            d_task_md, (unsigned long)fn, s ? (int)s->state : -1);
+    fflush(stderr);
     if (!s) return;
     switch (d_task_md) {
     case DSP_TASK_FB:
@@ -155,6 +158,30 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
     }
 }
 
+/* W1C latches in calypso_trx.c (set by c54x DSP-side iter writes).
+ * Invalidate them here so ARM read falls through to fresh fbsb values
+ * instead of stale DSP iter values. The master gate is g_a_sync_valid
+ * (false → all a_sync_* + d_fb_det reads fall through). Individual
+ * latch values cleared for hygiene. */
+extern bool     g_a_sync_valid;
+extern uint16_t g_d_fb_det_latch;
+extern uint16_t g_d_fb_mode_latch;
+extern uint16_t g_a_sync_TOA_latch;
+extern uint16_t g_a_sync_PM_latch;
+extern uint16_t g_a_sync_ANG_latch;
+extern uint16_t g_a_sync_SNR_latch;
+
+static inline void invalidate_fbsb_latches(void)
+{
+    g_a_sync_valid     = false;
+    g_d_fb_det_latch   = 0;
+    g_d_fb_mode_latch  = 0;
+    g_a_sync_TOA_latch = 0;
+    g_a_sync_PM_latch  = 0;
+    g_a_sync_ANG_latch = 0;
+    g_a_sync_SNR_latch = 0;
+}
+
 /* ---------------------------------------------------------------- */
 void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
                                    int16_t toa, uint16_t pm,
@@ -171,6 +198,10 @@ void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
     cell_wr(s, NDB_A_SYNC_DEMOD_SNR, snr);
     cell_wr(s, NDB_D_FB_DET, 1);
 
+    /* Invalidate W1C latches so ARM read returns these fresh values,
+     * not stale DSP iter snapshot. */
+    invalidate_fbsb_latches();
+
     (void)toa; (void)pm; (void)angle; (void)snr;
 }
 
@@ -179,6 +210,10 @@ void calypso_fbsb_clear_fb(CalypsoFbsb *s)
     if (!s) return;
     cell_wr(s, NDB_D_FB_DET, 0);
     cell_wr(s, NDB_A_SYNC_DEMOD_TOA, 0);
+    /* Same latch invalidation as publish path — without this, ARM
+     * could keep reading a stale latched d_fb_det=1 after we cleared
+     * the cell. */
+    invalidate_fbsb_latches();
 }
 
 /* ---------------------------------------------------------------- *

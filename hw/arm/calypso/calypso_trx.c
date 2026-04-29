@@ -16,6 +16,7 @@
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
 #include "hw/arm/calypso/calypso_sim.h"
+#include "hw/arm/calypso/calypso_fbsb.h"
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -73,6 +74,16 @@ typedef struct CalypsoTRX {
 } CalypsoTRX;
 
 static CalypsoTRX *g_trx;
+
+/* FBSB host-side orchestration. Reintroduced after preNoCell refactor
+ * (28 Apr) accidentally removed the wire. The bridge delivers I/Q from
+ * a fixed cos/sin LUT (no AFC DAC feedback in QEMU), so the DSP
+ * correlator cannot converge across iterations. This wire publishes
+ * synthetic clean FB/SB results at the NDB level when ARM dispatches
+ * FB_DSP_TASK, allowing the L1→L2→L3 stack to progress toward Location
+ * Update without requiring physical RF AFC simulation. */
+static CalypsoFbsb g_fbsb;
+static bool        g_fbsb_inited;
 
 /* W1C latches for FB-detection result snapshot.
  * Set by c54x data_write when DSP writes a_sync_SNR (LAST cell of
@@ -279,6 +290,23 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
                         (unsigned)offset, (unsigned)value, s->fn);
             task_log++;
+
+            /* FBSB orchestration hook: ARM has just written d_task_md.
+             * Initialise on first call, then dispatch to the host-side
+             * state machine which publishes synthetic FB/SB results
+             * into NDB so ARM can progress past l1s_fbdet_resp. */
+            if (!g_fbsb_inited) {
+                calypso_fbsb_init(&g_fbsb, s->dsp_ram, 0x0800);
+                g_fbsb_inited = true;
+                TRX_LOG("fbsb init ok ndb_base=0x0800");
+            }
+            if (g_fbsb_inited) {
+                TRX_LOG("fbsb hook fired task=%u fn=%u",
+                        (unsigned)value, s->fn);
+                calypso_fbsb_on_dsp_task_change(&g_fbsb,
+                                                (uint16_t)value,
+                                                (uint64_t)s->fn);
+            }
         }
     }
     /* DSP page */
