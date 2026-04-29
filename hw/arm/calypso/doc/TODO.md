@@ -1,6 +1,29 @@
 # TODO — chemin FBSB QEMU Calypso
 
-## Status 2026-04-29 (see `SESSION_20260429.md`)
+## Status 2026-04-29 afternoon — FBSB chain validée E2E
+
+Cette demi-session :
+- ✓ **ARP off-by-one fix** dans `resolve_smem` + BANZ/BANZD/F80x (`cur_arp = nar`)
+- ✓ **fbsb wire reintroduction** dans `calypso_trx.c` au site ARM TASK WR=5 (perdu refactor preNoCell 28/04)
+- ✓ **W1C latch invalidation** dans `calypso_fbsb_publish_fb_found` / `clear_fb`
+- ✓ **46× FBSB_CONF result=0** validés via `osmocon -d r` (msg_type 0x02 traversent socket)
+- ✓ Code path `cell_log.c:402 SCAN_STATE_READ` vérifié inconditionnel par lecture directe
+
+**Blocker LU restant** : 0× `L1CTL_DATA_IND` (msg_type 0x03) → BCCH read jamais complet.
+
+**Cause double, ordre d'attaque** :
+
+(1) **PRIORITY** — Stabilité timing TDMA insuffisante. ~12k+ "LOST N!" / run, distribution bimodale ~2470/~5020 (pas bruit aléatoire). 28% des frames TDMA marquées LOST. Probabilité tenir 10 frames clean (BCCH multiframe) ≈ 3.7%. Sans fix, BCCH synth sera rejeté.
+
+(2) `calypso_fbsb` ne synthétise pas BCCH (DSP_TASK_NB_RX task=24 fall-through default).
+
+**Prochaine session** : timer instrumentation. `calypso_timer.c::calypso_timer_read` log count + virtual time, comparer deltas pour discriminer "timer ticke mal" vs "L1S scheduler appelle de façon jittery". Math attendue : tick rate=406.25 kHz, period=18.465 ms ≈ 4 TDMA frames. Drift attendu sub-tick. Mesure observée 28% LOST = bug à localiser.
+
+Ne PAS toucher firmware OsmocomBB — fix doit être côté QEMU device timing (upstream-defendable).
+
+---
+
+## Status 2026-04-29 morning (see `SESSION_20260429.md`)
 
 5 structural fixes appliqués et validés empiriquement (cf. `PROJECT_STATUS.md` § Latest):
 - ✓ Silicon-aligned reset (PMST=0xFFA8, ST0=0x181F, ST1=0x2900)
@@ -9,9 +32,7 @@
 - ✓ APTS misnomer fix (bit 4 PMST = AVIS, not APTS) — stack leak 1.96M → 0
 - ✓ F3xx complete dispatch — 364 sites, wedge PC=0x8eb9 unblocked
 
-**Bloqueur restant** : INTM=1 forever. Mécanisme silicon non identifié dans la
-doc publique (TI Calypso DBB datasheet privée). DIAG-HACK reframé comme
-**diagnostic instrumental documenté**, pas workaround.
+**Bloqueur INTM=1 forever** : reframé via DIAG-HACK `CALYPSO_FORCE_INTM_CLEAR_AT=N` comme instrument diagnostic. Avec hack=200M, FBSB chain marche E2E (cf. status afternoon).
 
 Pistes pour la prochaine session : voir `SESSION_20260429.md` §
 "Suggested investigation paths".

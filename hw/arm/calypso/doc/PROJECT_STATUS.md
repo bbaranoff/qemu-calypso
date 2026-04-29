@@ -1,5 +1,31 @@
 # Calypso GSM Baseband Emulator — Project Status
 
+## Latest update — 2026-04-29 afternoon — FBSB chain validée E2E
+
+**Milestone L1 atteint** : 46× `L1CTL_FBSB_CONF` result=0 traversent firmware → osmocon → cell_log. Cell_log entre `SCAN_STATE_READ` (vérifié par lecture directe `cell_log.c:402`, transition inconditionnelle).
+
+**3 fixes nouveaux cette demi-session** :
+
+| # | Fix | File | Empirical impact |
+|---|---|---|---|
+| 6 | **ARP off-by-one** dans `resolve_smem` + BANZ/BANZD/F80x | `calypso_c54x.c` | `cur_arp = nar` (était `arp(s)`). DSP exécute correctement les indirect addressing modes. |
+| 7 | **fbsb wire reintroduction** au site ARM TASK WR=5 | `calypso_trx.c::calypso_dsp_write` + `#include "calypso_fbsb.h"` | Module `calypso_fbsb` était linké mais pas wire (perdu collatéralement preNoCell refactor 28/04). Publish synthétique FB+SB sur task=5/6. |
+| 8 | **W1C latch invalidation** dans `publish_fb_found` / `clear_fb` | `calypso_fbsb.c` | Sans invalidation, latches DSP iter masquent valeurs synthétiques fbsb (ARM lit angle=-29569 stale au lieu de 0 fresh). |
+
+**Validation E2E** :
+- `osmocon -d r` dump : 46× `hdlc_recv(dlci=5): 02 ...` (msg_type FBSB_CONF, result=0)
+- `cell_log.c:412 case S_L1CTL_FBSB_RESP` : `state = SCAN_STATE_READ` + `start_timer(READ_WAIT)` inconditionnel
+- Compteur "syncs left" décrémente 47→36 sur run continu
+- `LOGP(DRR, ...)` "Synchronized, start reading" filtré par `app_cell_log.c:86 log_parse_category_mask("DSUM")` — invisible mais code path exécuté
+
+**Blocker LU restant** : 0× `L1CTL_DATA_IND` (msg_type 0x03) → BCCH read jamais complet → READ_WAIT timeout → cell_log re-scan ARFCN. Cause double :
+1. **Stabilité timing TDMA insuffisante** (priority 1) : ~12000+ "LOST N!" sur run, distribution bimodale ~2470/~5020 (pas du bruit aléatoire). 28% des frames TDMA marquées LOST. Probabilité tenir 10 frames clean consécutives (BCCH multiframe) ≈ 3.7%.
+2. `calypso_fbsb` ne synthétise pas BCCH bursts (DSP_TASK_NB_RX falls-through default).
+
+**Prochaine session** : timer fidelity AVANT BCCH synthesis. Sans timing stable, BCCH synth sera rejeté.
+
+---
+
 ## Latest update — 2026-04-29 (see `SESSION_20260429.md` for full report)
 
 5 structural opcode-dispatch fixes validated empirically. ~2530 firmware sites unblocked.
