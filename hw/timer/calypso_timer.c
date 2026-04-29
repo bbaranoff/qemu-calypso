@@ -123,6 +123,23 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTimerState *s = CALYPSO_TIMER(opaque);
 
+    {
+        static int rd_count = 0;
+        static int64_t prev_t_virt = 0;
+        if (rd_count < 0) {  /* DISABLED — re-enable by setting >0 */
+            uint16_t live = calypso_timer_current_count(s);
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t dt = prev_t_virt ? (now - prev_t_virt) : 0;
+            fprintf(stderr, "[timer] RD ts=%p off=0x%02x live=%u stored=%u "
+                    "running=%d tick_ns=%" PRId64 " epoch=%" PRId64
+                    " t_virt=%" PRId64 " dt=%" PRId64 " rd#=%d\n",
+                    (void *)s, (unsigned)offset, live, s->count, s->running,
+                    s->tick_ns, s->epoch_ns, now, dt, rd_count);
+            prev_t_virt = now;
+            rd_count++;
+        }
+    }
+
     switch (offset) {
     case 0x00: return s->ctrl;
     case 0x02: return s->load;

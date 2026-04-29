@@ -524,6 +524,7 @@ static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->ir
 
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
+    int64_t entry_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
 
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
@@ -630,14 +631,81 @@ static void calypso_tdma_tick(void *opaque) {
     }
 
     /* ── 7. TPU FRAME IRQ → ARM L1 scheduler ── */
+    {
+        static FILE *firq_log = NULL;
+        static int firq_count = 0;
+        static int64_t prev_firq_t = 0;
+        if (firq_count < 0) {  /* DISABLED for baseline — re-enable by setting >0 */
+            if (!firq_log) firq_log = fopen("/tmp/frame_irq.log", "w");
+            if (firq_log) {
+                int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                int64_t dt = prev_firq_t ? (now - prev_firq_t) : 0;
+                int64_t target = now + GSM_TDMA_NS;
+                fprintf(firq_log, "[frame-irq] raise t_virt=%" PRId64
+                        " dt=%" PRId64 " next_target=%" PRId64
+                        " gap_to_target=%" PRId64 " fn=%u #%d\n",
+                        now, dt, target, (target - now), s->fn, firq_count);
+                prev_firq_t = now;
+                firq_count++;
+            }
+        }
+    }
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
     timer_mod_ns(s->frame_irq_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 
-    /* ── 8. Re-arm TDMA timer ── */
-    if (s->tdma_running)
-        timer_mod_ns(s->tdma_timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+    /* ── 8. Re-arm TDMA timer ──
+     * FIX: anchor on entry_t (start of tick), not on exit_t. Otherwise
+     * the work_dt of the body cumulates into the deadline and the TDMA
+     * cadence drifts to (work_dt + GSM_TDMA_NS) instead of staying at
+     * GSM_TDMA_NS exact.
+     *
+     * Si déjà en retard (work_dt > GSM_TDMA_NS), sauter aux frames suivantes
+     * pour rester aligné sur la grille TDMA. Mimique silicon : la(les) frame(s)
+     * sont perdues mais le timer ne dérive pas et le main loop n'est pas saturé
+     * par des back-to-back catch-up. */
+    {
+        int64_t target = entry_t + GSM_TDMA_NS;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int skipped = 0;
+        while (target <= now) {
+            target += GSM_TDMA_NS;
+            skipped++;
+        }
+
+        {
+            static int rearm_log_count = 0;
+            if (rearm_log_count < 50) {
+                fprintf(stderr, "[rearm-fix] entry_t=%" PRId64 " target=%" PRId64
+                        " now=%" PRId64 " gap_to_now=%" PRId64 " skipped=%d\n",
+                        entry_t, target, now, target - now, skipped);
+                rearm_log_count++;
+            }
+        }
+
+        if (skipped > 0 && (s->fn % 100 == 0)) {
+            fprintf(stderr, "[tdma-skip] fn=%u skipped=%d work_dt=%" PRId64 "\n",
+                    s->fn, skipped, now - entry_t);
+        }
+
+        if (s->tdma_running)
+            timer_mod_ns(s->tdma_timer, target);
+    }
+
+    {
+        static FILE *tick_log = NULL;
+        static int tick_count = 0;
+        if (tick_count < 500) {
+            if (!tick_log) tick_log = fopen("/tmp/tdma_tick.log", "w");
+            if (tick_log) {
+                int64_t exit_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                fprintf(tick_log, "[tdma-tick] entry=%" PRId64 " exit=%" PRId64
+                        " work_dt=%" PRId64 " fn=%u #%d\n",
+                        entry_t, exit_t, (exit_t - entry_t), s->fn, tick_count);
+                tick_count++;
+            }
+        }
+    }
 }
 
 static void calypso_tdma_start(CalypsoTRX *s)

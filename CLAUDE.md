@@ -1,5 +1,15 @@
 # QEMU Calypso — Claude Code Context
 
+> **⚠️ PAS DE BUILD, PAS DE COMMIT, PAS DE RUN — règle #0.**
+> Claude n'exécute jamais `ninja` / `cmake`, ne `git commit` jamais, ne lance
+> jamais `run.sh` / `qemu-system-arm` / docker exec build|run. L'user pilote
+> son cycle build/run via tmux. Claude lit, édite, propose ; l'user exécute.
+
+> **⚠️ PAS D'EDIT SANS CONFIRMATION — règle #0bis.**
+> Aucun `Edit` / `Write` sur fichier projet sans accord explicite de l'user
+> ou de Claude web. Claude propose le diff en texte, attend "ok"/"go"/"applique"
+> avant d'écrire. Vaut pour `.c` / `.h` / `.md` / `.sh` / `.py` du repo.
+
 > **⚠️ PAS DE HACK — règle #1.**
 > Pas d'injection, pas de stub, pas de bypass, pas de "TEMPORARY", pas de
 > hardcode pour faire avancer un état. Le DSP exécute le vrai ROM, la BSP
