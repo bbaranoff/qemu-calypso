@@ -109,6 +109,73 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         s->state = FBSB_SB_FOUND;
         calypso_fbsb_dump(s, "SB_FOUND (synth, immediate)");
         break;
+    case DSP_TASK_ALLC: {
+        /* CCCH read (task=24, ALLC_DSP_TASK).
+         *
+         * Étape 1 : echo d_task_d/d_burst_d pour passer guard EMPTY de
+         * prim_rx_nb.c:73-83 (db_r->d_task_d != 0, db_r->d_burst_d == K).
+         *
+         * Étape 2 — XXX TEMP HARDCODE replace with bridge intercept :
+         * Hardcode d'un payload SI3 fixture (libosmocore tests). Vrai pipeline
+         * existe (osmo-bts émet BCCH bursts via TRXD UDP 5702 → bridge.py).
+         * Hardcode = stub (règle #1 CLAUDE.md). Documenté TODO.md avec
+         * critère de retrait : intercept LAPDm dans bridge.py et push via
+         * canal séparé vers QEMU.
+         *
+         * Critère retrait : bridge.py expose endpoint UDP recevant 23 bytes
+         * LAPDm depuis osmo-bts (avant ou après interleaving), QEMU lit
+         * dans calypso_fbsb au lieu de la fixture statique. */
+        static uint16_t allc_burst_idx = 0;
+        static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
+
+        /* XXX TEMP HARDCODE — SI3 fixture from libosmocore
+         * tests/gb/gprs_bssgp_rim_test.c:376. 21 bytes + 0x2B 0x2B fill
+         * = 23 bytes LAPDm UI frame for BCCH/CCCH downlink.
+         * À retirer dès intercept bridge.py opérationnel. */
+        static const uint8_t si3_blob[23] = {
+            0x1b, 0x75, 0x30, 0x00, 0xf1, 0x10, 0x23, 0x6e,
+            0xc9, 0x03, 0x3c, 0x27, 0x47, 0x40, 0x79, 0x00,
+            0x00, 0x3c, 0x0b, 0x2b, 0x2b, 0x2b, 0x2b
+        };
+
+        /* Echo d_task_d / d_burst_d dans les deux read pages */
+        for (int p = 0; p < 2; p++) {
+            uint16_t *rp = &s->ndb[db_r_word_base[p]];
+            rp[0] = DSP_TASK_ALLC;     /* d_task_d = 24 */
+            rp[1] = allc_burst_idx;    /* d_burst_d cycling 0..3 */
+        }
+
+        /* a_cd[] dans NDB à word offset 0x01D2 (= NDB 0x01A8 + 0x1FC ARM byte).
+         *
+         * EMPIRIQUE 2026-04-29 nuit : project memory disait NDB+0x1F8 (word
+         * 0x01D0) mais runs avec 0x01D0 montrent shift de 2 words côté ARM
+         * (data starts at si3_blob[4] au lieu de [0], num_biterr=0x30 au
+         * lieu de 0x00). Cause probable : derniers 2 words de a_ramp[16]
+         * juste avant. Offset corrigé empiriquement à 0x01D2.
+         *
+         * Layout :
+         *   a_cd[0] : flags. B_BLUD=bit15 (block present). FIRE=bits 5,6 (=0 NO ERROR).
+         *   a_cd[1] : info block (skipped par firmware).
+         *   a_cd[2] : num_biterr (lower 16 bits).
+         *   a_cd[3..14] : 23 bytes LAPDm payload (12 words, dernier word demi-utilisé). */
+        {
+            uint16_t *acd = &s->ndb[0x01D2];
+            acd[0] = 0x8000;           /* B_BLUD set, FIRE bits clear */
+            acd[1] = 0x0000;
+            acd[2] = 0x0000;           /* num_biterr = 0 */
+            for (int i = 0; i < 12; i++) {
+                uint16_t lo = (i*2     < 23) ? si3_blob[i*2]     : 0;
+                uint16_t hi = (i*2 + 1 < 23) ? si3_blob[i*2 + 1] : 0;
+                acd[3 + i] = (uint16_t)(lo | (hi << 8));
+            }
+        }
+
+        fprintf(stderr, "[fbsb] ALLC echo+SI3 task=24 burst_d=%u fn=%lu\n",
+                allc_burst_idx, (unsigned long)fn);
+        fflush(stderr);
+        allc_burst_idx = (allc_burst_idx + 1) & 3;
+        break;
+    }
     case DSP_TASK_NONE:
     default:
         break;

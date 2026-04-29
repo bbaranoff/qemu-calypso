@@ -1,5 +1,67 @@
 # TODO — chemin FBSB QEMU Calypso
 
+## Status 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
+
+**Milestone L2** : 88 DATA_IND traversent firmware → osmocon avec payload
+byte-à-byte exact (si3_blob[0..22]). 24 FBSB_CONF result=0. Pipeline NDB →
+DARAM → ARM L1S → l1ctl_data_ind → osmocon validé.
+
+3 fixes appliqués (cf. `PROJECT_STATUS.md` § Latest):
+- ✓ **ALLC echo + DSP_TASK_ALLC handler** (passe guard EMPTY de prim_rx_nb)
+- ✓ **a_cd[] base shift +2 words** (0x01D0 → 0x01D2, empirique)
+- ✓ **Fix re-arm TDMA timer** (`entry_t + while-skip`)
+
+**NON validé** : L23 SI3 parsing mobile (fixture BSSGP probablement incompatible
+format BCCH). À départager (a/b/c) via verbosity mobile / GSMTAP.
+
+**Hacks bruts à retirer** : `si3_blob[]` hardcode + `allc_burst_idx` static
+counter. Voir `doc/hacks.md` pour inventaire complet.
+
+**Prochaine session — direction** :
+1. Hypothèse parsing SI3 (verbosity mobile + GSMTAP capture)
+2. Si fixture invalide : intercept osmo-bts → bridge.py → QEMU pour SI3 réel
+3. Fix off-by-one `allc_burst_idx` (frame-tick scheduled write) si × 4 DATA_IND nécessaire pour LU
+4. Update `hacks.md` au fil des retraits
+
+---
+
+## ⚠️⚠️⚠️ XXX TEMP HARDCODE — SI3 dans calypso_fbsb.c ⚠️⚠️⚠️
+
+**Fichier** : `hw/arm/calypso/calypso_fbsb.c`, `case DSP_TASK_ALLC` (ajouté
+2026-04-29 soir).
+
+**Quoi** : `static const uint8_t si3_blob[23] = { 0x1b, 0x75, ... }`,
+fixture SI3 de libosmocore (tests/gb/gprs_bssgp_rim_test.c:376), poussée
+dans `a_cd[3..14]` à chaque task=24 fire pour produire DATA_IND avec
+payload LAPDm valide vers ARM L23.
+
+**Pourquoi** : permet de valider chaîne BCCH read end-to-end (ARM L1S →
+L2 LAPDm → L3 RR/MM → cell_log/mobile cell synced) sans avoir le pipeline
+osmo-bts → bridge → QEMU complet pour BCCH.
+
+**Pourquoi c'est un hack** : viole règle #1 CLAUDE.md "no stubs". Le vrai
+pipeline existe : `osmo-bts` émet bursts BCCH via TRXD UDP 5702 → bridge.py.
+Hardcode court-circuite ce pipeline.
+
+**Critère de retrait OBLIGATOIRE** :
+1. `bridge.py` instrumenté pour intercepter les bursts BCCH
+   (TN=0, fn%51 ∈ {2,3,4,5}) reçus de osmo-bts.
+2. Soit : déinterleavage côté Python (4 bursts → 23 bytes LAPDm) puis
+   forward via canal UDP séparé vers QEMU.
+3. Soit : intercept osmo-bts avant interleaving (RSL/scheduler) pour
+   obtenir directement les 23 bytes LAPDm pré-encodés.
+4. `calypso_fbsb.c::case DSP_TASK_ALLC` lit depuis ce buffer dynamique
+   au lieu de `si3_blob[]` statique.
+5. Hardcode physiquement retiré du `.c`, entrée TODO.md supprimée.
+6. Run validation : DATA_IND traversent et cell_log/mobile syncs avec
+   le SI3 réel du BSC (LAI/CGI cohérents avec config network).
+
+**Activation** : automatique dès qu'ARM dispatch d_task_d=24. Pas d'env var.
+Désactivable temporairement en commentant le bloc de packing a_cd[3..14]
+(garde l'echo task_d/burst_d).
+
+---
+
 ## Status 2026-04-29 afternoon — FBSB chain validée E2E
 
 Cette demi-session :

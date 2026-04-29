@@ -64,6 +64,7 @@
 #define DSP_TASK_SB         6   /* SB_DSP_TASK (sync burst, idle)      */
 #define DSP_TASK_TCH_FB     8   /* TCH_FB_DSP_TASK (dedicated) */
 #define DSP_TASK_TCH_SB     9   /* TCH_SB_DSP_TASK (dedicated) */
+#define DSP_TASK_ALLC      24   /* ALLC_DSP_TASK (CCCH read while FULL BCCH/CCCH) */
 
 /* FBSB orchestration state. One instance per Calypso. */
 typedef enum {

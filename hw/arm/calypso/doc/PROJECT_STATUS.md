@@ -1,6 +1,57 @@
 # Calypso GSM Baseband Emulator — Project Status
 
-## Latest update — 2026-04-29 afternoon — FBSB chain validée E2E
+## Latest update — 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
+
+**Milestone L2 atteint** : pipeline BCCH descend de QEMU jusqu'à L23 mobile,
+avec payload structuré byte-à-byte vérifié.
+
+| Indicateur | Valeur | Notes |
+|---|---|---|
+| `L1CTL_DATA_IND` (msg_type 0x03) traversent osmocon | **88** | vs 0 hier matin |
+| `L1CTL_FBSB_CONF` result=0 | **24** | régulier |
+| ALLC echo+SI3 hooks fired | 360 | task=24 dispatched |
+| `num_biterr` | `0x00` systématique | a_cd[2] write OK |
+| `fire_crc` | `0x00` systématique (NO ERROR) | a_cd[0] FIRE bits OK |
+| Payload byte-match si3_blob[0..22] | **23/23 bytes exact** | NDB→ARM mailbox validé |
+
+**3 fixes nouveaux cette session** :
+
+| # | Fix | File | Empirical impact |
+|---|---|---|---|
+| 9 | **ALLC echo + DSP_TASK_ALLC handler** | `calypso_fbsb.c` + `.h` | Passe guard `EMPTY` de `prim_rx_nb.c:73` (était EMPTY×56 avant fix). |
+| 10 | **a_cd[] base offset shift +2 words** (0x01D0→0x01D2) | `calypso_fbsb.c` | Project memory disait NDB+0x1F8 mais runs montrent shift de 2 words. Empirique : data byte 0 maintenant = si3_blob[0] (=0x1b), num_biterr=0 propre. |
+| 11 | **Fix re-arm TDMA timer** (`entry_t + while-skip`) | `calypso_trx.c::calypso_tdma_tick` | now=exit_t accumulait work_dt → cadence drift 11ms. entry_t + while-skip aligné grille. Forward progress firmware (vs fix-a saturation). |
+
+**XXX TEMP HARDCODE — à retirer impérativement** (cf. `hacks.md` + `TODO.md`) :
+- `si3_blob[]` fixture libosmocore BSSGP — viole règle #1 "no stubs". Critère
+  retrait : intercept bridge.py / osmo-bts pour SI3 réel du BSC.
+- `allc_burst_idx` static counter — off-by-one connu (75% mismatch). À
+  remplacer par frame-tick scheduled write basé sur fn modulo 51.
+
+**Validation byte-à-byte** :
+```
+si3_blob[]   : 1b 75 30 00 f1 10 23 6e c9 03 3c 27 47 40 79 00 00 3c 0b 2b 2b 2b 2b
+DATA_IND obs : 1b 75 30 00 f1 10 23 6e c9 03 3c 27 47 40 79 00 00 3c 0b 2b 2b 2b 2b
+                ─────────────── 23 bytes MATCH ───────────────
+```
+
+**NON validé** : L23 SI3 parsing côté mobile (pas de marker "system info" /
+"cell synced" / "LU REQ" visible dans logs locaux). Fixture libosmocore est
+BSSGP test, pas BCCH air-interface — format LAPDm pseudo-length probablement
+incompatible. Trois hypothèses (a/b/c) à départager via verbosity mobile +
+GSMTAP capture, ou directement par intercept osmo-bts.
+
+**Doc nouvelle** : `doc/hacks.md` — inventaire honnête des 3 niveaux de
+hacks/workarounds par fichier. Référence pour audit B2B / licensing.
+
+**Prochaine session** :
+1. Verbosity mobile + GSMTAP capture pour départager (a)/(b)/(c) du parsing SI3.
+2. Si fixture invalide : intercept osmo-bts → bridge.py → QEMU pour SI3 réel.
+3. Fix off-by-one `allc_burst_idx` (×4 gain DATA_IND si nécessaire pour LU).
+
+---
+
+## 2026-04-29 afternoon — FBSB chain validée E2E
 
 **Milestone L1 atteint** : 46× `L1CTL_FBSB_CONF` result=0 traversent firmware → osmocon → cell_log. Cell_log entre `SCAN_STATE_READ` (vérifié par lecture directe `cell_log.c:402`, transition inconditionnelle).
 

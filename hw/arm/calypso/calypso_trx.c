@@ -643,7 +643,7 @@ static void calypso_tdma_tick(void *opaque) {
         static FILE *firq_log = NULL;
         static int firq_count = 0;
         static int64_t prev_firq_t = 0;
-        if (firq_count > 0) {  /* DISABLED for baseline — re-enable by setting >0 */
+        if (firq_count  < 2000) {  /* DISABLED for baseline — re-enable by setting >0 */
             if (!firq_log) firq_log = fopen("/tmp/frame_irq.log", "w");
             if (firq_log) {
                 int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
