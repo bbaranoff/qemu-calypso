@@ -74,6 +74,22 @@ typedef struct CalypsoTRX {
 
 static CalypsoTRX *g_trx;
 
+/* W1C latches for FB-detection result snapshot.
+ * Set by c54x data_write when DSP writes a_sync_SNR (LAST cell of
+ * fb-det iteration sequence) from a real fb-det PC. Snapshot captures
+ * d_fb_det/d_fb_mode/a_sync_demod[*] coherent for the iteration.
+ * Consumed by ARM read; survives DSP-side clears and stack-stomp at
+ * PC=0x0662. Order in DSP firmware:
+ *   d_fb_det → d_fb_mode → a_sync_TOA → PM → ANG → SNR (insn N..N+150)
+ * Snapshot at SNR ensures all values are this-iter values. */
+uint16_t g_d_fb_det_latch;
+uint16_t g_d_fb_mode_latch;
+uint16_t g_a_sync_TOA_latch;
+uint16_t g_a_sync_PM_latch;
+uint16_t g_a_sync_ANG_latch;
+uint16_t g_a_sync_SNR_latch;
+bool     g_a_sync_valid;
+
 /* All firmware patches removed — verified that the layer1.highram.elf
  * runs unmodified against the current QEMU emulation (PM scan, FBSB,
  * RESET cycle stable for >1 minute with NO patches applied).
@@ -125,8 +141,67 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             val = DSP_DL_STATUS_BOOT;
         }
     }
-    /* No stubs — the DSP writes results into dsp_ram (shared API RAM)
-     * and the firmware reads them directly. No intercepts. */
+    /* W1C latch consume — snapshot at fb-det iteration end (a_sync_SNR
+     * write by real fb-det PC).
+     * d_fb_det read consumes the latch (ARM acks detection); a_sync_*
+     * remain valid for the subsequent burst-read until next snapshot
+     * overwrites them. */
+    if (offset == 0x01F0 && size == 2 && g_a_sync_valid &&
+        g_d_fb_det_latch != 0) {
+        uint16_t v = g_d_fb_det_latch;
+        g_d_fb_det_latch = 0;
+        TRX_LOG("ARM RD d_fb_det LATCH-CONSUME = 0x%04x (cleared) fn=%u",
+                v, s->fn);
+        return v;
+    }
+    if (g_a_sync_valid && size == 2) {
+        uint16_t v = 0;
+        const char *name = NULL;
+        switch (offset) {
+        case 0x01F2: v = g_d_fb_mode_latch;  name = "d_fb_mode";  break;
+        case 0x01F4: v = g_a_sync_TOA_latch; name = "a_sync_TOA"; break;
+        case 0x01F6: v = g_a_sync_PM_latch;  name = "a_sync_PM";  break;
+        case 0x01F8: v = g_a_sync_ANG_latch; name = "a_sync_ANG"; break;
+        case 0x01FA: v = g_a_sync_SNR_latch; name = "a_sync_SNR"; break;
+        }
+        if (name) {
+            TRX_LOG("ARM RD %s LATCH = 0x%04x (s=%d) fn=%u",
+                    name, v, (int)(int16_t)v, s->fn);
+            return v;
+        }
+    }
+
+    /* ARM-read trace on d_fb_det / d_fb_mode / a_sync_demod cells:
+     *   0x01F0 = d_fb_det        (DSP word 0x08F8)
+     *   0x01F2 = d_fb_mode       (DSP word 0x08F9)
+     *   0x01F4..0x01FA = a_sync_demod[0..3] (TOA/PM/ANGLE/SNR)
+     * Capped + thinned. Goal: confirm whether ARM polls these cells and
+     * what value it sees vs what DSP wrote. If ARM never reads while DSP
+     * writes 0x095b → ARM-side mapping/timing bug. */
+    if (offset >= 0x01F0 && offset <= 0x01FE && (offset & 1) == 0) {
+        static unsigned arm_rd_log = 0;
+        static unsigned arm_rd_mode = 0;
+        arm_rd_log++;
+        bool is_mode = (offset == 0x01F2);
+        if (is_mode) arm_rd_mode++;
+        /* d_fb_mode: log EVERY read (no cap) — race-window check.
+         * Other cells: thinned. */
+        bool log_it = is_mode ||
+                      (arm_rd_log <= 200 || (arm_rd_log % 5000) == 0) ||
+                      (val != 0 && offset == 0x01F0);
+        if (log_it) {
+            const char *name =
+                (offset == 0x01F0) ? "d_fb_det"   :
+                (offset == 0x01F2) ? "d_fb_mode"  :
+                (offset == 0x01F4) ? "a_sync_TOA" :
+                (offset == 0x01F6) ? "a_sync_PM"  :
+                (offset == 0x01F8) ? "a_sync_ANG" :
+                (offset == 0x01FA) ? "a_sync_SNR" : "unk";
+            TRX_LOG("ARM RD %s [arm=0x%04x dsp_word=0x%04x] = 0x%04x sz=%d fn=%u #%u",
+                    name, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                    (unsigned)val, size, s->fn, arm_rd_log);
+        }
+    }
     return val;
 }
 
@@ -196,10 +271,14 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         hwaddr w1_d  = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
         if ((offset == w0_md || offset == w1_md ||
              offset == w0_d  || offset == w1_d) && value != 0) {
-            static int task_log = 0;
-            if (++task_log <= 100)
+            static unsigned task_log = 0;
+            /* Always log non-PM tasks (value != 1) so FB_TASK=5 / SB=6
+             * surfaces no matter when it occurs. PM=1 thinned. */
+            bool is_pm = (value == 1);
+            if (!is_pm || task_log < 100 || (task_log % 500) == 0)
                 TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
                         (unsigned)offset, (unsigned)value, s->fn);
+            task_log++;
         }
     }
     /* DSP page */

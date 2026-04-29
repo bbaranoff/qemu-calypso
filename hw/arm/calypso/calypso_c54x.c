@@ -12,6 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* W1C latches for FB-detection iteration snapshot — defined in
+ * calypso_trx.c. Set here in data_write when DSP writes a_sync_SNR
+ * (LAST cell of fb-det sequence) from a real fb-det PC. Snapshot
+ * captures all 6 cells coherent. Consumed by ARM read. */
+extern uint16_t g_d_fb_det_latch;
+extern uint16_t g_d_fb_mode_latch;
+extern uint16_t g_a_sync_TOA_latch;
+extern uint16_t g_a_sync_PM_latch;
+extern uint16_t g_a_sync_ANG_latch;
+extern uint16_t g_a_sync_SNR_latch;
+extern bool     g_a_sync_valid;
+
 static int g_boot_trace = 0;
 
 #define C54_LOG(fmt, ...) \
@@ -508,25 +520,142 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                     s->prog[s->pc],
                     s->prog[(uint16_t)(s->pc + 1)]);
         }
-        /* d_fb_det (NDB word 36 = DSP data 0x08F8). Real firmware writes
-         * a small unsigned value here (BSIC byte, status). Spurious writes
-         * caused by parallel/indirect store side-effects in nearby code
-         * can blast garbage like 0xC000 — only treat 1..0xFF as a real
-         * FB-detected event so we don't get false positives. */
+        /* d_fb_det (NDB word 36 = DSP data 0x08F8). The DSP correlator
+         * output here is treated as Q15-signed by the firmware FB-det
+         * path — small unsigned BSIC was a wrong assumption. Log every
+         * write unconditionally (thinned past 200) and dump the
+         * adjacent NDB cells [0x08F0..0x0900] so we can see correlator
+         * + flag + a_sync_demod fields together. */
+        /* Silent NDB cells watch — d_fb_mode (binary "FB matched" flag,
+         * THE actual trigger ARM tests), a_sync_PM (power), a_sync_SNR
+         * (SNR). All read as 0 by ARM during 200M run despite d_fb_det
+         * varying. Confirms: DSP never declares valid detection.
+         * Three discriminating outcomes:
+         *   (α) never written → "FB confirmed" code path unreached
+         *   (β) written =0 explicitly → DSP scans, never matches threshold
+         *   (γ) written !=0 but ARM reads 0 → coherence bug */
+        /* W1C latch on d_fb_mode for real fb-det PCs.
+         * Race-window evidence (200M run, 2026-04-29) :
+         *   DSP writes d_fb_mode = 0x0001 30× from PC=0x8d33/0x8f51
+         *   ARM reads d_fb_mode 1× and sees 0x0000
+         * → DSP sets, then clears within tight loop, ARM polls between
+         *   → 100% of detections lost.
+         * Latch: real-fb-det PC with non-zero val sets g_d_fb_mode_latch.
+         * ARM read in calypso_trx.c::calypso_dsp_read consumes & clears. */
+        /* Snapshot trigger: DSP writes a_sync_SNR (0x08FD, LAST cell of
+         * fb-det iteration) from a real fb-det PC. At this moment all 6
+         * cells (d_fb_det, d_fb_mode, a_sync_TOA/PM/ANG/SNR) are coherent
+         * for the just-completed iteration. Snapshot atomically; survives
+         * subsequent stack-stomp at PC=0x0662 etc.
+         * Order observed: d_fb_det → d_fb_mode → a_sync_TOA → PM → ANG
+         * → SNR (insn N..N+150). */
+        if (addr == 0x08FD && val != 0 &&
+            (s->pc == 0x8d33 || s->pc == 0x8eb9 || s->pc == 0x8f51)) {
+            g_d_fb_det_latch   = s->data[0x08F8];
+            g_d_fb_mode_latch  = s->data[0x08F9];
+            g_a_sync_TOA_latch = s->data[0x08FA];
+            g_a_sync_PM_latch  = s->data[0x08FB];
+            g_a_sync_ANG_latch = s->data[0x08FC];
+            g_a_sync_SNR_latch = val;
+            g_a_sync_valid     = true;
+        }
+        /* Full a_sync_demod + d_fb_mode WR watch — every cell, no PC
+         * filter (so we catch real-fb-det writes AND stomp candidates).
+         * Stomp zone PC=0x06xx tagged for easy grep. */
+        if (addr == 0x08F9 || addr == 0x08FA ||
+            addr == 0x08FB || addr == 0x08FC || addr == 0x08FD) {
+            static unsigned ts_log[5] = {0};
+            static uint16_t prev_d_fb_mode = 0xFFFF;
+            int idx = (addr == 0x08F9) ? 0 :
+                      (addr == 0x08FA) ? 1 :
+                      (addr == 0x08FB) ? 2 :
+                      (addr == 0x08FC) ? 3 : 4;
+            const char *name = (idx == 0) ? "d_fb_mode"  :
+                               (idx == 1) ? "a_sync_TOA" :
+                               (idx == 2) ? "a_sync_PM"  :
+                               (idx == 3) ? "a_sync_ANG" : "a_sync_SNR";
+            ts_log[idx]++;
+            bool transition = (idx == 0) &&
+                              (prev_d_fb_mode != 0xFFFF) &&
+                              (prev_d_fb_mode != val) &&
+                              (val != 0 || prev_d_fb_mode != 0);
+            bool stomp_zone = (s->pc >= 0x0600 && s->pc < 0x0700);
+            bool log_it = transition ||
+                          (idx == 0 && val != 0) ||
+                          (val != 0 && ts_log[idx] <= 50) ||
+                          (ts_log[idx] % 1000) == 0;
+            if (log_it) {
+                C54_LOG("DSP WR %s = 0x%04x (s=%d) PC=0x%04x%s insn=%u #%u%s",
+                        name, val, (int)(int16_t)val, s->pc,
+                        stomp_zone ? " [STOMP?]" : "",
+                        s->insn_count, ts_log[idx],
+                        transition ? " *TRANSITION*" : "");
+            }
+            if (idx == 0) prev_d_fb_mode = val;
+        }
         if (addr == 0x08F8) {
-            static int fbd_log = 0;
-            bool plausible = (val >= 1 && val <= 0xFF);
-            if (plausible || fbd_log < 5) {
-                C54_LOG("DSP WR d_fb_det = 0x%04x PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x %s",
-                        val, s->pc, s->insn_count,
+            static unsigned fbd_log = 0;
+            /* Filter out stack-stomp at d_fb_det: only PCs known to be
+             * actual fb-det correlator stores (0x8d33, 0x8eb9, 0x8f51) get
+             * the full per-write log + NDB+DARAM dumps. Other PCs (e.g.
+             * 0xb906 push site, 0x7763/0x7764 SP-overflow) get a counted
+             * one-line tag so we don't lose visibility on them, but they
+             * stop polluting the watch stream. */
+            bool real_fbdet = (s->pc == 0x8d33 || s->pc == 0x8eb9 ||
+                               s->pc == 0x8f51);
+            /* FBDET-DIVERSITY: count distinct values per 1M-insn window.
+             * 1 = DSP pegged on stale data. >5 = real scan. Discriminates
+             * "BSP delivers fresh I/Q" from "DSP recorrelates same window". */
+            if (real_fbdet) {
+                static uint16_t recent_vals[8] = {0};
+                static unsigned next_window = 1000000;
+                static int n_distinct = 0;
+                int seen = 0;
+                for (int i = 0; i < 8; i++) {
+                    if (recent_vals[i] == val) { seen = 1; break; }
+                }
+                if (!seen) {
+                    recent_vals[n_distinct & 7] = val;
+                    n_distinct++;
+                }
+                if (s->insn_count >= next_window) {
+                    C54_LOG("FBDET-DIVERSITY window=%uM distinct=%d",
+                            next_window / 1000000, n_distinct);
+                    n_distinct = 0;
+                    for (int i = 0; i < 8; i++) recent_vals[i] = 0;
+                    next_window = (s->insn_count / 1000000 + 1) * 1000000;
+                }
+            }
+            if (real_fbdet && (fbd_log < 200 || (fbd_log % 1000) == 0)) {
+                C54_LOG("DSP WR d_fb_det = 0x%04x (s=%d) PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x",
+                        val, (int)(int16_t)val, s->pc, s->insn_count,
                         s->prog[(uint16_t)(s->pc - 2)],
                         s->prog[(uint16_t)(s->pc - 1)],
                         s->prog[s->pc],
-                        s->prog[(uint16_t)(s->pc + 1)],
-                        plausible ? "*** FB DETECTED ***" :
-                        (val == 0 ? "(clear)" : "(spurious, ignored)"));
-                fbd_log++;
+                        s->prog[(uint16_t)(s->pc + 1)]);
+                C54_LOG("  NDB[0x08F0..0x0900]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                        s->data[0x08F0], s->data[0x08F1], s->data[0x08F2], s->data[0x08F3],
+                        s->data[0x08F4], s->data[0x08F5], s->data[0x08F6], s->data[0x08F7],
+                        val,             s->data[0x08F9], s->data[0x08FA], s->data[0x08FB],
+                        s->data[0x08FC], s->data[0x08FD], s->data[0x08FE], s->data[0x08FF],
+                        s->data[0x0900]);
+                if (fbd_log < 5) {
+                    C54_LOG("  DARAM[0x3FB0..0x3FBF]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                            s->data[0x3FB0], s->data[0x3FB1], s->data[0x3FB2], s->data[0x3FB3],
+                            s->data[0x3FB4], s->data[0x3FB5], s->data[0x3FB6], s->data[0x3FB7],
+                            s->data[0x3FB8], s->data[0x3FB9], s->data[0x3FBA], s->data[0x3FBB],
+                            s->data[0x3FBC], s->data[0x3FBD], s->data[0x3FBE], s->data[0x3FBF]);
+                }
+            } else if (!real_fbdet) {
+                static unsigned other_pc_count = 0;
+                other_pc_count++;
+                if (other_pc_count == 1 || other_pc_count == 100 ||
+                    other_pc_count == 10000 || other_pc_count == 1000000) {
+                    C54_LOG("d_fb_det NON-FBDET-PC write #%u val=0x%04x PC=0x%04x SP=0x%04x",
+                            other_pc_count, val, s->pc, s->sp);
+                }
             }
+            fbd_log++;
         }
     }
 
@@ -599,11 +728,20 @@ static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
 {
     if (opcode & 0x80) {
-        /* Indirect addressing */
+        /* Indirect addressing.
+         * Per SPRU131G §5.4.1 Table 5-5: bits 2:0 = ARF select the AR for
+         * THIS instruction. ARP (in ST0) is then updated to ARF for the
+         * NEXT direct-Smem reference. Earlier this code used arp(s) for
+         * cur_arp, which made every indirect insn operate on the
+         * PREVIOUS insn's ARF — off-by-one. Symptoms: BANZD *AR1- after
+         * STL *AR2+ would decrement AR2 instead of AR1 (BANZD test
+         * against AR2 stayed non-zero forever, AR1 frozen). Diagnosed
+         * via 5×500M-insn STATE-DUMP showing AR1=0x1c / AR2=0x2b0c
+         * frozen across 2B insns at PC=0xa2c2..0xa2ca. */
         *indirect = true;
         int mod = (opcode >> 3) & 0x0F;
         int nar = opcode & 0x07;
-        int cur_arp = arp(s);
+        int cur_arp = nar;
         uint16_t addr = s->ar[cur_arp];
 
         /* Post-modify */
@@ -1885,14 +2023,15 @@ static int c54x_exec_one(C54xState *s)
             }
             /* F80x-F81x: BANZ pmad, Smem (2 words)
              * Per SPRU172C + tic54x-opc.c: entire F8xx range is BANZ.
-             * Smem determines AR post-modify; test AR(ARP) != 0 → branch. */
+             * Sind operand selects AR via op[2:0] (nar). Test pre-mod
+             * value; resolve_smem applies Sind post-mod. Same off-by-ARP
+             * fix as 0x6C00 / 0x6E00 BANZ/BANZD. */
             if (sub <= 0x1) {
-                uint16_t ar_idx = arp(s);
-                uint16_t old_ar = s->ar[ar_idx];
+                int nar = op & 0x07;
+                uint16_t old_ar = s->ar[nar];
                 addr = resolve_smem(s, op, &ind);
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
-                s->ar[ar_idx]--; /* BANZ always decrements AR(ARP) */
                 if (old_ar != 0) {
                     s->pc = op2;
                     return 0;
@@ -2959,30 +3098,31 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if ((op & 0xFF00) == 0x6C00) {
-            /* BANZ pmad, Sind — branch if ARx != 0 after indirect-mode applied.
-             * Per SPRU172C p.4-15: resolve_smem applies the indirect mode (may
-             * modify ARx pre/post depending on mode); BANZ tests resulting
-             * ARx and branches to pmad if non-zero, else falls through. */
-            int arp = (s->st0 >> ST0_ARP_SHIFT) & 0x7;
-            resolve_smem(s, op, &ind);  /* side-effect on s->ar[arp] */
+            /* BANZ pmad, Sind — branch if ARx (selected by ARF in op[2:0])
+             * is non-zero. Test on PRE-modify value; resolve_smem applies
+             * post-mod regardless of branch outcome. Previously read ARP
+             * from ST0 (the PREVIOUS instruction's nar) — wrong AR was
+             * tested. Cf resolve_smem comment for the off-by-ARP bug. */
+            int nar = op & 0x07;
+            uint16_t pre = s->ar[nar];
+            resolve_smem(s, op, &ind);
             uint16_t pmad = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
             consumed = 2;
-            if (s->ar[arp] != 0) {
+            if (pre != 0) {
                 s->pc = pmad;
-                return 0;  /* PC set directly */
+                return 0;
             }
             return consumed + s->lk_used;
         }
         if ((op & 0xFF00) == 0x6E00) {
             /* BANZD pmad, Sind — delayed BANZ (2 slots after the 2-word op).
-             * Reuses the existing delayed_pc/delay_slots machinery (same one
-             * CALAD/CALLD/RPTBD use) so the 2 delay slots run before PC
-             * commits to pmad. */
-            int arp = (s->st0 >> ST0_ARP_SHIFT) & 0x7;
+             * Same off-by-ARP fix as BANZ above. */
+            int nar = op & 0x07;
+            uint16_t pre = s->ar[nar];
             resolve_smem(s, op, &ind);
             uint16_t pmad = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
             consumed = 2;
-            if (s->ar[arp] != 0) {
+            if (pre != 0) {
                 s->delayed_pc  = pmad;
                 s->delay_slots = 2;
             }
@@ -4229,6 +4369,131 @@ int c54x_run(C54xState *s, int n_insns)
     static int run_num = 0;
     run_num++;
 
+    /* SP history ring buffer (64 entries × insn/PC/SP). Sampled every
+     * 1M insns at top of run-loop. Dumped on STATE-DUMP. Reveals whether
+     * SP descends monotonically (cumulative leak — each ISR entry leaks
+     * one stack frame) or oscillates around a value (one big initial
+     * drop then steady-state). Different fixes. */
+    static struct { unsigned insn; uint16_t pc; uint16_t sp; } sp_ring[64];
+    static unsigned sp_ring_idx = 0;
+    static unsigned next_sp_sample = 1000000u;
+    if (s->insn_count >= next_sp_sample) {
+        next_sp_sample += 1000000u;
+        sp_ring[sp_ring_idx & 63].insn = s->insn_count;
+        sp_ring[sp_ring_idx & 63].pc   = s->pc;
+        sp_ring[sp_ring_idx & 63].sp   = s->sp;
+        sp_ring_idx++;
+    }
+
+    /* Periodic DSP state dump (every 500M insns, starting at 500M).
+     * Captures: state regs, hot-zone disasm (0xa2c0..0xa2d0 + 0xb8e0..0xb910),
+     * vector table at current PMST IPTR base, hot-PC opcodes, SP history. */
+    {
+        static unsigned next_dump = 500000000u;
+        if (s->insn_count >= next_dump) {
+            next_dump += 500000000u;
+            uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+            uint16_t vbase = iptr * 0x80;
+            C54_LOG("STATE-DUMP insn=%u PC=0x%04x ST0=0x%04x ST1=0x%04x INTM=%d IMR=0x%04x IFR=0x%04x XPC=%d PMST=0x%04x SP=0x%04x AR1=0x%04x AR2=0x%04x BRC=%d",
+                    s->insn_count, s->pc, s->st0, s->st1,
+                    !!(s->st1 & ST1_INTM),
+                    s->imr, s->ifr, s->xpc, s->pmst, s->sp,
+                    s->ar[1], s->ar[2], s->brc);
+            C54_LOG("STATE-DUMP prog[0xa2c0..0xa2d0]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->prog[0xa2c0], s->prog[0xa2c1], s->prog[0xa2c2], s->prog[0xa2c3],
+                    s->prog[0xa2c4], s->prog[0xa2c5], s->prog[0xa2c6], s->prog[0xa2c7],
+                    s->prog[0xa2c8], s->prog[0xa2c9], s->prog[0xa2ca], s->prog[0xa2cb],
+                    s->prog[0xa2cc], s->prog[0xa2cd], s->prog[0xa2ce], s->prog[0xa2cf],
+                    s->prog[0xa2d0]);
+            /* Hot zone after ARP fix: b8e9..b906 (run 2, vec1 handler). */
+            C54_LOG("STATE-DUMP prog[0xb8e0..0xb910]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->prog[0xb8e0], s->prog[0xb8e1], s->prog[0xb8e2], s->prog[0xb8e3],
+                    s->prog[0xb8e4], s->prog[0xb8e5], s->prog[0xb8e6], s->prog[0xb8e7],
+                    s->prog[0xb8e8], s->prog[0xb8e9], s->prog[0xb8ea], s->prog[0xb8eb],
+                    s->prog[0xb8ec], s->prog[0xb8ed], s->prog[0xb8ee], s->prog[0xb8ef],
+                    s->prog[0xb8f0], s->prog[0xb8f1], s->prog[0xb8f2], s->prog[0xb8f3],
+                    s->prog[0xb8f4], s->prog[0xb8f5], s->prog[0xb8f6], s->prog[0xb8f7],
+                    s->prog[0xb8f8], s->prog[0xb8f9], s->prog[0xb8fa], s->prog[0xb8fb],
+                    s->prog[0xb8fc], s->prog[0xb8fd], s->prog[0xb8fe], s->prog[0xb8ff],
+                    s->prog[0xb900]);
+            C54_LOG("STATE-DUMP prog[0xb900..0xb920]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->prog[0xb900], s->prog[0xb901], s->prog[0xb902], s->prog[0xb903],
+                    s->prog[0xb904], s->prog[0xb905], s->prog[0xb906], s->prog[0xb907],
+                    s->prog[0xb908], s->prog[0xb909], s->prog[0xb90a], s->prog[0xb90b],
+                    s->prog[0xb90c], s->prog[0xb90d], s->prog[0xb90e], s->prog[0xb90f],
+                    s->prog[0xb910], s->prog[0xb911], s->prog[0xb912], s->prog[0xb913],
+                    s->prog[0xb914], s->prog[0xb915], s->prog[0xb916], s->prog[0xb917],
+                    s->prog[0xb918], s->prog[0xb919], s->prog[0xb91a], s->prog[0xb91b],
+                    s->prog[0xb91c], s->prog[0xb91d], s->prog[0xb91e], s->prog[0xb91f],
+                    s->prog[0xb920]);
+            C54_LOG("STATE-DUMP vbase=0x%04x prog[vbase..vbase+0x18]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    vbase,
+                    s->prog[vbase+0x00], s->prog[vbase+0x01], s->prog[vbase+0x02], s->prog[vbase+0x03],
+                    s->prog[vbase+0x04], s->prog[vbase+0x05], s->prog[vbase+0x06], s->prog[vbase+0x07],
+                    s->prog[vbase+0x08], s->prog[vbase+0x09], s->prog[vbase+0x0a], s->prog[vbase+0x0b],
+                    s->prog[vbase+0x0c], s->prog[vbase+0x0d], s->prog[vbase+0x0e], s->prog[vbase+0x0f],
+                    s->prog[vbase+0x10], s->prog[vbase+0x11], s->prog[vbase+0x12], s->prog[vbase+0x13],
+                    s->prog[vbase+0x14], s->prog[vbase+0x15], s->prog[vbase+0x16], s->prog[vbase+0x17],
+                    s->prog[vbase+0x18]);
+            /* Hot-PC opcode dump for known correlator/handler sites */
+            C54_LOG("STATE-DUMP HOT-OPS: 0x8d33=%04x 0x8eb9=%04x 0x8f51=%04x 0xa2c7=%04x 0xa2c8=%04x 0xb8e9=%04x 0xb8eb=%04x 0xb8f4=%04x 0xb8f5=%04x 0xb906=%04x",
+                    s->prog[0x8d33], s->prog[0x8eb9], s->prog[0x8f51],
+                    s->prog[0xa2c7], s->prog[0xa2c8],
+                    s->prog[0xb8e9], s->prog[0xb8eb], s->prog[0xb8f4],
+                    s->prog[0xb8f5], s->prog[0xb906]);
+            /* DARAM 0x066F..0x0682 wait-loop disasm (run 3 stuck zone).
+             * Looking for B-self (f073 066f) vs IDLE n (f7e1/f7e2/f7e3)
+             * vs poll-and-branch. If IDLE found → emulator IDLE handler
+             * is the real bug (3 runs all hit the same opcode, terminate
+             * in different bassins because PMST/IPTR varies). */
+            C54_LOG("STATE-DUMP prog[0x0660..0x0690]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->prog[0x0660], s->prog[0x0661], s->prog[0x0662], s->prog[0x0663],
+                    s->prog[0x0664], s->prog[0x0665], s->prog[0x0666], s->prog[0x0667],
+                    s->prog[0x0668], s->prog[0x0669], s->prog[0x066a], s->prog[0x066b],
+                    s->prog[0x066c], s->prog[0x066d], s->prog[0x066e], s->prog[0x066f],
+                    s->prog[0x0670], s->prog[0x0671], s->prog[0x0672], s->prog[0x0673],
+                    s->prog[0x0674], s->prog[0x0675], s->prog[0x0676], s->prog[0x0677],
+                    s->prog[0x0678], s->prog[0x0679], s->prog[0x067a], s->prog[0x067b],
+                    s->prog[0x067c], s->prog[0x067d], s->prog[0x067e], s->prog[0x067f],
+                    s->prog[0x0680]);
+            /* Same range but data[] view in case OVLY=1 routes fetches
+             * to data array (different memory than prog). */
+            C54_LOG("STATE-DUMP data[0x0660..0x0680]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->data[0x0660], s->data[0x0661], s->data[0x0662], s->data[0x0663],
+                    s->data[0x0664], s->data[0x0665], s->data[0x0666], s->data[0x0667],
+                    s->data[0x0668], s->data[0x0669], s->data[0x066a], s->data[0x066b],
+                    s->data[0x066c], s->data[0x066d], s->data[0x066e], s->data[0x066f],
+                    s->data[0x0670], s->data[0x0671], s->data[0x0672], s->data[0x0673],
+                    s->data[0x0674], s->data[0x0675], s->data[0x0676], s->data[0x0677],
+                    s->data[0x0678], s->data[0x0679], s->data[0x067a], s->data[0x067b],
+                    s->data[0x067c], s->data[0x067d], s->data[0x067e], s->data[0x067f],
+                    s->data[0x0680]);
+            /* IRQ entry handler at PC=0x1854 (last 0→1 transition) */
+            C54_LOG("STATE-DUMP prog[0x1850..0x1860]: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    s->prog[0x1850], s->prog[0x1851], s->prog[0x1852], s->prog[0x1853],
+                    s->prog[0x1854], s->prog[0x1855], s->prog[0x1856], s->prog[0x1857],
+                    s->prog[0x1858], s->prog[0x1859], s->prog[0x185a], s->prog[0x185b],
+                    s->prog[0x185c], s->prog[0x185d], s->prog[0x185e], s->prog[0x185f],
+                    s->prog[0x1860]);
+            /* SP history ring (last 32 sampled at 1M-insn intervals) */
+            {
+                char buf[2048]; int o = 0;
+                int start = (sp_ring_idx >= 32) ? (sp_ring_idx - 32) : 0;
+                for (unsigned i = start; i < sp_ring_idx; i++) {
+                    int idx = i & 63;
+                    o += snprintf(buf+o, sizeof(buf)-o,
+                                  "[%u:PC=%04x SP=%04x] ",
+                                  sp_ring[idx].insn,
+                                  sp_ring[idx].pc,
+                                  sp_ring[idx].sp);
+                    if (o > (int)sizeof(buf) - 64) break;
+                }
+                C54_LOG("STATE-DUMP SP-RING (last %d): %s",
+                        (int)(sp_ring_idx >= 32 ? 32 : sp_ring_idx), buf);
+            }
+        }
+    }
+
     while (executed < n_insns && s->running && !s->idle) {
         /* Replay any interrupt that fired while INTM=1.
          * c54x_interrupt_ex sets IFR but does nothing else when INTM=1;
@@ -4264,6 +4529,59 @@ int c54x_run(C54xState *s, int n_insns)
         /* Record PC in ring buffer */
         pc_ring[pc_ring_idx & 255] = s->pc;
         pc_ring_idx++;
+
+        /* Push counter at PC=0xb906 (and other suspected push sites).
+         * Logs at powers of 10 to track cadence. SP captured at hit. */
+        {
+            static unsigned hit_b906 = 0;
+            if (s->pc == 0xb906) {
+                hit_b906++;
+                if (hit_b906 == 1 || hit_b906 == 10 || hit_b906 == 100 ||
+                    hit_b906 == 1000 || hit_b906 == 10000 ||
+                    hit_b906 == 100000 || hit_b906 == 1000000) {
+                    C54_LOG("HIT-b906 #%u op=0x%04x SP=0x%04x XPC=%d insn=%u",
+                            hit_b906, s->prog[0xb906], s->sp, s->xpc,
+                            s->insn_count);
+                }
+            }
+        }
+
+        /* INTM transition tracer: every change of ST1 bit 11 with
+         * surrounding state. Identifies which IRQ entered the trap and
+         * whether RETE / RSBX paths ever execute again. On each 0->1
+         * (IRQ entry), also dump prog[PC..PC+8] and the 4 most-recently
+         * pushed stack words (data[SP..SP+3]) so we can see what handler
+         * we're entering and why it never RETEs. */
+        {
+            static int intm_log = 0;
+            static uint16_t prev_intm = 0xFFFF;
+            uint16_t cur_intm = !!(s->st1 & ST1_INTM);
+            if (prev_intm != 0xFFFF && cur_intm != prev_intm && intm_log < 200) {
+                C54_LOG("INTM-TRANS %u->%u PC=0x%04x op=0x%04x XPC=%d IFR=0x%04x SP=0x%04x insn=%u",
+                        (unsigned)prev_intm, (unsigned)cur_intm,
+                        s->pc, s->prog[s->pc], s->xpc, s->ifr, s->sp,
+                        s->insn_count);
+                if (cur_intm == 1) {
+                    C54_LOG("  HANDLER prog[PC..PC+8]: %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                            s->prog[s->pc],
+                            s->prog[(uint16_t)(s->pc + 1)],
+                            s->prog[(uint16_t)(s->pc + 2)],
+                            s->prog[(uint16_t)(s->pc + 3)],
+                            s->prog[(uint16_t)(s->pc + 4)],
+                            s->prog[(uint16_t)(s->pc + 5)],
+                            s->prog[(uint16_t)(s->pc + 6)],
+                            s->prog[(uint16_t)(s->pc + 7)],
+                            s->prog[(uint16_t)(s->pc + 8)]);
+                    C54_LOG("  STACK data[SP..SP+3]: %04x %04x %04x %04x",
+                            s->data[s->sp],
+                            s->data[(uint16_t)(s->sp + 1)],
+                            s->data[(uint16_t)(s->sp + 2)],
+                            s->data[(uint16_t)(s->sp + 3)]);
+                }
+                intm_log++;
+            }
+            prev_intm = cur_intm;
+        }
 
         /* SP-WATCH: log every transition where SP enters / leaves the
          * API mailbox region [0x0800..0x08FF]. This pinpoints the exact
