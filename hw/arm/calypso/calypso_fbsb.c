@@ -128,14 +128,28 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         static uint16_t allc_burst_idx = 0;
         static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
 
-        /* XXX TEMP HARDCODE — SI3 fixture from libosmocore
-         * tests/gb/gprs_bssgp_rim_test.c:376. 21 bytes + 0x2B 0x2B fill
-         * = 23 bytes LAPDm UI frame for BCCH/CCCH downlink.
-         * À retirer dès intercept bridge.py opérationnel. */
+        /* XXX TEMP HARDCODE — SI3 hand-crafted depuis cell params VTY osmo-bsc
+         * (LAI 001/01/0001, CI=6001, BSIC=7, ARFCN=514).
+         * Layout TS 44.018 §9.1.35 + struct gsm48_system_information_type_3.
+         *
+         * Étape 2.5 (2026-04-30) : remplace fixture libosmocore BSSGP
+         * (rejetée par L23 — verifié GSMTAP MM_EVENT_NO_CELL_FOUND × N).
+         * À retirer dès intercept bridge.py / osmo-bts opérationnel. */
         static const uint8_t si3_blob[23] = {
-            0x1b, 0x75, 0x30, 0x00, 0xf1, 0x10, 0x23, 0x6e,
-            0xc9, 0x03, 0x3c, 0x27, 0x47, 0x40, 0x79, 0x00,
-            0x00, 0x3c, 0x0b, 0x2b, 0x2b, 0x2b, 0x2b
+            0x49,                                   /* l2_plen = LEN2PLEN(18) */
+            0x06,                                   /* PD=RR, skip=0 */
+            0x1B,                                   /* MTI = GSM48_MT_RR_SYSINFO_3 */
+            0x17, 0x71,                             /* cell_identity = 6001 BE */
+            0x00, 0xF1, 0x10, 0x00, 0x01,           /* LAI BCD: MCC=001 MNC=01 LAC=1 */
+            0x49,                                   /* CCD oct1: mscr=0 att=1 bs_ag=1 ccch_conf=1 */
+            0x03,                                   /* CCD oct2: bs_pa_mfrms=3 (=N-2 for N=5) */
+            0x00,                                   /* T3212 = 0 */
+            0x04,                                   /* cell_options: dtx=0 pwrc=0 rl_timeout=4 */
+            0x4F,                                   /* cell_sel_par oct1: hyst=2 (4dB) txpwr=15 */
+            0x00,                                   /* cell_sel_par oct2: acs=0 neci=0 rxlev_min=0 */
+            0xE5,                                   /* RACH oct1: max_trans=3 (=7) tx_int=9 cell_bar=0 RE=1 */
+            0x00, 0x00,                             /* RACH t2/t3: ACC mask 0x3FF (none barred) */
+            0x2B, 0x2B, 0x2B, 0x2B                  /* rest_octets fill (no SI2ter/quater indicator) */
         };
 
         /* Echo d_task_d / d_burst_d dans les deux read pages */
