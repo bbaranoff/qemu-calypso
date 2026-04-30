@@ -121,28 +121,30 @@ for i in $(seq 1 30); do
 done
 if grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null; then echo " OK"; else echo " TIMEOUT"; fi
 
-# ---------- 4. osmo-bts-trx ----------
+# ---------- 4. rsl_si_tap.py — BEFORE osmo-bts pour capturer BCCH_INFO du re-attach ----------
+# Sniffe RSL osmo-bsc → osmo-bts (TCP lo:3003), parse BCCH_INFO, populate
+# /dev/shm/calypso_si.bin dynamiquement. Doit démarrer AVANT osmo-bts pour
+# capturer les BCCH_INFO émis par BSC au moment de l'attachement BTS.
+RSL_SI_TAP="/opt/GSM/qemu-src/scripts/rsl_si_tap.py"
+tmux new-window -t "$SESSION" -n rsl_si_tap
+tmux send-keys -t "$SESSION:rsl_si_tap" \
+    "python3 $RSL_SI_TAP 2>&1 | tee /tmp/rsl_si_tap.log" C-m
+sleep 1  # let tap bind socket before BTS attaches
+
+# ---------- 5. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
 sleep 2
 
-# ---------- 5. mobile ----------
+# ---------- 6. mobile ----------
 tmux new-window -t "$SESSION" -n mobile
 tmux send-keys -t "$SESSION:mobile" \
     "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
 
-# ---------- 6. gsmtap capture ----------
+# ---------- 7. gsmtap capture ----------
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
     "sleep 5 && tcpdump -i eth1 -w /root/mobile-gsmtap.pcap udp port 4729" C-m
-
-# ---------- 7. (étape 3 future) rsl_si_tap.py ----------
-# Dès que scripts/rsl_si_tap.py est implémenté, dé-commenter ce block et
-# supprimer l'appel populate-si.sh phase 0 ci-dessus.
-#
-#tmux new-window -t "$SESSION" -n rsl_si_tap
-#tmux send-keys -t "$SESSION:rsl_si_tap" \
-#    "python3 /opt/GSM/qemu-src/scripts/rsl_si_tap.py 2>&1 | tee /tmp/rsl_si_tap.log" C-m
 
 # ---------- shell + attach ----------
 tmux new-window -t "$SESSION" -n shell
