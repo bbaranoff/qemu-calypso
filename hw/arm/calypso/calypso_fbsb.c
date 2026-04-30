@@ -14,6 +14,118 @@
  */
 #include "calypso_fbsb.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+
+/* ---------------------------------------------------------------- *
+ * MMAP SI consumer (cf. doc/MMAP_SI_FORMAT.md v1).
+ * Lit /dev/shm/calypso_si.bin (ou $CALYPSO_SI_MMAP_PATH si défini).
+ * Layout : 16-byte header + 5×32-byte slots = 176 bytes total.
+ * Magic 4 bytes "CSI1" = 0x31495343 LE.
+ * Slots fixés : 0=SI1, 1=SI2, 2=SI3, 3=SI4, 4=SI13.
+ * Si fichier absent / magic invalide / slot vide → fallback hardcoded
+ * (transition graceful pendant dev). À retirer une fois bridge stable.
+ * ---------------------------------------------------------------- */
+#define CSI_MAGIC          0x31495343u  /* "CSI1" LE uint32 */
+#define CSI_HEADER_SIZE    16
+#define CSI_SLOT_SIZE      32
+#define CSI_SLOT_COUNT     5
+#define CSI_FILE_SIZE      (CSI_HEADER_SIZE + CSI_SLOT_COUNT * CSI_SLOT_SIZE)
+
+#define CSI_SLOT_VALID     (1u << 0)
+
+#define CSI_SLOT_SI1   0
+#define CSI_SLOT_SI2   1
+#define CSI_SLOT_SI3   2
+#define CSI_SLOT_SI4   3
+#define CSI_SLOT_SI13  4
+
+static struct {
+    int   fd;
+    void *map;
+    int   state;   /* 0=uninit, 1=ready, -1=disabled */
+} g_csi = { -1, NULL, 0 };
+
+static void csi_init_once(void)
+{
+    if (g_csi.state != 0) return;
+
+    const char *path = getenv("CALYPSO_SI_MMAP_PATH");
+    if (!path) path = "/dev/shm/calypso_si.bin";
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[fbsb] CSI mmap: open(%s) failed: %s — fallback hardcoded\n",
+                path, strerror(errno));
+        g_csi.state = -1;
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size < (off_t)CSI_FILE_SIZE) {
+        fprintf(stderr, "[fbsb] CSI mmap: %s too small (%lld < %d) — fallback\n",
+                path, (long long)st.st_size, (int)CSI_FILE_SIZE);
+        close(fd);
+        g_csi.state = -1;
+        return;
+    }
+    void *map = mmap(NULL, CSI_FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "[fbsb] CSI mmap: mmap failed: %s — fallback\n", strerror(errno));
+        close(fd);
+        g_csi.state = -1;
+        return;
+    }
+    uint32_t magic;
+    memcpy(&magic, map, 4);
+    if (magic != CSI_MAGIC) {
+        fprintf(stderr, "[fbsb] CSI mmap: bad magic 0x%08x (expected 0x%08x) — fallback\n",
+                magic, CSI_MAGIC);
+        munmap(map, CSI_FILE_SIZE);
+        close(fd);
+        g_csi.state = -1;
+        return;
+    }
+    g_csi.fd = fd;
+    g_csi.map = map;
+    g_csi.state = 1;
+    const uint8_t *h = (const uint8_t *)map;
+    fprintf(stderr, "[fbsb] CSI mmap: ready (%s, ver=%u, slots=%u)\n",
+            path, h[4], h[5]);
+    fflush(stderr);
+}
+
+/* TS 44.018 §3.4 table 1 — TC → SI mapping for normal BCCH multiframe.
+ * SI3 émis 3× par cycle (TC=2,4,6) car critique pour cell selection. */
+static const uint8_t tc_to_slot[8] = {
+    CSI_SLOT_SI1,   /* TC=0 */
+    CSI_SLOT_SI2,   /* TC=1 */
+    CSI_SLOT_SI3,   /* TC=2 */
+    CSI_SLOT_SI4,   /* TC=3 */
+    CSI_SLOT_SI3,   /* TC=4 */
+    CSI_SLOT_SI2,   /* TC=5 */
+    CSI_SLOT_SI3,   /* TC=6 */
+    CSI_SLOT_SI4    /* TC=7 */
+};
+
+/* Returns pointer to 23-byte SI blob for given TC, or NULL if mmap unavailable
+ * or slot empty/invalid. Caller must fallback to hardcoded SI3 if NULL. */
+static const uint8_t *csi_lookup_for_tc(uint8_t tc, uint8_t *out_si_type)
+{
+    if (g_csi.state != 1) return NULL;
+    uint8_t slot_idx = tc_to_slot[tc & 7];
+    const uint8_t *slot = (const uint8_t *)g_csi.map + CSI_HEADER_SIZE +
+                          slot_idx * CSI_SLOT_SIZE;
+    if (slot[0] == 0x00) return NULL;
+    if (!(slot[1] & CSI_SLOT_VALID)) return NULL;
+    if (slot[2] != 23) return NULL;
+    if (out_si_type) *out_si_type = slot[0];
+    return &slot[4];
+}
 
 /* ---------------------------------------------------------------- *
  * Internal: NDB cell access. ndb is the ARM-side dsp_ram[] view
@@ -115,41 +227,29 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
          * Étape 1 : echo d_task_d/d_burst_d pour passer guard EMPTY de
          * prim_rx_nb.c:73-83 (db_r->d_task_d != 0, db_r->d_burst_d == K).
          *
-         * Étape 2 — XXX TEMP HARDCODE replace with bridge intercept :
-         * Hardcode d'un payload SI3 fixture (libosmocore tests). Vrai pipeline
-         * existe (osmo-bts émet BCCH bursts via TRXD UDP 5702 → bridge.py).
-         * Hardcode = stub (règle #1 CLAUDE.md). Documenté TODO.md avec
-         * critère de retrait : intercept LAPDm dans bridge.py et push via
-         * canal séparé vers QEMU.
+         * Étape 2a : SI blob lu depuis mmap /dev/shm/calypso_si.bin
+         * (cf. doc/MMAP_SI_FORMAT.md). Slot sélectionné selon TC (TS 44.018
+         * §3.4 table 1) : SI1/SI2/SI3/SI4 alternés, SI3 3× par cycle.
          *
-         * Critère retrait : bridge.py expose endpoint UDP recevant 23 bytes
-         * LAPDm depuis osmo-bts (avant ou après interleaving), QEMU lit
-         * dans calypso_fbsb au lieu de la fixture statique. */
+         * Fallback hardcoded SI3 si mmap absent/invalide (transition graceful
+         * pendant dev). À retirer une fois rsl_si_tap.py opérationnel +
+         * runs validés CALYPSO_SI_MMAP_PATH actif. */
         static uint16_t allc_burst_idx = 0;
         static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
 
-        /* XXX TEMP HARDCODE — SI3 hand-crafted depuis cell params VTY osmo-bsc
-         * (LAI 001/01/0001, CI=6001, BSIC=7, ARFCN=514).
-         * Layout TS 44.018 §9.1.35 + struct gsm48_system_information_type_3.
-         *
-         * Étape 2.5 (2026-04-30) : remplace fixture libosmocore BSSGP
-         * (rejetée par L23 — verifié GSMTAP MM_EVENT_NO_CELL_FOUND × N).
-         * À retirer dès intercept bridge.py / osmo-bts opérationnel. */
-        static const uint8_t si3_blob[23] = {
-            0x49,                                   /* l2_plen = LEN2PLEN(18) */
-            0x06,                                   /* PD=RR, skip=0 */
-            0x1B,                                   /* MTI = GSM48_MT_RR_SYSINFO_3 */
-            0x17, 0x71,                             /* cell_identity = 6001 BE */
-            0x00, 0xF1, 0x10, 0x00, 0x01,           /* LAI BCD: MCC=001 MNC=01 LAC=1 */
-            0x49,                                   /* CCD oct1: mscr=0 att=1 bs_ag=1 ccch_conf=1 */
-            0x03,                                   /* CCD oct2: bs_pa_mfrms=3 (=N-2 for N=5) */
-            0x00,                                   /* T3212 = 0 */
-            0x04,                                   /* cell_options: dtx=0 pwrc=0 rl_timeout=4 */
-            0x4F,                                   /* cell_sel_par oct1: hyst=2 (4dB) txpwr=15 */
-            0x00,                                   /* cell_sel_par oct2: acs=0 neci=0 rxlev_min=0 */
-            0xE5,                                   /* RACH oct1: max_trans=3 (=7) tx_int=9 cell_bar=0 RE=1 */
-            0x00, 0x00,                             /* RACH t2/t3: ACC mask 0x3FF (none barred) */
-            0x2B, 0x2B, 0x2B, 0x2B                  /* rest_octets fill (no SI2ter/quater indicator) */
+        /* XXX FALLBACK HARDCODE — SI3 hand-crafted (LAI 001/01/0001, CI=6001).
+         * Utilisé seulement si mmap CSI absent ou slot SI3 vide.
+         * À retirer une fois /dev/shm/calypso_si.bin alimenté en steady-state
+         * par rsl_si_tap.py. */
+        static const uint8_t si3_fallback[23] = {
+            0x49, 0x06, 0x1B,
+            0x17, 0x71,
+            0x00, 0xF1, 0x10, 0x00, 0x01,
+            0x49, 0x03, 0x00,
+            0x04,
+            0x4F, 0x00,
+            0xE5, 0x00, 0x00,
+            0x2B, 0x2B, 0x2B, 0x2B
         };
 
         /* Echo d_task_d / d_burst_d dans les deux read pages */
@@ -159,33 +259,38 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
             rp[1] = allc_burst_idx;    /* d_burst_d cycling 0..3 */
         }
 
-        /* a_cd[] dans NDB à word offset 0x01D2 (= NDB 0x01A8 + 0x1FC ARM byte).
-         *
-         * EMPIRIQUE 2026-04-29 nuit : project memory disait NDB+0x1F8 (word
-         * 0x01D0) mais runs avec 0x01D0 montrent shift de 2 words côté ARM
-         * (data starts at si3_blob[4] au lieu de [0], num_biterr=0x30 au
-         * lieu de 0x00). Cause probable : derniers 2 words de a_ramp[16]
-         * juste avant. Offset corrigé empiriquement à 0x01D2.
-         *
+        /* Sélection SI selon TC (BCCH multiframe slot pattern) */
+        csi_init_once();
+        uint8_t tc = (uint8_t)((fn / 51) & 7);
+        uint8_t si_type = 0;
+        const uint8_t *blob = csi_lookup_for_tc(tc, &si_type);
+        if (!blob) {
+            blob = si3_fallback;
+            si_type = 0x03;  /* fallback always SI3 */
+        }
+
+        /* a_cd[] dans NDB à word offset 0x01D2 (NDB+0x1FC ARM byte, empirique).
          * Layout :
-         *   a_cd[0] : flags. B_BLUD=bit15 (block present). FIRE=bits 5,6 (=0 NO ERROR).
-         *   a_cd[1] : info block (skipped par firmware).
-         *   a_cd[2] : num_biterr (lower 16 bits).
-         *   a_cd[3..14] : 23 bytes LAPDm payload (12 words, dernier word demi-utilisé). */
+         *   a_cd[0] : flags B_BLUD=bit15 + FIRE bits 5,6 (=0 NO ERROR)
+         *   a_cd[1] : info block (firmware skip)
+         *   a_cd[2] : num_biterr
+         *   a_cd[3..14] : 23 bytes LAPDm BCCH payload */
         {
             uint16_t *acd = &s->ndb[0x01D2];
             acd[0] = 0x8000;           /* B_BLUD set, FIRE bits clear */
             acd[1] = 0x0000;
             acd[2] = 0x0000;           /* num_biterr = 0 */
             for (int i = 0; i < 12; i++) {
-                uint16_t lo = (i*2     < 23) ? si3_blob[i*2]     : 0;
-                uint16_t hi = (i*2 + 1 < 23) ? si3_blob[i*2 + 1] : 0;
+                uint16_t lo = (i*2     < 23) ? blob[i*2]     : 0;
+                uint16_t hi = (i*2 + 1 < 23) ? blob[i*2 + 1] : 0;
                 acd[3 + i] = (uint16_t)(lo | (hi << 8));
             }
         }
 
-        fprintf(stderr, "[fbsb] ALLC echo+SI3 task=24 burst_d=%u fn=%lu\n",
-                allc_burst_idx, (unsigned long)fn);
+        fprintf(stderr,
+                "[fbsb] ALLC echo+SI task=24 burst_d=%u fn=%lu TC=%u si_type=0x%02x %s\n",
+                allc_burst_idx, (unsigned long)fn, tc, si_type,
+                (g_csi.state == 1 && blob != si3_fallback) ? "(mmap)" : "(fallback SI3)");
         fflush(stderr);
         allc_burst_idx = (allc_burst_idx + 1) & 3;
         break;
