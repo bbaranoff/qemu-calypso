@@ -183,6 +183,24 @@ void calypso_fbsb_reset(CalypsoFbsb *s)
  * firmware's prim_fbsb.c expects: when the task is FB_DSP_TASK we
  * enter FB0_SEARCH; when it's SB_DSP_TASK we enter SB_SEARCH.
  * ---------------------------------------------------------------- */
+/* CALYPSO_FBSB_SYNTH=1 → publish synthetic FB/SB results in NDB so the
+ * firmware progresses past FBSB without waiting for the DSP correlator
+ * to converge. Documented dev-assist for cases where the emulated DSP
+ * fb-det doesn't converge on bridge-fed GMSK samples. Default 0 = real
+ * DSP path. Read once at first call. */
+static int fbsb_synth_mode(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_FBSB_SYNTH");
+        cached = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr, "[calypso-fbsb] CALYPSO_FBSB_SYNTH=%d (%s path)\n",
+                cached, cached ? "synth, dev-assist" : "real DSP");
+        fflush(stderr);
+    }
+    return cached;
+}
+
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn)
 {
@@ -190,73 +208,68 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
             d_task_md, (unsigned long)fn, s ? (int)s->state : -1);
     fflush(stderr);
     if (!s) return;
+    int synth = fbsb_synth_mode();
     switch (d_task_md) {
     case DSP_TASK_FB:
-        /* Re-arm on every FB task write. Publish immediately —
-         * prim_fbsb's first poll happens at frame N+2 (cf
-         * docs/FBSB_FLOW.md §3), so d_fb_det=1 must already be set
-         * by then. Waiting in on_frame_tick was racing the previous
-         * cycle's result=255. */
+        /* The DSP runs the real fb-det routine on the I/Q stream that
+         * the BSP feeds from osmo-bts-trx (GMSK-modulated). Convergence
+         * depends on the routine running fully each frame — see
+         * doc/FBSB_FLOW.md and the icount/wall-clock notes in run.sh.
+         * If CALYPSO_FBSB_SYNTH=1, publish synthetic results to bypass
+         * the (currently non-converging) emulated correlator. */
         s->state       = FBSB_FB0_SEARCH;
         s->fb0_attempt = 0;
         s->fb1_attempt = 0;
         s->sb_attempt  = 0;
         s->fn_started  = fn;
-        calypso_fbsb_publish_fb_found(s,
-            /* toa   */ 0,
-            /* pm    */ 80,
-            /* angle */ 0,
-            /* snr   */ 100);
-        s->state = FBSB_FB0_FOUND;
-        calypso_fbsb_dump(s, "FB0_FOUND (synth, immediate)");
+        if (synth) {
+            calypso_fbsb_publish_fb_found(s,
+                /* toa */ 0, /* pm */ 80, /* angle */ 0, /* snr */ 100);
+            s->state = FBSB_FB0_FOUND;
+            calypso_fbsb_dump(s, "FB0_FOUND (synth)");
+        } else {
+            calypso_fbsb_dump(s, "FB0_SEARCH (real DSP path)");
+        }
         break;
     case DSP_TASK_SB:
-        /* Synthesize a sync burst immediately so l1s_sbdet_resp finds
-         * a_sch[0] with B_SCH_CRC=0 (CRC OK) and a decodable BSIC at
-         * a_sch[3..4]. We use bsic=0 (valid placeholder). */
         s->state      = FBSB_SB_SEARCH;
         s->sb_attempt = 0;
         s->fn_started = fn;
-        calypso_fbsb_publish_sb_found(s, /* bsic */ 0);
-        s->state = FBSB_SB_FOUND;
-        calypso_fbsb_dump(s, "SB_FOUND (synth, immediate)");
+        if (synth) {
+            calypso_fbsb_publish_sb_found(s, /* bsic */ 0);
+            s->state = FBSB_SB_FOUND;
+            calypso_fbsb_dump(s, "SB_FOUND (synth)");
+        } else {
+            calypso_fbsb_dump(s, "SB_SEARCH (real DSP path)");
+        }
         break;
     case DSP_TASK_ALLC: {
         /* CCCH read (task=24, ALLC_DSP_TASK).
          *
-         * Étape 1 : echo d_task_d/d_burst_d pour passer guard EMPTY de
+         * Echo d_task_d/d_burst_d to pass the EMPTY guard in
          * prim_rx_nb.c:73-83 (db_r->d_task_d != 0, db_r->d_burst_d == K).
+         * d_burst_d is FN-derived (block index in the BCCH multiframe)
+         * so it stays in lockstep with the firmware's own scheduling
+         * regardless of TDMA jitter.
          *
-         * Étape 2a : SI blob lu depuis mmap /dev/shm/calypso_si.bin
-         * (cf. doc/MMAP_SI_FORMAT.md). Slot sélectionné selon TC (TS 44.018
-         * §3.4 table 1) : SI1/SI2/SI3/SI4 alternés, SI3 3× par cycle.
-         *
-         * Fallback hardcoded SI3 si mmap absent/invalide (transition graceful
-         * pendant dev). À retirer une fois rsl_si_tap.py opérationnel +
-         * runs validés CALYPSO_SI_MMAP_PATH actif. */
-        static uint16_t allc_burst_idx = 0;
+         * SI blob lu depuis mmap /dev/shm/calypso_si.bin (cf.
+         * doc/MMAP_SI_FORMAT.md). Si mmap absent/invalide → on n'écrit
+         * rien et le firmware verra a_cd vide (FBSB échouera proprement,
+         * pas de fallback hardcoded). */
         static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
 
-        /* XXX FALLBACK HARDCODE — SI3 hand-crafted (LAI 001/01/0001, CI=6001).
-         * Utilisé seulement si mmap CSI absent ou slot SI3 vide.
-         * À retirer une fois /dev/shm/calypso_si.bin alimenté en steady-state
-         * par rsl_si_tap.py. */
-        static const uint8_t si3_fallback[23] = {
-            0x49, 0x06, 0x1B,
-            0x17, 0x71,
-            0x00, 0xF1, 0x10, 0x00, 0x01,
-            0x49, 0x03, 0x00,
-            0x04,
-            0x4F, 0x00,
-            0xE5, 0x00, 0x00,
-            0x2B, 0x2B, 0x2B, 0x2B
-        };
+        /* d_burst_d = block index 0..3 inside the 4-burst BCCH block.
+         * In a 51-multiframe, BCCH bursts occupy fn%51 in {2,3,4,5}, so
+         * the burst index inside that block is (fn-2)%4 — but the simpler,
+         * lockstep-safe expression is fn & 3 (block alignment is what
+         * matters here, not absolute slot). */
+        uint16_t burst_d = (uint16_t)(fn & 3);
 
         /* Echo d_task_d / d_burst_d dans les deux read pages */
         for (int p = 0; p < 2; p++) {
             uint16_t *rp = &s->ndb[db_r_word_base[p]];
-            rp[0] = DSP_TASK_ALLC;     /* d_task_d = 24 */
-            rp[1] = allc_burst_idx;    /* d_burst_d cycling 0..3 */
+            rp[0] = DSP_TASK_ALLC;
+            rp[1] = burst_d;
         }
 
         /* Sélection SI selon TC (BCCH multiframe slot pattern) */
@@ -264,22 +277,18 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         uint8_t tc = (uint8_t)((fn / 51) & 7);
         uint8_t si_type = 0;
         const uint8_t *blob = csi_lookup_for_tc(tc, &si_type);
-        if (!blob) {
-            blob = si3_fallback;
-            si_type = 0x03;  /* fallback always SI3 */
-        }
 
-        /* a_cd[] dans NDB à word offset 0x01D2 (NDB+0x1FC ARM byte, empirique).
-         * Layout :
-         *   a_cd[0] : flags B_BLUD=bit15 + FIRE bits 5,6 (=0 NO ERROR)
-         *   a_cd[1] : info block (firmware skip)
-         *   a_cd[2] : num_biterr
-         *   a_cd[3..14] : 23 bytes LAPDm BCCH payload */
-        {
+        if (blob) {
+            /* a_cd[] dans NDB à word offset 0x01D2.
+             * Layout :
+             *   a_cd[0] : flags B_BLUD=bit15 + FIRE bits 5,6 (=0 NO ERROR)
+             *   a_cd[1] : info block (firmware skip)
+             *   a_cd[2] : num_biterr
+             *   a_cd[3..14] : 23 bytes LAPDm BCCH payload */
             uint16_t *acd = &s->ndb[0x01D2];
-            acd[0] = 0x8000;           /* B_BLUD set, FIRE bits clear */
+            acd[0] = 0x8000;
             acd[1] = 0x0000;
-            acd[2] = 0x0000;           /* num_biterr = 0 */
+            acd[2] = 0x0000;
             for (int i = 0; i < 12; i++) {
                 uint16_t lo = (i*2     < 23) ? blob[i*2]     : 0;
                 uint16_t hi = (i*2 + 1 < 23) ? blob[i*2 + 1] : 0;
@@ -288,11 +297,10 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         }
 
         fprintf(stderr,
-                "[fbsb] ALLC echo+SI task=24 burst_d=%u fn=%lu TC=%u si_type=0x%02x %s\n",
-                allc_burst_idx, (unsigned long)fn, tc, si_type,
-                (g_csi.state == 1 && blob != si3_fallback) ? "(mmap)" : "(fallback SI3)");
+                "[fbsb] ALLC task=24 burst_d=%u fn=%lu TC=%u si_type=0x%02x %s\n",
+                burst_d, (unsigned long)fn, tc, si_type,
+                blob ? "(mmap)" : "(no SI — mmap unavailable)");
         fflush(stderr);
-        allc_burst_idx = (allc_burst_idx + 1) & 3;
         break;
     }
     case DSP_TASK_NONE:

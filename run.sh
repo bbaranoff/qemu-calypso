@@ -32,8 +32,15 @@ sleep 1
 tmux new-session -d -s $SESSION -n qemu
 
 # ---- 1. QEMU ----
+# -icount makes the virtual clock track instructions instead of wall-clock,
+# so TDMA tick scheduling and DSP cycle counts are reproducible across runs
+# regardless of host load. shift=auto adapts the instruction-to-virtual-ns
+# scaling. align=off skips real-time alignment (we drive timing externally
+# via BRIDGE_CLK_FROM_QEMU). sleep=off keeps virtual time advancing at host
+# rate when the guest is idle.
 CALYPSO_DSP_ROM=/opt/GSM/calypso_dsp.txt \
 $QEMU -M calypso -cpu arm946 \
+  -icount shift=auto,align=off,sleep=off \
   -serial pty -serial pty \
   -monitor "unix:${MON_SOCK},server,nowait" \
   -kernel "$FW" > /root/qemu.log 2>&1 &
@@ -48,8 +55,11 @@ done
 echo " OK (PID=$QEMU_PID)"
 
 # ---- 2. Bridge (receives CLK ticks from QEMU on UDP 6700) ----
+# BRIDGE_CLK_FROM_QEMU=1 drives CLK IND from QEMU FN advance instead of host
+# wall-clock, eliminating run-to-run variance from host scheduler jitter.
 tmux new-window -t $SESSION -n bridge
-tmux send-keys -t $SESSION:bridge "python3 $BRIDGE 2>&1 | tee /tmp/bridge.log" C-m
+tmux send-keys -t $SESSION:bridge \
+  "BRIDGE_CLK_FROM_QEMU=1 python3 $BRIDGE 2>&1 | tee /tmp/bridge.log" C-m
 
 echo -n "Waiting for bridge to receive QEMU ticks..."
 for i in $(seq 1 30); do

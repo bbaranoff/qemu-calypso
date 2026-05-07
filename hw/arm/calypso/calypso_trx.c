@@ -37,6 +37,9 @@ extern CalypsoUARTState *g_uart_modem;
 #define DB_W_D_TASK_U    2
 #define DB_W_D_BURST_U   3
 #define DB_W_D_TASK_MD   4
+#define DB_W_D_BACKGROUND 5
+#define DB_W_D_DEBUG     6
+#define DB_W_D_TASK_RA   7   /* RACH access task — separate from d_task_u */
 /* No PM/FB/SB stubs — the DSP handles everything via shared API RAM */
 
 typedef struct CalypsoTRX {
@@ -618,20 +621,44 @@ static void calypso_tdma_tick(void *opaque) {
     t_bsp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 6b. UL burst poll ──
-     * Check if the DSP wrote an UL task. If so, read bits from DSP
-     * DARAM 0x0900 and send via UDP to BTS. */
+     * The MCU→DSP write page exposes three independent UL task fields:
+     *   d_task_u  (word 2) — generic UL: SDCCH/SACCH/FACCH/TCH NB
+     *   d_task_ra (word 7) — RACH access burst (8 info bits → AB)
+     *   d_burst_u (word 3) — TN selector
+     * Each UL kind has its own d_task_*; the firmware (prim_rach.c,
+     * prim_tx_nb.c) writes whichever applies. We must poll all of them
+     * — polling only d_task_u silently drops every RACH attempt. */
     {
         uint16_t *wp = s->dsp_page ?
             &s->dsp_ram[DSP_API_W_PAGE1 / 2] : &s->dsp_ram[DSP_API_W_PAGE0 / 2];
-        uint16_t task_u = wp[DB_W_D_TASK_U];
+        uint16_t task_u  = wp[DB_W_D_TASK_U];
+        uint16_t task_ra = wp[DB_W_D_TASK_RA];
+        uint8_t  tn      = wp[DB_W_D_BURST_U] & 0x07;
+
+        if (task_ra != 0 && s->dsp) {
+            /* RACH: dsp_task_iq_swap(RACH_DSP_TASK, arfcn, 1) packs
+             * task ID + ARFCN. The 8-bit RACH info is in NDB d_rach.
+             * Burst encoding (gsm0503_rach_ext_encode) belongs in the
+             * BSP UL path — see calypso_bsp.c. */
+            uint8_t bits[148];
+            if (calypso_bsp_tx_rach_burst(s->fn, bits)) {
+                calypso_bsp_send_ul(tn, s->fn, bits);
+                static int rach_log = 0;
+                if (++rach_log <= 20)
+                    TRX_LOG("UL RACH task=0x%04x tn=%u fn=%u",
+                            task_ra, tn, s->fn);
+            }
+            wp[DB_W_D_TASK_RA] = 0;
+        }
+
         if (task_u != 0 && s->dsp) {
-            uint8_t tn = wp[DB_W_D_BURST_U] & 0x07;
             uint8_t bits[148];
             if (calypso_bsp_tx_burst(tn, s->fn, bits)) {
                 calypso_bsp_send_ul(tn, s->fn, bits);
                 static int ul_log = 0;
                 if (++ul_log <= 20)
-                    TRX_LOG("UL burst task=%u tn=%u fn=%u", task_u, tn, s->fn);
+                    TRX_LOG("UL NB task=0x%04x tn=%u fn=%u",
+                            task_u, tn, s->fn);
             }
             wp[DB_W_D_TASK_U] = 0;
         }

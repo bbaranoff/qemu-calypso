@@ -202,11 +202,12 @@ static void bsp_trxd_readable(void *opaque)
                          (struct sockaddr *)&addr, &alen);
     if (n < 8) return;
 
-    /* Remember BTS peer for UL replies */
-    if (!bsp.trxd_peer_valid) {
+    /* Refine UL peer to actual DL sender (init-time default is bridge
+     * 127.0.0.1:5702 — DL source confirms it or replaces it). */
+    if (addr.sin_addr.s_addr != bsp.trxd_peer.sin_addr.s_addr ||
+        addr.sin_port != bsp.trxd_peer.sin_port) {
         bsp.trxd_peer = addr;
-        bsp.trxd_peer_valid = true;
-        BSP_LOG("TRXD peer: %s:%d",
+        BSP_LOG("TRXD peer learned: %s:%d",
                 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
 
@@ -328,7 +329,15 @@ void calypso_bsp_init(C54xState *dsp)
     bsp.bursts_dropped_stale = 0;
     memset(bsp.q, 0, sizeof(bsp.q));
     bsp.trxd_fd = -1;
-    bsp.trxd_peer_valid = false;
+    /* Pre-set UL peer to bridge default (TRXDv0 listener on 127.0.0.1:5702).
+     * Eliminates the race where ARM/DSP fires the first UL burst before any
+     * DL has arrived to learn the peer addr. The peer is refined to the
+     * actual sender on first DL receive (bsp_trxd_readable). */
+    memset(&bsp.trxd_peer, 0, sizeof(bsp.trxd_peer));
+    bsp.trxd_peer.sin_family = AF_INET;
+    bsp.trxd_peer.sin_port   = htons(5702);
+    bsp.trxd_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bsp.trxd_peer_valid = true;
 
     /* Bind UDP socket for TRXDv0 DL bursts from bridge/BTS */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -532,6 +541,12 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
 {
     if (!bsp.dsp || !bits) return false;
 
+    /* On real Calypso, the DSP encodes the UL burst (channel coding +
+     * interleaving + burst formation) and writes the 148 hard bits to a
+     * DARAM buffer that the BSP TX DMA reads. The exact destination is
+     * configured per task by TPU scenarios. We currently read from a
+     * candidate location; if it's all-zero, the DSP encoder did not run
+     * for this frame (timing miss or wrong addr) and we drop the burst. */
     bool any = false;
     for (int i = 0; i < 148; i++) {
         uint16_t w = bsp.dsp->data[0x0900 + i];
@@ -540,4 +555,62 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
     }
 
     return any;
+}
+
+/* ---- RACH access burst encoding ---- */
+#include <osmocom/coding/gsm0503_coding.h>
+
+/* d_rach lives in NDB at a struct offset that depends on the DSP version.
+ * The firmware writes (uic|bsic)<<2 | (ra<<8) to ndb->d_rach right before
+ * setting db_w->d_task_ra. We find d_rach by overriding via env var
+ * (CALYPSO_NDB_D_RACH_OFFSET, hex word index from API_BASE 0xFFD00000) so
+ * the offset can be pinned without recompiling once verified at runtime.
+ *
+ * Default 0x01CB matches the DSP==33 layout walk:
+ *   NDB_BASE 0x01A8 byte → word 0xD4 from API base
+ *   d_rach is the 247th word inside NDB → 0xD4 + 247 = 0x1CB. */
+static uint32_t d_rach_word_offset(void)
+{
+    static uint32_t cached = 0;
+    if (cached) return cached;
+    const char *e = getenv("CALYPSO_NDB_D_RACH_OFFSET");
+    cached = e ? (uint32_t)strtoul(e, NULL, 0) : 0x01CB;
+    BSP_LOG("d_rach offset: 0x%04x (env=%s)", cached, e ? e : "(default)");
+    return cached;
+}
+
+bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
+{
+    if (!bsp.dsp || !bits) return false;
+
+    /* Read d_rach from NDB. dsp->data[] is the DSP-side word view; the
+     * API RAM at DSP word 0x0800.. is shared with the ARM-visible page
+     * at 0xFFD00000. We address via dsp->data[0x0800 + offset]. */
+    uint32_t off = d_rach_word_offset();
+    uint16_t d_rach = bsp.dsp->data[0x0800 + off];
+    if (d_rach == 0) {
+        BSP_LOG("RACH: d_rach@0x%04x is zero — skipping (offset wrong?)", off);
+        return false;
+    }
+
+    /* prim_rach.c:73 packs as:
+     *   d_rach[7:0]  = uic<<2 (or bsic<<2)
+     *   d_rach[15:8] = ra (8-bit RACH info) */
+    uint8_t uic_or_bsic = (uint8_t)((d_rach & 0xFF) >> 2);
+    uint8_t ra          = (uint8_t)((d_rach >> 8) & 0xFF);
+
+    /* gsm0503_rach_ext_encode writes 148 unpacked bits (ubit_t=uint8_t 0/1)
+     * into burst[]. is_11bit=false → use 8-bit RACH (legacy GSM). */
+    int rc = gsm0503_rach_ext_encode(bits, ra, uic_or_bsic, false);
+    if (rc < 0) {
+        BSP_LOG("RACH encode failed rc=%d ra=0x%02x bsic=0x%02x", rc, ra, uic_or_bsic);
+        return false;
+    }
+
+    static int rach_log = 0;
+    if (++rach_log <= 20) {
+        BSP_LOG("RACH encode #%d fn=%u ra=0x%02x bsic=0x%02x d_rach=0x%04x",
+                rach_log, fn, ra, uic_or_bsic, d_rach);
+    }
+    return true;
 }

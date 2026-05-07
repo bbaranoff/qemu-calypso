@@ -1,5 +1,43 @@
 # TODO — chemin FBSB QEMU Calypso
 
+## Status 2026-05-07 — UL connections wired, hacks removed
+
+Decision retenue : **option (b)** — wire UL real, no hack.
+
+### Done in this pass
+
+- ✓ `DB_W_D_TASK_RA = 7` polling added in `calypso_trx.c::tdma_tick`
+  (RACH writes are no longer silently dropped — only `d_task_u` was polled
+  before, which is why CLAUDE.md mentioned "garbage 64413/65427" : these
+  values lived in the unread word 7 = d_task_ra slot, not task_u garbage).
+- ✓ `calypso_bsp_tx_rach_burst` in `calypso_bsp.c` :
+  reads NDB `d_rach`, calls `gsm0503_rach_ext_encode` (libosmocoding) to
+  produce a real 148-symbol AB burst, sends via the bridge UL path.
+- ✓ libosmocoding linkage in `hw/arm/calypso/meson.build`.
+- ✓ bridge.py UL handler de-raced : `trxd_remote` pre-set to (BTS, 5802)
+  so the first UL burst is no longer silently dropped.
+- ✓ BSP UL trxd_peer pre-set to (bridge, 5702).
+- ✓ Hacks deleted (cf. `doc/hacks.md` § Cleanup 2026-05-07).
+- ✓ Stability : `-icount` on QEMU + `BRIDGE_CLK_FROM_QEMU=1`.
+
+### Open items
+
+1. **Verify d_rach offset** : `CALYPSO_NDB_D_RACH_OFFSET` defaults to
+   `0x01CB` (DSP==33 layout walk). The firmware writes `d_rach` right
+   before `d_task_ra` ; trace API RAM writes during a RACH attempt to
+   confirm. Set env var to override if needed.
+2. **NB UL bits buffer addr** : `calypso_bsp_tx_burst` reads from
+   `dsp->data[0x0900]`. Candidate, unverified. Trace DSP DARAM writes
+   during a real SDCCH UL to find the actual encoder output buffer.
+3. **Test discriminant** for the IMM_ASS_CMD silence : tcpdump GSMTAP.
+   - IMM_ASS visible on air → bug in DL AGCH path (DSP misses sub-slots).
+   - Absent + osmo-bts-trx RACH counter at 0 → bug in UL emission.
+4. **NB UL encoding** for SDCCH/SACCH/FACCH : `gsm0503_xcch_encode` +
+   `gsm0503_xcch_burst_encode`. Same pattern as RACH — call site is
+   `calypso_bsp_tx_burst` (currently reads candidate DARAM addr only).
+
+---
+
 ## Status 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
 
 **Milestone L2** : 88 DATA_IND traversent firmware → osmocon avec payload
@@ -483,6 +521,37 @@ contre fire prématuré (l'IRQ stay pending dans IFR jusqu'à clear INTM).
 
 
 ## Dette technique post-LU (à refactorer après le premier FB1/FB2)
+
+### Cleanup post-LU bourrin (2026-05-06)
+
+**Hacks bruts ajoutés en mode bourrin pour passer LU PoC.** À retirer DÈS que :
+- LU end-to-end OK
+- DSP fb-det réimplémentée correctement OU short-circuit conditionnel propre
+
+**Inventaire** :
+
+#### `calypso_c54x.c:864` — Short-circuit fb-det `[0x8d00, 0x8f80]`
+
+POP+RET émulé à l'entrée de la routine fb-det DSP. Économise ~3M cycles/tick.
+- Marqueur : `XXX BOURRIN PRE-LU 2026-05-06`
+- Log : `BOURRIN-FBDET-SKIP #N entry_pc=0x… ra=0x… SP=0x… XPC=u`
+- Risque : si caller FCALL (FAR) → XPC orphelin sur stack, caller peut déphaser. Vérifier `BOURRIN-FBDET-SKIP` log empirique : si `ra` n'est pas un PC de retour cohérent (e.g., très différent du XPC courant), il faut passer en `data_read+pop` XPC en plus.
+- Retrait : remplacer par exec réelle de la routine OU `if (fbsb_synth_active) bypass else exec`.
+
+#### Si insuffisant (work_dt toujours > 4.5M) — escalade prévue
+
+- Étendre shortcut aux routines AFC, autocorr (à identifier par hot-PC profiling : tdma_profile.log + hot PCs dans `c54x.c` STATE-DUMP).
+- Si toujours > 5M : dispatch opcode dominant → computed goto + decode cache.
+- Si toujours plafond : `-icount` + bridge slave (refactor structurel, autre session).
+
+**Critères de succès phase bourrin** :
+- `work_dt < 4.5M` cycles/tick sustained sur 100+ ticks consécutifs (cf. `/tmp/tdma_tick.log`)
+- LOST counter qui plafonne ou diminue (`/tmp/qemu-fw-console.log`)
+- `FBSB_CONF` apparaît dans osmocon.log
+- `DATA_IND` traversent
+- Bonus : Location Update se complète end-to-end (`mobile.log`)
+
+---
 
 ### `c54x_reset` MVPD memcpy — modèle incorrect
 

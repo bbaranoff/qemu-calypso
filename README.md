@@ -6,7 +6,54 @@ the [osmocom-bb](https://osmocom.org/projects/baseband/) `layer1.highram.elf` fi
 on the ARM side, with a Python bridge that connects to `osmo-bts-trx` for full
 GSM cell simulation.
 
-## Latest update — Session 2026-04-29
+## Latest update — Session 2026-05-07 (UL pipeline + cleanup)
+
+**DL milestone retained, UL pipeline wired, hacks removed.**
+
+End-to-end DL chain validated 2026-05-06 by edit-and-observe : `cell_identity 777→888`
+in `osmo-bsc.cfg` propagates through RSL → BTS → bridge → BSP → DSP → ARM L1 → mobile
+L3, with `<0001> sysinfo.c New SYSTEM INFORMATION 3 (lai=001-01-1)` reaching the
+mobile parser byte-for-byte. Two independent observation points (`rsl_si_tap` mmap
+side and mobile L3 logs) converge.
+
+| Area | Change | File |
+|---|---|---|
+| **UL** | `d_task_ra` (write-page word 7) is now polled — RACH writes were silently dropped before | `calypso_trx.c` |
+| **UL** | `calypso_bsp_tx_rach_burst` builds real 148-symbol AB bursts via `gsm0503_rach_ext_encode` (libosmocoding) | `calypso_bsp.c` |
+| **UL** | `bsp.trxd_peer` pre-set to bridge default (no first-DL race) | `calypso_bsp.c` |
+| **UL** | bridge `trxd_remote` pre-set to (BTS, base+102) (no first-UL drop) | `bridge.py` |
+| **Stability** | `-icount shift=auto,align=off,sleep=off` on QEMU | `run.sh` |
+| **Stability** | `BRIDGE_CLK_FROM_QEMU=1` env mode drives CLK IND from QEMU FN, not wall-clock | `bridge.py` |
+| **Removed** | BOURRIN-FBDET-SKIP block (`c54x_exec_one` PC range pop+jump) | `calypso_c54x.c` |
+| **Removed** | DIAG-HACK INTM force-clear + ALIAS-CHECK dump | `calypso_c54x.c` |
+| **Removed** | `si3_fallback[]` hardcode (rsl_si_tap mmap is the real path now) | `calypso_fbsb.c` |
+| **Removed** | `allc_burst_idx` static cycle 0..3 (replaced by `fn & 3`) | `calypso_fbsb.c` |
+| **Env-gated** | `CALYPSO_FBSB_SYNTH=1` re-enables synthetic FB/SB publish (dev assist when emulated DSP correlator does not converge on bridge-fed GMSK) | `calypso_fbsb.c` |
+
+Cf. [`hw/arm/calypso/doc/hacks.md`](hw/arm/calypso/doc/hacks.md) § Cleanup 2026-05-07
+and [`hw/arm/calypso/doc/TODO.md`](hw/arm/calypso/doc/TODO.md) § Status 2026-05-07.
+
+**Current blocker (UL side)** : Mobile sends RACH but no `IMM_ASS_CMD` returns —
+not yet discriminated between (a) BTS not decoding the RACH UL we emit and (b)
+mobile DSP missing the IMM_ASS sub-slot on AGCH. Test : tcpdump GSMTAP during a
+`with-synth` run (see `Run config` below).
+
+## Quick start
+
+```bash
+# Real DSP path (FBSB will not converge until correlator emulation is fixed)
+./run.sh
+
+# Dev-assist path : synth FB/SB so DL chain reaches L3 + RACH UL fires for real
+CALYPSO_FBSB_SYNTH=1 ./run.sh
+
+# RACH d_rach offset override (default 0x01CB matches DSP==33 layout walk)
+CALYPSO_NDB_D_RACH_OFFSET=0x01CB CALYPSO_FBSB_SYNTH=1 ./run.sh
+```
+
+---
+
+### Earlier — Session 2026-04-29 (opcode dispatch baseline)
 
 Five structural opcode-dispatch fixes validated empirically. ~2530 firmware sites
 unblocked. DSP CPU emulation now silicon-aligned against binutils tic54x-opc.c +
@@ -19,14 +66,6 @@ SPRU172C/131G + 3 FreeCalypso ROM dumps.
 | 3 | 0x68-0x6E handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) | 1563 sites unblocked |
 | 4 | APTS misnomer fix (bit 4 PMST = AVIS, no stack semantics) | Stack leak 1.96M events → 0 |
 | 5 | F3xx complete (AND/OR/XOR/SFTL + #lk variants) | 364 sites, wedge PC=0x8eb9 unblocked |
-
-**Final blocker:** INTM=1 forever (silicon mechanism for initial INTM clear not
-documented in public corpus). The diagnostic instrument
-`CALYPSO_FORCE_INTM_CLEAR_AT=N` is intentionally retained — see
-[`SESSION_20260429.md`](hw/arm/calypso/doc/SESSION_20260429.md) and
-[`datasheets/README.md`](hw/arm/calypso/doc/datasheets/README.md) for the full
-reasoning, evidence corpus (5 TI PDFs + 3 ROM dumps + Calypso overview), and
-suggested investigation paths.
 
 Specs traceable against binutils:
 - [`opcodes/0x68_0x6F.md`](hw/arm/calypso/doc/opcodes/0x68_0x6F.md) — verified v2 with `insn_template` struct
