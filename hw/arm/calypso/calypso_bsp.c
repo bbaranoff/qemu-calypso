@@ -562,27 +562,26 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
 
 /* d_rach lives in NDB at a struct offset that depends on the DSP version.
  * The firmware writes (uic|bsic)<<2 | (ra<<8) to ndb->d_rach right before
- * setting db_w->d_task_ra. We find d_rach by overriding via env var
- * (CALYPSO_NDB_D_RACH_OFFSET, hex word index from API_BASE 0xFFD00000) so
- * the offset can be pinned without recompiling once verified at runtime.
+ * setting db_w->d_task_ra. Override via CALYPSO_NDB_D_RACH_OFFSET if the
+ * firmware version moves it.
  *
- * Default 0x01CB matches the DSP==33 layout walk:
- *   NDB_BASE 0x01A8 byte → word 0xD4 from API base
- *   d_rach is the 247th word inside NDB → 0xD4 + 247 = 0x1CB. */
+ * Default 0x023A — confirmed empirically 2026-05-07 via D_RACH-FINDER ring
+ * trace : ARM-side write at API byte 0x0474 (= DSP word 0x0A3A = word 0x23A
+ * from API base) carries values 0x0300, 0x0f00, ... matching the mobile L3
+ * `RANDOM ACCESS ra 0xRR` log lines exactly. The earlier candidate 0x01CB
+ * (DSP==33 struct walk of osmocom-bb dsp_api.h) was incorrect for the
+ * actual firmware layout in use. */
 static uint32_t d_rach_word_offset(void)
 {
     static uint32_t cached = 0;
     if (cached) return cached;
     const char *e = getenv("CALYPSO_NDB_D_RACH_OFFSET");
-    /* Treat unset OR empty string as "use default". The shell exports
-     * variables with `:-}` syntax as empty strings, not unset, so a plain
-     * `e ? ... : default` would silently read offset 0 (= NDB base = wrong). */
     if (e && *e) {
         cached = (uint32_t)strtoul(e, NULL, 0);
         BSP_LOG("d_rach offset: 0x%04x (env=%s)", cached, e);
     } else {
-        cached = 0x01CB;
-        BSP_LOG("d_rach offset: 0x%04x (default)", cached);
+        cached = 0x023A;
+        BSP_LOG("d_rach offset: 0x%04x (default — empirically pinned 2026-05-07)", cached);
     }
     return cached;
 }

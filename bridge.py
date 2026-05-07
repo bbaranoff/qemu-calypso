@@ -20,8 +20,14 @@ Usage: bridge.py
 import errno, os, select, signal, socket, struct, sys, time
 
 GSM_HYPERFRAME = 2715648
-CLK_IND_PERIOD = 102
-CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000  # ~0.471 s real-time
+# CLK IND period in frames (default 102 = stock GSM TDMA spec).
+# In debug runs where QEMU is slower than wall-clock, send CLK IND more
+# frequently (e.g. 51) so osmo-bts-trx scheduler accumulates less skew
+# between two corrections — band-aid that buys time to capture RACH
+# attempts before bts_shutdown_fsm fires "PC clock skew too high" or
+# "No more clock from transceiver". Override via env BRIDGE_CLK_PERIOD.
+CLK_IND_PERIOD = int(os.environ.get("BRIDGE_CLK_PERIOD", "102"))
+CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000
 
 QEMU_BSP_ADDR = ("127.0.0.1", 6702)
 

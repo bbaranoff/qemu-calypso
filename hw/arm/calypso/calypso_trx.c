@@ -285,13 +285,21 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * index (= (offset - 0x01A8) / 2 + 0xD4 in the convention used by
      * calypso_bsp.c). */
     {
-        struct ndb_wr_entry { hwaddr off; uint16_t val; uint32_t fn; uint64_t insn; };
-        static struct ndb_wr_entry ring[16];
+        #define D_RACH_RING_SIZE 128
+        struct ndb_wr_entry { hwaddr off; uint32_t val; uint32_t fn; uint32_t insn; uint8_t sz; };
+        static struct ndb_wr_entry ring[D_RACH_RING_SIZE];
         static int idx;
+        static int dump_count;
 
-        if (offset >= 0x01A8 && offset < 0x0400 && size == 2 && value != 0) {
-            ring[idx & 15] = (struct ndb_wr_entry){
-                offset, (uint16_t)value, s->fn, 0
+        /* Capture all sizes (1/2/4) over the full NDB + post-NDB region
+         * (NDB extent varies by DSP firmware version; widen to 0x0800 to
+         * be safe, restrict later once the actual d_rach offset is pinned).
+         * Filter only zero-value writes to keep the ring useful. */
+        if (offset >= 0x01A8 && offset < 0x0800 && value != 0 &&
+            (size == 1 || size == 2 || size == 4)) {
+            ring[idx % D_RACH_RING_SIZE] = (struct ndb_wr_entry){
+                offset, (uint32_t)value, s->fn, s->dsp ? s->dsp->insn_count : 0,
+                (uint8_t)size
             };
             idx++;
         }
@@ -299,24 +307,31 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         bool task_ra_commit =
             (offset == DSP_API_W_PAGE0 + DB_W_D_TASK_RA * 2 ||
              offset == DSP_API_W_PAGE1 + DB_W_D_TASK_RA * 2) && value != 0;
-        if (task_ra_commit) {
-            static int dump_count = 0;
-            if (dump_count++ < 20) {
-                TRX_LOG("D_RACH-FINDER task_ra commit @0x%04x = 0x%04x fn=%u — last 16 NDB writes:",
-                        (unsigned)offset, (unsigned)value, s->fn);
-                int n = (idx < 16) ? idx : 16;
-                int start = (idx - n) & 15;
-                for (int i = 0; i < n; i++) {
-                    int k = (start + i) & 15;
-                    uint16_t v   = ring[k].val;
-                    uint8_t  ra  = (uint8_t)((v >> 8) & 0xFF);
-                    uint8_t  low = (uint8_t)(v & 0xFF);
-                    uint8_t  bsic = low >> 2;
-                    fprintf(stderr,
-                            "[trx] D_RACH-FINDER  #%d off=0x%04x val=0x%04x "
-                            "ra_candidate=0x%02x bsic_candidate=0x%02x fn=%u\n",
-                            i, (unsigned)ring[k].off, v, ra, bsic, ring[k].fn);
-                }
+        if (task_ra_commit && dump_count < 30) {
+            dump_count++;
+            uint32_t commit_insn = s->dsp ? s->dsp->insn_count : 0;
+            TRX_LOG("D_RACH-FINDER task_ra commit @0x%04x = 0x%04x fn=%u insn=%u — full ring (last 128 NDB writes):",
+                    (unsigned)offset, (unsigned)value, s->fn, commit_insn);
+            int n = (idx < D_RACH_RING_SIZE) ? idx : D_RACH_RING_SIZE;
+            int start = idx - n;
+            for (int i = 0; i < n; i++) {
+                int k = (start + i) % D_RACH_RING_SIZE;
+                uint32_t v   = ring[k].val;
+                int32_t d_insn = (int32_t)(commit_insn - ring[k].insn);
+                uint8_t  ra  = (uint8_t)((v >> 8) & 0xFF);
+                uint8_t  low = (uint8_t)(v & 0xFF);
+                uint8_t  bsic = low >> 2;
+                /* Mark entries within the "RACH window" (last 1000 insn
+                 * before commit) — those are the candidates worth scanning
+                 * by eye for ra match against mobile L3 log. Older entries
+                 * are init/unrelated but kept in the dump for offline
+                 * correlation when filtering misses the d_rach write. */
+                const char *tag = (d_insn >= 0 && d_insn <= 1000) ? "*HOT*" : "";
+                fprintf(stderr,
+                        "[trx] D_RACH-FINDER  #%d off=0x%04x val=0x%04x sz=%u "
+                        "d_insn=%+d ra=0x%02x bsic=0x%02x fn=%u %s\n",
+                        i, (unsigned)ring[k].off, v, ring[k].sz,
+                        -d_insn, ra, bsic, ring[k].fn, tag);
             }
         }
     }

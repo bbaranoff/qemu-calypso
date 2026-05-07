@@ -601,14 +601,26 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
         } else {
             uint8_t ch = (uint8_t)value;
 
-            /* TX trace: tag modem UART as L1CTL-PTY */
+            /* TX trace: tag modem UART as L1CTL-PTY.
+             * Per-byte log is volume-heavy (>140k lines per minute under
+             * fw-console "LOST N!" flood). Gated on env CALYPSO_UART_TRACE=1
+             * (default OFF) to keep host I/O free for QEMU emulation —
+             * heavy stderr writes were causing BTS to die from "No more
+             * clock from transceiver" because bridge couldn't get scheduled. */
             {
-                const char *tag = (s->label && !strcmp(s->label, "modem"))
-                                  ? "L1CTL-PTY" : "UART";
-                const char *lbl = (s->label && !strcmp(s->label, "modem"))
-                                  ? "" : s->label ? s->label : "?";
-                fprintf(stderr, "[%s%s%s] >>>TX %02x\n",
-                        tag, *lbl ? ":" : "", lbl, ch);
+                static int trace_enabled = -1;
+                if (trace_enabled < 0) {
+                    const char *e = getenv("CALYPSO_UART_TRACE");
+                    trace_enabled = (e && *e == '1') ? 1 : 0;
+                }
+                if (trace_enabled) {
+                    const char *tag = (s->label && !strcmp(s->label, "modem"))
+                                      ? "L1CTL-PTY" : "UART";
+                    const char *lbl = (s->label && !strcmp(s->label, "modem"))
+                                      ? "" : s->label ? s->label : "?";
+                    fprintf(stderr, "[%s%s%s] >>>TX %02x\n",
+                            tag, *lbl ? ":" : "", lbl, ch);
+                }
             }
 
             if (s->label && !strcmp(s->label, "modem")) {

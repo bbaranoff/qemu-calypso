@@ -29,6 +29,7 @@ Removed in this pass :
 | W1C latch system on `a_sync_demod` cells | bypass | `calypso_c54x.c` capture + `calypso_trx.c` consume | Env-gated via `CALYPSO_W1C_LATCH=1` (default OFF — ARM reads NDB direct) |
 | `DSP_TASK_ALLC` db_r echo + a_cd mmap inject | bypass | `calypso_fbsb.c::on_dsp_task_change` | Env-gated via `CALYPSO_BCCH_INJECT=1` (default OFF — real DSP CCCH demod path). Pair with `FBSB_SYNTH=1` to deliver SIs end-to-end. |
 | Kick timer on `QEMU_CLOCK_REALTIME` | dette | `calypso_trx.c::calypso_kick_cb` | Moved to `QEMU_CLOCK_VIRTUAL` (2026-05-07). Was vestigial main-loop wake on wall-clock, broke `-icount` by interrupting the TCG burst before VIRTUAL-clock timers (TDMA, TINT0, frame_irq) could reach their deadlines. |
+| DSP MAC simulation in dispatcher idle loop | optim | `calypso_c54x.c::dsp_idle_fast_forward` | NOT a hack — simulator optimisation (2026-05-07). When DSP PC is in the polling dispatcher (0xe9ac..0xe9b7) AND no task slot is set AND no IRQ pending → skip MAC emulation, advance cycle counter. DSP exits idle naturally when ARM writes a task slot or an IRQ fires. Cuts ~80% host CPU spent on a sterile loop. Env-gated `CALYPSO_DSP_IDLE_FF=1` (default ON) ; set to 0 to fall back to full emulation. |
 
 Functions kept compiled but unused (`calypso_fbsb_publish_fb_found` /
 `_publish_sb_found`) — diagnostic utilities, no live caller.

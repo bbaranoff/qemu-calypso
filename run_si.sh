@@ -43,9 +43,25 @@ CALYPSO_BCCH_INJECT="${CALYPSO_BCCH_INJECT:-0}"
 CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
+CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"
+CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
+CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}"
+CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
 BRIDGE_CLK_FROM_QEMU="${BRIDGE_CLK_FROM_QEMU:-1}"
+# CLK IND period — default 51 (half of stock 102) to keep osmo-bts-trx
+# scheduler happy when QEMU runs slower than wall-clock real-time. With
+# a 102-frame period, the BTS accumulates skew between consecutive
+# CLK INDs faster than they arrive → bts_shutdown_fsm "PC clock skew
+# too high" or "No more clock from transceiver" within ~30 s. With 51,
+# the correction rate doubles and BTS survives long enough for the
+# mobile to complete a Location Update cycle.
+# Set to 102 explicitly when QEMU runs near wall-clock (or in production).
+BRIDGE_CLK_PERIOD="${BRIDGE_CLK_PERIOD:-51}"
 export CALYPSO_FBSB_SYNTH CALYPSO_BCCH_INJECT CALYPSO_W1C_LATCH \
-       CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC BRIDGE_CLK_FROM_QEMU
+       CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
+       CALYPSO_DSP_IDLE_FF CALYPSO_DSP_IDLE_RANGE \
+       CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE \
+       BRIDGE_CLK_FROM_QEMU BRIDGE_CLK_PERIOD
 
 # ---- icount mode (deterministic virtual clock paced by instruction count) ----
 # Default ON (auto = shift=auto,sleep=on,align=off). Set CALYPSO_ICOUNT=off
@@ -189,6 +205,8 @@ echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x01
 echo "  CALYPSO_RACH_FORCE_BSIC     = ${CALYPSO_RACH_FORCE_BSIC:-(unset = use d_rach byte)}"
 echo "  BRIDGE_CLK_FROM_QEMU        = $BRIDGE_CLK_FROM_QEMU"
 echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
+echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
+echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7)}"
 echo
 echo "Manual warm-start (debug, if BSC unavailable) :"
 echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"

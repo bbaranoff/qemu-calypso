@@ -365,7 +365,12 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         switch (addr) {
         case MMR_IMR:
             if (val != s->imr)
-                C54_LOG("IMR change 0x%04x → 0x%04x PC=0x%04x", s->imr, val, s->pc);
+                {
+                    static unsigned imr_log = 0;
+                    if (imr_log++ < 50)
+                        C54_LOG("IMR change 0x%04x → 0x%04x PC=0x%04x #%u/50",
+                                s->imr, val, s->pc, imr_log);
+                }
             s->imr = val; return;
         case MMR_IFR:  s->ifr &= ~val; return;  /* write 1 to clear */
         case MMR_ST0:  s->st0 = val; return;
@@ -405,17 +410,28 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             if (val != s->pmst) {
                 uint16_t old_iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 uint16_t new_iptr = (val >> PMST_IPTR_SHIFT) & 0x1FF;
-                C54_LOG("PMST change 0x%04x → 0x%04x (IPTR=0x%03x→0x%03x OVLY=%d) PC=0x%04x SP=0x%04x insn=%u",
-                        s->pmst, val, old_iptr, new_iptr, !!(val & PMST_OVLY), s->pc, s->sp, s->insn_count);
+                {
+                    static unsigned pmst_log = 0;
+                    if (pmst_log++ < 100)
+                        C54_LOG("PMST change 0x%04x → 0x%04x (IPTR=0x%03x→0x%03x OVLY=%d) PC=0x%04x SP=0x%04x insn=%u #%u/100",
+                                s->pmst, val, old_iptr, new_iptr, !!(val & PMST_OVLY), s->pc, s->sp, s->insn_count, pmst_log);
+                }
 
                 static uint16_t last_dumped_iptr = 0xFFFF;
-                if (new_iptr != last_dumped_iptr) {
+                static unsigned vecdump_count = 0;
+                /* Cap at 8 dumps total — firmware may oscillate between 2-3
+                 * IPTR values thousands of times during a session, and each
+                 * dump emits 32 fprintf lines. Without cap : 250k+ log lines
+                 * = saturates host I/O = bridge stops emitting CLK INDs =
+                 * BTS shutdown "No more clock from transceiver". */
+                if (new_iptr != last_dumped_iptr && vecdump_count < 8) {
+                    vecdump_count++;
                     last_dumped_iptr = new_iptr;
                     uint32_t base = (uint32_t)new_iptr << 7;
                     uint16_t saved_pmst = s->pmst;
                     s->pmst = val;
-                    C54_LOG("VECDUMP IPTR=0x%03x base=0x%04x (32 vectors):",
-                            new_iptr, (uint16_t)base);
+                    C54_LOG("VECDUMP IPTR=0x%03x base=0x%04x (32 vectors) #%u/8:",
+                            new_iptr, (uint16_t)base, vecdump_count);
                     for (int vec = 0; vec < 32; vec++) {
                         uint32_t a = base + vec * 4;
                         uint16_t w0 = prog_read(s, a + 0);
@@ -4363,6 +4379,128 @@ unimpl:
  * Main execution loop
  * ================================================================ */
 
+/* DSP idle fast-forward — simulator optimisation, NOT a hack.
+ *
+ * The Calypso DSP polls its task slots in NDB and write pages while
+ * waiting for ARM/TPU to post work. Empirically this dispatcher loop
+ * lives in PROM1 mirror at PC 0xe9ac..0xe9b7 (8-instruction body cycled
+ * ~285k times per 1.4G insn window when nothing pending). Each iteration
+ * costs C-level MAC/branch emulation that ends up consuming 80%+ of host
+ * CPU for zero useful work, making QEMU run ~3x slower than wall-clock
+ * GSM and starving the BTS scheduler of CLK INDs.
+ *
+ * Detection: PC inside the polling range AND all four task fields in
+ * both write pages are zero AND no interrupt pending. When confirmed,
+ * advance cycles/insn_count without invoking c54x_exec_one. The DSP
+ * exits idle naturally next iteration if either:
+ *   - ARM writes a task field (mirrored via calypso_dsp_write to
+ *     s->data[0x0800+offset])
+ *   - An IRQ fires (calypso_c54x_interrupt_ex sets s->ifr)
+ *   - PC moves outside the range (shouldn't happen while polling)
+ *
+ * Env vars (default ON) :
+ *   CALYPSO_DSP_IDLE_FF=0          disable
+ *   CALYPSO_DSP_IDLE_RANGE=lo:hi   override hex PC range
+ */
+#define DSP_IDLE_FF_MAX_RANGES 4
+static bool dsp_idle_fast_forward(C54xState *s, int *consumed_out)
+{
+    static int     ff_enabled = -1;
+    static int     ff_n_ranges = 0;
+    static uint16_t ff_lo[DSP_IDLE_FF_MAX_RANGES];
+    static uint16_t ff_hi[DSP_IDLE_FF_MAX_RANGES];
+    static uint64_t ff_hits = 0;
+
+    if (ff_enabled < 0) {
+        const char *e = getenv("CALYPSO_DSP_IDLE_FF");
+        ff_enabled = (!e || *e != '0') ? 1 : 0;
+        /* Defaults: two empirically observed dispatcher loops in the
+         * stock layer1.highram.elf firmware:
+         *   1) 0xe9ac..0xe9b7 — PROM1 mirror, init/SP-aware path
+         *   2) 0xcc62..0xcc6f — PROM0 page 0, runtime mailbox poll loop
+         * Override via CALYPSO_DSP_IDLE_RANGE="lo1:hi1,lo2:hi2,..."
+         * (max 4 ranges). Each range is hex. Empty = use defaults. */
+        const char *r = getenv("CALYPSO_DSP_IDLE_RANGE");
+        if (r && *r) {
+            const char *p = r;
+            while (*p && ff_n_ranges < DSP_IDLE_FF_MAX_RANGES) {
+                unsigned lo, hi;
+                if (sscanf(p, "%x:%x", &lo, &hi) == 2 && lo <= hi &&
+                    lo <= 0xFFFF && hi <= 0xFFFF) {
+                    ff_lo[ff_n_ranges] = (uint16_t)lo;
+                    ff_hi[ff_n_ranges] = (uint16_t)hi;
+                    ff_n_ranges++;
+                }
+                while (*p && *p != ',') p++;
+                if (*p == ',') p++;
+            }
+        }
+        if (ff_n_ranges == 0) {
+            ff_lo[0] = 0xe9ac; ff_hi[0] = 0xe9b7;
+            ff_lo[1] = 0xcc62; ff_hi[1] = 0xcc6f;
+            ff_n_ranges = 2;
+        }
+        char buf[160] = ""; int blen = 0;
+        for (int i = 0; i < ff_n_ranges; i++) {
+            blen += snprintf(buf + blen, sizeof(buf) - blen,
+                             "%s0x%04x..0x%04x",
+                             i ? "," : "", ff_lo[i], ff_hi[i]);
+        }
+        C54_LOG("DSP IDLE FF: %s, ranges=[%s]",
+                ff_enabled ? "enabled" : "disabled", buf);
+    }
+    if (!ff_enabled) return false;
+    bool in_range = false;
+    for (int i = 0; i < ff_n_ranges; i++) {
+        if (s->pc >= ff_lo[i] && s->pc <= ff_hi[i]) {
+            in_range = true;
+            break;
+        }
+    }
+    if (!in_range) return false;
+
+    /* Task slots in both write pages — DSP word addresses :
+     *   page 0 : 0x0800 (d_task_d), 0x0802 (d_task_u),
+     *            0x0804 (d_task_md), 0x0807 (d_task_ra)
+     *   page 1 : 0x0814, 0x0816, 0x0818, 0x081B (offsets +0x14)
+     */
+    if (s->data[0x0800] | s->data[0x0802] | s->data[0x0804] | s->data[0x0807] |
+        s->data[0x0814] | s->data[0x0816] | s->data[0x0818] | s->data[0x081B]) {
+        return false;  /* something pending → exec normally */
+    }
+    /* Pending IRQ would also break us out of the dispatcher next iter. */
+    if (!(s->st1 & ST1_INTM) && (s->ifr & s->imr)) {
+        return false;
+    }
+
+    /* Fast-forward this dispatcher iteration.
+     *
+     * Cycle-budget calibration: real C54x at 65 MHz means 1 cycle ≈ 15 ns.
+     * The dispatcher body is ~8 instructions per pass (matches the 8 hot
+     * PCs observed). One pass ≈ 8 cycles ≈ 120 ns of *DSP* time.
+     *
+     * Per Claude web 2026-05-07 review: previously this returned a
+     * fixed 8-cycle skip per call regardless of host wall time. Combined
+     * with c54x_run(256000) that meant a single tick callback could
+     * burn through 32k FF iterations in microseconds host time but
+     * accumulate the full 256k cycles credit on the DSP — the net
+     * effect on QEMU virtual time was minimal (DSP cycles aren't a
+     * QEMU clock anyway), so this isn't itself the cause of the BTS
+     * timing skew. But to match wall-clock more honestly we now cap
+     * the FF run length per c54x_run invocation: at most enough skips
+     * to consume the budget (n_insns) without overshooting.
+     *
+     * The actual wall-clock alignment (CLK IND cadence) is owned by
+     * the TDMA timer in calypso_trx.c, not by this function. */
+    *consumed_out = 8;
+    ff_hits++;
+    if ((ff_hits & 0xFFFFFFu) == 0) {
+        C54_LOG("DSP IDLE FF: %llu skips so far (PC=0x%04x SP=0x%04x)",
+                (unsigned long long)ff_hits, s->pc, s->sp);
+    }
+    return true;
+}
+
 int c54x_run(C54xState *s, int n_insns)
 {
     int executed = 0;
@@ -4497,6 +4635,72 @@ int c54x_run(C54xState *s, int n_insns)
     }
 
     while (executed < n_insns && s->running && !s->idle) {
+        /* DSP idle fast-forward — see dsp_idle_fast_forward() comment.
+         * Skips MAC simulation when DSP is in its empty-task-slot
+         * polling loop, returning host CPU to the rest of QEMU. */
+        {
+            int ff_cyc;
+            if (dsp_idle_fast_forward(s, &ff_cyc)) {
+                s->cycles    += ff_cyc;
+                s->insn_count += ff_cyc;
+                executed     += ff_cyc;
+                continue;
+            }
+        }
+
+        /* CALYPSO_DSP_FBDET_SKIP — completion of the SYNTH strategy.
+         * When the firmware enters the fb-det routine (PC range
+         * 0x8d00..0x8f80) AND we already publish synthetic FB results
+         * via CALYPSO_FBSB_SYNTH=1, executing the routine is pure
+         * waste : the caller will read NDB, find the synth d_fb_det=1,
+         * and ignore whatever the routine would have computed.
+         *
+         * Mechanism : at the FIRST PC entering the range from outside,
+         * pop the return addr from stack (CALL convention) and jump to
+         * it. Subsequent PCs inside the range fall back to normal exec
+         * (we only short-circuit the entry point per call).
+         *
+         * Default OFF. Enable with CALYPSO_DSP_FBDET_SKIP=1 alongside
+         * CALYPSO_FBSB_SYNTH=1 for B2B / demo runs where you accept the
+         * shunt for performance. Silently no-op without FBSB_SYNTH so
+         * the user can leave it set without affecting real-DSP runs.
+         */
+        {
+            static int fbdet_skip_enabled = -1;
+            static int fbsb_synth_active = -1;
+            static uint16_t prev_pc_fbdet = 0;
+            static uint64_t fbdet_skip_count = 0;
+
+            if (fbdet_skip_enabled < 0) {
+                const char *e1 = getenv("CALYPSO_DSP_FBDET_SKIP");
+                fbdet_skip_enabled = (e1 && *e1 == '1') ? 1 : 0;
+                const char *e2 = getenv("CALYPSO_FBSB_SYNTH");
+                fbsb_synth_active = (e2 && *e2 == '1') ? 1 : 0;
+                C54_LOG("DSP FBDET SKIP: %s%s",
+                        fbdet_skip_enabled ? "enabled" : "disabled",
+                        fbdet_skip_enabled && !fbsb_synth_active
+                            ? " (but FBSB_SYNTH=0 — skip is no-op)" : "");
+            }
+            if (fbdet_skip_enabled && fbsb_synth_active &&
+                s->pc >= 0x8d00 && s->pc < 0x8f80 &&
+                (prev_pc_fbdet < 0x8d00 || prev_pc_fbdet >= 0x8f80)) {
+                uint16_t ra = data_read(s, s->sp);
+                s->sp = (uint16_t)(s->sp + 1);
+                fbdet_skip_count++;
+                if (fbdet_skip_count <= 5 || (fbdet_skip_count % 10000) == 0) {
+                    C54_LOG("FBDET-SKIP #%llu entry_pc=0x%04x ra=0x%04x SP=0x%04x",
+                            (unsigned long long)fbdet_skip_count,
+                            s->pc, ra, s->sp);
+                }
+                s->pc = ra;
+                prev_pc_fbdet = ra;
+                s->cycles += 5;
+                executed += 5;
+                continue;
+            }
+            prev_pc_fbdet = s->pc;
+        }
+
         /* Replay any interrupt that fired while INTM=1.
          * c54x_interrupt_ex sets IFR but does nothing else when INTM=1;
          * the real C54x re-evaluates pending interrupts every cycle, so
