@@ -51,6 +51,15 @@ CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000
 
 QEMU_BSP_ADDR = ("127.0.0.1", 6702)
 
+# RACH-allowed slots in the 51-multiframe TN=0 uplink for combined CCCH+SDCCH8
+# (TS 45.002 §7 Table 3). Mobile L3 announces "S(lots) 115" = these slots when
+# combined=yes. A burst whose FN%51 falls outside this set is discarded by
+# osmo-bts-trx scheduler before the RACH detector runs.
+RACH_SLOTS_COMBINED = (
+    set(range(4, 11)) | set(range(14, 21)) |
+    set(range(24, 31)) | set(range(34, 41)) | set(range(44, 51))
+)
+
 # Mode toggle. With the wall-clock-paced wall_fn (default), BRIDGE_CLK_FROM_QEMU
 # is effectively ignored — both CLK IND and UL FN rewrite use wall_fn. Kept
 # as env var for backward compat / future override.
@@ -179,7 +188,14 @@ class Bridge:
         elif verb == "POWEROFF":
             self.powered = False; rsp = "RSP POWEROFF 0"
         elif verb == "SETFORMAT":
-            rsp = f"RSP SETFORMAT 0 {' '.join(args)}"
+            # CRITICAL: bridge always emits TRXDv0 (8-byte header + 148 soft
+            # bits = 156 bytes). If BTS asks for v1 and we echo "agreed v1",
+            # BTS parses our v0 packets with v1 layout → silent drop before
+            # RACH detector. Force v0 in the response regardless of request.
+            requested = args[0] if args else "0"
+            rsp = "RSP SETFORMAT 0 0 0"  # status=0 (ok), accepted=0, available=0 (v0)
+            print(f"TRXC SETFORMAT requested=v{requested} → forced reply v0 "
+                  f"(bridge sends TRXDv0 only)", flush=True)
         elif verb == "NOMTXPOWER":
             rsp = "RSP NOMTXPOWER 0 50"
         elif verb == "MEASURE":
@@ -187,6 +203,11 @@ class Bridge:
             rsp = f"RSP MEASURE 0 {freq} -60"
         else:
             rsp = f"RSP {verb} 0 {' '.join(args)}".rstrip()
+
+        # Log all TRXC exchanges so init-time negotiation is visible
+        if self.stats["trxc"] <= 50 or verb in ("POWERON", "POWEROFF"):
+            print(f"TRXC < CMD {verb} {' '.join(args)}".rstrip()
+                  + f"  →  > {rsp}", flush=True)
 
         self.trxc_sock.sendto((rsp + "\0").encode(), addr)
 
@@ -244,16 +265,30 @@ class Bridge:
         if wfn != qemu_fn:
             self.stats["ul_fn_rewrite"] += 1
 
+        # Slot-validity diagnostic: was wall_fn % 51 a valid RACH slot for
+        # combined CCCH+SDCCH8 (the only mode mobile knows about)? Counters
+        # printed in the rolling stats line so the distribution is visible.
+        slot_mod51 = wfn % 51
+        in_rach_slot = slot_mod51 in RACH_SLOTS_COMBINED
+        if in_rach_slot:
+            self.stats.setdefault("ul_in_slot", 0)
+            self.stats["ul_in_slot"] += 1
+        else:
+            self.stats.setdefault("ul_off_slot", 0)
+            self.stats["ul_off_slot"] += 1
+
         # Print full header + first/last bits of every UL burst (cap 200 to
-        # avoid log flood). Show both FNs to track the rewrite.
+        # avoid log flood). Show both FNs + slot validity to track the rewrite.
         if self.stats["ul"] <= 200 or (self.stats["ul"] % 1000) == 0:
             hdr_in_hex  = data[:8].hex()
             hdr_out_hex = bytes(out[:8]).hex()
             payload = data[8:]
             head = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[:16])
             tail = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[-8:])
+            slot_mark = "RACH" if in_rach_slot else "OFF"
             print(f"bridge: UL #{self.stats['ul']} TN={tn} "
-                  f"qfn={qemu_fn}→wfn={wfn} rssi=-{rssi} toa={toa} len={len(data)} "
+                  f"qfn={qemu_fn}→wfn={wfn} slot={slot_mod51:02d}/51={slot_mark} "
+                  f"rssi=-{rssi} toa={toa} len={len(data)} "
                   f"hdr_in={hdr_in_hex} hdr_out={hdr_out_hex} "
                   f"bits[0:16]=[{head}] bits[140:148]=[{tail}] "
                   f"→ BTS {self.trxd_remote}", flush=True)
@@ -318,10 +353,13 @@ class Bridge:
             if (self.stats["dl"] + self.stats["ul"]) > 0 and \
                ((self.stats["dl"] + self.stats["ul"]) % 5000) == 0:
                 wfn = self.wall_fn()
+                in_s  = self.stats.get("ul_in_slot", 0)
+                off_s = self.stats.get("ul_off_slot", 0)
                 print(f"bridge: tick={self.stats['tick']} "
                       f"clk={self.stats['clk']} "
                       f"dl={self.stats['dl']} ul={self.stats['ul']} "
                       f"ul_rewrite={self.stats['ul_fn_rewrite']} "
+                      f"ul_slot_in/off={in_s}/{off_s} "
                       f"wall_fn={wfn} qfn={self.fn}",
                       flush=True)
 
