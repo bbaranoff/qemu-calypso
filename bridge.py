@@ -7,33 +7,53 @@ QEMU side: BSP receives DL bursts on UDP 6702
            QEMU sends TDMA ticks on UDP 6700 (QEMU is clock master)
            QEMU sends UL bursts back on UDP 5702 (TRXD is bidirectional)
 
-The bridge tracks QEMU's FN but sends CLK IND to the BTS at wall-clock
-rate (~470ms = 102 frames). The BTS scheduler needs real-time CLK IND
-to avoid drift, but the FN must come from QEMU for coherence.
+CLOCK DOMAIN BRIDGE
+-------------------
+QEMU runs ~2x slower than wall-clock in this build (DSP emulator cost).
+osmo-bts-trx and osmo-bsc both run on wall-clock. Without a translation
+layer, the FN counters diverge and the BTS scheduler shuts down with
+"PC clock skew too high".
+
+This bridge maintains its own *wall-clock-paced* FN counter (`wall_fn`)
+that ticks at 217 Hz regardless of QEMU's emulation speed. CLK INDs to
+the BTS use `wall_fn` so BTS↔BSC see consistent wall-paced GSM time.
+
+UL bursts arriving from QEMU carry QEMU's lagged FN in their TRXD
+header ; we rewrite the FN field to the current `wall_fn` before
+forwarding to osmo-bts-trx, so the BTS RACH/SDCCH scheduler matches
+the burst against its wall-clock-aligned window. Burst content (sync
+sequence, FIRE-encoded data, parity) is FN-invariant so this rewrite
+is safe.
+
+DL bursts from BTS already carry wall_fn in their TRXD header. They
+are forwarded to QEMU's BSP unchanged — the BSP queue uses a wide
+match window (cf. BSP_FN_MATCH_WINDOW in calypso_bsp.c) so wall-clock-
+tagged bursts are still picked up by QEMU at delivery time.
 
 TRXD socket (5702) is bidirectional:
   DL: BTS → bridge:5702 → QEMU:6702   (forward downlink to BSP)
-  UL: QEMU:6702 → bridge:5702 → BTS   (forward uplink to BTS peer)
+  UL: QEMU:6702 → bridge:5702 → BTS   (forward uplink to BTS, FN rewritten)
 
 Usage: bridge.py
 """
 import errno, os, select, signal, socket, struct, sys, time
 
 GSM_HYPERFRAME = 2715648
+GSM_TDMA_S = 4615 / 1_000_000  # 4.615 ms per TDMA frame, wall-clock
+
 # CLK IND period in frames (default 102 = stock GSM TDMA spec).
-# In debug runs where QEMU is slower than wall-clock, send CLK IND more
-# frequently (e.g. 51) so osmo-bts-trx scheduler accumulates less skew
-# between two corrections — band-aid that buys time to capture RACH
-# attempts before bts_shutdown_fsm fires "PC clock skew too high" or
-# "No more clock from transceiver". Override via env BRIDGE_CLK_PERIOD.
+# In debug runs where QEMU is slower than wall-clock, the bridge sends
+# CLK IND at wall-clock pace using its own wall_fn counter — see CLOCK
+# DOMAIN BRIDGE block above. CLK_IND_PERIOD just controls the cadence
+# (every N wall-paced frames). Default 102 = standard GSM rate.
 CLK_IND_PERIOD = int(os.environ.get("BRIDGE_CLK_PERIOD", "102"))
 CLK_IND_WALL_S = (CLK_IND_PERIOD * 4615) / 1_000_000
 
 QEMU_BSP_ADDR = ("127.0.0.1", 6702)
 
-# When set, drive CLK IND from QEMU FN advance instead of host wall-clock.
-# Eliminates host-load jitter at the cost of CLK IND rate following QEMU
-# emulation speed. Pair with -icount on QEMU for full determinism.
+# Mode toggle. With the wall-clock-paced wall_fn (default), BRIDGE_CLK_FROM_QEMU
+# is effectively ignored — both CLK IND and UL FN rewrite use wall_fn. Kept
+# as env var for backward compat / future override.
 CLK_FROM_QEMU = os.environ.get("BRIDGE_CLK_FROM_QEMU", "0") == "1"
 
 def udp_bind(port):
@@ -55,26 +75,40 @@ class Bridge:
         # has arrived. Refined to the actual sender on first DL.
         self.trxd_remote = ("127.0.0.1", bts_base + 102)
         self.powered = False
+        # QEMU-side FN — kept for telemetry only. NOT used to drive CLK IND
+        # or UL FN rewrite anymore (both use wall_fn).
         self.fn = 0
-        # BTS starts its own FN at 0 on POWERON — several seconds after QEMU
-        # has already advanced. Remember QEMU's FN at POWERON so we can re-
-        # anchor BTS-tagged bursts to QEMU's timeline on the way in.
+        # BTS starts its own FN at 0 on POWERON — several seconds after the
+        # bridge has already been running. Remember bridge wall_fn at
+        # POWERON so BTS-tagged DL bursts can be matched against the right
+        # timeline if needed (currently only telemetry).
         self.fn_anchor = 0
         self.anchored = False
         self._stop = False
-        self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0, "tick": 0}
+        self.stats = {"clk": 0, "trxc": 0, "dl": 0, "ul": 0,
+                      "tick": 0, "ul_fn_rewrite": 0}
 
         # QEMU CLK tick receiver
         self.qemu_clk_sock = udp_bind(6700)
 
-        # CLK IND is driven by wall-clock (see maybe_send_clk).
-        self.last_clk_fn = None
+        # Wall-clock-paced FN counter — independent of QEMU. Anchored to
+        # POWERON so BTS sees fn=0 right when it asks to power up.
+        self._wall_t0 = None       # set at POWERON
+        self._last_clk_fn_sent = None
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} ↔ BSP@6702", flush=True)
-        print(f"bridge: QEMU CLK ticks on UDP 6700 (clock-master, bridge slave)", flush=True)
+        print(f"bridge: wall-clock-paced wall_fn ({1/GSM_TDMA_S:.1f} Hz) — UL FN rewritten to wall_fn", flush=True)
+
+    def wall_fn(self):
+        """Compute current bridge wall-paced FN. Anchored at POWERON."""
+        if self._wall_t0 is None:
+            return 0
+        elapsed = time.monotonic() - self._wall_t0
+        return int(elapsed / GSM_TDMA_S) % GSM_HYPERFRAME
 
     def handle_qemu_tick(self):
-        """Receive TDMA tick from QEMU — 4 bytes big-endian FN."""
+        """Receive TDMA tick from QEMU — 4 bytes big-endian FN.
+        Used as telemetry only ; CLK IND is wall_fn-paced now."""
         try:
             data, addr = self.qemu_clk_sock.recvfrom(64)
         except OSError:
@@ -87,36 +121,30 @@ class Bridge:
         self.stats["tick"] += 1
 
         if self.stats["tick"] <= 3 or self.stats["tick"] % 10000 == 0:
-            print(f"bridge: QEMU tick #{self.stats['tick']} FN={self.fn}", flush=True)
-
-        # In QEMU-driven CLK mode, send CLK IND on every tick crossing the
-        # CLK_IND_PERIOD boundary. Eliminates wall-clock jitter.
-        if CLK_FROM_QEMU and self.powered:
-            if self.last_clk_fn is None or \
-               (self.fn - self.last_clk_fn) % GSM_HYPERFRAME >= CLK_IND_PERIOD:
-                self._send_clk_ind()
-                self.last_clk_fn = self.fn
+            wfn = self.wall_fn()
+            lag = (wfn - self.fn) % GSM_HYPERFRAME
+            print(f"bridge: QEMU tick #{self.stats['tick']} qfn={self.fn} "
+                  f"wall_fn={wfn} lag={lag}", flush=True)
 
     def _send_clk_ind(self):
-        clk_fn = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+        wfn = self.wall_fn()
+        clk_fn = (wfn // CLK_IND_PERIOD) * CLK_IND_PERIOD
         try:
             self.clk_sock.sendto(
                 f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
             self.stats["clk"] += 1
+            self._last_clk_fn_sent = clk_fn
         except OSError:
             pass
 
     def maybe_send_clk(self):
-        """Wall-clock-paced CLK IND.
+        """Wall-clock-paced CLK IND — bridge's own wall_fn counter, no QEMU dep.
 
-        osmo-bts-trx's scheduler_trx.c monitors PC clock skew (real elapsed
-        time between CLK INDs vs the GSM time they advertise). When the
-        guest emulation is slower than real-time, sending CLK INDs at
-        wall-clock cadence keeps the BTS scheduler from declaring skew —
-        but introduces host-load-dependent jitter. Use BRIDGE_CLK_FROM_QEMU=1
-        for deterministic runs (CLK driven from QEMU FN advance).
+        Sent at exact GSM TDMA rate (every CLK_IND_PERIOD * 4.615 ms wall).
+        BTS scheduler stays synchronized with bridge regardless of QEMU
+        emulation speed.
         """
-        if CLK_FROM_QEMU or not self.powered:
+        if not self.powered:
             return
         now = time.monotonic()
         if not hasattr(self, '_last_clk_wall'):
@@ -141,9 +169,12 @@ class Bridge:
 
         if verb == "POWERON":
             self.powered = True
+            # Anchor wall-clock FN at POWERON so BTS sees fn=0 right when
+            # it powers up — matches osmo-bts-trx scheduler expectation.
+            self._wall_t0 = time.monotonic()
             self.fn_anchor = self.fn
             self.anchored = True
-            print(f"BTS: POWERON (FN anchor = {self.fn_anchor})", flush=True)
+            print(f"BTS: POWERON (wall_fn anchor at t0, qfn={self.fn})", flush=True)
             rsp = "RSP POWERON 0"
         elif verb == "POWEROFF":
             self.powered = False; rsp = "RSP POWEROFF 0"
@@ -186,49 +217,65 @@ class Bridge:
 
         Format (TRXDv0 UL, 156 bytes total, set in calypso_bsp_send_ul):
           [0]    TN
-          [1:5]  FN (BE)
+          [1:5]  FN (BE) — REWRITTEN by bridge to current wall_fn
           [5]    RSSI offset (BTS sees -value dBm)
           [6:8]  ToA256 (BE)
           [8:]   148 soft bits (±127)
 
-        trxd_remote is pre-set in __init__ so the first UL is never dropped.
+        FN rewrite: QEMU runs ~2x slower than wall-clock so the FN in the
+        incoming burst lags wall-clock by hundreds of frames. BTS scheduler
+        only accepts bursts within a small window of its current wall-paced
+        FN. We rewrite the header FN to wall_fn so the burst lands in the
+        BTS scheduler window. Burst content is FN-invariant.
         """
         self.stats["ul"] += 1
         tn = data[0] & 0x07
-        fn = int.from_bytes(data[1:5], 'big')
+        qemu_fn = int.from_bytes(data[1:5], 'big')
         rssi = data[5] if len(data) > 5 else 0
         toa = int.from_bytes(data[6:8], 'big', signed=True) if len(data) >= 8 else 0
 
+        # Rewrite FN to wall_fn before forwarding
+        wfn = self.wall_fn() if self.powered else qemu_fn
+        out = bytearray(data)
+        out[1] = (wfn >> 24) & 0xFF
+        out[2] = (wfn >> 16) & 0xFF
+        out[3] = (wfn >>  8) & 0xFF
+        out[4] =  wfn        & 0xFF
+        if wfn != qemu_fn:
+            self.stats["ul_fn_rewrite"] += 1
+
         # Print full header + first/last bits of every UL burst (cap 200 to
-        # avoid log flood). Hex dump exposes any TRXD framing issue end-to-end.
+        # avoid log flood). Show both FNs to track the rewrite.
         if self.stats["ul"] <= 200 or (self.stats["ul"] % 1000) == 0:
-            hdr_hex = data[:8].hex()
+            hdr_in_hex  = data[:8].hex()
+            hdr_out_hex = bytes(out[:8]).hex()
             payload = data[8:]
-            # Show first 16 + last 8 sbits as signed int8 for visual decode
             head = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[:16])
             tail = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[-8:])
-            print(f"bridge: UL #{self.stats['ul']} TN={tn} fn={fn} "
-                  f"rssi=-{rssi} toa={toa} len={len(data)} "
-                  f"hdr={hdr_hex} bits[0:16]=[{head}] bits[140:148]=[{tail}] "
+            print(f"bridge: UL #{self.stats['ul']} TN={tn} "
+                  f"qfn={qemu_fn}→wfn={wfn} rssi=-{rssi} toa={toa} len={len(data)} "
+                  f"hdr_in={hdr_in_hex} hdr_out={hdr_out_hex} "
+                  f"bits[0:16]=[{head}] bits[140:148]=[{tail}] "
                   f"→ BTS {self.trxd_remote}", flush=True)
 
         try:
-            self.trxd_sock.sendto(data, self.trxd_remote)
+            self.trxd_sock.sendto(bytes(out), self.trxd_remote)
         except OSError as e:
             print(f"bridge: UL send error: {e}", flush=True)
 
     def _handle_dl(self, data, addr):
-        """DL burst from BTS → forward to QEMU BSP."""
+        """DL burst from BTS → forward to QEMU BSP.
+
+        BTS sends DL with wall-clock-aligned FN. We forward unchanged ;
+        QEMU's BSP queue uses a tolerant FN match window so bursts are
+        still picked up at delivery time even with QEMU FN drift.
+        """
         self.trxd_remote = addr
         self.stats["dl"] += 1
 
         tn = data[0] & 0x07
         bts_fn = int.from_bytes(data[1:5], 'big')
-
-        # osmo-bts-trx maintains its own continuous FN (wall-clock based)
-        # and locks onto our CLK_IND stream — so bts_fn is already on
-        # QEMU's timeline. fn_anchor kept for telemetry only.
-        fn = bts_fn
+        fn = bts_fn  # forward as-is
 
         # Log burst content: first 8 data bytes + check if FB (all zeros)
         hdr_bytes = data[:8] if len(data) >= 8 else data
@@ -241,15 +288,8 @@ class Bridge:
                   f"bits[0:8]={list(payload[:8])} "
                   f"{'*** FB ***' if is_fb else ''}", flush=True)
 
-        # Rewrite the FN in-place before forwarding (no-op currently, kept
-        # in case BTS clock-slaves on its own counter again in the future).
-        out = bytearray(data)
-        out[1] = (fn >> 24) & 0xFF
-        out[2] = (fn >> 16) & 0xFF
-        out[3] = (fn >>  8) & 0xFF
-        out[4] =  fn        & 0xFF
         try:
-            self.trxd_sock.sendto(bytes(out), QEMU_BSP_ADDR)
+            self.trxd_sock.sendto(data, QEMU_BSP_ADDR)
         except OSError as e:
             print(f"bridge: DL send error: {e}", flush=True)
 
@@ -263,7 +303,7 @@ class Bridge:
         while running:
             fds = [self.trxc_sock, self.trxd_sock, self.qemu_clk_sock]
             try:
-                readable, _, _ = select.select(fds, [], [], 0.1)
+                readable, _, _ = select.select(fds, [], [], 0.05)
             except (OSError, ValueError) as e:
                 print(f"bridge: select error: {e}", flush=True)
                 break
@@ -272,20 +312,24 @@ class Bridge:
             if self.trxc_sock in readable: self.handle_trxc()
             if self.trxd_sock in readable: self.handle_trxd()
 
-            # Send CLK IND at wall-clock rate
+            # Send CLK IND at wall-clock rate using bridge's wall_fn
             self.maybe_send_clk()
 
             if (self.stats["dl"] + self.stats["ul"]) > 0 and \
                ((self.stats["dl"] + self.stats["ul"]) % 5000) == 0:
+                wfn = self.wall_fn()
                 print(f"bridge: tick={self.stats['tick']} "
                       f"clk={self.stats['clk']} "
-                      f"dl={self.stats['dl']} ul={self.stats['ul']}",
+                      f"dl={self.stats['dl']} ul={self.stats['ul']} "
+                      f"ul_rewrite={self.stats['ul_fn_rewrite']} "
+                      f"wall_fn={wfn} qfn={self.fn}",
                       flush=True)
 
         self._stop = True
         print(f"bridge: tick={self.stats['tick']} clk={self.stats['clk']} "
               f"trxc={self.stats['trxc']} dl={self.stats['dl']} "
-              f"ul={self.stats['ul']}", flush=True)
+              f"ul={self.stats['ul']} ul_rewrite={self.stats['ul_fn_rewrite']}",
+              flush=True)
 
 if __name__ == "__main__":
     Bridge().run()

@@ -720,8 +720,18 @@ static void calypso_tdma_tick(void *opaque) {
             /* RACH: dsp_task_iq_swap(RACH_DSP_TASK, arfcn, 1) packs
              * task ID + ARFCN. The 8-bit RACH info is in NDB d_rach.
              * Burst encoding (gsm0503_rach_ext_encode) belongs in the
-             * BSP UL path — see calypso_bsp.c. */
-            uint8_t bits[148];
+             * BSP UL path — see calypso_bsp.c.
+             *
+             * IMPORTANT : zero-init bits[148] before encode. libosmocoding
+             * fills only the 41-bit sync + 36-bit FIRE-encoded data + 3-bit
+             * tail (~80 bits total in the AB structure). The remaining 60
+             * bits of guard period (positions 88..147) are NOT written by
+             * the encoder ; without zero-init we'd transmit stack garbage
+             * in the guard period, which BTS RACH detector treats as
+             * out-of-sync noise → silent drop. Confirmed empirically via
+             * burst hex print : same 8 trailing bits across all RAs before
+             * this fix. */
+            uint8_t bits[148] = {0};
             if (calypso_bsp_tx_rach_burst(s->fn, bits)) {
                 calypso_bsp_send_ul(tn, s->fn, bits);
                 static int rach_log = 0;
@@ -733,7 +743,8 @@ static void calypso_tdma_tick(void *opaque) {
         }
 
         if (task_u != 0 && s->dsp) {
-            uint8_t bits[148];
+            /* NB UL : same zero-init reasoning as RACH path. */
+            uint8_t bits[148] = {0};
             if (calypso_bsp_tx_burst(tn, s->fn, bits)) {
                 calypso_bsp_send_ul(tn, s->fn, bits);
                 static int ul_log = 0;
