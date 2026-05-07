@@ -106,4 +106,8 @@ void calypso_trx_tx_burst_poll(void);
  * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
 uint32_t calypso_trx_get_fn(void);
 
+/* CALYPSO_W1C_LATCH=1 enables the W1C latch system on a_sync_demod cells.
+ * Cached at first call; default 0 = ARM reads NDB direct. */
+int calypso_w1c_latch_enabled(void);
+
 #endif /* CALYPSO_TRX_H */

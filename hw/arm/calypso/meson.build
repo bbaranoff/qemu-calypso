@@ -1,8 +1,10 @@
 # hw/arm/calypso/meson.build
 
 # libosmocoding for RACH/NB UL burst encoding (gsm0503_rach_ext_encode etc).
-# Needed by calypso_bsp.c::calypso_bsp_tx_rach_burst.
-osmocoding = dependency('libosmocoding', required: false)
+# Needed by calypso_bsp.c::calypso_bsp_tx_rach_burst — required:true so meson
+# configure fails fast if the dev package is missing, instead of failing at
+# link time with undefined gsm0503_rach_ext_encode.
+osmocoding = dependency('libosmocoding', required: true)
 
 arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
   files(

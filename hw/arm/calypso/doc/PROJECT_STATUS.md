@@ -46,6 +46,8 @@ GMSK samples, doesn't converge → mobile loops `L1CTL_FBSB_REQ`.
 | Env var | Effect |
 |---|---|
 | `CALYPSO_FBSB_SYNTH=1` | `calypso_fbsb_publish_fb_found` + `_publish_sb_found` re-enabled in `on_dsp_task_change`. Used while emulated DSP correlator does not converge on bridge GMSK. |
+| `CALYPSO_BCCH_INJECT=1` | Enables db_r echo (passes prim_rx_nb EMPTY guard) + a_cd[] write from mmap in `DSP_TASK_ALLC`. Pair with FBSB_SYNTH=1 to deliver SIs end-to-end while DSP CCCH demod is non-converging. Default OFF = real DSP CCCH path. |
+| `CALYPSO_W1C_LATCH=1` | Enables capture (c54x.c) + consume (trx.c) of a_sync_demod latches. Mitigates DSP-set/clear vs ARM-poll race window. Default OFF = ARM reads NDB direct. |
 | `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index in NDB (verify offset for active DSP version). |
 | `BRIDGE_CLK_FROM_QEMU=1` | Replaces wall-clock-paced CLK IND with QEMU-FN-paced. Pair with `-icount`. |
 

@@ -26,6 +26,8 @@ Removed in this pass :
 | `allc_burst_idx` static cycle 0..3 | brut | `calypso_fbsb.c::on_dsp_task_change DSP_TASK_ALLC` | `burst_d = fn & 3` (FN-derived, no static state) |
 | `ul_drop_no_bts` race in bridge UL | brut | `bridge.py::_handle_ul` | `trxd_remote` pre-set to (BTS, base+102) at init |
 | BSP `trxd_peer_valid=false` until first DL | brut | `calypso_bsp.c::calypso_bsp_init` | Pre-set to bridge default (127.0.0.1:5702) ; refined on first DL |
+| W1C latch system on `a_sync_demod` cells | bypass | `calypso_c54x.c` capture + `calypso_trx.c` consume | Env-gated via `CALYPSO_W1C_LATCH=1` (default OFF — ARM reads NDB direct) |
+| `DSP_TASK_ALLC` db_r echo + a_cd mmap inject | bypass | `calypso_fbsb.c::on_dsp_task_change` | Env-gated via `CALYPSO_BCCH_INJECT=1` (default OFF — real DSP CCCH demod path). Pair with `FBSB_SYNTH=1` to deliver SIs end-to-end. |
 
 Functions kept compiled but unused (`calypso_fbsb_publish_fb_found` /
 `_publish_sb_found`) — diagnostic utilities, no live caller.
@@ -109,11 +111,21 @@ returns result=255. Mitigation : `-icount shift=auto` on QEMU.
 **Status** : was conceptual in the original `hacks.md` ; no concrete
 implementation found in code at audit time. No removal needed.
 
-#### `case ALLC_DSP_TASK` echo `d_task_d` + `d_burst_d`
+#### `case ALLC_DSP_TASK` echo `d_task_d` + `d_burst_d` + a_cd inject — ENV-GATED (2026-05-07)
 
-**Quoi** : le DSP émulé ne handle pas task=24. On écrit `d_task_d=24, d_burst_d=N` dans la read page pour passer la guard `EMPTY` de `prim_rx_nb.c`.
+**Status** : env-gated via `CALYPSO_BCCH_INJECT=1`. Default = OFF (real
+DSP CCCH demod path, currently non-converging in QEMU).
 
-**Pourquoi bypass** : implémentation complète DSP CCCH read = mois de travail (NB processing : demod, deinterleaving, channel decoding, CRC). Court-circuit la chaîne mais expose le slot mailbox correct.
+**Sites du code** : `calypso_fbsb.c::on_dsp_task_change DSP_TASK_ALLC` —
+gardé par `bcch_inject_mode()`.
+
+**Quand activer** : pair avec `CALYPSO_FBSB_SYNTH=1` pour la chaîne DL
+end-to-end (mobile L3 décode SI1/SI2/SI3/SI4 depuis le mmap rsl_si_tap).
+
+**Pourquoi bypass** : implémentation complète DSP CCCH read = mois de
+travail (NB processing : demod, deinterleaving, channel decoding, FIRE
+CRC). Court-circuit la chaîne mais expose le slot mailbox correct et
+l'a_cd[] avec les vrais octets RSL du BSC.
 
 ---
 
@@ -141,15 +153,19 @@ BSP RX delivery path converged ; no need for force-clear anymore.
 
 ### Bypass architecturaux
 
-#### W1C latch snapshot dans `data_write`
+#### W1C latch snapshot dans `data_write` — ENV-GATED (2026-05-07)
 
-**Quoi** : quand DSP écrit `d_fb_mode != 0` depuis PCs `{0x8d33, 0x8eb9, 0x8f51}` (real fb-det iteration end), snapshot `a_sync_demod` cells dans globaux `g_*_latch`.
+**Status** : env-gated via `CALYPSO_W1C_LATCH=1`. Default = OFF (ARM reads
+NDB direct). Pattern aligné avec `CALYPSO_FBSB_SYNTH=1`.
 
-**Pourquoi bypass** : résolve une race window où le DSP écrit ses values DSP-iter par-dessus les valeurs synthétiques fbsb avant qu'ARM ne les lise. Le latch capture la "fin d'itération" cohérente.
+**Quand activer** : si on observe une race ARM-DSP où DSP écrit
+`d_fb_mode != 0` depuis PCs `{0x8d33, 0x8eb9, 0x8f51}` puis clear avant
+qu'ARM ne lise. Le latch capture la "fin d'itération" cohérente
+(snapshot des 6 cells au moment du write a_sync_SNR).
 
-**Status actuel** : **inactif** dans les runs récents (LATCH count = 0). fbsb publish gagne la race par timing.
-
-**Dette technique parallèle** : le code latch reste compilé. À supprimer ou activer proprement post-LU.
+**Sites du code** :
+- Capture : `calypso_c54x.c` (~552-561) — gardé par `calypso_w1c_latch_enabled()`
+- Consume : `calypso_trx.c` (~163-188) — gardé par `calypso_w1c_latch_enabled()`
 
 #### Liste statique `real_fbdet_pcs[] = {0x8d33, 0x8eb9, 0x8f51}`
 

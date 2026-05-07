@@ -579,6 +579,34 @@ static uint32_t d_rach_word_offset(void)
     return cached;
 }
 
+/* CALYPSO_RACH_FORCE_BSIC=N forces the BSIC used by the RACH encoder to a
+ * fixed value, overriding whatever is read from d_rach. Useful when the
+ * d_rach offset is uncertain : if the BTS responds with IMM_ASS_CMD as
+ * soon as we encode with the BSC's `base_station_id_code`, the chain is
+ * proven and we know the only remaining bug is the d_rach offset.
+ *
+ * Returns -1 if unset, otherwise the forced BSIC value (0..63). */
+static int rach_force_bsic(void)
+{
+    static int cached = -2;
+    if (cached != -2) return cached;
+    const char *e = getenv("CALYPSO_RACH_FORCE_BSIC");
+    if (!e || !*e) {
+        cached = -1;
+        BSP_LOG("CALYPSO_RACH_FORCE_BSIC unset → BSIC read from d_rach");
+        return cached;
+    }
+    long v = strtol(e, NULL, 0);
+    if (v < 0 || v > 63) {
+        BSP_LOG("CALYPSO_RACH_FORCE_BSIC=%s out of range [0..63] — ignored", e);
+        cached = -1;
+        return cached;
+    }
+    cached = (int)v;
+    BSP_LOG("CALYPSO_RACH_FORCE_BSIC=%d (forcing all RACH bursts with this BSIC)", cached);
+    return cached;
+}
+
 bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
 {
     if (!bsp.dsp || !bits) return false;
@@ -598,6 +626,12 @@ bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
      *   d_rach[15:8] = ra (8-bit RACH info) */
     uint8_t uic_or_bsic = (uint8_t)((d_rach & 0xFF) >> 2);
     uint8_t ra          = (uint8_t)((d_rach >> 8) & 0xFF);
+
+    /* Optional BSIC override (probes whether wrong BSIC is the only blocker). */
+    int forced = rach_force_bsic();
+    if (forced >= 0) {
+        uic_or_bsic = (uint8_t)forced;
+    }
 
     /* gsm0503_rach_ext_encode writes 148 unpacked bits (ubit_t=uint8_t 0/1)
      * into burst[]. is_11bit=false → use 8-bit RACH (legacy GSM). */

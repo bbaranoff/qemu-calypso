@@ -129,6 +129,20 @@ deterministic virtual time and bridge.py with `BRIDGE_CLK_FROM_QEMU=1`
 for QEMU-driven CLK IND. The pair eliminates host-load jitter that was
 producing 28% LOST timer events.
 
+### Env-gated dev assists
+
+| Env | Effect |
+|---|---|
+| `CALYPSO_FBSB_SYNTH=1` | Synth FB/SB publish in `on_dsp_task_change` (default OFF) |
+| `CALYPSO_BCCH_INJECT=1` | db_r echo + a_cd mmap inject in DSP_TASK_ALLC (default OFF) |
+| `CALYPSO_W1C_LATCH=1` | W1C latch on a_sync_demod cells (default OFF) |
+| `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index (default 0x01CB) |
+| `CALYPSO_RACH_FORCE_BSIC=N` | Force BSIC in RACH encoder to N (0..63), overriding d_rach byte. Match `osmo-bsc.cfg base_station_id_code` |
+| `BRIDGE_CLK_FROM_QEMU=1` | CLK IND from QEMU FN (default OFF = wall-clock) |
+
+DL milestone end-to-end requires `FBSB_SYNTH=1 + BCCH_INJECT=1` together
+until DSP correlator + DSP CCCH demod converge on bridge-fed GMSK.
+
 ### Run config
 
 ```bash

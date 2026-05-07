@@ -104,6 +104,25 @@ uint16_t g_a_sync_ANG_latch;
 uint16_t g_a_sync_SNR_latch;
 bool     g_a_sync_valid;
 
+/* CALYPSO_W1C_LATCH=1 enables the W1C latch system : DSP writes at the
+ * a_sync_demod iteration end (PCs 0x8d33/0x8eb9/0x8f51) snapshot all 6
+ * cells, ARM reads consume them. Mitigates a race window where DSP sets
+ * d_fb_mode then clears within a tight loop, and ARM polls between.
+ * Default 0 = ARM reads NDB directly. Read once at first call, cached. */
+int calypso_w1c_latch_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_W1C_LATCH");
+        cached = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr,
+                "[calypso-trx] CALYPSO_W1C_LATCH=%d (%s)\n",
+                cached, cached ? "latch on a_sync_SNR snapshot, consume on ARM read"
+                               : "ARM reads NDB direct");
+    }
+    return cached;
+}
+
 /* All firmware patches removed — verified that the layer1.highram.elf
  * runs unmodified against the current QEMU emulation (PM scan, FBSB,
  * RESET cycle stable for >1 minute with NO patches applied).
@@ -160,7 +179,8 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * d_fb_det read consumes the latch (ARM acks detection); a_sync_*
      * remain valid for the subsequent burst-read until next snapshot
      * overwrites them. */
-    if (offset == 0x01F0 && size == 2 && g_a_sync_valid &&
+    if (calypso_w1c_latch_enabled() &&
+        offset == 0x01F0 && size == 2 && g_a_sync_valid &&
         g_d_fb_det_latch != 0) {
         uint16_t v = g_d_fb_det_latch;
         g_d_fb_det_latch = 0;
@@ -168,7 +188,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
                 v, s->fn);
         return v;
     }
-    if (g_a_sync_valid && size == 2) {
+    if (calypso_w1c_latch_enabled() && g_a_sync_valid && size == 2) {
         uint16_t v = 0;
         const char *name = NULL;
         switch (offset) {

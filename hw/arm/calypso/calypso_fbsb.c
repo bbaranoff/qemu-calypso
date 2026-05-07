@@ -28,8 +28,8 @@
  * Layout : 16-byte header + 5×32-byte slots = 176 bytes total.
  * Magic 4 bytes "CSI1" = 0x31495343 LE.
  * Slots fixés : 0=SI1, 1=SI2, 2=SI3, 3=SI4, 4=SI13.
- * Si fichier absent / magic invalide / slot vide → fallback hardcoded
- * (transition graceful pendant dev). À retirer une fois bridge stable.
+ * Si fichier absent / magic invalide / slot vide → no SI written
+ * (caller skips a_cd write, mobile fails FBSB cleanly).
  * ---------------------------------------------------------------- */
 #define CSI_MAGIC          0x31495343u  /* "CSI1" LE uint32 */
 #define CSI_HEADER_SIZE    16
@@ -60,14 +60,14 @@ static void csi_init_once(void)
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "[fbsb] CSI mmap: open(%s) failed: %s — fallback hardcoded\n",
+        fprintf(stderr, "[fbsb] CSI mmap: open(%s) failed: %s — SI writes disabled\n",
                 path, strerror(errno));
         g_csi.state = -1;
         return;
     }
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size < (off_t)CSI_FILE_SIZE) {
-        fprintf(stderr, "[fbsb] CSI mmap: %s too small (%lld < %d) — fallback\n",
+        fprintf(stderr, "[fbsb] CSI mmap: %s too small (%lld < %d) — SI writes disabled\n",
                 path, (long long)st.st_size, (int)CSI_FILE_SIZE);
         close(fd);
         g_csi.state = -1;
@@ -75,7 +75,7 @@ static void csi_init_once(void)
     }
     void *map = mmap(NULL, CSI_FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
-        fprintf(stderr, "[fbsb] CSI mmap: mmap failed: %s — fallback\n", strerror(errno));
+        fprintf(stderr, "[fbsb] CSI mmap: mmap failed: %s — SI writes disabled\n", strerror(errno));
         close(fd);
         g_csi.state = -1;
         return;
@@ -83,7 +83,7 @@ static void csi_init_once(void)
     uint32_t magic;
     memcpy(&magic, map, 4);
     if (magic != CSI_MAGIC) {
-        fprintf(stderr, "[fbsb] CSI mmap: bad magic 0x%08x (expected 0x%08x) — fallback\n",
+        fprintf(stderr, "[fbsb] CSI mmap: bad magic 0x%08x (expected 0x%08x) — SI writes disabled\n",
                 magic, CSI_MAGIC);
         munmap(map, CSI_FILE_SIZE);
         close(fd);
@@ -113,7 +113,7 @@ static const uint8_t tc_to_slot[8] = {
 };
 
 /* Returns pointer to 23-byte SI blob for given TC, or NULL if mmap unavailable
- * or slot empty/invalid. Caller must fallback to hardcoded SI3 if NULL. */
+ * or slot empty/invalid. Caller skips a_cd write when NULL. */
 static const uint8_t *csi_lookup_for_tc(uint8_t tc, uint8_t *out_si_type)
 {
     if (g_csi.state != 1) return NULL;
@@ -201,6 +201,28 @@ static int fbsb_synth_mode(void)
     return cached;
 }
 
+/* CALYPSO_BCCH_INJECT=1 → in DSP_TASK_ALLC, echo db_r->d_task_d/d_burst_d
+ * (passes prim_rx_nb EMPTY guard) AND inject SI bytes from mmap into
+ * a_cd[]. Default 0 = real DSP CCCH demod path (DSP itself writes a_cd
+ * after channel decoding the BCCH bursts the BSP delivered). The real
+ * path doesn't currently work in QEMU (DSP CCCH demod not converging),
+ * so opt-in is required to see SIs reach mobile L3.
+ *
+ * Pair with CALYPSO_FBSB_SYNTH=1 for the full DL chain to work end-to-end. */
+static int bcch_inject_mode(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_BCCH_INJECT");
+        cached = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr, "[calypso-fbsb] CALYPSO_BCCH_INJECT=%d (%s)\n",
+                cached, cached ? "db_r echo + a_cd mmap inject"
+                               : "real DSP CCCH demod");
+        fflush(stderr);
+    }
+    return cached;
+}
+
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn)
 {
@@ -246,16 +268,33 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
     case DSP_TASK_ALLC: {
         /* CCCH read (task=24, ALLC_DSP_TASK).
          *
-         * Echo d_task_d/d_burst_d to pass the EMPTY guard in
-         * prim_rx_nb.c:73-83 (db_r->d_task_d != 0, db_r->d_burst_d == K).
-         * d_burst_d is FN-derived (block index in the BCCH multiframe)
-         * so it stays in lockstep with the firmware's own scheduling
-         * regardless of TDMA jitter.
+         * Real DSP path : the DSP demodulates BCCH bursts delivered by
+         * BSP DMA, channel-decodes (deinterleaving + FIRE check), and
+         * writes the resulting LAPDm bytes to a_cd[] + responds via
+         * db_r->d_task_d/d_burst_d. ARM L1S then synthesizes a DATA_IND.
          *
-         * SI blob lu depuis mmap /dev/shm/calypso_si.bin (cf.
-         * doc/MMAP_SI_FORMAT.md). Si mmap absent/invalide → on n'écrit
-         * rien et le firmware verra a_cd vide (FBSB échouera proprement,
-         * pas de fallback hardcoded). */
+         * Currently the emulated DSP CCCH demod does not converge on the
+         * bridge-fed GMSK samples (same family of problem as fb-det). The
+         * env-gated bypass below short-circuits this :
+         *   - echo db_r->d_task_d/d_burst_d to pass the EMPTY guard in
+         *     prim_rx_nb.c:73-83 (`db_r->d_task_d != 0, db_r->d_burst_d == K`)
+         *   - write a_cd[] from /dev/shm/calypso_si.bin (rsl_si_tap.py mmap),
+         *     selecting SI type per TC (BCCH multiframe slot pattern)
+         *
+         * Default 0 = real DSP path (broken in QEMU but pure).
+         * CALYPSO_BCCH_INJECT=1 = bypass active. */
+        if (!bcch_inject_mode()) {
+            static int log_once;
+            if (!log_once++) {
+                fprintf(stderr,
+                        "[fbsb] ALLC task=24 fn=%lu — real DSP path "
+                        "(set CALYPSO_BCCH_INJECT=1 to inject SIs from mmap)\n",
+                        (unsigned long)fn);
+                fflush(stderr);
+            }
+            break;
+        }
+
         static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
 
         /* d_burst_d = block index 0..3 inside the 4-burst BCCH block.
@@ -299,7 +338,7 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
         fprintf(stderr,
                 "[fbsb] ALLC task=24 burst_d=%u fn=%lu TC=%u si_type=0x%02x %s\n",
                 burst_d, (unsigned long)fn, tc, si_type,
-                blob ? "(mmap)" : "(no SI — mmap unavailable)");
+                blob ? "(mmap inject)" : "(no SI — mmap unavailable)");
         fflush(stderr);
         break;
     }

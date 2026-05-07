@@ -18,6 +18,7 @@
  * captures all 6 cells coherent. Consumed by ARM read. */
 extern uint16_t g_d_fb_det_latch;
 extern uint16_t g_d_fb_mode_latch;
+extern int calypso_w1c_latch_enabled(void);
 extern uint16_t g_a_sync_TOA_latch;
 extern uint16_t g_a_sync_PM_latch;
 extern uint16_t g_a_sync_ANG_latch;
@@ -549,7 +550,8 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
          * subsequent stack-stomp at PC=0x0662 etc.
          * Order observed: d_fb_det → d_fb_mode → a_sync_TOA → PM → ANG
          * → SNR (insn N..N+150). */
-        if (addr == 0x08FD && val != 0 &&
+        if (calypso_w1c_latch_enabled() &&
+            addr == 0x08FD && val != 0 &&
             (s->pc == 0x8d33 || s->pc == 0x8eb9 || s->pc == 0x8f51)) {
             g_d_fb_det_latch   = s->data[0x08F8];
             g_d_fb_mode_latch  = s->data[0x08F9];

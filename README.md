@@ -44,12 +44,35 @@ mobile DSP missing the IMM_ASS sub-slot on AGCH. Test : tcpdump GSMTAP during a
 # Real DSP path (FBSB will not converge until correlator emulation is fixed)
 ./run.sh
 
-# Dev-assist path : synth FB/SB so DL chain reaches L3 + RACH UL fires for real
-CALYPSO_FBSB_SYNTH=1 ./run.sh
+# Dev-assist path : synth FB/SB + inject SIs from mmap so DL chain reaches L3
+# (FBSB_SYNTH alone gets past FBSB but mobile then blocks on empty CCCH read ;
+#  pair with BCCH_INJECT to actually deliver SIs to mobile L3)
+CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 ./run.sh
 
 # RACH d_rach offset override (default 0x01CB matches DSP==33 layout walk)
-CALYPSO_NDB_D_RACH_OFFSET=0x01CB CALYPSO_FBSB_SYNTH=1 ./run.sh
+CALYPSO_NDB_D_RACH_OFFSET=0x01CB CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 ./run.sh
+
+# W1C latch on a_sync_demod (DSP write→ARM read race mitigation, opt-in)
+CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 CALYPSO_W1C_LATCH=1 ./run.sh
 ```
+
+### Env vars (default = real path, opt-in for dev assist)
+
+| Env | Default | Effect |
+|---|---|---|
+| `CALYPSO_FBSB_SYNTH` | `0` | `1` re-enables `publish_fb_found` + `publish_sb_found` synth in `on_dsp_task_change` (used while emulated DSP correlator does not converge on bridge GMSK) |
+| `CALYPSO_BCCH_INJECT` | `0` | `1` enables `db_r` echo (passes prim_rx_nb EMPTY guard) + `a_cd[]` write from mmap in `DSP_TASK_ALLC`. Pair with `FBSB_SYNTH=1` to deliver SIs to mobile L3 while DSP CCCH demod is non-converging |
+| `CALYPSO_W1C_LATCH` | `0` | `1` enables capture in `calypso_c54x.c` (DSP writes at fb-det iteration end snapshot 6 NDB cells) + consume in `calypso_trx.c` (ARM reads return latch) — mitigates a DSP-set/clear race vs ARM polling |
+| `CALYPSO_NDB_D_RACH_OFFSET` | `0x01CB` | Override word index of `d_rach` in NDB (DSP version-dependent layout) |
+| `CALYPSO_RACH_FORCE_BSIC` | unset | If set (0..63), forces the RACH encoder BSIC to this value, overriding the byte read from d_rach. Match it to `osmo-bsc.cfg`'s `base_station_id_code`. Diagnostic for the case where d_rach offset is wrong → BSIC read garbage → BTS rejects RACH FIRE check |
+| `BRIDGE_CLK_FROM_QEMU` | `0` | `1` replaces wall-clock-paced CLK IND with QEMU-FN-paced. Pair with `-icount`. |
+| `CALYPSO_BSP_BYPASS_BDLENA` | `0` | `1` bypasses the IOTA BDLENA gate — debug only, breaks BSP RX gating semantics |
+| `CALYPSO_BSP_DARAM_ADDR` | `0x3fb0` | DSP DARAM destination word for BSP RX DMA. Verified empirically against DSP-read range 0x3fb3-0x3fbf |
+| `CALYPSO_DBG` | `corrupt,unimpl` | Comma-separated debug categories ; `none` / `all` accepted |
+| `CALYPSO_SI_MMAP_PATH` | `/dev/shm/calypso_si.bin` | Path to SI mmap file written by `rsl_si_tap.py` |
+| `CALYPSO_DSP_ROM` | `calypso_dsp.txt` | Path to DSP ROM dump |
+| `CALYPSO_SIM_CFG` | `~/.osmocom/bb/sim.cfg` | SIM IMSI/Ki config |
+| `L1CTL_SOCK` | `/tmp/osmocom_l2` | Mobile↔QEMU L1CTL Unix socket |
 
 ---
 
