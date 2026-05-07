@@ -197,11 +197,20 @@ class Bridge:
         tn = data[0] & 0x07
         fn = int.from_bytes(data[1:5], 'big')
         rssi = data[5] if len(data) > 5 else 0
+        toa = int.from_bytes(data[6:8], 'big', signed=True) if len(data) >= 8 else 0
 
-        if self.stats["ul"] <= 10 or (self.stats["ul"] % 5000) == 0:
+        # Print full header + first/last bits of every UL burst (cap 200 to
+        # avoid log flood). Hex dump exposes any TRXD framing issue end-to-end.
+        if self.stats["ul"] <= 200 or (self.stats["ul"] % 1000) == 0:
+            hdr_hex = data[:8].hex()
+            payload = data[8:]
+            # Show first 16 + last 8 sbits as signed int8 for visual decode
+            head = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[:16])
+            tail = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[-8:])
             print(f"bridge: UL #{self.stats['ul']} TN={tn} fn={fn} "
-                  f"rssi=-{rssi} len={len(data)} → BTS {self.trxd_remote}",
-                  flush=True)
+                  f"rssi=-{rssi} toa={toa} len={len(data)} "
+                  f"hdr={hdr_hex} bits[0:16]=[{head}] bits[140:148]=[{tail}] "
+                  f"→ BTS {self.trxd_remote}", flush=True)
 
         try:
             self.trxd_sock.sendto(data, self.trxd_remote)

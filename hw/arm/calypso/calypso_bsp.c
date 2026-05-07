@@ -33,6 +33,10 @@
  * (which would drag in hw/irq.h and qemu internals not needed in this TU). */
 uint32_t calypso_trx_get_fn(void);
 
+/* Forward decls for env-gated helpers used in calypso_bsp_init pre-warm. */
+static uint32_t d_rach_word_offset(void);
+static int rach_force_bsic(void);
+
 #define BSP_LOG(fmt, ...) \
     do { fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -211,13 +215,18 @@ static void bsp_trxd_readable(void *opaque)
                 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
 
-    /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes */
+    /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes.
+     * (Confirmed empirically 2026-05-07 — earlier "asymmetric 6-byte
+     * header" hypothesis was wrong : RX header IS 8 bytes like TX.
+     * Even when BTS emits 154-byte packets, the n-8 skip + 148-bit
+     * clamp keeps DSP demod aligned. n-6 broke mobile L1 sync —
+     * mobile stayed in cell-selection loop and never reached LU.) */
     uint8_t  tn  = buf[0] & 0x07;
     uint32_t fn  = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
                    ((uint32_t)buf[3]<<8)|buf[4];
     bsp.last_att = (n > 5) ? buf[5] : 0;
 
-    int nbits = (int)n - 8;  /* skip 8-byte header */
+    int nbits = (int)n - 8;  /* TRXDv0 header is 8 bytes (TS+FN+RSSI+ToA) */
     if (nbits > 148) nbits = 148;
     if (nbits <= 0) return;
 
@@ -359,6 +368,12 @@ void calypso_bsp_init(C54xState *dsp)
             close(fd);
         }
     }
+
+    /* Pre-init env-gated state so the first RACH burst doesn't pay the
+     * cost of strtoul/getenv mid-run. Reportedly the static-cache pattern
+     * had correlated runtime variability with LU success rate. */
+    (void)d_rach_word_offset();
+    (void)rach_force_bsic();
 
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",
             (void *)dsp, bsp.daram_addr, bsp.daram_len,
@@ -521,7 +536,17 @@ void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148])
 {
     if (bsp.trxd_fd < 0 || !bsp.trxd_peer_valid) return;
 
-    /* TRXDv0 UL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes */
+    /* TRXDv0 UL (TRX → BTS): tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes.
+     *
+     * The osmo-bts-trx TRXD protocol is *asymmetric* :
+     *   - DL (BTS → TRX) : 6-byte header, 154 bytes total. No ToA.
+     *   - UL (TRX → BTS) : 8-byte header WITH ToA, 156 bytes total. The
+     *     ToA is needed by BTS RACH/SACCH timing-advance estimation.
+     *
+     * Sending 154-byte UL caused osmo-bts-trx::trx_if.c:821 to log
+     *   "Rx TRXD PDU with odd burst length 146"
+     * (BTS subtracts its 8-byte header from msg len, expects 148 body).
+     * Always send 156 bytes for UL. */
     uint8_t pkt[8 + 148];
     pkt[0] = tn & 0x07;
     pkt[1] = (fn >> 24) & 0xff;
@@ -529,9 +554,32 @@ void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148])
     pkt[3] = (fn >>  8) & 0xff;
     pkt[4] =  fn        & 0xff;
     pkt[5] = 60;            /* RSSI → -60 dBm at the BTS */
-    pkt[6] = 0; pkt[7] = 0; /* ToA256 = 0 */
+    pkt[6] = 0; pkt[7] = 0; /* ToA256 = 0 (centered, no timing advance request) */
     for (int i = 0; i < 148; i++)
         pkt[8 + i] = bits[i] ? 127 : (uint8_t)(-127);
+
+    /* Hex dump of every UL burst as it's sent — symmetric with the bridge.py
+     * UL print, so we can correlate L1 → bridge → BTS at the byte level
+     * when chasing TRXD framing or RACH parity issues. Cap at 200 to keep
+     * log finite. */
+    {
+        static unsigned ul_log_count = 0;
+        if (ul_log_count++ < 200 || (ul_log_count % 1000) == 0) {
+            BSP_LOG("UL #%u TN=%u fn=%u rssi=-60 toa=0 len=%zu "
+                    "hdr=%02x%02x%02x%02x%02x%02x%02x%02x "
+                    "bits[0:16]=[%+d %+d %+d %+d %+d %+d %+d %+d "
+                    "%+d %+d %+d %+d %+d %+d %+d %+d]",
+                    ul_log_count, tn, fn, sizeof(pkt),
+                    pkt[0], pkt[1], pkt[2], pkt[3],
+                    pkt[4], pkt[5], pkt[6], pkt[7],
+                    (int8_t)pkt[8], (int8_t)pkt[9], (int8_t)pkt[10],
+                    (int8_t)pkt[11], (int8_t)pkt[12], (int8_t)pkt[13],
+                    (int8_t)pkt[14], (int8_t)pkt[15],
+                    (int8_t)pkt[16], (int8_t)pkt[17], (int8_t)pkt[18],
+                    (int8_t)pkt[19], (int8_t)pkt[20], (int8_t)pkt[21],
+                    (int8_t)pkt[22], (int8_t)pkt[23]);
+        }
+    }
 
     sendto(bsp.trxd_fd, pkt, sizeof(pkt), 0,
            (struct sockaddr *)&bsp.trxd_peer, sizeof(bsp.trxd_peer));
@@ -562,27 +610,31 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
 
 /* d_rach lives in NDB at a struct offset that depends on the DSP version.
  * The firmware writes (uic|bsic)<<2 | (ra<<8) to ndb->d_rach right before
- * setting db_w->d_task_ra. Override via CALYPSO_NDB_D_RACH_OFFSET if the
- * firmware version moves it.
+ * setting db_w->d_task_ra.
  *
  * Default 0x023A — confirmed empirically 2026-05-07 via D_RACH-FINDER ring
  * trace : ARM-side write at API byte 0x0474 (= DSP word 0x0A3A = word 0x23A
- * from API base) carries values 0x0300, 0x0f00, ... matching the mobile L3
- * `RANDOM ACCESS ra 0xRR` log lines exactly. The earlier candidate 0x01CB
- * (DSP==33 struct walk of osmocom-bb dsp_api.h) was incorrect for the
- * actual firmware layout in use. */
+ * from API base) carries values 0x0300, 0x0f00, ... matching mobile L3
+ * `RANDOM ACCESS ra 0xRR` log lines exactly.
+ *
+ * Cached via env var for ABI predictability — the old static-init+branch
+ * pattern was reportedly correlated with worse LU success rate vs explicit
+ * env set, so we now read env once and stash in bsp.* state at init. */
+#define D_RACH_DEFAULT_OFFSET 0x023A
 static uint32_t d_rach_word_offset(void)
 {
     static uint32_t cached = 0;
-    if (cached) return cached;
+    static bool     done = false;
+    if (done) return cached;
     const char *e = getenv("CALYPSO_NDB_D_RACH_OFFSET");
     if (e && *e) {
         cached = (uint32_t)strtoul(e, NULL, 0);
         BSP_LOG("d_rach offset: 0x%04x (env=%s)", cached, e);
     } else {
-        cached = 0x023A;
-        BSP_LOG("d_rach offset: 0x%04x (default — empirically pinned 2026-05-07)", cached);
+        cached = D_RACH_DEFAULT_OFFSET;
+        BSP_LOG("d_rach offset: 0x%04x (default macro — pinned 2026-05-07)", cached);
     }
+    done = true;
     return cached;
 }
 
@@ -625,7 +677,15 @@ bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
     uint32_t off = d_rach_word_offset();
     uint16_t d_rach = bsp.dsp->data[0x0800 + off];
     if (d_rach == 0) {
-        BSP_LOG("RACH: d_rach@0x%04x is zero — skipping (offset wrong?)", off);
+        /* Pre-LU : firmware hasn't written d_rach yet. Normal during cell
+         * selection / SI decode phase. Don't alarm — just skip silently
+         * (cap log to first 5 to keep it visible if there's a real issue). */
+        static unsigned zero_log = 0;
+        if (zero_log++ < 5) {
+            BSP_LOG("RACH: d_rach@0x%04x is zero — skipping #%u "
+                    "(normal pre-LU, mobile not yet in RR_EST_REQ)",
+                    off, zero_log);
+        }
         return false;
     }
 
