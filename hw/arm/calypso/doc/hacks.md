@@ -28,6 +28,7 @@ Removed in this pass :
 | BSP `trxd_peer_valid=false` until first DL | brut | `calypso_bsp.c::calypso_bsp_init` | Pre-set to bridge default (127.0.0.1:5702) ; refined on first DL |
 | W1C latch system on `a_sync_demod` cells | bypass | `calypso_c54x.c` capture + `calypso_trx.c` consume | Env-gated via `CALYPSO_W1C_LATCH=1` (default OFF — ARM reads NDB direct) |
 | `DSP_TASK_ALLC` db_r echo + a_cd mmap inject | bypass | `calypso_fbsb.c::on_dsp_task_change` | Env-gated via `CALYPSO_BCCH_INJECT=1` (default OFF — real DSP CCCH demod path). Pair with `FBSB_SYNTH=1` to deliver SIs end-to-end. |
+| Kick timer on `QEMU_CLOCK_REALTIME` | dette | `calypso_trx.c::calypso_kick_cb` | Moved to `QEMU_CLOCK_VIRTUAL` (2026-05-07). Was vestigial main-loop wake on wall-clock, broke `-icount` by interrupting the TCG burst before VIRTUAL-clock timers (TDMA, TINT0, frame_irq) could reach their deadlines. |
 
 Functions kept compiled but unused (`calypso_fbsb_publish_fb_found` /
 `_publish_sb_found`) — diagnostic utilities, no live caller.

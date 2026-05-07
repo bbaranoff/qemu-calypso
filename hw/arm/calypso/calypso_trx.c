@@ -275,6 +275,52 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                     (unsigned)offset, (unsigned)value, size, s->fn);
     }
 
+    /* d_rach offset finder — circular buffer of recent NDB writes.
+     * NDB starts at byte offset 0x01A8 in API RAM (= dsp_ram + 0x01A8).
+     * We capture every non-zero ARM-side write to NDB range and dump the
+     * last 16 entries when d_task_ra commits (0x000E page0 or 0x0036 page1).
+     * The d_rach value matches the pattern (ra<<8) | (bsic<<2) — the ra
+     * byte mirrors what the mobile L3 just announced in `RANDOM ACCESS`.
+     * Once observed, set CALYPSO_NDB_D_RACH_OFFSET to the matching word
+     * index (= (offset - 0x01A8) / 2 + 0xD4 in the convention used by
+     * calypso_bsp.c). */
+    {
+        struct ndb_wr_entry { hwaddr off; uint16_t val; uint32_t fn; uint64_t insn; };
+        static struct ndb_wr_entry ring[16];
+        static int idx;
+
+        if (offset >= 0x01A8 && offset < 0x0400 && size == 2 && value != 0) {
+            ring[idx & 15] = (struct ndb_wr_entry){
+                offset, (uint16_t)value, s->fn, 0
+            };
+            idx++;
+        }
+
+        bool task_ra_commit =
+            (offset == DSP_API_W_PAGE0 + DB_W_D_TASK_RA * 2 ||
+             offset == DSP_API_W_PAGE1 + DB_W_D_TASK_RA * 2) && value != 0;
+        if (task_ra_commit) {
+            static int dump_count = 0;
+            if (dump_count++ < 20) {
+                TRX_LOG("D_RACH-FINDER task_ra commit @0x%04x = 0x%04x fn=%u — last 16 NDB writes:",
+                        (unsigned)offset, (unsigned)value, s->fn);
+                int n = (idx < 16) ? idx : 16;
+                int start = (idx - n) & 15;
+                for (int i = 0; i < n; i++) {
+                    int k = (start + i) & 15;
+                    uint16_t v   = ring[k].val;
+                    uint8_t  ra  = (uint8_t)((v >> 8) & 0xFF);
+                    uint8_t  low = (uint8_t)(v & 0xFF);
+                    uint8_t  bsic = low >> 2;
+                    fprintf(stderr,
+                            "[trx] D_RACH-FINDER  #%d off=0x%04x val=0x%04x "
+                            "ra_candidate=0x%02x bsic_candidate=0x%02x fn=%u\n",
+                            i, (unsigned)ring[k].off, v, ra, bsic, ring[k].fn);
+                }
+            }
+        }
+    }
+
     /* DSP bootloader mailbox writes (osmocom-bb dsp.c BL_*).
      * ARM byte → DSP word mapping (api_ram[w] ↔ ARM byte w*2):
      *   ARM 0x0FF8 BL_ADDR_HI    ↔ DSP word 0x0FFC
@@ -799,9 +845,18 @@ static void calypso_tdma_start(CalypsoTRX *s)
     timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
 }
 
-/* ---- kick ---- */
+/* ---- kick ----
+ * Periodic CPU exit + main-loop wake. Originally on QEMU_CLOCK_REALTIME
+ * (vestigial workaround for an old QEMU main-loop blocking issue). Moved
+ * to QEMU_CLOCK_VIRTUAL on 2026-05-07 so it cooperates with -icount mode :
+ * under icount, REALTIME advances independently of guest progress, and a
+ * REALTIME-driven cpu_exit was interrupting the TCG burst before the
+ * VIRTUAL-clock TDMA timer could reach its deadline → bridge UDP path
+ * frozen. With VIRTUAL, the kick fires in the same time domain as every
+ * other Calypso timer.
+ */
 static QEMUTimer *g_kick_timer;
-static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);}
+static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+5000000);}
 
 /* ---- Sercomm burst transport (DLCI 4) ---- */
 
@@ -924,8 +979,8 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     s->dsp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_dsp_done,s);
     s->frame_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_frame_irq_lower,s);
 
-    g_kick_timer = timer_new_ns(QEMU_CLOCK_REALTIME,calypso_kick_cb,NULL);
-    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
+    g_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_kick_cb,NULL);
+    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+5000000);
 
     /* C54x DSP emulator */
     {

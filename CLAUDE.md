@@ -139,6 +139,7 @@ producing 28% LOST timer events.
 | `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index (default 0x01CB) |
 | `CALYPSO_RACH_FORCE_BSIC=N` | Force BSIC in RACH encoder to N (0..63), overriding d_rach byte. Match `osmo-bsc.cfg base_station_id_code` |
 | `BRIDGE_CLK_FROM_QEMU=1` | CLK IND from QEMU FN (default OFF = wall-clock) |
+| `CALYPSO_ICOUNT=auto/off/shift=N` | QEMU icount mode (default `auto`). Kick timer is on VIRTUAL clock so icount doesn't freeze TDMA. |
 
 DL milestone end-to-end requires `FBSB_SYNTH=1 + BCCH_INJECT=1` together
 until DSP correlator + DSP CCCH demod converge on bridge-fed GMSK.

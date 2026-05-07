@@ -574,8 +574,16 @@ static uint32_t d_rach_word_offset(void)
     static uint32_t cached = 0;
     if (cached) return cached;
     const char *e = getenv("CALYPSO_NDB_D_RACH_OFFSET");
-    cached = e ? (uint32_t)strtoul(e, NULL, 0) : 0x01CB;
-    BSP_LOG("d_rach offset: 0x%04x (env=%s)", cached, e ? e : "(default)");
+    /* Treat unset OR empty string as "use default". The shell exports
+     * variables with `:-}` syntax as empty strings, not unset, so a plain
+     * `e ? ... : default` would silently read offset 0 (= NDB base = wrong). */
+    if (e && *e) {
+        cached = (uint32_t)strtoul(e, NULL, 0);
+        BSP_LOG("d_rach offset: 0x%04x (env=%s)", cached, e);
+    } else {
+        cached = 0x01CB;
+        BSP_LOG("d_rach offset: 0x%04x (default)", cached);
+    }
     return cached;
 }
 
@@ -591,6 +599,7 @@ static int rach_force_bsic(void)
     static int cached = -2;
     if (cached != -2) return cached;
     const char *e = getenv("CALYPSO_RACH_FORCE_BSIC");
+    /* Same empty-string-as-unset handling as d_rach_word_offset(). */
     if (!e || !*e) {
         cached = -1;
         BSP_LOG("CALYPSO_RACH_FORCE_BSIC unset → BSIC read from d_rach");

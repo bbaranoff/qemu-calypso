@@ -32,15 +32,17 @@ sleep 1
 tmux new-session -d -s $SESSION -n qemu
 
 # ---- 1. QEMU ----
-# -icount makes the virtual clock track instructions instead of wall-clock,
-# so TDMA tick scheduling and DSP cycle counts are reproducible across runs
-# regardless of host load. shift=auto adapts the instruction-to-virtual-ns
-# scaling. align=off skips real-time alignment (we drive timing externally
-# via BRIDGE_CLK_FROM_QEMU). sleep=off keeps virtual time advancing at host
-# rate when the guest is idle.
+# icount via CALYPSO_ICOUNT env (default 'auto'). The kick timer was
+# moved to QEMU_CLOCK_VIRTUAL so icount no longer freezes TDMA→bridge.
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
+if [ "$CALYPSO_ICOUNT" = "off" ]; then
+    QEMU_ICOUNT_FLAG=""
+else
+    QEMU_ICOUNT_FLAG="-icount $CALYPSO_ICOUNT"
+fi
 CALYPSO_DSP_ROM=/opt/GSM/calypso_dsp.txt \
 $QEMU -M calypso -cpu arm946 \
-  -icount shift=auto,align=off,sleep=off \
+  $QEMU_ICOUNT_FLAG \
   -serial pty -serial pty \
   -monitor "unix:${MON_SOCK},server,nowait" \
   -kernel "$FW" > /root/qemu.log 2>&1 &

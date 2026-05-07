@@ -66,6 +66,7 @@ CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 CALYPSO_W1C_LATCH=1 ./run.sh
 | `CALYPSO_NDB_D_RACH_OFFSET` | `0x01CB` | Override word index of `d_rach` in NDB (DSP version-dependent layout) |
 | `CALYPSO_RACH_FORCE_BSIC` | unset | If set (0..63), forces the RACH encoder BSIC to this value, overriding the byte read from d_rach. Match it to `osmo-bsc.cfg`'s `base_station_id_code`. Diagnostic for the case where d_rach offset is wrong → BSIC read garbage → BTS rejects RACH FIRE check |
 | `BRIDGE_CLK_FROM_QEMU` | `0` | `1` replaces wall-clock-paced CLK IND with QEMU-FN-paced. Pair with `-icount`. |
+| `CALYPSO_ICOUNT` | `auto` | QEMU `-icount` mode passed verbatim. Values: `auto` (= `shift=auto,sleep=on,align=off`), `shift=N,sleep=on`, or `off` to disable. The kick timer in `calypso_trx.c` was moved to `QEMU_CLOCK_VIRTUAL` so icount no longer freezes the TDMA tick. |
 | `CALYPSO_BSP_BYPASS_BDLENA` | `0` | `1` bypasses the IOTA BDLENA gate — debug only, breaks BSP RX gating semantics |
 | `CALYPSO_BSP_DARAM_ADDR` | `0x3fb0` | DSP DARAM destination word for BSP RX DMA. Verified empirically against DSP-read range 0x3fb3-0x3fbf |
 | `CALYPSO_DBG` | `corrupt,unimpl` | Comma-separated debug categories ; `none` / `all` accepted |
