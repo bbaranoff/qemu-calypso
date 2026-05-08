@@ -1,218 +1,53 @@
 # Calypso GSM Baseband Emulator — Project Status
 
-## 2026-05-07 — UL pipeline wired + hack cleanup
+## État courant (2026-05-08)
 
-**State** : DL milestone preserved, UL chain instrumented end-to-end, all
-documented hacks either removed or env-gated. Next blocker discriminated to
-`RACH→BTS→IMM_ASS_CMD` round-trip.
+### Ce qui marche
+- Pipeline ARM ↔ TPU ↔ BSP ↔ DSP fonctionnel (timer, UART, RPTB, sercomm)
+- Mobile L23 atteint **gsm322 cell selection (DSC=90)** avec `CALYPSO_FBSB_SYNTH=1`
+- `CALYPSO_BSP_DARAM_ADDR` configurable, samples I/Q FCCH binarisés (`7ffe/8002/0000`) livrés
+- 9 probes runtime instrumentés (PC-HIST-3FB/3DD, WATCH-WRITE 0x3dd2, INTM-TRANS, WAIT-A21A, ENTER-7740, ST1-WR, POST-BOOTSTUB-RET, D_FB_DET-WR-SITE)
 
-### Verified live (this session)
+### Fixes émulateur 2026-05-08
+1. **POPM (0x8A00 mask 0xFF00) fixé** — était décodé en MVDK Smem,dmad. Corrigé : pop top-of-stack vers MMR. Débloque restore ST1 → INTM se clear correctement → fin du dwell INTM=1 perpétuel observé depuis avril.
+2. **8 stubs NOP** posés sur opcodes misclassifiés causant push/pop fantômes :
+   - `0x80` (était MVDD, doit être STL src,Smem)
+   - `0x8B` (était MVDK long-addr, doit être POPD Smem)
+   - `0xAA/AB` (était STLM duplicate, doit être LD variant — vrai STLM en 0x88/89)
+   - `0xC5` (était PSHM, doit être ST||OP — vrai PSHM en 0x4A)
+   - `0xCD` (était POPM, doit être ST||OP — vrai POPM en 0x8A)
+   - `0xCE` (était FRAME, doit être ST||OP)
+   - `0xDD` (était POPD, doit être ST||OP — cause SP runaway post-POPM)
+   - `0xDE` (était POPD dmad 2-word, doit être ST||OP)
+3. **Référence opcode** : `doc/opcodes/tic54x_hi8_map.md` créé (table tic54x complète).
 
-With `CALYPSO_FBSB_SYNTH=1 ./run.sh` :
-- DL : `<0001> sysinfo.c New SYSTEM INFORMATION 3 (lai=001-01-1)` reappears
-  in mobile log ; SI1/SI2/SI3/SI4 all decoded ; `Changing CCCH_MODE to 2`
-- UL : 8 packets delivered to BTS via bridge UL, including
-  `bridge: UL #7 TN=0 fn=1480` and `UL #8 TN=0 fn=1480` (RACH-slot,
-  vs noise-slots TN=4/6 we saw on first instrumentation)
-- bridge stats : `tick=5931 clk=68 dl=54996 ul=N` — CLK IND skew greatly
-  reduced vs pre-icount (1-FN compensations vs 102-FN before)
+### Symptômes débloqués vs résiduels
 
-Without `CALYPSO_FBSB_SYNTH` : DSP runs the real fb-det against bridge-fed
-GMSK samples, doesn't converge → mobile loops `L1CTL_FBSB_REQ`.
-
-### Wiring added
-
-| Connection | File | Notes |
+| Symptôme | Avant 2026-05-08 | Après |
 |---|---|---|
-| `DB_W_D_TASK_RA` polling (write-page word 7) | `calypso_trx.c::tdma_tick` | RACH was silently dropped — `d_task_u` (word 2) is the SDCCH/SACCH/TCH lane, not RACH |
-| `calypso_bsp_tx_rach_burst` | `calypso_bsp.c` | `gsm0503_rach_ext_encode` produces real 148-symbol AB ; `d_rach` read at `CALYPSO_NDB_D_RACH_OFFSET` (default 0x01CB) |
-| libosmocoding link | `hw/arm/calypso/meson.build` | `dependency('libosmocoding')` |
-| `bsp.trxd_peer` pre-set | `calypso_bsp.c::calypso_bsp_init` | UL works before first DL |
-| `bridge.trxd_remote` pre-set | `bridge.py::Bridge.__init__` | UL forwards to (BTS, base+102) immediately |
-| `BRIDGE_CLK_FROM_QEMU` env mode | `bridge.py` | CLK IND from QEMU FN advance, not host wall-clock |
-| `-icount shift=auto,align=off,sleep=off` | `run.sh` | Deterministic virtual time |
+| INTM=1 dwell | perpétuel après insn=90.2M | INTM=0 dans POST-BOOTSTUB-RET ✓ |
+| WAIT-A21A | 5.7M iters (loop morte) | 0 ✓ |
+| ENTER-7740 | 37k figé | 0 (path différent) |
+| DSP throughput | 1× | **5× plus rapide** (4.3B insn / 44s) |
+| RETE | 0 | **0** (toujours zéro) |
+| fb0_att | 0 | **0** (correlator lit zone vide) |
+| L1CTL_DATA_IND | 0 | **0** (pas de BCCH décodé) |
 
-### Hacks removed (per CLAUDE.md règle #1)
+### Blocker actuel — D_FB_DET-WR-SITE révèle mismatch source/sink
 
-| Hack | File | Line span |
-|---|---|---|
-| BOURRIN-FBDET-SKIP block (PC range pop+jump bypass) | `calypso_c54x.c` | ~864-899 (36 lines) |
-| DIAG-HACK INTM force-clear + ALIAS-CHECK + BOOT+100k VECDUMP | `calypso_c54x.c` | ~4950-5066 (~120 lines) |
-| `si3_fallback[23]` hardcoded SI3 | `calypso_fbsb.c::DSP_TASK_ALLC` | inline literal |
-| `allc_burst_idx` static cycle 0..3 | `calypso_fbsb.c::DSP_TASK_ALLC` | replaced by `fn & 3` |
+50 hits captures à PC=0x8f51 (write d_fb_det) :
 
-### Env-gated (default OFF — real path) ; on retains DL milestone
-
-| Env var | Effect |
-|---|---|
-| `CALYPSO_FBSB_SYNTH=1` | `calypso_fbsb_publish_fb_found` + `_publish_sb_found` re-enabled in `on_dsp_task_change`. Used while emulated DSP correlator does not converge on bridge GMSK. |
-| `CALYPSO_BCCH_INJECT=1` | Enables db_r echo (passes prim_rx_nb EMPTY guard) + a_cd[] write from mmap in `DSP_TASK_ALLC`. Pair with FBSB_SYNTH=1 to deliver SIs end-to-end while DSP CCCH demod is non-converging. Default OFF = real DSP CCCH path. |
-| `CALYPSO_W1C_LATCH=1` | Enables capture (c54x.c) + consume (trx.c) of a_sync_demod latches. Mitigates DSP-set/clear vs ARM-poll race window. Default OFF = ARM reads NDB direct. |
-| `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index in NDB (verify offset for active DSP version). |
-| `BRIDGE_CLK_FROM_QEMU=1` | Replaces wall-clock-paced CLK IND with QEMU-FN-paced. Pair with `-icount`. |
-
-### Current blocker
-
-Mobile sends RACH, no `IMM_ASS_CMD` reaches L3. Two failure modes not yet
-discriminated :
-- (a) BTS doesn't decode our UL RACH bursts (encoding off, FN off, BSIC
-  mismatch, or burst arrives outside BTS RACH detect window)
-- (b) BTS does decode and BSC sends IMM_ASS, but mobile DSP misses the
-  AGCH sub-slot on the CCCH multiframe
-
-Test discriminant : tcpdump GSMTAP during a `CALYPSO_FBSB_SYNTH=1` run.
-- IMM_ASS visible on air → (b) — debug DL AGCH sub-slot scheduling
-- Absent + `osmo-bts-trx` RACH detect counter at 0 → (a) — debug UL
-  burst encoding (verify d_rach offset, BSIC source, FN tagging)
-
-### Co-issue discovered : task_ra spurious values
-
-`task_ra` and `task_u` both read non-zero at fn=104 with seemingly random
-values (e.g. `task_ra=0x2d4e tn=6 fn=104`, `d_rach=0x19a9 ra=0x19 bsic=0x2a`).
-BSIC varies run-to-run, RA looks plausible. Two hypotheses :
-- d_rach offset wrong → reading garbage from a different NDB slot
-- Firmware actually writes nonzero values to d_task_ra during init that we
-  pick up as legitimate RACH triggers
-
-Open : trace API RAM writes to (page word 7) and to candidate d_rach
-offsets during a known RACH attempt (after Location Update L3 starts) to
-filter noise from real RACH commands.
-
----
-
-## 2026-04-30 13:00 — Milestone L3 mobile-side via dynamic RSL tap
-
-- BCCH SI injection: 100% dynamic from osmo-bsc live RSL
-  - `rsl_si_tap.py` sniffs lo:3003, parses RSL_MT_BCCH_INFO (0x11),
-    extracts FULL_BCCH_INFO IE (0x27) by SYSTEM_INFO_TYPE IE (0x1e)
-  - Writes `/dev/shm/calypso_si.bin` per `doc/MMAP_SI_FORMAT.md` v1
-- QEMU mmap consumer in `calypso_fbsb.c` (`csi_init_once` + `csi_lookup_for_tc`)
-- TC scheduling per TS 44.018 §3.4 table 1 (SI3 emitted 3× per cycle)
-- Fallback hardcoded SI3 in `calypso_fbsb.c` retained as cold-start safety,
-  inactive when tap operational
-- `populate-si.sh` retained as manual debug tool (NOT in run_si.sh boot path
-  any more; tap covers warm-start dès osmo-bts attach)
-
-Mobile L23 reaches:
-- `New SYSTEM INFORMATION 1, 2, 3` parsed (lai=001-01-1)
-- `Changing CCCH_MODE to 2`
-- MM cell-selected (CGI 001-01-1-6001)
-- `RR_EST_REQ` → state idle → connection pending
-- `CHANNEL REQUEST: 00 (Location Update with NECI)`
-- `RANDOM ACCESS` bursts × 8 (max retransmits)
-- T3126 timeout (5s) — no IMM ASSIGN downstream
-- Cycle: T3126 fired → return idle → re-RR_EST_REQ → re-CHANNEL REQUEST
-
-Blockers downstream:
-1. UL chain broken (3 sub-issues per diag) :
-   - DSP-emulated RACH encoding absent in `calypso_trx.c`
-   - `d_task_u` read returns garbage (firmware doesn't write proper RACH task)
-   - `bridge.py` has 0 UL forward handler (no UDP 5701 sender)
-2. AGCH downlink not synthesized — IMM ASSIGN never reaches mobile
-
----
-
-## 2026-04-30 nuit — BCCH pipeline end-to-end validé (étape 2)
-
-**Milestone L2 atteint** : pipeline BCCH descend de QEMU jusqu'à L23 mobile,
-avec payload structuré byte-à-byte vérifié.
-
-| Indicateur | Valeur | Notes |
-|---|---|---|
-| `L1CTL_DATA_IND` (msg_type 0x03) traversent osmocon | **88** | vs 0 hier matin |
-| `L1CTL_FBSB_CONF` result=0 | **24** | régulier |
-| ALLC echo+SI3 hooks fired | 360 | task=24 dispatched |
-| `num_biterr` | `0x00` systématique | a_cd[2] write OK |
-| `fire_crc` | `0x00` systématique (NO ERROR) | a_cd[0] FIRE bits OK |
-| Payload byte-match si3_blob[0..22] | **23/23 bytes exact** | NDB→ARM mailbox validé |
-
-**3 fixes nouveaux cette session** :
-
-| # | Fix | File | Empirical impact |
-|---|---|---|---|
-| 9 | **ALLC echo + DSP_TASK_ALLC handler** | `calypso_fbsb.c` + `.h` | Passe guard `EMPTY` de `prim_rx_nb.c:73` (était EMPTY×56 avant fix). |
-| 10 | **a_cd[] base offset shift +2 words** (0x01D0→0x01D2) | `calypso_fbsb.c` | Project memory disait NDB+0x1F8 mais runs montrent shift de 2 words. Empirique : data byte 0 maintenant = si3_blob[0] (=0x1b), num_biterr=0 propre. |
-| 11 | **Fix re-arm TDMA timer** (`entry_t + while-skip`) | `calypso_trx.c::calypso_tdma_tick` | now=exit_t accumulait work_dt → cadence drift 11ms. entry_t + while-skip aligné grille. Forward progress firmware (vs fix-a saturation). |
-
-**XXX TEMP HARDCODE — à retirer impérativement** (cf. `hacks.md` + `TODO.md`) :
-- `si3_blob[]` fixture libosmocore BSSGP — viole règle #1 "no stubs". Critère
-  retrait : intercept bridge.py / osmo-bts pour SI3 réel du BSC.
-- `allc_burst_idx` static counter — off-by-one connu (75% mismatch). À
-  remplacer par frame-tick scheduled write basé sur fn modulo 51.
-
-**Validation byte-à-byte** :
 ```
-si3_blob[]   : 1b 75 30 00 f1 10 23 6e c9 03 3c 27 47 40 79 00 00 3c 0b 2b 2b 2b 2b
-DATA_IND obs : 1b 75 30 00 f1 10 23 6e c9 03 3c 27 47 40 79 00 00 3c 0b 2b 2b 2b 2b
-                ─────────────── 23 bytes MATCH ───────────────
+#1   AR1=001c AR2=0000 AR3=0000 AR4=2bc0 AR7=0000  data[AR1]=bbef BK=00b0
+#50  AR1=004a AR2=fc5d AR3=03a3 AR4=2bc3 AR7=fc5d  data[AR1]=0000 BK=00b0
 ```
 
-**NON validé** : L23 SI3 parsing côté mobile (pas de marker "system info" /
-"cell synced" / "LU REQ" visible dans logs locaux). Fixture libosmocore est
-BSSGP test, pas BCCH air-interface — format LAPDm pseudo-length probablement
-incompatible. Trois hypothèses (a/b/c) à départager via verbosity mobile +
-GSMTAP capture, ou directement par intercept osmo-bts.
+- AR3 stride +19, base 0 → **lit DARAM `[0x0000..0x03A3]`** (linéaire)
+- AR2/AR7 stride −19, BK=176 → **wrap circulaire `[0xfc5d..]`**
+- AR4 = 0x2bc0 quasi-fixe → table coefficients ROM
+- **Aucun AR ne tombe dans la zone BSP DMA target.**
 
-**Doc nouvelle** : `doc/hacks.md` — inventaire honnête des 3 niveaux de
-hacks/workarounds par fichier. Référence pour audit B2B / licensing.
-
-**Prochaine session** :
-1. Verbosity mobile + GSMTAP capture pour départager (a)/(b)/(c) du parsing SI3.
-2. Si fixture invalide : intercept osmo-bts → bridge.py → QEMU pour SI3 réel.
-3. Fix off-by-one `allc_burst_idx` (×4 gain DATA_IND si nécessaire pour LU).
-
----
-
-## 2026-04-29 afternoon — FBSB chain validée E2E
-
-**Milestone L1 atteint** : 46× `L1CTL_FBSB_CONF` result=0 traversent firmware → osmocon → cell_log. Cell_log entre `SCAN_STATE_READ` (vérifié par lecture directe `cell_log.c:402`, transition inconditionnelle).
-
-**3 fixes nouveaux cette demi-session** :
-
-| # | Fix | File | Empirical impact |
-|---|---|---|---|
-| 6 | **ARP off-by-one** dans `resolve_smem` + BANZ/BANZD/F80x | `calypso_c54x.c` | `cur_arp = nar` (était `arp(s)`). DSP exécute correctement les indirect addressing modes. |
-| 7 | **fbsb wire reintroduction** au site ARM TASK WR=5 | `calypso_trx.c::calypso_dsp_write` + `#include "calypso_fbsb.h"` | Module `calypso_fbsb` était linké mais pas wire (perdu collatéralement preNoCell refactor 28/04). Publish synthétique FB+SB sur task=5/6. |
-| 8 | **W1C latch invalidation** dans `publish_fb_found` / `clear_fb` | `calypso_fbsb.c` | Sans invalidation, latches DSP iter masquent valeurs synthétiques fbsb (ARM lit angle=-29569 stale au lieu de 0 fresh). |
-
-**Validation E2E** :
-- `osmocon -d r` dump : 46× `hdlc_recv(dlci=5): 02 ...` (msg_type FBSB_CONF, result=0)
-- `cell_log.c:412 case S_L1CTL_FBSB_RESP` : `state = SCAN_STATE_READ` + `start_timer(READ_WAIT)` inconditionnel
-- Compteur "syncs left" décrémente 47→36 sur run continu
-- `LOGP(DRR, ...)` "Synchronized, start reading" filtré par `app_cell_log.c:86 log_parse_category_mask("DSUM")` — invisible mais code path exécuté
-
-**Blocker LU restant** : 0× `L1CTL_DATA_IND` (msg_type 0x03) → BCCH read jamais complet → READ_WAIT timeout → cell_log re-scan ARFCN. Cause double :
-1. **Stabilité timing TDMA insuffisante** (priority 1) : ~12000+ "LOST N!" sur run, distribution bimodale ~2470/~5020 (pas du bruit aléatoire). 28% des frames TDMA marquées LOST. Probabilité tenir 10 frames clean consécutives (BCCH multiframe) ≈ 3.7%.
-2. `calypso_fbsb` ne synthétise pas BCCH bursts (DSP_TASK_NB_RX falls-through default).
-
-**Prochaine session** : timer fidelity AVANT BCCH synthesis. Sans timing stable, BCCH synth sera rejeté.
-
----
-
-## Latest update — 2026-04-29 (see `SESSION_20260429.md` for full report)
-
-5 structural opcode-dispatch fixes validated empirically. ~2530 firmware sites unblocked.
-DSP CPU emulation, opcode dispatch, reset values, and ISR mechanism are all
-silicon-aligned (binutils tic54x-opc.c + SPRU172C/131G + 3 FreeCalypso ROM dumps).
-
-| # | Fix | Sites unblocked | Marker |
-|---|---|---|---|
-| 1 | Silicon-aligned reset (PMST=0xFFA8, ST0=0x181F, ST1=0x2900) | — | DSP enters PROM1 init zone |
-| 2 | 0x6F00 ext dispatch (ADD/SUB/LD/STH/STL Smem,SHIFT,DST) | 544 | Wedge PC=0x8353 → 0 |
-| 3 | 0x68-0x6E handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) | 1563 | DSP traverses init |
-| 4 | APTS misnomer fix (5 FAR opcodes always push/pop XPC) | — | Stack leak 1.96M → 0 |
-| 5 | F3xx complete dispatch (AND/OR/XOR/SFTL + #lk variants) | 364 | Wedge PC=0x8eb9 unblocked |
-
-**Final blocker:** INTM=1 forever (3 mesures empiriques, 100% strict). Mécanisme
-silicon de clear non documenté publiquement (TI Calypso DBB datasheet privée).
-Diagnostic instrument `CALYPSO_FORCE_INTM_CLEAR_AT=N` documenté comme tel,
-pas un workaround. Voir `SESSION_20260429.md` § "INTM=1 final blocker".
-
-**Files added this session:** `doc/datasheets/` (5 PDFs TI + Calypso overview FreeCalypso
-+ 3 ROM dumps + README), `doc/opcodes/0x68_0x6F.md`, `doc/opcodes/0xF3.md`,
-`doc/SESSION_20260429.md`, `scripts/inject_fcch.py`.
-
----
+Tests A/B `CALYPSO_BSP_DARAM_ADDR` (`0x3fb0` / `0x2bc0` / `0x0080`) → D_FB_DET-WR-SITE bit-pour-bit identique. **L'init AR du firmware est indépendante de daram_addr.**
 
 ## Goal
 Run real OsmocomBB layer1.highram.elf firmware on emulated TI Calypso (ARM7 + TMS320C54x DSP) in QEMU. Connect to a real BTS via TRX protocol through a bridge. Mobile/ccch_scan sees the BTS and decodes BCCH/CCCH.
