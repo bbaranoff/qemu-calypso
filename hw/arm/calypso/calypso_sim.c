@@ -569,22 +569,31 @@ void calypso_sim_reg_write(CalypsoSim *s, hwaddr off, uint16_t val)
         s->cmd = val;
         if (val & CALYPSO_SIM_CMD_START) {
             s->powered = true;
-            SIM_LOG("CMDSTART → ATR scheduled");
-            schedule_atr(s);
+            SIM_LOG("CMDSTART → ATR delivered (synchronous)");
+            /* AUDIT FIX 2026-05-08 night : was schedule_atr() (1ms VIRTUAL
+             * timer). Under -icount auto, virtual time is rate-limited;
+             * the firmware's SIM driver enters a busy-loop polling
+             * rxDoneFlag (firmware data 0x830510) with IRQs masked
+             * (PSR I=1) before the timer fires, deadlocking the ARM CPU.
+             * Direct delivery: bytes in FIFO at MMIO write return time,
+             * IRQ raised immediately. Same effect as the timer being 0ns.
+             * Equivalent under icount=off (timer fires ~instantly anyway). */
+            deliver_atr(s);
         }
         if (val & CALYPSO_SIM_CMD_STOP) {
             s->powered = false;
             SIM_LOG("CMDSTOP");
         }
         if (val & (CALYPSO_SIM_CMD_CARDRST | CALYPSO_SIM_CMD_IFRST)) {
-            SIM_LOG("RESET");
+            SIM_LOG("RESET → ATR delivered (synchronous)");
             s->apdu_pos = 0;
             s->apdu_expected = 0;
             s->resp_len = 0;
             s->rx_head = s->rx_tail = 0;
             s->selected_df = 0x3F00;
             s->selected_ef = 0x3F00;
-            if (s->powered) schedule_atr(s);
+            /* Same audit fix as CMDSTART above. */
+            if (s->powered) deliver_atr(s);
         }
         break;
     case CALYPSO_SIM_REG_STAT:    s->stat   = val; break;
