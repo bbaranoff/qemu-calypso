@@ -897,7 +897,45 @@ static void calypso_tdma_start(CalypsoTRX *s)
  * (fixed in calypso_uart.c same session), not this kick timer.
  */
 static QEMUTimer *g_kick_timer;
-static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);}
+static void calypso_kick_cb(void *o){
+    /* AUDIT INSTRUMENTATION 2026-05-08 night : confirm kick fires under
+     * -icount auto. Per Claude web : if 0 hits in 5s wall → REALTIME timer
+     * not armed correctly with icount. If N≈1000 hits/5s (5ms period) →
+     * timer fires but cpu_exit/notify don't propagate to scheduler. */
+    static unsigned kick_n;
+    kick_n++;
+    if (kick_n <= 30 || (kick_n % 200) == 0) {
+        uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t rt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        fprintf(stderr, "[kick] fire #%u vt=%lu rt=%lu\n",
+                kick_n, (unsigned long)vt, (unsigned long)rt);
+    }
+
+    /* XXX HACK 2026-05-08 night — CALYPSO_FORCE_RX_DONE periodic enforcement.
+     *
+     * Each firmware SIM operation (ATR, SELECT, READ_BINARY, ...) calls
+     * calypso_sim_receive at 0x822588 which clears rxDoneFlag (firmware
+     * data @ 0x830510), then busy-polls. Under -icount auto, the conditional
+     * STR in sim_irq_handler @ 0x8224ac never commits (TCG bug Task #29).
+     *
+     * Firing the workaround only on SIM_IT-read fires once per WT cycle
+     * which doesn't cover subsequent SIM ops. Periodic enforcement here
+     * (every 5ms wall via REALTIME kick) keeps rxDoneFlag = 1 reliably,
+     * regardless of which SIM op is in flight. cpu_exit forces ARM TB
+     * recompile so busy-loop @ 0x822b90 picks up the new value. */
+    {
+        const char *env = getenv("CALYPSO_FORCE_RX_DONE");
+        if (env && env[0] == '1') {
+            const uint32_t one = 1;
+            cpu_physical_memory_write(0x00830510, &one, sizeof(one));
+            /* No need to log every kick (every 5ms = 200/s); cpu_exit
+             * is done unconditionally below. */
+        }
+    }
+
+    CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();
+    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
+}
 
 /* ---- Sercomm burst transport (DLCI 4) ---- */
 

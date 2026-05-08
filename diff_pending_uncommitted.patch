@@ -1,0 +1,64 @@
+diff --git a/hw/arm/calypso/calypso_sim.c b/hw/arm/calypso/calypso_sim.c
+index e7097c3..91b4db0 100644
+--- a/hw/arm/calypso/calypso_sim.c
++++ b/hw/arm/calypso/calypso_sim.c
+@@ -543,9 +543,29 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
+     case CALYPSO_SIM_REG_IT: {
+         refresh_it_rx(s);
+         uint16_t v = s->it;
+-        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays. */
+-        s->it &= CALYPSO_SIM_IT_RX;
++        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays.
++         *
++         * AUDIT FIX 2026-05-08 night (Claude web Q2 hardening) : was
++         *   s->it &= CALYPSO_SIM_IT_RX;
++         * which clears ANY bit set after the snapshot (race with concurrent
++         * fire_wt / IRQ handlers raising new bits). Correct semantic : clear
++         * only edge bits that were observed in `v`, so a bit raised between
++         * snapshot and clear survives. RX bit always preserved (level). */
++        uint16_t edge_seen = v & ~CALYPSO_SIM_IT_RX;
++        s->it &= ~edge_seen;
+         update_irq(s);
++        /* INSTRUMENTATION 2026-05-08 night : log every SIM_IT read so we can
++         * see what value the firmware FIQ handler at 0x822498 receives in R2.
++         * If we see SIM_IT read=0x0002 (IT_WT) but rxDoneFlag stays 0, the
++         * handler's TST/STR chain is failing. If we see SIM_IT read=0x0000
++         * for the WT entry, the IT_WT bit was cleared before handler arrived
++         * (race or wrong read sequencing). Cap at 30. */
++        static unsigned itrd;
++        if (itrd++ < 30)
++            fprintf(stderr,
++                    "[sim] SIM_IT read=0x%04x rx_count=%d edge_cleared=0x%04x "
++                    "post_it=0x%04x\n",
++                    v, rx_count(s), edge_seen, s->it);
+         return v;
+     }
+     case CALYPSO_SIM_REG_DRX: {
+diff --git a/hw/arm/calypso/calypso_trx.c b/hw/arm/calypso/calypso_trx.c
+index f149507..375dd3a 100644
+--- a/hw/arm/calypso/calypso_trx.c
++++ b/hw/arm/calypso/calypso_trx.c
+@@ -897,7 +897,22 @@ static void calypso_tdma_start(CalypsoTRX *s)
+  * (fixed in calypso_uart.c same session), not this kick timer.
+  */
+ static QEMUTimer *g_kick_timer;
+-static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);}
++static void calypso_kick_cb(void *o){
++    /* AUDIT INSTRUMENTATION 2026-05-08 night : confirm kick fires under
++     * -icount auto. Per Claude web : if 0 hits in 5s wall → REALTIME timer
++     * not armed correctly with icount. If N≈1000 hits/5s (5ms period) →
++     * timer fires but cpu_exit/notify don't propagate to scheduler. */
++    static unsigned kick_n;
++    kick_n++;
++    if (kick_n <= 30 || (kick_n % 200) == 0) {
++        uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        uint64_t rt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        fprintf(stderr, "[kick] fire #%u vt=%lu rt=%lu\n",
++                kick_n, (unsigned long)vt, (unsigned long)rt);
++    }
++    CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();
++    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
++}
+ 
+ /* ---- Sercomm burst transport (DLCI 4) ---- */
+ 

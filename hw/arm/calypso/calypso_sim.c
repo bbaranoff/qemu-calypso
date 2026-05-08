@@ -22,6 +22,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
+#include "exec/cpu-common.h"
+#include "hw/core/cpu.h"
 #include "hw/arm/calypso/calypso_sim.h"
 
 #define SIM_LOG(...) do { fprintf(stderr, "[sim] " __VA_ARGS__); fputc('\n', stderr); } while(0)
@@ -225,6 +228,46 @@ static void fire_wt(void *opaque)
     s->it |= CALYPSO_SIM_IT_WT;
     SIM_LOG("WT timeout fired (RX FIFO empty)");
     update_irq(s);
+
+    /* XXX HACK 2026-05-08 night — CALYPSO_FORCE_RX_DONE workaround.
+     *
+     * Under -icount auto, sim_irq_handler at PC=0x822498 is correctly
+     * called for the IT_WT FIQ entry (verified : ARM_PC=0x82249c when
+     * SIM_IT read=0x0002), but the STR rxDoneFlag at PC=0x8224ac never
+     * commits — rxDoneFlag (firmware data @ 0x830510) stays 0, ARM
+     * busy-loops forever at calypso_sim_powerup+0x54 (0x822b90).
+     *
+     * Investigation chain (Claude web night audit):
+     *  - (C) parallel polling — eliminated (PC=0x82249c on all 5 reads)
+     *  - (D) INTH FIQ_NUM dispatch broken — eliminated (handler runs)
+     *  - (H) update_irq mid-TB causes cpu_io_recompile abort — partial
+     *    confirm (commenting update_irq → rxDoneFlag=1 once, but FIQ
+     *    line stays high → infinite re-entry)
+     *  - bh-defer of update_irq → rxDoneFlag still 0 (root not in propagate)
+     *  - removing ARM PC env access in MMIO read → still 0
+     *
+     * Real root unknown ; suspected TCG/icount conditional execution
+     * race specific to FIQ-mode mid-MMIO. Needs gdb watchpoint on
+     * 0x830510 for upstream report — done another day with fresh head.
+     *
+     * Until then, this env-gated hack writes rxDoneFlag = 1 directly
+     * via cpu_physical_memory_write right after the WT IRQ propagates.
+     * Hardcoded address 0x830510 = `rxDoneFlag` symbol in firmware
+     * (verified via nm on layer1.highram.elf). Will silently break if
+     * firmware is rebuilt with different layout — caller's
+     * responsibility to verify.
+     *
+     * TODO: open ticket. Test path : write watchpoint via gdb on
+     * 0x830510 to discriminate STRNE-skip vs STR-then-clear-by-other.
+     * Remove hack once TCG bug is identified or sim_irq_handler path
+     * is patched to avoid the icount race.
+     */
+    /* Hack moved to calypso_sim_reg_read SIM_IT case so it fires every
+     * time IT_WT is observed by firmware, not just on the initial ATR
+     * fire_wt. Firmware does multiple SIM operations (SELECT, READ_BINARY,
+     * etc.); each one calls calypso_sim_receive which clears rxDoneFlag,
+     * then busy-polls. Without re-firing the hack on each cycle, only the
+     * first SIM operation gets through. */
 }
 
 static void schedule_wt(CalypsoSim *s)
@@ -543,9 +586,59 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
     case CALYPSO_SIM_REG_IT: {
         refresh_it_rx(s);
         uint16_t v = s->it;
-        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays. */
-        s->it &= CALYPSO_SIM_IT_RX;
+        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays.
+         *
+         * AUDIT FIX 2026-05-08 night (Claude web Q2 hardening) : was
+         *   s->it &= CALYPSO_SIM_IT_RX;
+         * which clears ANY bit set after the snapshot (race with concurrent
+         * fire_wt / IRQ handlers raising new bits). Correct semantic : clear
+         * only edge bits that were observed in `v`, so a bit raised between
+         * snapshot and clear survives. RX bit always preserved (level). */
+        uint16_t edge_seen = v & ~CALYPSO_SIM_IT_RX;
+        s->it &= ~edge_seen;
         update_irq(s);
+
+        /* XXX HACK 2026-05-08 night — CALYPSO_FORCE_RX_DONE workaround.
+         *
+         * Fires on EVERY SIM_IT read where IT_WT bit (0x0002) is observed.
+         * Each firmware SIM operation (ATR, SELECT, READ_BINARY, ...)
+         * calls calypso_sim_receive at 0x822588 which clears rxDoneFlag
+         * (STR R0, [R3] at 0x82259c with R0=0), then busy-polls. The TCG
+         * conditional STR in sim_irq_handler @ 0x8224ac never commits
+         * under -icount auto (bug to root-cause Task #29). Without firing
+         * this hack on every WT-observation cycle, only the first SIM op
+         * (ATR) gets through ; subsequent ones deadlock again.
+         *
+         * Hardcoded address 0x830510 = `rxDoneFlag` from nm
+         * layer1.highram.elf. cpu_exit() forces the busy-loop TB at
+         * 0x822b90 to recompile so it picks up the new memory value.
+         */
+        if (v & CALYPSO_SIM_IT_WT) {
+            const char *env = getenv("CALYPSO_FORCE_RX_DONE");
+            if (env && env[0] == '1') {
+                static unsigned force_n;
+                const uint32_t one = 1;
+                cpu_physical_memory_write(0x00830510, &one, sizeof(one));
+                CPUState *cpu = first_cpu;
+                if (cpu) cpu_exit(cpu);
+                if (force_n++ < 30)
+                    SIM_LOG("XXX HACK FORCE_RX_DONE on SIM_IT-read #%u "
+                            "(IT=0x%04x) → write 1 to 0x830510 + cpu_exit",
+                            force_n, v);
+            }
+        }
+        /* Lighter instrumentation : just IT bits + FIFO state, no PC read.
+         * The ARM_PC access via env.regs[15] from inside an MMIO read may
+         * itself trigger TB recompile under -icount auto. Now we know all
+         * 5 reads come from PC=0x82249c (sim_irq_handler), the PC log
+         * isn't needed and removing it eliminates a potential TB-abort
+         * trigger separate from update_irq. */
+        static unsigned itrd;
+        if (itrd++ < 30)
+            fprintf(stderr,
+                    "[sim] SIM_IT read=0x%04x rx_count=%d edge_cleared=0x%04x "
+                    "post_it=0x%04x\n",
+                    v, rx_count(s), edge_seen, s->it);
         return v;
     }
     case CALYPSO_SIM_REG_DRX: {
