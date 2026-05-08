@@ -209,6 +209,12 @@ typedef struct C54xState {
     /* Debug */
     uint32_t unimpl_count;
     uint16_t last_unimpl;
+    /* Last executed instruction snapshot — captured at end of each
+     * c54x_run iteration. Used by the INTM-TRANS tracer (and others)
+     * to attribute post-instruction state changes to the actual cause
+     * PC/opcode rather than the post-advance PC. */
+    uint16_t last_exec_pc;
+    uint16_t last_exec_op;
 } C54xState;
 
 /* Feed burst samples to BSP (called by calypso_trx) */
