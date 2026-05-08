@@ -81,6 +81,72 @@ static uint16_t prog_read(C54xState *s, uint32_t addr);
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* PC-histogram pour identifier la routine PM. Deux ranges :
+     *   [0x3fb0..0x3fbf] = buffer BSP (samples I/Q)
+     *   [0x3dcf..0x3dd5] = buffer scratch dominant (78k+52k reads observés)
+     * Compte par PC, dump top-10 toutes les 50k reads dans chaque range.
+     * Plus compteur d'entrée par PC dominant pour distinguer
+     * "PM cassée" vs "PM jamais appelée" (vu IRQ rate 1.5 Hz). */
+    if (addr >= 0x3fb0 && addr <= 0x3fbf) {
+        static uint32_t pc_hist_3fb[65536];
+        static uint32_t total_3fb;
+        pc_hist_3fb[s->pc]++;
+        total_3fb++;
+        if ((total_3fb % 50000) == 0) {
+            uint32_t top_pc[10] = {0};
+            uint32_t top_cnt[10] = {0};
+            for (uint32_t p = 0; p < 65536; p++) {
+                uint32_t c = pc_hist_3fb[p];
+                if (c == 0) continue;
+                for (int i = 0; i < 10; i++) {
+                    if (c > top_cnt[i]) {
+                        for (int j = 9; j > i; j--) {
+                            top_pc[j]  = top_pc[j-1];
+                            top_cnt[j] = top_cnt[j-1];
+                        }
+                        top_pc[i]  = p;
+                        top_cnt[i] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[c54x] PC-HIST-3FB total=%u :", total_3fb);
+            for (int i = 0; i < 10 && top_cnt[i]; i++) {
+                fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    if (addr >= 0x3dcf && addr <= 0x3dd5) {
+        static uint32_t pc_hist_3dd[65536];
+        static uint32_t total_3dd;
+        pc_hist_3dd[s->pc]++;
+        total_3dd++;
+        if ((total_3dd % 50000) == 0) {
+            uint32_t top_pc[10] = {0};
+            uint32_t top_cnt[10] = {0};
+            for (uint32_t p = 0; p < 65536; p++) {
+                uint32_t c = pc_hist_3dd[p];
+                if (c == 0) continue;
+                for (int i = 0; i < 10; i++) {
+                    if (c > top_cnt[i]) {
+                        for (int j = 9; j > i; j--) {
+                            top_pc[j]  = top_pc[j-1];
+                            top_cnt[j] = top_cnt[j-1];
+                        }
+                        top_pc[i]  = p;
+                        top_cnt[i] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[c54x] PC-HIST-3DD total=%u :", total_3dd);
+            for (int i = 0; i < 10 && top_cnt[i]; i++) {
+                fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     /* Watch the mailbox slots that the firmware polls at PROM0 0xb41a
      * (LDU *(0x0ffe), A then BACC A) and 0xb41c (CMPM *(0x0fff), 4).
      * If these stay zero / 0x10 forever, ARM never wrote them. */
@@ -368,6 +434,23 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     /* WATCH-WRITE on the same mailbox slots tracked in data_read.
      * Whoever writes them — DSP or ARM via api_ram alias — gets logged
      * so we can attribute the source of the value the firmware polls. */
+    /* WATCH-WRITE 0x3dd2 — la cellule sur laquelle 0x75db poll en boucle
+     * (37M reads/15s). Identifier qui écrit (et qui ne le fait pas).
+     * Cas 1 : zéro write → un bloc compute ne fire jamais.
+     * Cas 2 : write boot only → init OK mais set steady-state manquant.
+     * Cas 3 : writes périodiques avec valeur jamais matchée par le test
+     *         à 0x75db → bug dans le compute en amont. */
+    if (addr == 0x3dd2) {
+        static unsigned w3dd2;
+        w3dd2++;
+        if (w3dd2 <= 100 || (w3dd2 % 1000) == 0) {
+            fprintf(stderr,
+                    "[c54x] WATCH-WRITE 0x3dd2 #%u <- 0x%04x (was 0x%04x) "
+                    "PC=0x%04x insn=%u INTM=%d\n",
+                    w3dd2, val, s->data[addr], s->pc, s->insn_count,
+                    !!(s->st1 & ST1_INTM));
+        }
+    }
     if (addr == 0x0ffe || addr == 0x0fff || addr == 0x01F0) {
         static unsigned wcount;
         if (wcount++ < 30) {
@@ -1037,6 +1120,30 @@ static int c54x_exec_one(C54xState *s)
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
+    /* INTM-TRANS probe : log toute transition INTM 0→1.
+     * Le SSBX INTM orphelin se cache entre insn=89.83M (last write 0x3dd2)
+     * et insn=98.38M (entrée wait permanente). Cap à 200 transitions pour
+     * éviter le flood au boot ; capture le PC qui a fait passer INTM à 1
+     * et l'adresse de retour stack pour identifier le caller. */
+    {
+        static int prev_intm = -1;
+        static unsigned itrans_total;
+        int cur_intm = !!(s->st1 & ST1_INTM);
+        if (prev_intm == 0 && cur_intm == 1) {
+            itrans_total++;
+            if (itrans_total <= 200) {
+                uint16_t ret = s->data[s->sp];
+                uint16_t ret_p1 = s->data[(uint16_t)(s->sp + 1)];
+                fprintf(stderr,
+                        "[c54x] INTM-TRANS #%u 0->1 PC=0x%04x insn=%u SP=0x%04x "
+                        "RET=%04x RET+1=%04x op=0x%04x IMR=0x%04x IFR=0x%04x\n",
+                        itrans_total, s->pc, s->insn_count, s->sp,
+                        ret, ret_p1, op, s->imr, s->ifr);
+            }
+        }
+        prev_intm = cur_intm;
+    }
+
     /* Detect when DSP enters DARAM code zone (0x0080-0x27FF) from ROM */
     {
         static uint16_t prev_pc = 0;
@@ -1090,6 +1197,40 @@ static int c54x_exec_one(C54xState *s)
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7],
                         s->insn_count);
             }
+        }
+        /* WAIT-A21A probe : à PC=0xa21a, snapshot INTM + IMR + IFR.
+         * Tranche H1/H2/H3 :
+         *   INTM=1 + IFR=0  + IMR plein → H3 strict, hardware silencieux
+         *   INTM=1 + IFR≠0  + IMR plein → H3 + IRQ pending bloquée (BUG)
+         *   INTM=0                       → H1/H2 (IRQ servable mais path
+         *                                  vers 0x7740 cassé en amont) */
+        if (s->pc == 0xa21a) {
+            static uint64_t a21a_total;
+            a21a_total++;
+            if (a21a_total <= 5 || (a21a_total % 100000) == 0) {
+                C54_LOG("WAIT-A21A #%llu insn=%u INTM=%d IMR=0x%04x IFR=0x%04x "
+                        "ST0=0x%04x ST1=0x%04x SP=0x%04x",
+                        (unsigned long long)a21a_total, s->insn_count,
+                        !!(s->st1 & ST1_INTM), s->imr, s->ifr,
+                        s->st0, s->st1, s->sp);
+            }
+        }
+        /* CALLER-7740 tracer : à l'entrée 0x7740, log le contexte caller.
+         * data[sp] = adresse de retour pushée par le CALL/CALLD précédent.
+         * INTM=1 → on est dans un IRQ context. Permet de distinguer
+         * "appelé via IRQ ISR" vs "appelé via flow régulier", et de
+         * remonter la chaîne caller→callee jusqu'à l'IRQ vector. */
+        if (s->pc == 0x7740) {
+            static uint64_t enter7740;
+            enter7740++;
+            uint16_t ret_addr = s->data[s->sp];
+            uint16_t ret_addr_p1 = s->data[(uint16_t)(s->sp + 1)];
+            C54_LOG("ENTER-7740 #%llu insn=%u SP=%04x RET=%04x RET+1=%04x "
+                    "INTM=%d XPC=%02x AR2=%04x AR3=%04x BK=%04x",
+                    (unsigned long long)enter7740, s->insn_count,
+                    s->sp, ret_addr, ret_addr_p1,
+                    !!(s->st1 & ST1_INTM), s->xpc,
+                    s->ar[2], s->ar[3], s->bk);
         }
         /* MAC-7700 tracer: at PC=0x7700 (MAC *AR2-, A) we want to know
          * what AR2 points at, what data[AR2] holds, T, and A before/after.
@@ -2819,6 +2960,24 @@ static int c54x_exec_one(C54xState *s)
                                 s->pc, cc, ra, s->sp);
                     rc_log++;
                 }
+                /* POST-BOOTSTUB-RET : si on est en train de RET depuis le
+                 * boot stub (PC ∈ 0x0000..0x0008), c'est la sortie du
+                 * task-switch trampoline 0x701b/0x701d → 0x0000. Le ra
+                 * poppé est le PC du task qui prend le contrôle. À insn≈90.2M
+                 * (dernière transition INTM), ce PC = le task qui ne clear
+                 * jamais INTM ensuite. */
+                if (s->pc <= 0x0008) {
+                    static unsigned bsr;
+                    bsr++;
+                    if (bsr <= 200 || (bsr % 50) == 0) {
+                        fprintf(stderr,
+                                "[c54x] POST-BOOTSTUB-RET #%u PC=0x%04x -> task=0x%04x "
+                                "SP_new=0x%04x B=0x%010llx INTM=%d insn=%u\n",
+                                bsr, s->pc, ra, s->sp,
+                                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                                !!(s->st1 & ST1_INTM), s->insn_count);
+                    }
+                }
                 s->pc = ra;
                 return 0;
             }
@@ -3176,6 +3335,25 @@ static int c54x_exec_one(C54xState *s)
             uint8_t mmr = op & 0x7F;
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
+            /* WATCH-ST1-WRITE : MMR 0x07 = ST1. Capture toutes les
+             * écritures de ST1 (STM #lk, ST1) — incluant celles qui
+             * ne changent pas la valeur d'INTM mais redéfinissent
+             * tout le mot ST1. Sortie : valeur écrite, bit 11 (INTM),
+             * delta vs current ST1. Cap 200 entries pour boot, puis
+             * sample 1/100. */
+            if (mmr == 0x07) {
+                static unsigned st1w;
+                st1w++;
+                if (st1w <= 200 || (st1w % 100) == 0) {
+                    int new_intm = !!(op2 & (1 << 11));
+                    int cur_intm = !!(s->st1 & ST1_INTM);
+                    fprintf(stderr,
+                            "[c54x] ST1-WR #%u STM #0x%04x,ST1 PC=0x%04x "
+                            "cur=0x%04x->0x%04x INTM:%d->%d insn=%u XPC=%d\n",
+                            st1w, op2, s->pc, s->st1, op2,
+                            cur_intm, new_intm, s->insn_count, s->xpc);
+                }
+            }
             data_write(s, mmr, op2);
             return consumed + s->lk_used;
         }
@@ -3821,8 +3999,31 @@ static int c54x_exec_one(C54xState *s)
             if ((op >> 7) & 1) s->ar[xar_s]--; else s->ar[xar_s]++;
             return consumed + s->lk_used;
         }
-        if (hi8 == 0x8A) {
-            /* MVDK Smem, dmad */
+        /* POPM MMR — pop top-of-stack into MMR (1-word).
+         * Per tic54x-opc.c: { "popm", 0x8A00, 0xFF00, {OP_MMR} }.
+         * Per SPRU172C section 4 : value at SP popped to MMR, SP++.
+         *
+         * Bug fix 2026-05-08 : 0x8Axx était précédemment mal décodé en
+         * MVDK Smem,dmad (qui est en réalité 0x7100 mask 0xFF00). Le
+         * pattern PSHM/POPM symétrique du firmware (e.g. PROM0 0x7013-0x7023
+         * sauve/restaure 6 MMRs autour d'un CALA) ne fonctionnait jamais
+         * post-CALA → ST1 jamais restauré → INTM=1 dwell perpétuel
+         * → IRQ vectoring bloqué → DSP wait stuck → L1 mort.
+         * Le case MVDK ci-dessous devient dead code mais est laissé pour
+         * référence historique. */
+        if ((op & 0xFF00) == 0x8A00) {
+            uint16_t mmr = op & 0x7F;
+            uint16_t val = data_read(s, s->sp);
+            s->sp = (s->sp + 1) & 0xFFFF;
+            data_write(s, mmr, val);
+            return consumed + s->lk_used;
+        }
+        /* OBSOLETE — superseded by POPM above. The 0x8Axx range belongs to
+         * POPM per tic54x-opc.c, not MVDK (which is 0x7100 mask 0xFF00).
+         * Kept commented for one revision so any caller depending on the
+         * old (incorrect) behaviour is forced to be re-examined. */
+        if (0 && hi8 == 0x8A) {
+            /* MVDK Smem, dmad — INCORRECT for 0x8Axx, see POPM above */
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;

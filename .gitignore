@@ -12,3 +12,4 @@ __pycache__/
 *.bak.*
 hw/arm/calypso/calypso_tdma_hw.*
 hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*
