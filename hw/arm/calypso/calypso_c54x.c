@@ -125,6 +125,84 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
                     s->data[0x08F8], s->pc, s->insn_count);
         }
     }
+    /* === DIAG-FORCE-DARAM62 ===
+     * Pinned diag (env-gated, default OFF) : when set, override the read
+     * of daram[0x62] inside the dispatcher loop (PC ∈ 0xCC62..0xCC6F) to
+     * return 1 instead of the actual stored value. Goal: force the
+     * dispatcher's "branch if flag != 0" to fire and observe whether the
+     * DSP escapes the loop and jumps to api[0x1f0c]=0x770c (the dispatch
+     * target). Three outcomes (binary diagnostic) :
+     *   - PC leaves cc62..cc6f → 0x770c and new code paths run :
+     *     loop hypothesis correct, flag is the gate, INT3 ISR is the
+     *     missing writer (next step: trace writes to confirm).
+     *   - PC reaches 0x770c then returns to cc62 immediately :
+     *     flag is set but handler bails because something else missing
+     *     (a_cd[] init, NDB cell, ...).
+     *   - No change : branch / compare is more subtle than read.
+     * This is a force-test, not a fix — remove or env-leave-off after. */
+    if (addr == 0x0062 && s->pc >= 0xCC62 && s->pc <= 0xCC6F) {
+        static int force_cached = -1;
+        if (force_cached < 0) {
+            const char *e = getenv("CALYPSO_DSP_FORCE_DARAM62");
+            force_cached = (e && *e == '1') ? 1 : 0;
+            fprintf(stderr,
+                    "[c54x] CALYPSO_DSP_FORCE_DARAM62=%d (%s)\n",
+                    force_cached,
+                    force_cached ? "FORCING daram[0x62]=1 in idle disp loop"
+                                 : "real value (no force)");
+            fflush(stderr);
+        }
+        if (force_cached) {
+            static unsigned force_log;
+            if (force_log < 5) {
+                fprintf(stderr,
+                        "[c54x] FORCE-DARAM62 #%u PC=0x%04x real=0x%04x → returning 0x0001 insn=%u\n",
+                        force_log, s->pc, s->data[0x62], s->insn_count);
+                force_log++;
+            }
+            return 1;
+        }
+    }
+
+    /* === DSP idle dispatcher trace (PC ∈ 0xCC62..0xCC6F) ===
+     * The DSP gets stuck in this PROM0 loop polling task slots. Dump the
+     * exact (PC, addr, value, AR2..AR5) for the first N reads so we can
+     * see WHICH memory location the dispatcher inspects to decide whether
+     * to branch out (task_md ? db_r ? api_ram ? other ?). Capped to keep
+     * log size manageable.
+     *
+     * Captures all reads (DARAM + API RAM + MMR) so we don't miss the
+     * critical poll address. */
+    if (s->pc >= 0xCC62 && s->pc <= 0xCC6F) {
+        static unsigned idle_rd_log;
+        const unsigned LIMIT = 200;
+        if (idle_rd_log < LIMIT) {
+            uint16_t v;
+            const char *region;
+            if (addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE) {
+                v = s->api_ram ? s->api_ram[addr - C54X_API_BASE] : 0;
+                region = "api";
+            } else if (addr < 0x4000) {
+                v = s->data[addr];
+                region = "daram";
+            } else {
+                v = s->data[addr];
+                region = "mmr/other";
+            }
+            fprintf(stderr,
+                    "[c54x] IDLE-DISP RD #%u PC=0x%04x [%s 0x%04x]=0x%04x "
+                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                    idle_rd_log, s->pc, region, addr, v,
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+            idle_rd_log++;
+            if (idle_rd_log == LIMIT) {
+                fprintf(stderr,
+                        "[c54x] IDLE-DISP RD log capped at %u — pattern should be visible above\n",
+                        LIMIT);
+            }
+        }
+    }
+
     /* === DARAM discovery histogram ===
      * Track ALL data reads from DARAM (addr < 0x4000) regardless of PC.
      * The FB handler runs from both PROM0 (0xBD47) and DARAM overlay,

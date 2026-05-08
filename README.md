@@ -8,13 +8,15 @@ GSM cell simulation.
 
 ## Latest update — Session 2026-05-07 (UL pipeline + cleanup)
 
-**DL milestone retained, UL pipeline wired, hacks removed.**
+**Hacks purged 2026-05-08. Top blocker now sits at the DSP CCCH demod.**
 
-End-to-end DL chain validated 2026-05-06 by edit-and-observe : `cell_identity 777→888`
-in `osmo-bsc.cfg` propagates through RSL → BTS → bridge → BSP → DSP → ARM L1 → mobile
-L3, with `<0001> sysinfo.c New SYSTEM INFORMATION 3 (lai=001-01-1)` reaching the
-mobile parser byte-for-byte. Two independent observation points (`rsl_si_tap` mmap
-side and mobile L3 logs) converge.
+The earlier "DL milestone end-to-end" claim leaned on `rsl_si_tap.py` +
+`/dev/shm/calypso_si.bin` mmap + `CALYPSO_BCCH_INJECT` — a side-channel that
+fed BCCH SIs into NDB's `a_cd[]` directly, bypassing the DSP CCCH demod.
+That shortcut survived BTS death (mmap persistence), so the mobile camped
+on a stale cache instead of live BTS data. Removed entirely on 2026-05-08
+along with `scripts/rsl_si_tap.py`, `CALYPSO_BCCH_INJECT`, and
+`CALYPSO_SI_MMAP_PATH`.
 
 | Area | Change | File |
 |---|---|---|
@@ -23,37 +25,30 @@ side and mobile L3 logs) converge.
 | **UL** | `bsp.trxd_peer` pre-set to bridge default (no first-DL race) | `calypso_bsp.c` |
 | **UL** | bridge `trxd_remote` pre-set to (BTS, base+102) (no first-UL drop) | `bridge.py` |
 | **Stability** | `-icount shift=auto,align=off,sleep=off` on QEMU | `run.sh` |
-| **Stability** | `BRIDGE_CLK_FROM_QEMU=1` env mode drives CLK IND from QEMU FN, not wall-clock | `bridge.py` |
+| **Stability** | `BRIDGE_CLK_FROM_QEMU=0` (default) wall-paced CLK IND keeps BTS happy | `bridge.py` |
 | **Removed** | BOURRIN-FBDET-SKIP block (`c54x_exec_one` PC range pop+jump) | `calypso_c54x.c` |
 | **Removed** | DIAG-HACK INTM force-clear + ALIAS-CHECK dump | `calypso_c54x.c` |
-| **Removed** | `si3_fallback[]` hardcode (rsl_si_tap mmap is the real path now) | `calypso_fbsb.c` |
+| **Removed** | `si3_fallback[]` hardcode | `calypso_fbsb.c` |
 | **Removed** | `allc_burst_idx` static cycle 0..3 (replaced by `fn & 3`) | `calypso_fbsb.c` |
+| **Removed 2026-05-08** | `scripts/rsl_si_tap.py` + `CALYPSO_BCCH_INJECT` + `CALYPSO_SI_MMAP_PATH` + `csi_*` block | `calypso_fbsb.c`, `run_si.sh` |
 | **Env-gated** | `CALYPSO_FBSB_SYNTH=1` re-enables synthetic FB/SB publish (dev assist when emulated DSP correlator does not converge on bridge-fed GMSK) | `calypso_fbsb.c` |
 
-Cf. [`hw/arm/calypso/doc/hacks.md`](hw/arm/calypso/doc/hacks.md) § Cleanup 2026-05-07
-and [`hw/arm/calypso/doc/TODO.md`](hw/arm/calypso/doc/TODO.md) § Status 2026-05-07.
-
-**Current blocker (UL side)** : Mobile sends RACH but no `IMM_ASS_CMD` returns —
-not yet discriminated between (a) BTS not decoding the RACH UL we emit and (b)
-mobile DSP missing the IMM_ASS sub-slot on AGCH. Test : tcpdump GSMTAP during a
-`with-synth` run (see `Run config` below).
+**Current top blocker** : DSP CCCH demod does not converge on bridge-fed
+GMSK samples → `a_cd[]` never populated → mobile L3 never gets SI → cell-search
+forever. UL/RACH/IMM_ASS chain cannot be tested until DL is fixed. Cf.
+`DIAG_FOR_CLAUDE_WEB.md`.
 
 ## Quick start
 
 ```bash
-# Real DSP path (FBSB will not converge until correlator emulation is fixed)
-./run.sh
+# Real DSP path. Mobile will NOT camp until DSP CCCH demod is fixed.
+./run_si.sh
 
-# Dev-assist path : synth FB/SB + inject SIs from mmap so DL chain reaches L3
-# (FBSB_SYNTH alone gets past FBSB but mobile then blocks on empty CCCH read ;
-#  pair with BCCH_INJECT to actually deliver SIs to mobile L3)
-CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 ./run.sh
-
-# RACH d_rach offset override (default 0x01CB matches DSP==33 layout walk)
-CALYPSO_NDB_D_RACH_OFFSET=0x01CB CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 ./run.sh
+# Synth FB/SB only (gets past FBSB phase, then blocks on empty CCCH).
+CALYPSO_FBSB_SYNTH=1 ./run_si.sh
 
 # W1C latch on a_sync_demod (DSP write→ARM read race mitigation, opt-in)
-CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 CALYPSO_W1C_LATCH=1 ./run.sh
+CALYPSO_FBSB_SYNTH=1 CALYPSO_W1C_LATCH=1 ./run_si.sh
 ```
 
 ### Env vars (default = real path, opt-in for dev assist)
@@ -61,7 +56,6 @@ CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 CALYPSO_W1C_LATCH=1 ./run.sh
 | Env | Default | Effect |
 |---|---|---|
 | `CALYPSO_FBSB_SYNTH` | `0` | `1` re-enables `publish_fb_found` + `publish_sb_found` synth in `on_dsp_task_change` (used while emulated DSP correlator does not converge on bridge GMSK) |
-| `CALYPSO_BCCH_INJECT` | `0` | `1` enables `db_r` echo (passes prim_rx_nb EMPTY guard) + `a_cd[]` write from mmap in `DSP_TASK_ALLC`. Pair with `FBSB_SYNTH=1` to deliver SIs to mobile L3 while DSP CCCH demod is non-converging |
 | `CALYPSO_W1C_LATCH` | `0` | `1` enables capture in `calypso_c54x.c` (DSP writes at fb-det iteration end snapshot 6 NDB cells) + consume in `calypso_trx.c` (ARM reads return latch) — mitigates a DSP-set/clear race vs ARM polling |
 | `CALYPSO_NDB_D_RACH_OFFSET` | `0x01CB` | Override word index of `d_rach` in NDB (DSP version-dependent layout) |
 | `CALYPSO_RACH_FORCE_BSIC` | unset | If set (0..63), forces the RACH encoder BSIC to this value, overriding the byte read from d_rach. Match it to `osmo-bsc.cfg`'s `base_station_id_code`. Diagnostic for the case where d_rach offset is wrong → BSIC read garbage → BTS rejects RACH FIRE check |
@@ -72,7 +66,6 @@ CALYPSO_FBSB_SYNTH=1 CALYPSO_BCCH_INJECT=1 CALYPSO_W1C_LATCH=1 ./run.sh
 | `CALYPSO_BSP_BYPASS_BDLENA` | `0` | `1` bypasses the IOTA BDLENA gate — debug only, breaks BSP RX gating semantics |
 | `CALYPSO_BSP_DARAM_ADDR` | `0x3fb0` | DSP DARAM destination word for BSP RX DMA. Verified empirically against DSP-read range 0x3fb3-0x3fbf |
 | `CALYPSO_DBG` | `corrupt,unimpl` | Comma-separated debug categories ; `none` / `all` accepted |
-| `CALYPSO_SI_MMAP_PATH` | `/dev/shm/calypso_si.bin` | Path to SI mmap file written by `rsl_si_tap.py` |
 | `CALYPSO_DSP_ROM` | `calypso_dsp.txt` | Path to DSP ROM dump |
 | `CALYPSO_SIM_CFG` | `~/.osmocom/bb/sim.cfg` | SIM IMSI/Ki config |
 | `L1CTL_SOCK` | `/tmp/osmocom_l2` | Mobile↔QEMU L1CTL Unix socket |

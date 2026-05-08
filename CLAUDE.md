@@ -1,5 +1,55 @@
 # QEMU Calypso — Claude Code Context
 
+## Session pickup (2026-05-08 night → next session)
+
+```
+DONE
+- DL FN rewrite slot-aware implemented in bridge.py
+  → BSP delta passed from 15000 → 0..32 (within BSP_FN_MATCH_WINDOW=64)
+  → env BRIDGE_DL_FN_REWRITE=slot|naive|off, default slot
+  → env BRIDGE_DL_FN_LOOKAHEAD=32 (half BSP window margin)
+- BCCH_INJECT / FBSB_SYNTH purge clean
+  → scripts/rsl_si_tap.py deleted entirely
+  → CALYPSO_BCCH_INJECT + CALYPSO_SI_MMAP_PATH env vars deleted
+  → calypso_fbsb.c: csi_*, bcch_inject_*, ALLC inject block deleted
+  → run_si.sh clears /dev/shm/calypso_si.bin at startup (inter-run hygiene)
+- Force test daram[0x62]=1 (CALYPSO_DSP_FORCE_DARAM62=1 in calypso_c54x.c
+  data_read override, env-gated) :
+  → DSP escapes idle dispatcher loop cc62..cc6f
+  → traps in NEW polling loop at df93..dfb1
+  → DARAM RD HIST pattern shifts radically (0060/2460/2413/2ee0/3dd2 family)
+  → Confirms gate hypothesis : INT3 ISR (or equivalent) is not writing
+    dispatcher flags. Forcing one flag bypasses one gate, but more gates
+    sit downstream — the ISR writes multiple flags per frame, not just 0x62.
+
+NEXT
+- Trace WRITES on DARAM[0x60..0x70] in calypso_c54x.c data_write hook
+  → If zero writes: INT3 wiring DSP path is the culprit, open the
+    interrupt wiring front (calypso_inth.c IMR/IRQ routing to DSP)
+  → If some writes but cleared too fast: timing / race
+- Cross-check PROM0 handler at 0x770c (the dispatch target read at
+  api[0x1f0c] = api[0x1f00] = 0x770c) — what does it expect on entry ?
+- Same instrumentation pattern as IDLE-DISP RD : add IDLE-DISP-2 trace
+  for PC ∈ 0xDF93..0xDFB1, observe what flag IT polls.
+
+KEY FILES TOUCHED
+- bridge.py                        (DL FN rewrite + slot-aware UL retained)
+- run_si.sh                        (cleanup + new envs + ENV summary)
+- hw/arm/calypso/calypso_fbsb.c    (mmap consumer + BCCH_INJECT removed)
+- hw/arm/calypso/calypso_c54x.c    (IDLE-DISP RD trace + FORCE-DARAM62)
+
+DROPPED ENVS (do not re-set)
+  CALYPSO_BCCH_INJECT  CALYPSO_SI_MMAP_PATH
+
+DEFAULTS (run_si.sh)
+  BRIDGE_CLK_FROM_QEMU=0           (wall-paced, BTS happy)
+  BRIDGE_CLK_PERIOD=51             (BTS skew tolerance)
+  BRIDGE_UL_FN_REWRITE=slot
+  BRIDGE_DL_FN_REWRITE=slot
+  BRIDGE_DL_FN_LOOKAHEAD=32
+  CALYPSO_FBSB_SYNTH=0             (set =1 to keep mobile past FBSB phase)
+```
+
 > **⚠️ PAS DE HACK — règle #1.**
 > Pas d'injection, pas de stub, pas de bypass, pas de "TEMPORARY", pas de
 > hardcode pour faire avancer un état. Le DSP exécute le vrai ROM, la BSP
@@ -70,12 +120,14 @@ Always verify against `tic54x-opc.c` (binutils) before changing any opcode:
 
 **UL RACH / IMM_ASS chain — Location Update stalled.**
 
-DL is validated end-to-end as of 2026-05-06: edit `cell_identity 777→888`
-in `osmo-bsc.cfg` propagates through RSL → BTS encoder → bridge → BSP
-DMA → DSP demod → ARM L1 → L1CTL_DATA_IND → mobile L3 (`gsm322` decodes
-SI3 with `lai=001-01-1` and `MON ... CGI=001-01-1-888`). Two independent
-observation points (rsl_si_tap mmap and mobile L3 logs) confirm byte-for-
-byte coherence (`03 78` ↔ Cell ID 888).
+DL was validated end-to-end up to 2026-05-07 via the
+`rsl_si_tap.py + /dev/shm mmap + CALYPSO_BCCH_INJECT` shortcut, but the
+shortcut was a hack: it bypassed the DSP CCCH demod path and let the
+mobile camp even after BTS death (mmap persistence). It was removed on
+2026-05-08. The legitimate path (BTS → bridge UDP relay → QEMU BSP DMA
+→ DSP CCCH demod → a_cd[] → ARM L1 → L1CTL_DATA_IND) currently does
+not converge on bridge-fed GMSK in QEMU — fixing that is the new
+prerequisite for any L3 progress.
 
 The mobile then issues `RR_EST_REQ` (Location Update) and sends RACH
 bursts (`ra 0x01`, `ra 0x05`, retries 8→7) but never receives an
@@ -118,9 +170,30 @@ real SDCCH UL).
   `calypso_fbsb_on_dsp_task_change`. DSP demod runs for real on the
   GMSK-modulated I/Q the BSP feeds from `osmo-bts-trx`.
 - `si3_fallback[]` hardcoded BCCH SI3 in `calypso_fbsb_on_dsp_task_change`.
-  CCCH read now relies entirely on `rsl_si_tap.py` mmap.
 - `allc_burst_idx` static cycle 0..3 counter — replaced by
   `burst_d = fn & 3` (FN-derived, lockstep-safe).
+
+### Removed in 2026-05-08 cleanup (hack purge)
+
+- `scripts/rsl_si_tap.py` deleted entirely. It sniffed the BSC↔BTS RSL
+  TCP stream, parsed BCCH_INFO messages, and wrote `/dev/shm/calypso_si.bin`
+  with the raw SI bytes.
+- `CALYPSO_BCCH_INJECT` env var + the `csi_init_once` / `csi_lookup_for_tc`
+  / `bcch_inject_consume` block in `calypso_fbsb.c` deleted. They read
+  the mmap and wrote `a_cd[]` directly in NDB during DSP_TASK_ALLC,
+  bypassing the real DSP CCCH demod.
+- `CALYPSO_SI_MMAP_PATH` env var deleted (no consumer left).
+- `doc/MMAP_SI_FORMAT.md` is now historical (kept for reference but not
+  applicable to any live path).
+- `run_si.sh` no longer launches `rsl_si_tap.py` and clears the legacy
+  `/dev/shm/calypso_si.bin` from prior runs at startup.
+
+Why removed : the mmap survived BTS death, so the mobile kept camping on
+a stale cache even after the BTS process exited. The "DL works" claim
+was therefore not honest — it worked off cached SI bytes, not off live
+BTS broadcast. Removing the shortcut forces the DSP CCCH demod path to
+be the only data flow, which is currently broken on bridge-fed GMSK
+samples (= the new top blocker).
 
 ### Stability config
 
@@ -134,15 +207,17 @@ producing 28% LOST timer events.
 | Env | Effect |
 |---|---|
 | `CALYPSO_FBSB_SYNTH=1` | Synth FB/SB publish in `on_dsp_task_change` (default OFF) |
-| `CALYPSO_BCCH_INJECT=1` | db_r echo + a_cd mmap inject in DSP_TASK_ALLC (default OFF) |
 | `CALYPSO_W1C_LATCH=1` | W1C latch on a_sync_demod cells (default OFF) |
 | `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index (default 0x01CB) |
 | `CALYPSO_RACH_FORCE_BSIC=N` | Force BSIC in RACH encoder to N (0..63), overriding d_rach byte. Match `osmo-bsc.cfg base_station_id_code` |
 | `BRIDGE_CLK_FROM_QEMU=1` | CLK IND from QEMU FN (default OFF = wall-clock) |
 | `CALYPSO_ICOUNT=auto/off/shift=N` | QEMU icount mode (default `auto`). Kick timer is on VIRTUAL clock so icount doesn't freeze TDMA. |
 
-DL milestone end-to-end requires `FBSB_SYNTH=1 + BCCH_INJECT=1` together
-until DSP correlator + DSP CCCH demod converge on bridge-fed GMSK.
+As of 2026-05-08, no env-gated dev-assist can deliver SIs to mobile L3
+anymore. The legitimate path (BTS → bridge → BSP → DSP CCCH demod →
+a_cd[]) is the only one wired. It currently does not converge on the
+bridge-fed GMSK samples — mobile stays in cell-search until the demod
+is fixed.
 
 ### Run config
 
