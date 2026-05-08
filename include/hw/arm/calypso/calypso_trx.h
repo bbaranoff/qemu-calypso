@@ -98,6 +98,12 @@
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
 
+/* W1C (Write-1-to-Clear) latch toggle for ARM↔DSP a_sync_* cells.
+ * Returns 1 if CALYPSO_W1C_LATCH=1 env is set, 0 otherwise. Used by
+ * both calypso_c54x.c (capture side) and calypso_trx.c (consume side)
+ * to gate the latch flow. */
+int calypso_w1c_latch_enabled(void);
+
 /* Sercomm burst transport (DLCI 4) — called by UART hardware */
 void calypso_trx_rx_burst(const uint8_t *data, int len);
 void calypso_trx_tx_burst_poll(void);
@@ -105,9 +111,5 @@ void calypso_trx_tx_burst_poll(void);
 /* Current TDMA frame number (0..GSM_HYPERFRAME-1). Used by BSP for
  * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
 uint32_t calypso_trx_get_fn(void);
-
-/* CALYPSO_W1C_LATCH=1 enables the W1C latch system on a_sync_demod cells.
- * Cached at first call; default 0 = ARM reads NDB direct. */
-int calypso_w1c_latch_enabled(void);
 
 #endif /* CALYPSO_TRX_H */

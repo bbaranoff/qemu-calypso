@@ -50,14 +50,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
  */
 bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148]);
 
-/*
- * Build a RACH access burst (148 bits) from NDB d_rach.
- *
- * Reads the firmware-set d_rach value (RA + UIC/BSIC packed in one word)
- * and runs gsm0503_rach_ext_encode to produce the 148-symbol AB burst
- * exactly as the BTS expects. Returns true if a valid d_rach was found
- * and encoded; false if d_rach is zero/uninitialized.
- */
+/* Build a RACH access burst (148 bits) by reading d_rach from NDB and
+ * channel-encoding it via libosmocoding (gsm0503_rach_ext_encode).
+ * Returns true if a valid RACH was produced, false if d_rach is zero or
+ * the encoder failed. Called by calypso_trx.c when ARM L1 commits a
+ * d_task_ra (RACH access). */
 bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148]);
 
 uint16_t calypso_bsp_get_daram_addr(void);

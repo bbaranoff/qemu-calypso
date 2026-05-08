@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>   /* inet_aton */
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -304,9 +305,16 @@ static void bsp_trxd_readable(void *opaque)
     int phase_idx = 0;
     int iq_count = 0;
     for (int i = 0; i < nbits; i++) {
-        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
-        iq[iq_count++] = cos_tab[phase_idx];  /* I */
+        /* Anomaly A fix (2026-05-08) : émettre AVANT advance, donc le premier
+         * sample est à phase=0 au lieu de phase=π/2. Le code original
+         * advance-then-emit décalait tout le burst de 90°, faisant que la
+         * corrélation cohérente du DSP correlator tombait dans la partie
+         * quadrature au lieu d'in-phase → d_fb_det principalement négatif
+         * (pattern observé : +23k, +20k occasionnel puis 4× -5k consécutifs).
+         * À valider sur le prochain run. */
+        iq[iq_count++] = cos_tab[phase_idx];  /* I — phase_idx avant advance */
         iq[iq_count++] = sin_tab[phase_idx];  /* Q */
+        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
     }
 
     /* Enqueue the burst FN-indexed for this TN. With BTS lookahead of up
@@ -348,23 +356,50 @@ void calypso_bsp_init(C54xState *dsp)
     bsp.trxd_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bsp.trxd_peer_valid = true;
 
-    /* Bind UDP socket for TRXDv0 DL bursts from bridge/BTS */
+    /* Bind UDP socket for TRXDv0 DL bursts from bridge/BTS.
+     *
+     * Default bind = 0.0.0.0 (was 127.0.0.1 hard-coded) so external
+     * sources can inject bursts — bridge in the same netns still works,
+     * and the host or other containers can reach BSP via the container
+     * IP or via Docker port mapping (-p 6702:6702/udp).
+     *
+     * Override via env :
+     *   CALYPSO_BSP_BIND_ADDR=<ip>  bind explicit IPv4 (e.g. 127.0.0.1,
+     *                                172.20.0.11). Default: 0.0.0.0
+     *   CALYPSO_BSP_BIND_LOOPBACK=1 legacy alias = 127.0.0.1 */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd >= 0) {
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        const char *bind_addr_env = getenv("CALYPSO_BSP_BIND_ADDR");
+        const char *bind_lo_env   = getenv("CALYPSO_BSP_BIND_LOOPBACK");
+        const char *bind_addr     = NULL;
+        if (bind_addr_env && *bind_addr_env)
+            bind_addr = bind_addr_env;
+        else if (bind_lo_env && *bind_lo_env == '1')
+            bind_addr = "127.0.0.1";
+        else
+            bind_addr = "0.0.0.0";
+
         struct sockaddr_in sa = {
             .sin_family = AF_INET,
             .sin_port = htons(BSP_TRXD_PORT),
-            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         };
+        if (inet_aton(bind_addr, &sa.sin_addr) == 0) {
+            BSP_LOG("CALYPSO_BSP_BIND_ADDR=%s invalid, falling back to 0.0.0.0",
+                    bind_addr);
+            sa.sin_addr.s_addr = htonl(INADDR_ANY);
+            bind_addr = "0.0.0.0";
+        }
         if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
             qemu_set_fd_handler(fd, bsp_trxd_readable, NULL, NULL);
             bsp.trxd_fd = fd;
-            BSP_LOG("TRXD UDP listening on 127.0.0.1:%d", BSP_TRXD_PORT);
+            BSP_LOG("TRXD UDP listening on %s:%d", bind_addr, BSP_TRXD_PORT);
         } else {
-            BSP_LOG("TRXD bind port %d failed: %s", BSP_TRXD_PORT, strerror(errno));
+            BSP_LOG("TRXD bind %s:%d failed: %s",
+                    bind_addr, BSP_TRXD_PORT, strerror(errno));
             close(fd);
         }
     }

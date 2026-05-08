@@ -10,3 +10,6 @@ __pycache__/
 # Manual snapshot backups
 *.bak
 *.bak.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*

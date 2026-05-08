@@ -237,11 +237,29 @@ static void calypso_uart_rx_poll(void *opaque)
 {
     CalypsoUARTState *s = (CalypsoUARTState *)opaque;
 
-    /* Kick the main loop to process any pending I/O sources.
-     * This is necessary because the CPU may run for long periods
-     * without returning to the event loop, starving chardev I/O. */
+    /* AUDIT FIX 2026-05-08 night : `main_loop_wait(false)` removed.
+     *
+     * In QEMU API, the parameter is named `nonblocking`. `false` means
+     * BLOCKING — the prior comment "non-blocking poll" was wrong.
+     * Worse, calling main_loop_wait from a timer callback creates
+     * arbitrary recursion : the very loop that dispatched this REALTIME
+     * timer is re-entered from within itself.
+     *
+     * Under -icount, this breaks the invariant
+     *   virtual_time = icount * (1 << shift)
+     * because nested TCG bursts update icount non-monotonically relative
+     * to the outer loop's scheduling decisions ; the auto-tune algorithm
+     * drifts and VIRTUAL-clock timers (tdma/firq) miss their deadlines
+     * for seconds at a time. Symptom : bridge UDP path frozen under any
+     * `icount != off`.
+     *
+     * `qemu_chr_fe_accept_input` alone is what's needed : it signals the
+     * chardev backend that more bytes can be delivered. The main loop
+     * resumes naturally at the end of this callback.
+     *
+     * Diagnosed by Claude web event-loop audit 2026-05-08. The user
+     * wants `CALYPSO_ICOUNT != off` to work end-to-end. */
     qemu_chr_fe_accept_input(&s->chr);
-    main_loop_wait(false);  /* non-blocking poll of all I/O sources */
 
     /* Re-arm (realtime, 50ms) */
     timer_mod(s->rx_poll_timer,

@@ -60,10 +60,114 @@ RACH_SLOTS_COMBINED = (
     set(range(24, 31)) | set(range(34, 41)) | set(range(44, 51))
 )
 
-# Mode toggle. With the wall-clock-paced wall_fn (default), BRIDGE_CLK_FROM_QEMU
-# is effectively ignored — both CLK IND and UL FN rewrite use wall_fn. Kept
-# as env var for backward compat / future override.
+# CLK IND source mode. Two clock domains live on the wire:
+#   - wall-clock (BTS scheduler expects ~235ms intervals at default period)
+#   - qfn (QEMU TDMA tick, ~2× slower than wall in this build)
+#
+#   "0" / unset → CLK IND fn = wall_fn rounded to CLK_IND_PERIOD (default).
+#                 BTS scheduler advances wall-paced. UL bursts must be
+#                 wall-paced too or they land outside the BTS RACH window.
+#   "1"          → CLK IND fn = qfn rounded to CLK_IND_PERIOD. BTS scheduler
+#                 advances qemu-paced (slow). Pair with passthrough UL
+#                 (BRIDGE_UL_FN_REWRITE=0) so UL bursts in qfn match BTS
+#                 scheduler window. Risk: BTS may shutdown on "PC clock
+#                 skew too high" if elapsed_fn between consecutive CLK INDs
+#                 deviates too much from CLK_IND_PERIOD; mitigate by lowering
+#                 BRIDGE_CLK_PERIOD (e.g., 51 → 26).
 CLK_FROM_QEMU = os.environ.get("BRIDGE_CLK_FROM_QEMU", "0") == "1"
+
+# UL FN rewrite mode. Three modes:
+#
+#   "1" / "slot" / unset (default)
+#       Slot-aware rewrite: sent_fn = next FN ≥ wall_fn whose (% 51) is a
+#       valid combined-CCCH RACH slot. BTS scheduler is wall-paced (CLK IND
+#       wall_fn) so we tag bursts a few frames in BTS's near-future at a
+#       slot where RACH detection is scheduled. BTS holds the burst briefly
+#       then processes it when its scheduler reaches that FN.
+#       Caveat: only RACH-correct for TN=0 during LU phase. Once SDCCH UL
+#       kicks in (post-IMM_ASS), needs a content-aware variant.
+#
+#   "0"
+#       Passthrough qfn. UL burst sent unchanged from QEMU. Tags the past
+#       from BTS POV → BTS likely drops as stale. Useful as a discriminant
+#       (e.g., to see what BTS error log says).
+#
+#   "naive"
+#       Blind wall_fn rewrite (legacy behavior pre-2026-05-08). Sent_fn =
+#       wall_fn rounded to nothing. ~60% of bursts land off-slot for
+#       combined CCCH+SDCCH8. Kept for A/B comparison.
+UL_FN_REWRITE_MODE = os.environ.get("BRIDGE_UL_FN_REWRITE", "1").lower()
+if UL_FN_REWRITE_MODE in ("1", "slot", "slot-aware", "true"):
+    UL_FN_REWRITE_MODE = "slot"
+elif UL_FN_REWRITE_MODE in ("0", "off", "passthrough", "false"):
+    UL_FN_REWRITE_MODE = "off"
+elif UL_FN_REWRITE_MODE in ("naive", "wall", "blind"):
+    UL_FN_REWRITE_MODE = "naive"
+else:
+    UL_FN_REWRITE_MODE = "slot"  # unrecognized → safe default
+
+# DL FN rewrite mode (symmetric to UL). The clock-domain split makes
+# `bts_fn` (wall-paced) drift ~50 frames/s ahead of QEMU's `qfn`. BSP's
+# default match window is 64 frames so DL bursts get dropped in seconds.
+# See RUN_SNAPSHOT_2026-05-08.md for the measured delta=15000+ frames.
+#
+#   "slot" / "1" / unset (default)
+#       Rewrite bts_fn → smallest qfn ≥ self.fn whose (% 51) matches
+#       (bts_fn % 51). Preserves the slot type within the 51-multiframe
+#       so DSP demod still types BCCH/CCCH/SDCCH correctly. If no qfn
+#       in the lookahead window matches, the burst is dropped (BCCH
+#       repeats so this is recoverable).
+#
+#   "naive"
+#       Rewrite bts_fn → self.fn (current qfn). Ignores slot type — DSP
+#       demod will mis-type bursts. Useful only as A/B comparison.
+#
+#   "off"
+#       Passthrough bts_fn unchanged. BSP will reject ~all bursts due
+#       to FN mismatch when QEMU is slow vs wall.
+DL_FN_REWRITE_MODE = os.environ.get("BRIDGE_DL_FN_REWRITE", "slot").lower()
+if DL_FN_REWRITE_MODE in ("1", "slot", "slot-aware", "true"):
+    DL_FN_REWRITE_MODE = "slot"
+elif DL_FN_REWRITE_MODE in ("0", "off", "passthrough", "false"):
+    DL_FN_REWRITE_MODE = "off"
+elif DL_FN_REWRITE_MODE in ("naive",):
+    DL_FN_REWRITE_MODE = "naive"
+else:
+    DL_FN_REWRITE_MODE = "slot"
+
+# How many qfn frames in the future we're willing to tag a DL burst.
+# Bounded above by BSP_FN_MATCH_WINDOW (default 64 in calypso_bsp.c)
+# minus a safety margin. Default 32 → at most ~50% of the BSP window
+# leaves headroom for queue jitter. With lookahead=51 every burst can
+# be slot-mapped (since each %51 value occurs once per 51-frame
+# window), but bursts get tagged up to 50 frames in the qfn future.
+DL_FN_LOOKAHEAD = int(os.environ.get("BRIDGE_DL_FN_LOOKAHEAD", "32"))
+
+
+def next_rach_slot_fn(fn):
+    """Return smallest FN ≥ fn whose (FN % 51) ∈ RACH_SLOTS_COMBINED.
+    Worst case scans 51 candidates, typically finds one within 4."""
+    for delta in range(0, 52):
+        if (fn + delta) % 51 in RACH_SLOTS_COMBINED:
+            return fn + delta
+    return fn  # unreachable since RACH_SLOTS_COMBINED covers 35/51 slots
+
+
+def dl_slot_aware_qfn(bts_fn, current_qfn, lookahead):
+    """Map bts_fn to the smallest qfn ≥ current_qfn whose (qfn % 51) matches
+    (bts_fn % 51). Preserves slot type for DSP demod typing.
+
+    Returns the target qfn, or None if no match exists within `lookahead`
+    frames (caller drops the burst — BCCH repeats so this is recoverable).
+
+    O(1): delta = ((bts_fn - current_qfn) mod 51) is the always-non-negative
+    offset to the next matching qfn slot ; either ≤ lookahead or we drop.
+    """
+    target_mod = bts_fn % 51
+    delta = (target_mod - (current_qfn % 51)) % 51
+    if delta > lookahead:
+        return None
+    return current_qfn + delta
 
 def udp_bind(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -106,7 +210,22 @@ class Bridge:
         self._last_clk_fn_sent = None
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} ↔ BSP@6702", flush=True)
-        print(f"bridge: wall-clock-paced wall_fn ({1/GSM_TDMA_S:.1f} Hz) — UL FN rewritten to wall_fn", flush=True)
+        print(f"bridge: CLK IND source={'qfn (qemu-paced)' if CLK_FROM_QEMU else 'wall_fn (wall-paced 217 Hz)'}, "
+              f"period={CLK_IND_PERIOD} frames", flush=True)
+        ul_desc = {
+            "slot": "slot-aware (next RACH slot ≥ wall_fn — combined CCCH+SDCCH8)",
+            "naive": "naive (wall_fn rounded, ignores slot mask)",
+            "off":  "off (passthrough qemu_fn)",
+        }[UL_FN_REWRITE_MODE]
+        dl_desc = {
+            "slot": f"slot-aware (next qfn ≥ self.fn matching bts_fn%%51, lookahead={DL_FN_LOOKAHEAD})",
+            "naive": "naive (rewrite to current qfn, ignores slot type)",
+            "off":  "off (passthrough bts_fn — BSP will reject ~all bursts)",
+        }[DL_FN_REWRITE_MODE]
+        print(f"bridge: UL FN rewrite mode={UL_FN_REWRITE_MODE} — {ul_desc}",
+              flush=True)
+        print(f"bridge: DL FN rewrite mode={DL_FN_REWRITE_MODE} — {dl_desc}",
+              flush=True)
 
     def wall_fn(self):
         """Compute current bridge wall-paced FN. Anchored at POWERON."""
@@ -135,26 +254,43 @@ class Bridge:
             print(f"bridge: QEMU tick #{self.stats['tick']} qfn={self.fn} "
                   f"wall_fn={wfn} lag={lag}", flush=True)
 
-    def _send_clk_ind(self):
-        wfn = self.wall_fn()
-        clk_fn = (wfn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+    def _send_clk_ind(self, clk_fn):
         try:
             self.clk_sock.sendto(
                 f"IND CLOCK {clk_fn}\0".encode(), self.bts_clk_addr)
             self.stats["clk"] += 1
             self._last_clk_fn_sent = clk_fn
+            if self.stats["clk"] <= 5 or (self.stats["clk"] % 200) == 0:
+                src = "qfn" if CLK_FROM_QEMU else "wall_fn"
+                print(f"bridge: CLK IND #{self.stats['clk']} fn={clk_fn} ({src})",
+                      flush=True)
         except OSError:
             pass
 
     def maybe_send_clk(self):
-        """Wall-clock-paced CLK IND — bridge's own wall_fn counter, no QEMU dep.
+        """CLK IND scheduler. Two modes:
 
-        Sent at exact GSM TDMA rate (every CLK_IND_PERIOD * 4.615 ms wall).
-        BTS scheduler stays synchronized with bridge regardless of QEMU
-        emulation speed.
+        wall-paced (default, CLK_FROM_QEMU=False)
+          Send every CLK_IND_WALL_S seconds with clk_fn = wall_fn rounded
+          to CLK_IND_PERIOD. BTS sees consistent ~235ms intervals.
+
+        qfn-paced (CLK_FROM_QEMU=True)
+          Send each time qfn has advanced by CLK_IND_PERIOD since last
+          send. clk_fn = qfn rounded down to CLK_IND_PERIOD. Wall-clock
+          interval between sends scales with QEMU emulation speed (slower
+          QEMU → longer wall gaps). BTS scheduler advances at qemu-rate.
         """
         if not self.powered:
             return
+
+        if CLK_FROM_QEMU:
+            target = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+            if self._last_clk_fn_sent is not None and \
+               target <= self._last_clk_fn_sent:
+                return  # qfn hasn't advanced enough — skip this poll
+            self._send_clk_ind(target)
+            return
+
         now = time.monotonic()
         if not hasattr(self, '_last_clk_wall'):
             self._last_clk_wall = now - CLK_IND_WALL_S  # force first send
@@ -164,7 +300,8 @@ class Bridge:
         # Catch up if we slipped a long time (avoid runaway send burst)
         if now - self._last_clk_wall > CLK_IND_WALL_S * 4:
             self._last_clk_wall = now
-        self._send_clk_ind()
+        wfn = self.wall_fn()
+        self._send_clk_ind((wfn // CLK_IND_PERIOD) * CLK_IND_PERIOD)
 
     def handle_trxc(self):
         try: data, addr = self.trxc_sock.recvfrom(256)
@@ -255,20 +392,27 @@ class Bridge:
         rssi = data[5] if len(data) > 5 else 0
         toa = int.from_bytes(data[6:8], 'big', signed=True) if len(data) >= 8 else 0
 
-        # Rewrite FN to wall_fn before forwarding
-        wfn = self.wall_fn() if self.powered else qemu_fn
+        # FN rewrite (or passthrough) per UL_FN_REWRITE_MODE.
+        # The actual FN that goes to BTS is the one that matters for the
+        # slot-validity diagnostic.
+        if not self.powered or UL_FN_REWRITE_MODE == "off":
+            sent_fn = qemu_fn
+        elif UL_FN_REWRITE_MODE == "naive":
+            sent_fn = self.wall_fn()
+        else:  # "slot" — default
+            sent_fn = next_rach_slot_fn(self.wall_fn())
         out = bytearray(data)
-        out[1] = (wfn >> 24) & 0xFF
-        out[2] = (wfn >> 16) & 0xFF
-        out[3] = (wfn >>  8) & 0xFF
-        out[4] =  wfn        & 0xFF
-        if wfn != qemu_fn:
+        out[1] = (sent_fn >> 24) & 0xFF
+        out[2] = (sent_fn >> 16) & 0xFF
+        out[3] = (sent_fn >>  8) & 0xFF
+        out[4] =  sent_fn        & 0xFF
+        if sent_fn != qemu_fn:
             self.stats["ul_fn_rewrite"] += 1
 
-        # Slot-validity diagnostic: was wall_fn % 51 a valid RACH slot for
+        # Slot-validity diagnostic: is sent_fn % 51 a valid RACH slot for
         # combined CCCH+SDCCH8 (the only mode mobile knows about)? Counters
         # printed in the rolling stats line so the distribution is visible.
-        slot_mod51 = wfn % 51
+        slot_mod51 = sent_fn % 51
         in_rach_slot = slot_mod51 in RACH_SLOTS_COMBINED
         if in_rach_slot:
             self.stats.setdefault("ul_in_slot", 0)
@@ -286,8 +430,9 @@ class Bridge:
             head = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[:16])
             tail = ' '.join(f"{b - 256 if b >= 128 else b:+d}" for b in payload[-8:])
             slot_mark = "RACH" if in_rach_slot else "OFF"
+            arrow = "→" if sent_fn != qemu_fn else "="
             print(f"bridge: UL #{self.stats['ul']} TN={tn} "
-                  f"qfn={qemu_fn}→wfn={wfn} slot={slot_mod51:02d}/51={slot_mark} "
+                  f"qfn={qemu_fn}{arrow}sent={sent_fn} slot={slot_mod51:02d}/51={slot_mark} "
                   f"rssi=-{rssi} toa={toa} len={len(data)} "
                   f"hdr_in={hdr_in_hex} hdr_out={hdr_out_hex} "
                   f"bits[0:16]=[{head}] bits[140:148]=[{tail}] "
@@ -299,32 +444,78 @@ class Bridge:
             print(f"bridge: UL send error: {e}", flush=True)
 
     def _handle_dl(self, data, addr):
-        """DL burst from BTS → forward to QEMU BSP.
+        """DL burst from BTS → forward to QEMU BSP, slot-aware FN-rewritten.
 
-        BTS sends DL with wall-clock-aligned FN. We forward unchanged ;
-        QEMU's BSP queue uses a tolerant FN match window so bursts are
-        still picked up at delivery time even with QEMU FN drift.
+        Format (TRXDv0 DL, 154 bytes total) :
+          [0]    TN
+          [1:5]  FN (BE)  — REWRITTEN to a near-future qfn that preserves
+                            (FN % 51) so DSP demod still types BCCH/CCCH
+                            correctly. Burst dropped if no match within
+                            DL_FN_LOOKAHEAD frames (BCCH repeats).
+          [5]    RSSI / format flags (TRXDv0 omits ToA on DL, header is 6 B)
+          [6:]   148 soft bits
+
+        WHY: BTS scheduler runs at wall-clock rate, QEMU BSP at qfn (~half).
+        delta=bts_fn-qfn grows ~50 frames/s and quickly exceeds BSP's match
+        window (default 64 frames in calypso_bsp.c). Without rewrite, BSP
+        rejects 100 % of bursts, DSP CCCH demod never runs, mobile L3 never
+        receives SI, mobile stays in cell-search forever.
         """
         self.trxd_remote = addr
         self.stats["dl"] += 1
 
         tn = data[0] & 0x07
         bts_fn = int.from_bytes(data[1:5], 'big')
-        fn = bts_fn  # forward as-is
+
+        # FN rewrite per DL_FN_REWRITE_MODE
+        if DL_FN_REWRITE_MODE == "off" or self.fn == 0:
+            sent_fn = bts_fn
+            drop = False
+        elif DL_FN_REWRITE_MODE == "naive":
+            sent_fn = self.fn
+            drop = False
+        else:  # "slot" — default
+            sent_fn = dl_slot_aware_qfn(bts_fn, self.fn, DL_FN_LOOKAHEAD)
+            drop = sent_fn is None
+
+        if drop:
+            self.stats.setdefault("dl_drop_no_slot", 0)
+            self.stats["dl_drop_no_slot"] += 1
+            # Log first few drops + every 1000th so the pattern is visible
+            n = self.stats["dl_drop_no_slot"]
+            if n <= 5 or n % 1000 == 0:
+                bts_mod = bts_fn % 51
+                qfn_mod = self.fn % 51
+                delta_to_match = (bts_mod - qfn_mod) % 51
+                print(f"bridge: DL drop #{n} TN={tn} bts_fn={bts_fn} (mod {bts_mod}) "
+                      f"qfn={self.fn} (mod {qfn_mod}) delta_to_match={delta_to_match} "
+                      f"> lookahead={DL_FN_LOOKAHEAD}", flush=True)
+            return
+
+        if sent_fn != bts_fn:
+            self.stats.setdefault("dl_rewrite", 0)
+            self.stats["dl_rewrite"] += 1
+
+        out = bytearray(data)
+        out[1] = (sent_fn >> 24) & 0xFF
+        out[2] = (sent_fn >> 16) & 0xFF
+        out[3] = (sent_fn >>  8) & 0xFF
+        out[4] =  sent_fn        & 0xFF
 
         # Log burst content: first 8 data bytes + check if FB (all zeros)
-        hdr_bytes = data[:8] if len(data) >= 8 else data
+        hdr_bytes = bytes(out[:8]) if len(out) >= 8 else bytes(out)
         payload = data[8:] if len(data) > 8 else b''
         is_fb = all(b == 0 for b in payload) if payload else False
         if self.stats["dl"] <= 10 or self.stats["dl"] % 5000 == 0 or is_fb:
+            arrow = "→" if sent_fn != bts_fn else "="
             print(f"bridge: DL #{self.stats['dl']} TN={tn} "
-                  f"bts_fn={bts_fn} fn={fn} (anchor={self.fn_anchor}) "
-                  f"len={len(data)} hdr={hdr_bytes[:8].hex()} "
+                  f"bts_fn={bts_fn}{arrow}qfn={sent_fn} (cur_qfn={self.fn}, anchor={self.fn_anchor}) "
+                  f"len={len(out)} hdr={hdr_bytes[:8].hex()} "
                   f"bits[0:8]={list(payload[:8])} "
                   f"{'*** FB ***' if is_fb else ''}", flush=True)
 
         try:
-            self.trxd_sock.sendto(data, QEMU_BSP_ADDR)
+            self.trxd_sock.sendto(bytes(out), QEMU_BSP_ADDR)
         except OSError as e:
             print(f"bridge: DL send error: {e}", flush=True)
 
@@ -355,11 +546,14 @@ class Bridge:
                 wfn = self.wall_fn()
                 in_s  = self.stats.get("ul_in_slot", 0)
                 off_s = self.stats.get("ul_off_slot", 0)
+                dl_rw = self.stats.get("dl_rewrite", 0)
+                dl_dr = self.stats.get("dl_drop_no_slot", 0)
                 print(f"bridge: tick={self.stats['tick']} "
                       f"clk={self.stats['clk']} "
                       f"dl={self.stats['dl']} ul={self.stats['ul']} "
                       f"ul_rewrite={self.stats['ul_fn_rewrite']} "
                       f"ul_slot_in/off={in_s}/{off_s} "
+                      f"dl_rewrite={dl_rw} dl_drop={dl_dr} "
                       f"wall_fn={wfn} qfn={self.fn}",
                       flush=True)
 
