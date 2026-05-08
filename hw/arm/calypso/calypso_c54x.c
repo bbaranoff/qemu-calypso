@@ -1198,6 +1198,28 @@ static int c54x_exec_one(C54xState *s)
                         s->insn_count);
             }
         }
+        /* D_FB_DET-WR-SITE probe : à PC=0x8f51 (le PC qui écrit d_fb_det).
+         * Snapshot AR0..AR7 + data[AR0/1/2] + BK + A pour identifier la
+         * zone DARAM lue par le correlator FB-det au moment de produire
+         * sa valeur d'output. Comparer la zone source avec le BSP DMA
+         * target (default 0x3fb0..0x3fbf) :
+         *   - zone source = BSP target → correlator lit bien les samples
+         *   - zone source ≠ BSP target → mismatch source/sink, blocker
+         *     structurel : DSP attend les samples ailleurs que là où le
+         *     BSP les écrit. Suite : tracer init AR, table coeffs, ou
+         *     MAC sur autre buffer. */
+        if (s->pc == 0x8f51) {
+            static int dfbwr_n;
+            if (dfbwr_n++ < 50) {
+                C54_LOG("D_FB_DET-WR-SITE #%d AR0..AR7=%04x %04x %04x %04x %04x %04x %04x %04x "
+                        "data[AR0]=%04x data[AR1]=%04x data[AR2]=%04x BK=%04x A=0x%010llx insn=%u",
+                        dfbwr_n, s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                        s->data[s->ar[0]], s->data[s->ar[1]], s->data[s->ar[2]],
+                        s->bk, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        s->insn_count);
+            }
+        }
         /* WAIT-A21A probe : à PC=0xa21a, snapshot INTM + IMR + IFR.
          * Tranche H1/H2/H3 :
          *   INTM=1 + IFR=0  + IMR plein → H3 strict, hardware silencieux
@@ -4052,12 +4074,11 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0x80) {
-            /* MVDD Smem, Smem (data→data) — 2-word */
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, op2, data_read(s, addr));
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0x80 = STL src,Smem (1-word).
+             * Ancienne classification qemu = MVDD 2-word (incorrect).
+             * Voir doc/opcodes/tic54x_hi8_map.md. Neutralisé pour éviter
+             * les écritures mémoire fantômes en attendant impl correcte. */
+            return 1;
         }
         if (hi8 == 0x8C) {
             /* MVPD pmad, Smem (prog→data) */
@@ -4218,11 +4239,10 @@ static int c54x_exec_one(C54xState *s)
         }
         /* 8Bxx: MVDK with long address */
         if (hi8 == 0x8B) {
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, op2, data_read(s, addr));
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0x8B = POPD Smem (1-word).
+             * Ancienne classification qemu = MVDK long-addr 2-word (incorrect).
+             * Voir doc/opcodes/tic54x_hi8_map.md. Neutralisé. */
+            return 1;
         }
         /* 8Dxx: MVDD Smem, Smem */
         if (hi8 == 0x8D) {
@@ -4374,12 +4394,11 @@ static int c54x_exec_one(C54xState *s)
         }
 ba_handler:
         if (hi8 == 0xAA || hi8 == 0xAB) {
-            /* STLM src, MMR — AA=A, AB=B */
-            int src_acc = (hi8 == 0xAB) ? 1 : 0;
-            uint16_t mmr = op & 0x7F;
-            int64_t acc = src_acc ? s->b : s->a;
-            data_write(s, mmr, (uint16_t)(acc & 0xFFFF));
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xAA/AB = LD variant.
+             * Ancienne classification qemu = STLM src,MMR (incorrect — STLM
+             * est en 0x88/0x89, déjà correctement décodé ligne 4046).
+             * Voir doc/opcodes/tic54x_hi8_map.md. Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xBA) {
             /* LDMM MMR, dst */
@@ -4681,24 +4700,25 @@ ba_handler:
             return consumed + s->lk_used;
         }
         if (hi8 == 0xC5) {
-            /* PSHM MMR */
-            uint16_t mmr = op & 0x7F;
-            s->sp--;
-            data_write(s, s->sp, data_read(s, mmr));
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xC5 = ST||family (parallel).
+             * Ancienne classification qemu = PSHM MMR (incorrect — vrai
+             * PSHM est en 0x4A, correctement décodé ligne 3816).
+             * Le sp-- ici causait des pushes fantômes. Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xCD) {
-            /* POPM MMR */
-            uint16_t mmr = op & 0x7F;
-            data_write(s, mmr, data_read(s, s->sp));
-            s->sp++;
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xCD = ST||family (parallel).
+             * Ancienne classification qemu = POPM MMR (incorrect — vrai
+             * POPM est en 0x8A, fixé 2026-05-08).
+             * Le sp++ ici causait des pops fantômes. Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xCE) {
-            /* FRAME #k (signed 8-bit) */
-            int8_t k = (int8_t)(op & 0xFF);
-            s->sp += k;
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xCE = ST||family (parallel).
+             * Ancienne classification qemu = FRAME #k (incorrect — FRAME
+             * n'a pas de hi8 fixe, encodage différent).
+             * Le sp+=k ici causait des sauts SP arbitraires. Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xC4) {
             /* C4xx: PSHD dmad (push data from absolute addr) */
@@ -4743,19 +4763,18 @@ ba_handler:
             return consumed + s->lk_used;
         }
         if (hi8 == 0xDD) {
-            /* POPD Smem */
-            addr = resolve_smem(s, op, &ind);
-            data_write(s, addr, data_read(s, s->sp));
-            s->sp++;
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xDD = ST||family (parallel) — base
+             * 0xDC00 mask 0xFC00. Ancienne classification qemu = POPD Smem
+             * (incorrect — vrai POPD en 0x8B, neutralisé en stub).
+             * Le sp++ ici causait le SP runaway post-POPM-fix observé
+             * 2026-05-08 (~13k faux pops en 64k insn). Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xDE) {
-            /* DExx: POPD dmad (2-word) */
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, op2, data_read(s, s->sp));
-            s->sp++;
-            return consumed + s->lk_used;
+            /* STUB-NOP : tic54x dit 0xDE = ST||family (parallel).
+             * Ancienne classification qemu = POPD dmad 2-word (incorrect).
+             * Le sp++ ici causait le SP runaway. Neutralisé. */
+            return 1;
         }
         if (hi8 == 0xDF) {
             /* DELAY Smem — shift delay line: data(Smem) → data(Smem+1)
