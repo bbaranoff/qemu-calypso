@@ -1,0 +1,5 @@
+config CALYPSO
+    bool
+    default y
+    select ARM_V4T
+    select PFLASH_CFI01

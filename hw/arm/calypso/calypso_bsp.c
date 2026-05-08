@@ -305,9 +305,16 @@ static void bsp_trxd_readable(void *opaque)
     int phase_idx = 0;
     int iq_count = 0;
     for (int i = 0; i < nbits; i++) {
-        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
-        iq[iq_count++] = cos_tab[phase_idx];  /* I */
+        /* Anomaly A fix (2026-05-08) : émettre AVANT advance, donc le premier
+         * sample est à phase=0 au lieu de phase=π/2. Le code original
+         * advance-then-emit décalait tout le burst de 90°, faisant que la
+         * corrélation cohérente du DSP correlator tombait dans la partie
+         * quadrature au lieu d'in-phase → d_fb_det principalement négatif
+         * (pattern observé : +23k, +20k occasionnel puis 4× -5k consécutifs).
+         * À valider sur le prochain run. */
+        iq[iq_count++] = cos_tab[phase_idx];  /* I — phase_idx avant advance */
         iq[iq_count++] = sin_tab[phase_idx];  /* Q */
+        phase_idx = (phase_idx + (bits[i] ? 3 : 1)) & 3;
     }
 
     /* Enqueue the burst FN-indexed for this TN. With BTS lookahead of up
