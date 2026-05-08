@@ -431,6 +431,40 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* DATA-W-MMR : log every write into the low MMR window (addr <= 0x1F)
+     * with full attribution context. Goal : disambiguate the IMR-W trace
+     * cascade observed at PC=0x8eb9 (op=0xf3e1) and PC=0x9ad0 (op=0x8192).
+     * The writer_kind field tells us *which path* triggered the write
+     * (opcode family / IRQ ack / ARM MMIO / resolve_smem side effect).
+     * Cap at 200 distinct events to avoid log flood. */
+    if (addr <= 0x1F) {
+        static unsigned mmrw_log;
+        if (mmrw_log++ < 200) {
+            const char *wk_name[] = {
+                "UNK", "F3", "8x", "77", "76", "PSHM",
+                "RET", "IRQ_ACK", "ARM_MMIO", "RES_AR", "OTHER"
+            };
+            uint8_t wk = s->writer_kind;
+            const char *wkn = (wk < sizeof(wk_name)/sizeof(wk_name[0]))
+                              ? wk_name[wk] : "??";
+            fprintf(stderr,
+                    "[c54x] DATA-W-MMR addr=0x%02x val=0x%04x "
+                    "exec_pc=0x%04x cur_pc=0x%04x cur_op=0x%04x "
+                    "xpc=%d wk=%s "
+                    "AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                    "AR4=%04x AR5=%04x AR6=%04x AR7=%04x "
+                    "SP=%04x DP=%d INTM=%d insn=%u\n",
+                    addr, val,
+                    s->last_exec_pc, s->pc, s->prog[s->pc],
+                    s->xpc, wkn,
+                    s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                    s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                    s->sp, dp(s),
+                    !!(s->st1 & ST1_INTM),
+                    s->insn_count);
+        }
+    }
+
     /* WATCH-WRITE on the same mailbox slots tracked in data_read.
      * Whoever writes them — DSP or ARM via api_ram alias — gets logged
      * so we can attribute the source of the value the firmware polls. */
@@ -1116,9 +1150,18 @@ static int c54x_exec_one(C54xState *s)
     uint16_t addr;
     int consumed = 1;
     s->lk_used = false;  /* reset before each instruction */
+    s->writer_kind = WK_UNKNOWN;  /* attribution tag for DATA-W-MMR */
 
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
+
+    /* Coarse default: any MMR write happening inside this opcode handler
+     * gets attributed to the opcode family so we can read the trace. */
+    if (hi8 == 0xF3)                    s->writer_kind = WK_OPCODE_F3;
+    else if (hi8 >= 0x80 && hi8 <= 0x8F) s->writer_kind = WK_OPCODE_8x;
+    else if (hi8 == 0x77)                s->writer_kind = WK_OPCODE_77;
+    else if (hi8 == 0x76)                s->writer_kind = WK_OPCODE_76;
+    else                                 s->writer_kind = WK_OPCODE_OTHER;
 
     /* INTM-TRANS probe : log toute transition INTM 0→1.
      * Le SSBX INTM orphelin se cache entre insn=89.83M (last write 0x3dd2)
@@ -2248,32 +2291,39 @@ static int c54x_exec_one(C54xState *s)
          * Per SPRU172C: dst += T * Xmem; Ymem += rnd(AH * T); T = Xmem
          * Exclude F272 (RPTBD), F273 (RETD), F274 (CALLD) — exact-match
          * opcodes that share the F2xx range but are handled below. */
-        if ((hi8 == 0xF2 || hi8 == 0xF3) &&
-            op != 0xF272 && op != 0xF273 && op != 0xF274) {
-            int xar_l = (op >> 4) & 0x07;
-            int yar_l = op & 0x07;
-            uint16_t xval_l = data_read(s, s->ar[xar_l]);
-            uint16_t yval_l = data_read(s, s->ar[yar_l]);
-            /* MAC: dst += T * Xmem */
-            int64_t prod_l = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_l;
-            if (s->st1 & ST1_FRCT) prod_l <<= 1;
-            int dst_l = hi8 & 1;
-            if (dst_l) s->b = sext40(s->b + prod_l);
-            else       s->a = sext40(s->a + prod_l);
-            /* LMS coefficient update: Ymem += rnd(AH * T) */
-            int16_t ah_l = (int16_t)((s->a >> 16) & 0xFFFF);
-            int32_t update = (int32_t)ah_l * (int32_t)(int16_t)s->t;
-            if (s->st1 & ST1_FRCT) update <<= 1;
-            update += 0x8000; /* round */
-            int16_t new_ym = (int16_t)yval_l + (int16_t)(update >> 16);
-            data_write(s, s->ar[yar_l], (uint16_t)new_ym);
-            /* T = Xmem */
-            s->t = xval_l;
-            /* Post-modify */
-            if ((op >> 7) & 1) s->ar[xar_l]--; else s->ar[xar_l]++;
-            if ((op & 0x08) == 0) s->ar[yar_l]++; else s->ar[yar_l]--;
-            return consumed + s->lk_used;
-        }
+        /* REMOVED 2026-05-08 night : the previous "LMS Xmem,Ymem" handler
+         * for hi8 ∈ {0xF2, 0xF3} (excluding F272/F273/F274) was mis-decoded
+         * — it claimed encoding `1111 001D XXXX YYYY` but per binutils
+         * tic54x-opc.c LMS is actually :
+         *
+         *   { "lms", 1,2,2, 0xE100, 0xFF00, {OP_Xmem,OP_Ymem}, ... }
+         *
+         * i.e. hi8 == 0xE1, NOT 0xF2/F3. The 0xE1 handler already exists
+         * (line ~3247) and is correct.
+         *
+         * The F2xx/F3xx range per binutils contains only :
+         *   F272 RPTBD, F273 RETD, F274 CALLD                (3 special-cases)
+         *   F300-F31F INTR k                                 (handled below)
+         *   F330-F35F AND/OR/XOR with shift  (mask FCF0)     (handled below)
+         *   F360-F367 ADD/SUB/AND/OR/XOR/MAC #lk (mask FCFF) (handled below)
+         *   F380-F3FF AND/OR/XOR/SFTL src,SHIFT,DST (FCE0)   (handled below)
+         *   F320-F32F + F368-F37F unmapped (NOP fallback)
+         *
+         * The bogus LMS catch-all stole every F3xx instruction before the
+         * proper F3 dispatch could see it. For 0xF3E1 (= SFTL B,1,B,
+         * 4872 sites in firmware) it computed `new_ym = AH*T-derived junk`
+         * and called data_write(s, AR1, new_ym). When AR1=0, that wrote
+         * the junk to MMR_IMR. This is the IMR-thrash cascade observed
+         * post-0x76-fix at PC=0x8eb9.
+         *
+         * Discovered after the 0x76 fix exposed the second-level cascade.
+         * Trace evidence : IMR-W 0x0000→{0x0540, 0x0525, 0x082b, 0xfd57,
+         * 0xfacf, ...} all PC=0x8eb9 op=0xf3e1, INTM-TRANS XPC=0
+         * (confirms genuine PROM0 execution, not XPC artifact).
+         *
+         * Fix : let the existing F3 dispatch (line 2468+) handle F3xx
+         * properly. F2xx (other than F272/3/4) falls through to F-class
+         * NOP fallback — firmware does not appear to use it. */
         /* F8xx: branches, RPT, BANZ, CALL, RET variants */
         if (hi8 == 0xF8) {
             uint8_t sub = (op >> 4) & 0xF;
@@ -3345,11 +3395,36 @@ static int c54x_exec_one(C54xState *s)
             /* MAR only modifies AR via addressing mode, no data access */
             return consumed + s->lk_used;
         }
-        /* 76xx: LDM MMR, dst */
+        /* 76xx: ST #lk, Smem  (2 or 3 words) — store 16-bit literal to data
+         * memory. Per binutils tic54x-opc.c {st, 2,2,2, 0x7600, 0xFF00,
+         * {OP_lk, OP_Smem}} and tic54x-dis.c get_insn_size = words +
+         * has_lkaddr (extra word when Smem mode in 0xC..0xF).
+         *
+         * Encoding (verified via tic54x-dis.c:192-204):
+         *   word 0 = opcode (0x76xx)
+         *   word 1 = lkaddr  (Smem extension, only if mode in 0xC..0xF)
+         *   word N = opcode2 (the #lk value being stored, last extension)
+         *
+         * Was previously misdecoded as LDM MMR,dst (1 word) — copy/paste
+         * of the wrong mnemonic. The real LDM is 0x48xx mask 0xFE00,
+         * already correctly handled in the 0x4 group. Misdecoding caused
+         * PC to advance by 1 instead of 2-3 ; the literal then executed
+         * as a stray opcode. In particular the 0x4F00 (DST B,Lmem with
+         * DP=0 → MMR_IMR) stray write zeroed IMR forever, masking
+         * INT3+BRINT0 → DSP parked in RPTB at e9ab..e9b6 awaiting a
+         * frame interrupt that was never serviced. Fix 2026-05-08. */
         if (hi8 == 0x76) {
-            uint8_t mmr = op & 0x7F;
-            uint16_t val = data_read(s, mmr);
-            s->a = (int64_t)(int16_t)val << 16;
+            static unsigned hit76_log;
+            addr = resolve_smem(s, op, &ind);
+            op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+            consumed = 2;
+            if (hit76_log++ < 30) {
+                fprintf(stderr,
+                        "[c54x] HIT-76 PC=0x%04x op=0x%04x addr=0x%04x "
+                        "lk=0x%04x lk_used=%d insn=%u\n",
+                        s->pc, op, addr, op2, s->lk_used, s->insn_count);
+            }
+            data_write(s, addr, op2);
             return consumed + s->lk_used;
         }
         /* 77xx: STM #lk, MMR (2 words) */
@@ -3964,21 +4039,32 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
 
-        /* 0x98/0x99: STH src, Smem — store high accumulator (no shift)
-         * 0x9A/0x9B: STL src, Smem — store low accumulator (no shift)
-         * Per SPRU172C: 1001 100S = STH, 1001 101S = STL */
+        /* AUDIT FIX 2026-05-08 night : STL ↔ STH swap.
+         * Per binutils tic54x-opc.c :
+         *   { "stl", 1,3,3, 0x9800, 0xFE00, {OP_SRC1,OP_SHFT,OP_Xmem} }
+         *   { "sth", 1,3,3, 0x9A00, 0xFE00, {OP_SRC1,OP_SHFT,OP_Xmem} }
+         * Old decoder claimed 0x98/99=STH and 0x9A/9B=STL — exactly inverted.
+         * Effect: every STL/STH-with-shift in firmware wrote the WRONG half
+         * of the accumulator. Hot pattern in DSP code (post-MAC scaling),
+         * so this corrupted ~half of all data writes from compute paths.
+         * Shift application is intentionally simplified (no SHFT decode)
+         * matching prior-art handlers — Tier B will add proper 4-bit shift
+         * decode from low nibble. Mirror swap : write low for 0x98/99,
+         * write high for 0x9A/9B, src bit 8 selects A/B. */
         if (hi8 == 0x98 || hi8 == 0x99) {
+            /* STL src, SHFT, Xmem — store LOW (acc&0xFFFF) */
             addr = resolve_smem(s, op, &ind);
-            int src_sth = hi8 & 1;
-            int64_t acc = src_sth ? s->b : s->a;
-            data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
+            int src = hi8 & 1;
+            int64_t acc = src ? s->b : s->a;
+            data_write(s, addr, (uint16_t)(acc & 0xFFFF));
             return consumed + s->lk_used;
         }
         if (hi8 == 0x9A || hi8 == 0x9B) {
+            /* STH src, SHFT, Xmem — store HIGH (acc>>16) */
             addr = resolve_smem(s, op, &ind);
-            int src_stl = hi8 & 1;
-            int64_t acc = src_stl ? s->b : s->a;
-            data_write(s, addr, (uint16_t)(acc & 0xFFFF));
+            int src = hi8 & 1;
+            int64_t acc = src ? s->b : s->a;
+            data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
 
@@ -4074,41 +4160,35 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0x80) {
-            /* STUB-NOP : tic54x dit 0x80 = STL src,Smem (1-word).
-             * Ancienne classification qemu = MVDD 2-word (incorrect).
-             * Voir doc/opcodes/tic54x_hi8_map.md. Neutralisé pour éviter
-             * les écritures mémoire fantômes en attendant impl correcte. */
-            return 1;
+            /* AUDIT FIX 2026-05-08 night : was stubbed NOP because old
+             * decoder claimed MVDD (2-word, wrong). Per binutils tic54x-opc.c :
+             *   { "stl", 1,2,2, 0x8000, 0xFE00, {OP_SRC1,OP_Smem}, 0, REST }
+             * 0x80xx/0x81xx = STL src, Smem (1-word, no shift). bit 8 = src.
+             * Range 0x8000-0x80FF = STL A, Smem (since bit 8 = 0 here).
+             * Stubbing this silently dropped every STL A in the firmware ;
+             * variables that should have been written to DARAM kept stale
+             * values (junk-state cascade). Mirror of the existing 0x82
+             * STH-with-shift handler but no shift here. */
+            addr = resolve_smem(s, op, &ind);
+            data_write(s, addr, (uint16_t)(s->a & 0xFFFF));
+            return consumed + s->lk_used;
         }
         if (hi8 == 0x8C) {
-            /* MVPD pmad, Smem (prog→data) */
+            /* AUDIT FIX 2026-05-08 night : was MVPD pmad,Smem (2 mots,
+             * prog→data move). Per binutils tic54x-opc.c :
+             *   { "mvpd", 2,2,2, 0x7C00, 0xFF00, {OP_pmad,OP_Smem}, 0, REST }
+             *   { "st",   1,2,2, 0x8C00, 0xFF00, {OP_T,OP_Smem},    0, REST }
+             * Real MVPD is at 0x7C — the 0x8C handler should be ST T, Smem
+             * (1 mot, store T register to data memory). Run-trace confirms
+             * 0 MVPD hits with the old handler, meaning firmware did not
+             * issue any 0x7Cxx → our wrong 0x8C MVPD was never triggered
+             * for legitimate MVPD anyway (PROM0 OVLY happens via DSP
+             * bootloader, not via 0x7C MVPD instruction). Switching to
+             * ST T,Smem is safe and unblocks the legitimate ST T pattern
+             * used after MAC for T persistence. Old MVPD-LOG instrumentation
+             * removed — was dead-code in current run. */
             addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t mvpd_val = prog_read(s, op2);
-            data_write(s, addr, mvpd_val);
-            {
-                static unsigned mvpd_log = 0;
-                static unsigned mvpd_total;
-                static uint16_t src_min = 0xFFFF, src_max;
-                static uint16_t dst_min = 0xFFFF, dst_max;
-                static unsigned hits_a040;
-                mvpd_total++;
-                if (op2 < src_min) src_min = op2;
-                if (op2 > src_max) src_max = op2;
-                if (addr < dst_min) dst_min = addr;
-                if (addr > dst_max) dst_max = addr;
-                if (addr >= 0xa040 && addr <= 0xa080) hits_a040++;
-                if (mvpd_log++ < 500 ||
-                    (addr >= 0xa040 && addr <= 0xa080) ||
-                    (mvpd_total % 1000) == 0)
-                    C54_LOG("MVPD#%u: prog[0x%04x]=0x%04x → data[0x%04x] PC=0x%04x insn=%u%s",
-                            mvpd_total, op2, mvpd_val, addr, s->pc, s->insn_count,
-                            (addr >= 0xa040 && addr <= 0xa080) ? " *A040*" : "");
-                if ((mvpd_total % 500) == 0)
-                    C54_LOG("MVPD-SUMMARY total=%u src=[0x%04x..0x%04x] dst=[0x%04x..0x%04x] hits_a040=%u",
-                            mvpd_total, src_min, src_max, dst_min, dst_max, hits_a040);
-            }
+            data_write(s, addr, s->t);
             return consumed + s->lk_used;
         }
         if (hi8 == 0x8E) {

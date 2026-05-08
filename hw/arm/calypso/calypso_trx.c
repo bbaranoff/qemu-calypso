@@ -872,17 +872,32 @@ static void calypso_tdma_start(CalypsoTRX *s)
 }
 
 /* ---- kick ----
- * Periodic CPU exit + main-loop wake. Originally on QEMU_CLOCK_REALTIME
- * (vestigial workaround for an old QEMU main-loop blocking issue). Moved
- * to QEMU_CLOCK_VIRTUAL on 2026-05-07 so it cooperates with -icount mode :
- * under icount, REALTIME advances independently of guest progress, and a
- * REALTIME-driven cpu_exit was interrupting the TCG burst before the
- * VIRTUAL-clock TDMA timer could reach its deadline → bridge UDP path
- * frozen. With VIRTUAL, the kick fires in the same time domain as every
- * other Calypso timer.
+ * Periodic CPU exit + main-loop wake. Whose role is to force the event
+ * loop to service fd handlers (UDP bridge sockets, chardev) even when
+ * the guest is in long TCG bursts.
+ *
+ * AUDIT FIX 2026-05-08 night : reverted to QEMU_CLOCK_REALTIME (was
+ * moved to VIRTUAL on 2026-05-07 based on a faulty diagnosis).
+ *
+ * Rationale per Claude web event-loop audit :
+ *  - Under -icount, VIRTUAL warps with guest progress. A VIRTUAL-clock
+ *    kick fires "in sync" with the guest = tautologically useless,
+ *    cpu_exit becomes a no-op (we're already in the main loop when the
+ *    timer dispatches), and the kick contributes nothing.
+ *  - REALTIME on the other hand advances independently and guarantees
+ *    that fd handlers are serviced at wall-time intervals regardless
+ *    of guest TCG burst length. This is precisely the original purpose.
+ *  - The 2026-05-07 claim that REALTIME-driven cpu_exit was blocking
+ *    VIRTUAL TDMA timers was wrong : cpu_exit terminates the current
+ *    burst, the main loop runs the next one immediately, and virtual
+ *    time is not gated on cpu_exit calls.
+ *
+ * The real culprit blocking the bridge under icount was the
+ * `main_loop_wait(false)` recursive call in calypso_uart_rx_poll
+ * (fixed in calypso_uart.c same session), not this kick timer.
  */
 static QEMUTimer *g_kick_timer;
-static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+5000000);}
+static void calypso_kick_cb(void *o){CPUState*cpu=first_cpu;if(cpu)cpu_exit(cpu);qemu_notify_event();timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);}
 
 /* ---- Sercomm burst transport (DLCI 4) ---- */
 
@@ -1005,8 +1020,8 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     s->dsp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_dsp_done,s);
     s->frame_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_frame_irq_lower,s);
 
-    g_kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_kick_cb,NULL);
-    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)+5000000);
+    g_kick_timer = timer_new_ns(QEMU_CLOCK_REALTIME,calypso_kick_cb,NULL);
+    timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
 
     /* C54x DSP emulator */
     {

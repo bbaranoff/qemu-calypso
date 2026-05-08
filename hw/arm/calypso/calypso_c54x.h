@@ -215,7 +215,28 @@ typedef struct C54xState {
      * PC/opcode rather than the post-advance PC. */
     uint16_t last_exec_pc;
     uint16_t last_exec_op;
+
+    /* writer_kind : set by each opcode handler / external writer before
+     * calling data_write. Logged in DATA-W-MMR trace to disambiguate
+     * which path is responsible for stray writes to MMR (addr<=0x1F).
+     * Reset to WK_UNKNOWN at the top of c54x_exec_one. */
+    uint8_t  writer_kind;
 } C54xState;
+
+/* writer_kind enum — keep small, extend as needed */
+enum {
+    WK_UNKNOWN     = 0,
+    WK_OPCODE_F3   = 1,   /* 0xF3xx family (SFTL/AND/OR/XOR/INTR/etc.) */
+    WK_OPCODE_8x   = 2,   /* 0x80xx-0x8Fxx (STL/STH/STLM/STM/LD-Smem) */
+    WK_OPCODE_77   = 3,   /* 0x77xx STM #lk, MMR */
+    WK_OPCODE_76   = 4,   /* 0x76xx ST #lk, Smem */
+    WK_OPCODE_PSHM = 5,   /* PSHM/POPM stack ops */
+    WK_OPCODE_RET  = 6,   /* RET/RETI/RETD frame restore */
+    WK_IRQ_ACK     = 7,   /* IRQ acknowledge / vector dispatch */
+    WK_ARM_MMIO    = 8,   /* ARM-side write through shared region */
+    WK_RESOLVE_AR  = 9,   /* resolve_smem AR-modify side effect */
+    WK_OPCODE_OTHER= 10,  /* anything else inside an opcode handler */
+};
 
 /* Feed burst samples to BSP (called by calypso_trx) */
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n);

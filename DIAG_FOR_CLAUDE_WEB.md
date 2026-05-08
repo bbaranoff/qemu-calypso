@@ -1,6 +1,38 @@
-# DIAG — DSP CCCH demod blocker (2026-05-08)
+# DIAG — DSP CCCH demod blocker (2026-05-08, refresh from live run)
 
 QEMU Calypso emulator. State after the **2026-05-08 hack purge**.
+
+## Live run snapshot (this session)
+
+Container `trying` (`bastienbaranoff/free-bb:removed-hacks-broken`) up,
+qemu-system-arm running, full osmocom chain alive, mobile launched.
+After ~580M DSP insn :
+
+```
+ARM side  : fbsb hook fires repeatedly (task=5 FB0_SEARCH, fn=9520→9534…)
+DSP side  : RPTB tight loop, PC HIST dominated by e9ab,e9ac,e9ae,e9b0,
+            e9b2,e9b4,e9b6 (each ≈ 14286 hits / 100k window)
+DMA ch0   : SRC=0x0000 PC=0xe9b6 — never armed
+McBSP     : sub[0x00]=0x0000 PC=0xe9b6 — feeds zero
+NDB writes: d_spcx_rif=0, d_dsp_page=0 in loop, op[pc-2..pc+1]=b398 b3dc cb9a 4914
+Counters  : fb0_att=0 fb1_att=0 sb_att=0 (no FB detected ever)
+```
+
+The e9ab..e9b6 block is the **RPTB-awaits-INT3** loop already identified
+in `project_session_20260508_diag_v2_findings.md`. The DSP is parked there
+waiting for the frame ISR. ARM keeps publishing tasks ; DSP never picks
+them up because INT3/BRINT0 service path is still not delivering.
+
+This matches `project_session_20260508_pm_fbdet_split.md` : PM is alive
+on the firmware side but never transitions to FB-det because the
+upstream IRQ rate is ~1.5 Hz instead of ~217 Hz. The `force daram[0x62]=1`
+probe (CLAUDE.md NEXT) is the only way past one of those gates ; more
+gates sit downstream.
+
+**Bottom line** : the new blocker is upstream of CCCH demod — it's the
+DSP frame-interrupt wiring (INT3 / BRINT0). Until the DSP exits e9ab..e9b6
+under its own steam (real ISR write to dispatcher flags in DARAM[0x60..0x70]),
+no DL bursts get demodulated regardless of what the bridge feeds.
 
 ## What happened
 
