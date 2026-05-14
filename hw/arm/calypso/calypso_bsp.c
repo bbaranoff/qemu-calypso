@@ -64,6 +64,29 @@ static int rach_force_bsic(void);
  * — confirmed not the bottleneck. Restored to 64.) */
 #define BSP_FN_MATCH_WINDOW  64
 
+/* === DARAM write-by-range instrumentation (2026-05-14) ===
+ *
+ * Plages observées dans le rapport 05-14 + finding 100% match PROM0 :
+ *   low    : DARAM zone lue par AR3 stride +19 dans le correlator FB-det
+ *   target : zone cible CALYPSO_BSP_DARAM_ADDR par défaut (0x3FB0..)
+ *   wrap   : zone wrap circulaire AR2/AR7 BK=176 stride -19
+ *   other  : ailleurs (incluant débord daram_len=296 vers [0x4000..0x40D7])
+ *
+ * Une stat tranche 3 hypothèses sur la priorité A :
+ *   low=0 ET target=0 ET wrap=0 → BSP DMA jamais armée (bug amont TPU/INTH)
+ *   target>>0 ET low=0          → BSP écrit mais env var ignorée
+ *   low>>0                       → BSP écrit où il faut, mismatch est en contenu/timing
+ *
+ * Exposé via log line `[BSP] DARAM-WR-STATS ...` toutes les 1000 writes,
+ * parseable par le harnais pytest (test_bsp_daram_write_distribution). */
+#define BSP_BUCKET_LOW_LO     0x0000
+#define BSP_BUCKET_LOW_HI     0x03A3
+#define BSP_BUCKET_TARGET_LO  0x3FB0
+#define BSP_BUCKET_TARGET_HI  0x3FFF
+#define BSP_BUCKET_WRAP_LO    0xFC5D
+#define BSP_BUCKET_WRAP_HI    0xFFED
+#define BSP_DARAM_WR_LOG_EVERY 1000
+
 typedef struct {
     int16_t  iq[296];  /* 148 I/Q pairs max */
     int      n;        /* number of int16 values */
@@ -92,7 +115,40 @@ static struct {
 
     /* FN-indexed queue per TN */
     BspBurstQueue  q[BSP_NUM_TN];
+
+    /* DARAM write-by-range counters (cf. BSP_BUCKET_* + 2026-05-14 plan). */
+    uint64_t   wr_low;
+    uint64_t   wr_target;
+    uint64_t   wr_wrap;
+    uint64_t   wr_other;
+    uint64_t   wr_total;
+    uint64_t   wr_last_logged;
 } bsp;
+
+/* Incrémente le bucket selon `addr` puis émet une ligne stats périodiquement.
+ * Appelé à chaque write DARAM côté BSP (rx_burst direct + deliver_buffered). */
+static inline void bsp_daram_wr_bucket(uint16_t addr)
+{
+    bsp.wr_total++;
+    if (addr <= BSP_BUCKET_LOW_HI) {
+        bsp.wr_low++;
+    } else if (addr >= BSP_BUCKET_TARGET_LO && addr <= BSP_BUCKET_TARGET_HI) {
+        bsp.wr_target++;
+    } else if (addr >= BSP_BUCKET_WRAP_LO && addr <= BSP_BUCKET_WRAP_HI) {
+        bsp.wr_wrap++;
+    } else {
+        bsp.wr_other++;
+    }
+    if (bsp.wr_total - bsp.wr_last_logged >= BSP_DARAM_WR_LOG_EVERY) {
+        bsp.wr_last_logged = bsp.wr_total;
+        BSP_LOG("DARAM-WR-STATS low=%llu target=%llu wrap=%llu other=%llu total=%llu",
+                (unsigned long long)bsp.wr_low,
+                (unsigned long long)bsp.wr_target,
+                (unsigned long long)bsp.wr_wrap,
+                (unsigned long long)bsp.wr_other,
+                (unsigned long long)bsp.wr_total);
+    }
+}
 
 /* Signed hyperframe distance (entry_fn - reference_fn) in (-H/2, H/2]. */
 static int32_t bsp_fn_delta(uint32_t entry_fn, uint32_t ref_fn)
@@ -463,7 +519,9 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     /* Also write to DARAM for code that reads samples directly. */
     static unsigned woff = 0;
     for (int i = 0; i < n; i++) {
-        bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = (uint16_t)iq[i];
+        uint16_t a = (uint16_t)(bsp.daram_addr + woff);
+        bsp.dsp->data[a] = (uint16_t)iq[i];
+        bsp_daram_wr_bucket(a);
         woff++;
         if (woff >= bsp.daram_len) woff = 0;
     }
@@ -528,7 +586,9 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
 
         static unsigned woff = 0;
         for (int i = 0; i < n; i++) {
-            bsp.dsp->data[(uint16_t)(bsp.daram_addr + woff)] = (uint16_t)sl->iq[i];
+            uint16_t a = (uint16_t)(bsp.daram_addr + woff);
+            bsp.dsp->data[a] = (uint16_t)sl->iq[i];
+            bsp_daram_wr_bucket(a);
             woff++;
             if (woff >= bsp.daram_len) woff = 0;
         }

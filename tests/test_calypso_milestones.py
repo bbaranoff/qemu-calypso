@@ -44,7 +44,8 @@ import pytest
 
 CONTAINER_NAME = os.environ.get("CALYPSO_CONTAINER", "trying")
 HOST_ROOT      = Path(os.environ.get("CALYPSO_HOST_ROOT", "/home/nirvana/myconfigs/osmo_root"))
-QEMU_LOG       = HOST_ROOT / "qemu.log"
+QEMU_LOG_CONTAINER = "/root/qemu.log"   # canonical, lecture via docker exec
+QEMU_LOG       = HOST_ROOT / "qemu.log" # backup mount, peut être stale
 MOBILE_PCAP    = HOST_ROOT / "mobile-gsmtap.pcap"
 
 REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/home/nirvana/qemu-calypso"))
@@ -79,9 +80,22 @@ T_FB0_ATT_CONVERGE    = 600.0
 # HELPERS conteneur
 # ---------------------------------------------------------------------------
 
+def _docker_cmd_or_none() -> Optional[list[str]]:
+    """Détecte le prefix docker utilisable (direct ou via `sudo -n`)."""
+    for prefix in (["docker"], ["sudo", "-n", "docker"]):
+        r = subprocess.run([*prefix, "info"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return prefix
+    return None
+
+_DOCKER = _docker_cmd_or_none()
+
 def docker_exec(cmd: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
+    if _DOCKER is None:
+        return subprocess.CompletedProcess(args=cmd, returncode=127,
+                                           stdout="", stderr="docker inaccessible")
     return subprocess.run(
-        ["docker", "exec", CONTAINER_NAME] + cmd,
+        [*_DOCKER, "exec", CONTAINER_NAME] + cmd,
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -90,24 +104,36 @@ def journal_grep(needle: str, since_seconds: int = 60) -> list[str]:
     r = docker_exec(["journalctl", f"--since=-{since_seconds}s", "--no-pager", "-o", "cat"])
     return [l for l in r.stdout.splitlines() if needle in l]
 
+def _qemu_log_size_container() -> int:
+    """Taille de /root/qemu.log côté container."""
+    r = docker_exec(["sh", "-c", f"wc -c < {QEMU_LOG_CONTAINER} 2>/dev/null || echo 0"])
+    try:
+        return int(r.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
 def tail_qemu_log(needle: str, timeout: float, since_byte: int = 0) -> Optional[str]:
-    """Tail QEMU_LOG (mount /root) jusqu'à voir `needle`."""
+    """
+    Tail /root/qemu.log côté container jusqu'à voir `needle`.
+    `since_byte` = offset retourné par qemu_log_offset() au début du test.
+    """
     deadline = time.monotonic() + timeout
-    pos = since_byte
+    last_size = since_byte
     while time.monotonic() < deadline:
-        if not QEMU_LOG.exists():
-            time.sleep(0.2); continue
-        with open(QEMU_LOG, "r", errors="ignore") as f:
-            f.seek(pos)
-            for line in f:
+        cur = _qemu_log_size_container()
+        if cur > last_size:
+            delta = cur - last_size
+            r = docker_exec(["sh", "-c", f"tail -c {delta} {QEMU_LOG_CONTAINER}"])
+            for line in r.stdout.splitlines():
                 if needle in line:
                     return line.rstrip()
-            pos = f.tell()
-        time.sleep(0.2)
+            last_size = cur
+        time.sleep(0.5)
     return None
 
 def qemu_log_offset() -> int:
-    return QEMU_LOG.stat().st_size if QEMU_LOG.exists() else 0
+    """Position de fin de /root/qemu.log côté container (baseline pour sample)."""
+    return _qemu_log_size_container()
 
 
 # ---------------------------------------------------------------------------
