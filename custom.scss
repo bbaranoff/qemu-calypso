@@ -1,0 +1,148 @@
+/*-- scss:defaults --*/
+
+// Polices manuscrites depuis Google Fonts
+@import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Kalam:wght@300;400;700&family=Patrick+Hand&family=Special+Elite&display=swap');
+
+$font-family-sans-serif: "Kalam", "Patrick Hand", system-ui, sans-serif !default;
+$headings-font-family: "Caveat", "Kalam", cursive !default;
+$font-family-monospace: "Special Elite", "Cascadia Code", "Courier New", monospace !default;
+
+$body-bg: #faf7ed !default;
+$body-color: #2a2a2a !default;
+$link-color: #1a3a8a !default;
+
+/*-- scss:rules --*/
+
+body {
+  font-size: 1.1rem !important;
+  line-height: 1.75 !important;
+  // Texture papier subtile (lignes horizontales très légères)
+  background-image:
+    repeating-linear-gradient(0deg, transparent, transparent 23px, rgba(0,0,0,0.02) 23px, rgba(0,0,0,0.02) 24px);
+}
+
+// Headers tordus, légèrement inclinés
+h1, h2, h3, h4 {
+  display: inline-block;
+  position: relative;
+}
+
+h1 {
+  font-size: 3.2rem !important;
+  transform: rotate(-1.2deg);
+  margin-bottom: 1.5rem;
+}
+
+h2 {
+  font-size: 2.3rem !important;
+  transform: rotate(-0.6deg);
+  text-decoration: underline wavy;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 6px;
+  margin-top: 2.5rem;
+}
+
+h3 {
+  font-size: 1.7rem !important;
+  transform: rotate(-0.3deg);
+}
+
+// Code blocks : bordures dessinées-main asymétriques
+div.sourceCode, pre.sourceCode, pre {
+  border: 2.5px solid #2a2a2a !important;
+  border-radius: 255px 15px 225px 15px / 15px 225px 15px 255px !important;
+  background-color: #fdfaf0 !important;
+  box-shadow: 4px 4px 0 rgba(0,0,0,0.08);
+  padding: 1rem 1.2rem !important;
+  font-family: "Cascadia Code", "Special Elite", monospace !important;
+  font-size: 0.95em !important;
+}
+
+// Code inline : petits rectangles tordus surlignés
+code:not(.sourceCode) {
+  background-color: #fff3c4 !important;
+  border: 1.5px solid #333 !important;
+  border-radius: 11px 5px 13px 7px / 8px 13px 5px 11px !important;
+  padding: 1px 7px !important;
+  font-family: "Cascadia Code", "Special Elite", monospace !important;
+  font-size: 0.92em !important;
+}
+
+// Liens : soulignement ondulé
+a {
+  text-decoration: underline wavy !important;
+  text-decoration-thickness: 1.5px !important;
+  text-underline-offset: 4px !important;
+}
+
+// Blockquotes
+blockquote {
+  border-left: 5px solid #333 !important;
+  background: rgba(255, 240, 180, 0.25);
+  padding: 0.8rem 1.2rem;
+  border-radius: 8px 30px 8px 30px / 25px 8px 30px 8px;
+  font-style: italic;
+}
+
+// Tables avec bordures dessinées-main
+table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+  border: 2.5px solid #333 !important;
+  border-radius: 15px 5px 12px 8px / 8px 15px 6px 12px !important;
+  overflow: hidden;
+  box-shadow: 3px 3px 0 rgba(0,0,0,0.08);
+}
+
+table th, table td {
+  border-bottom: 1.5px dashed #888 !important;
+  padding: 0.5rem 0.8rem !important;
+}
+
+// Callouts
+.callout {
+  border: 2.5px solid #333 !important;
+  border-radius: 25px 8px 22px 12px / 12px 22px 8px 25px !important;
+  box-shadow: 4px 4px 0 rgba(0,0,0,0.08);
+}
+
+// TOC sidebar
+.sidebar-navigation {
+  font-family: "Kalam", cursive !important;
+}
+
+.sidebar-navigation .nav-link {
+  font-size: 1.05rem !important;
+  border-radius: 11px 5px 13px 7px / 8px 13px 5px 11px !important;
+  padding: 0.3rem 0.7rem !important;
+}
+
+.sidebar-navigation .nav-link:hover {
+  background: rgba(255, 240, 180, 0.5) !important;
+  transform: rotate(-0.5deg);
+}
+
+.sidebar-navigation .nav-link.active {
+  background: rgba(255, 220, 100, 0.4) !important;
+  font-weight: 700 !important;
+}
+
+// Bloc titre du document
+.quarto-title-block {
+  border-bottom: 3px solid #333 !important;
+  padding-bottom: 1rem;
+  margin-bottom: 2rem;
+}
+
+// Séparateurs horizontaux
+hr {
+  border: none !important;
+  border-top: 3px dashed #333 !important;
+  margin: 2rem 0 !important;
+}
+
+// Boutons code-fold / code-tools
+.code-fold-btn, details summary {
+  font-family: "Kalam", cursive !important;
+  font-size: 0.9em !important;
+}
