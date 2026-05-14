@@ -203,10 +203,34 @@ def grep_dsp_rom_for_init(opcode_hex_low: int) -> list[tuple[str, int, Optional[
 # FIXTURES — le run est déjà lancé dans le container, on observe seulement
 # ---------------------------------------------------------------------------
 
+def _detect_docker_cmd() -> Optional[list[str]]:
+    """Retourne le prefix docker exécutable, ou None si pas d'accès."""
+    for prefix in (["docker"], ["sudo", "-n", "docker"]):
+        r = subprocess.run([*prefix, "info"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return prefix
+    return None
+
+
 @pytest.fixture(scope="session")
 def container_alive():
+    docker = _detect_docker_cmd()
+    if docker is None:
+        # Fallback host-side : qemu-system-arm en process suffit comme preuve de vie
+        r = subprocess.run(
+            ["pgrep", "-f", "qemu-system-arm.*calypso"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return  # OK, on bypasse docker inspect
+        pytest.skip(
+            f"Pas d'accès docker (ni direct, ni `sudo -n`) ET pas de "
+            f"qemu-system-arm visible côté host. Ajoute `nirvana` au groupe "
+            f"docker ou lance pytest avec sudo."
+        )
+        return
     r = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+        [*docker, "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
         capture_output=True, text=True,
     )
     if r.returncode != 0 or r.stdout.strip() != "true":

@@ -89,24 +89,50 @@ BRIDGE_FN_DRIFT_MAX_FRAMES      = 8
 # HELPERS
 # ---------------------------------------------------------------------------
 
+def _detect_docker_cmd() -> Optional[list[str]]:
+    """Retourne le prefix docker (direct ou via sudo -n), ou None si pas d'accès."""
+    for prefix in (["docker"], ["sudo", "-n", "docker"]):
+        r = subprocess.run([*prefix, "info"], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return prefix
+    return None
+
+DOCKER_CMD: Optional[list[str]] = _detect_docker_cmd()
+
+
 def dexec(cmd: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
+    if DOCKER_CMD is None:
+        return subprocess.CompletedProcess(args=cmd, returncode=127,
+                                           stdout="", stderr="docker inaccessible")
     return subprocess.run(
-        ["docker", "exec", CONTAINER, *cmd],
+        [*DOCKER_CMD, "exec", CONTAINER, *cmd],
         capture_output=True, text=True, timeout=timeout,
     )
 
 def dexec_sh(shell_cmd: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    if DOCKER_CMD is None:
+        return subprocess.CompletedProcess(args=shell_cmd, returncode=127,
+                                           stdout="", stderr="docker inaccessible")
     return subprocess.run(
-        ["docker", "exec", CONTAINER, "sh", "-c", shell_cmd],
+        [*DOCKER_CMD, "exec", CONTAINER, "sh", "-c", shell_cmd],
         capture_output=True, text=True, timeout=timeout,
     )
 
 def container_running() -> bool:
+    """Container up ? Tente docker inspect, puis sudo, puis fallback host pgrep."""
+    if DOCKER_CMD is not None:
+        r = subprocess.run(
+            [*DOCKER_CMD, "inspect", "-f", "{{.State.Running}}", CONTAINER],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip() == "true":
+            return True
+    # Fallback host : qemu-system-arm en process = run vivant
     r = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER],
+        ["pgrep", "-f", "qemu-system-arm.*calypso"],
         capture_output=True, text=True,
     )
-    return r.returncode == 0 and r.stdout.strip() == "true"
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 def list_processes() -> dict[str, list[int]]:
     """Retourne {nom_binaire: [pid, ...]} sur le container."""
@@ -171,6 +197,12 @@ def journal_sample(window_s: float, units: Optional[list[str]] = None) -> list[s
 @pytest.fixture(scope="session", autouse=True)
 def _container_alive():
     if not container_running():
+        if DOCKER_CMD is None:
+            pytest.skip(
+                f"Pas d'accès docker (ni direct, ni `sudo -n`) ET pas de "
+                f"qemu-system-arm visible côté host. Ajoute `nirvana` au "
+                f"groupe docker ou lance pytest avec sudo."
+            )
         pytest.skip(f"Container '{CONTAINER}' down — `docker start {CONTAINER}`")
 
 
