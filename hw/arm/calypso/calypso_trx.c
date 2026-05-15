@@ -160,9 +160,23 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
-    uint64_t val = (size == 2) ? s->dsp_ram[offset/2] :
-                   (size == 4) ? (s->dsp_ram[offset/2] | ((uint32_t)s->dsp_ram[offset/2+1] << 16)) :
-                   ((uint8_t *)s->dsp_ram)[offset];
+    /* === FIX 2026-05-15 : DSP→ARM mirror was missing ===
+     *
+     * Bug : `s->dsp_ram[]` et `s->dsp->data[]` sont deux arrays distincts.
+     * Le write path (calypso_dsp_write line 258) mirror ARM→DSP, mais le
+     * read path lisait seulement dsp_ram[] → toutes les écritures DSP étaient
+     * invisibles pour ARM. Verrouille tout le projet depuis ~6 mois :
+     * d_fb_det reste vu à 0 par firmware → FBSB_CONF=FAIL → mobile coincé.
+     *
+     * Fix : lire depuis dsp->data[] qui est la source de vérité (DSP writes
+     * via opcode + ARM writes mirrorés par calypso_dsp_write).
+     * Fallback sur dsp_ram[] si s->dsp pas encore alloué (pre-realize). */
+    uint16_t *src = (s->dsp && s->dsp->data)
+                    ? &s->dsp->data[offset/2 + 0x0800]
+                    : &s->dsp_ram[offset/2];
+    uint64_t val = (size == 2) ? src[0] :
+                   (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
+                   ((uint8_t *)src)[offset & 1];
     /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {

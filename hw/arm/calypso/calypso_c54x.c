@@ -79,6 +79,9 @@ static inline int asm_shift(C54xState *s)
 /* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
 static uint16_t prog_read(C54xState *s, uint32_t addr);
 
+/* Propagated by D_BURST_D probe, consumed by A_CD-BY-BURST correlation. */
+static uint16_t g_last_d_burst_d;
+
 /* === Generic watch-write zone helper (2026-05-15 matin) ===
  *
  * Factorisation du pattern COEFFS-WR / A_CD-WR / ... : pour chaque zone
@@ -287,6 +290,46 @@ static void read_stats_trigger_check(C54xState *s)
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
+    /* D_BURST_D_W probe : DSP lit db_w->d_burst_d ?
+     * 0x0801 (W_PAGE_0 + offset 1), 0x0815 (W_PAGE_1 + offset 1).
+     * Si DSP read voit 0,1,2,3 séquentiel → ARM écrit correctement db_w.
+     * Si DSP read voit 0 toujours → ARM ne configure pas burst_id.
+     * Si DSP ne lit jamais → DSP ne consulte pas db_w pour le burst sequence. */
+    if (addr == 0x0801 || addr == 0x0815) {
+        static uint64_t dbw_total[2];
+        static uint64_t dbw_per_val[2][16];
+        static uint64_t dbw_last_log[2];
+        static uint16_t dbw_last_val[2];
+        int page = (addr == 0x0815) ? 1 : 0;
+        uint16_t cur_val = s->data[addr] & 0xF;
+        dbw_total[page]++;
+        if (cur_val < 16) dbw_per_val[page][cur_val]++;
+        bool changed = (cur_val != dbw_last_val[page]);
+        dbw_last_val[page] = cur_val;
+        if (dbw_total[page] <= 100 || changed
+            || (s->insn_count - dbw_last_log[page]) > 1000000) {
+            fprintf(stderr,
+                    "[c54x] D_BURST_D_W-RD page=%d #%llu addr=0x%04x "
+                    "val=0x%04x exec_pc=0x%04x insn=%u\n",
+                    page, (unsigned long long)dbw_total[page], addr,
+                    s->data[addr], s->last_exec_pc, s->insn_count);
+            dbw_last_log[page] = s->insn_count;
+        }
+        /* Summary toutes les 50000 reads : histogramme valeurs lues */
+        if ((dbw_total[page] % 50000) == 0) {
+            fprintf(stderr,
+                    "[c54x] D_BURST_D_W-SUMMARY page=%d total=%llu "
+                    "val[0]=%llu [1]=%llu [2]=%llu [3]=%llu other=%llu\n",
+                    page, (unsigned long long)dbw_total[page],
+                    (unsigned long long)dbw_per_val[page][0],
+                    (unsigned long long)dbw_per_val[page][1],
+                    (unsigned long long)dbw_per_val[page][2],
+                    (unsigned long long)dbw_per_val[page][3],
+                    (unsigned long long)(dbw_total[page]
+                        - dbw_per_val[page][0] - dbw_per_val[page][1]
+                        - dbw_per_val[page][2] - dbw_per_val[page][3]));
+        }
+    }
     /* PC-histogram pour identifier la routine PM. Deux ranges :
      *   [0x3fb0..0x3fbf] = buffer BSP (samples I/Q)
      *   [0x3dcf..0x3dd5] = buffer scratch dominant (78k+52k reads observés)
@@ -677,14 +720,87 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     }
     /* A_CD-WR : a_cd[15] in NDB starts at DSP word 0x09D0 (= API byte 0x03A0,
      * = NDB byte offset 0x1F8). 15 words = [0x09D0..0x09DE].
-     * Cible : tracker si le DSP CCCH demod (DSP_TASK_ALLC) écrit ses résultats.
-     * Verdict (au choix après run) :
-     *   total=0      → DSP n'entre jamais dans CCCH demod ou échoue avant store
-     *   total>0 val=0 → CCCH demod tourne mais sort 0/pattern bizarre
-     *   total>0 val varié → CCCH demod produit, bug ARM-side L1 ne consomme pas */
+     * Cible : tracker si le DSP CCCH demod (DSP_TASK_ALLC) écrit ses résultats. */
     {
         static WatchWriteState wws_a_cd;
         watch_write_zone_check(s, addr, val, "A_CD", 0x09d0, 0x09de, &wws_a_cd);
+        /* A_CD-BY-BURST : corrélation a_cd[] writes avec d_burst_d courant.
+         * Si DSP fait burst 0→1→2→3 → ~25% des writes par burst_id.
+         * Si on voit 0 writes avec burst=3 → DSP n'écrit jamais la fin de
+         * séquence, d'où firmware ARM nb_resp bail (sous-cause #3). */
+        if (addr >= 0x09d0 && addr <= 0x09de) {
+            static uint64_t a_cd_by_burst[16];
+            static uint64_t a_cd_corr_total;
+            static uint64_t a_cd_corr_last_log;
+            uint16_t b = g_last_d_burst_d & 0xF;
+            a_cd_by_burst[b]++;
+            a_cd_corr_total++;
+            if (a_cd_corr_total - a_cd_corr_last_log >= 1000) {
+                a_cd_corr_last_log = a_cd_corr_total;
+                fprintf(stderr,
+                        "[c54x] A_CD-BY-BURST total=%llu "
+                        "burst[0]=%llu [1]=%llu [2]=%llu [3]=%llu other=%llu\n",
+                        (unsigned long long)a_cd_corr_total,
+                        (unsigned long long)a_cd_by_burst[0],
+                        (unsigned long long)a_cd_by_burst[1],
+                        (unsigned long long)a_cd_by_burst[2],
+                        (unsigned long long)a_cd_by_burst[3],
+                        (unsigned long long)(a_cd_corr_total -
+                                             a_cd_by_burst[0] - a_cd_by_burst[1] -
+                                             a_cd_by_burst[2] - a_cd_by_burst[3]));
+            }
+        }
+    }
+    /* D_BURST_D probe (2026-05-15 midi) — watch d_burst_d à 0x0829 (page 0)
+     * et 0x083D (page 1). Mesures : per-PC counter, transition matrix,
+     * histogramme. Tranche la sous-cause :
+     *   0,1,2,3 séquentiel → DSP signale correct, bug ARM-side
+     *   0,1,2 jamais 3     → DSP cale au 4e burst (sous-cause #3)
+     *   pas de write       → DSP n'écrit pas cette cellule du tout
+     */
+    if (addr == 0x0829 || addr == 0x083D) {
+        static uint64_t db_total[2];
+        static uint64_t db_per_pc[2][0x10000];
+        static uint16_t db_prev[2];
+        static uint64_t db_trans[2][16][16];
+        static uint64_t db_last_log[2];
+        static uint64_t db_last_summary[2];
+        int page = (addr == 0x083D) ? 1 : 0;
+        uint16_t exec_pc = s->last_exec_pc;
+        uint16_t prev_val = db_prev[page];
+        uint16_t curr_val = val & 0xF;
+        db_total[page]++;
+        db_per_pc[page][exec_pc]++;
+        if (prev_val < 16 && curr_val < 16) {
+            db_trans[page][prev_val][curr_val]++;
+        }
+        db_prev[page] = curr_val;
+        g_last_d_burst_d = curr_val;  /* propage pour A_CD-BY-BURST */
+        bool should_log = db_total[page] <= 200
+            || (s->insn_count - db_last_log[page]) > 100000;
+        if (should_log) {
+            fprintf(stderr,
+                    "[c54x] D_BURST_D-WR page=%d #%llu addr=0x%04x val=0x%04x "
+                    "exec_pc=0x%04x prev=%u curr=%u insn=%u\n",
+                    page, (unsigned long long)db_total[page], addr, val,
+                    exec_pc, prev_val, curr_val, s->insn_count);
+            db_last_log[page] = s->insn_count;
+        }
+        if (s->insn_count - db_last_summary[page] >= 5000000) {
+            db_last_summary[page] = s->insn_count;
+            fprintf(stderr,
+                    "[c54x] D_BURST_D-SUMMARY page=%d total=%llu trans:",
+                    page, (unsigned long long)db_total[page]);
+            for (int p = 0; p < 8; p++) {
+                for (int c = 0; c < 8; c++) {
+                    if (db_trans[page][p][c]) {
+                        fprintf(stderr, " %u->%u=%llu",
+                                p, c, (unsigned long long)db_trans[page][p][c]);
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+        }
     }
     /* DATA-W-MMR : log every write into the low MMR window (addr <= 0x1F)
      * with full attribution context. Goal : disambiguate the IMR-W trace
@@ -1198,6 +1314,52 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                             (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
                             s->st0, s->insn_count);
                     override_log++;
+                }
+            }
+            /* === NEW 2026-05-15 : SET non-zero trace + SET→CLEAR delta ===
+             *
+             * Symétrique au ZERO-WR. Capture chaque write de val != 0 à 0x08F8
+             * pour identifier QUI set le FB found, et combien de cycles ça
+             * tient avant qu'un PC clear ne l'écrase.
+             *
+             * Si delta SET→CLEAR < 100 insn → bug opcode tape immédiatement
+             * (style POPM fix). Si delta = milliers d'insn → race timing
+             * légitime entre DSP set et ARM read.
+             */
+            {
+                static uint64_t last_set_insn;
+                static uint16_t last_set_val;
+                static uint16_t last_set_pc;
+                static unsigned set_log_n = 0;
+                static unsigned delta_log_n = 0;
+                if (val != 0) {
+                    /* SET event */
+                    if (set_log_n < 500) {
+                        C54_LOG("D_FB_DET SET #%u val=0x%04x PC=0x%04x op=0x%04x "
+                                "prev=0x%04x A=%010llx insn=%u",
+                                set_log_n + 1,
+                                val, s->pc, s->prog[s->pc],
+                                s->data[0x08F8],
+                                (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+                                s->insn_count);
+                        set_log_n++;
+                    }
+                    last_set_insn = s->insn_count;
+                    last_set_val = val;
+                    last_set_pc = s->pc;
+                } else if (s->data[0x08F8] != 0 && last_set_insn != 0) {
+                    /* CLEAR after non-zero — log delta */
+                    uint64_t delta = (uint64_t)s->insn_count - last_set_insn;
+                    if (delta_log_n < 100) {
+                        C54_LOG("D_FB_DET SET-TO-CLEAR-DELTA #%u "
+                                "set_PC=0x%04x set_insn=%llu set_val=0x%04x "
+                                "clear_PC=0x%04x clear_insn=%u delta=%llu cycles",
+                                delta_log_n + 1,
+                                last_set_pc, (unsigned long long)last_set_insn,
+                                last_set_val, s->pc, s->insn_count,
+                                (unsigned long long)delta);
+                        delta_log_n++;
+                    }
                 }
             }
             fbd_log++;
