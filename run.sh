@@ -141,9 +141,23 @@ tmux new-session -d -s "$SESSION" -n qemu
 # timer in calypso_trx.c was moved to QEMU_CLOCK_VIRTUAL so icount no
 # longer freezes the TDMA tick → bridge UDP path. If you observe the
 # bridge wait timeout again, fall back with CALYPSO_ICOUNT=off.
+# gdb-stub : activé d'office sur 0.0.0.0:1234 pour que les tests/scripts
+# d'injection (inject.py / validating.py / tests/test_inject_frames.py)
+# puissent s'y connecter sans avoir à passer par le monitor HMP. La syntaxe
+# `tcp::1234` bind sur toutes les interfaces du container — utilisable
+# depuis l'IP container (ex. 172.20.0.11:1234) côté host.
+# Override via CALYPSO_GDB_PORT (set vide pour désactiver).
+CALYPSO_GDB_PORT="${CALYPSO_GDB_PORT:-1234}"
+if [ -n "$CALYPSO_GDB_PORT" ]; then
+    QEMU_GDB_FLAG="-gdb tcp::$CALYPSO_GDB_PORT"
+else
+    QEMU_GDB_FLAG=""
+fi
+
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M calypso -cpu arm946 \
     $QEMU_ICOUNT_FLAG \
+    $QEMU_GDB_FLAG \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \
     -kernel "$FW_ELF" \
