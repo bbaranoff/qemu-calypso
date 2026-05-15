@@ -1,485 +1,498 @@
-# qemu-calypso
+# qemu-calypso — Synthèse
 
-**QEMU emulation of the TI Calypso GSM baseband chipset** — the dual-core SoC
-(ARM7TDMI + TMS320C54x DSP) used in the OpenMoko Neo, Compal e88 family, and
-arguably the most reverse-engineered cellular modem in open-source history.
-
-Runs the **real TI Calypso DSP ROM** (not a stub) and the unmodified
-[osmocom-bb](https://osmocom.org/projects/baseband/) `layer1.highram.elf`
-firmware on the ARM side. A Python bridge connects the BSP to `osmo-bts-trx`,
-allowing the emulator to camp on a fully simulated GSM cell with
-osmo-msc/hlr/bsc/stp in the back.
-
-No firmware patching. No `#ifdef QEMU`. The whole point is that the same binaries
-that run on a physical Motorola C123 also run here — and if something doesn't
-work, that's where the bug lives, not in a convenient stub.
-
-> *"You can't actually emulate a GSM phone."*
-> — about half the people who looked at this when it started.
+Émulation QEMU du chipset TI Calypso (ARM7 + DSP TMS320C54x) faisant tourner
+le firmware **osmocom-bb `layer1.highram.elf` non patché**, connecté à un BTS
+réel via le protocole TRX. L'objectif est qu'un mobile L23 (mobile / ccch_scan)
+puisse camper sur une cellule simulée bout en bout.
 
 ---
 
-## What it does, concretely
+## Vue d'ensemble
 
 ```
-   ┌────────────────────┐         ┌──────────────────────┐
-   │  osmocom-bb mobile │ ←L1CTL→ │  layer1.highram.elf  │   ← ARM, real firmware
-   │       (L23)        │         │   (ARM7TDMI + L1)    │
-   └────────────────────┘         └──────────┬───────────┘
-                                             │ API RAM
-                                             ▼
-                                  ┌──────────────────────┐
-                                  │ Calypso DSP (C54x)   │   ← runs real TI ROM
-                                  │ + TPU/TSP/IOTA/BSP   │   ← gated peripherals
-                                  └──────────┬───────────┘
-                                             │ UDP 6702
-                                             ▼
-                                  ┌──────────────────────┐
-                                  │  bridge.py (Python)  │   ← QEMU clock-slave
-                                  └──────────┬───────────┘
-                                             │ UDP 5700-5702
-                                             ▼
-                                  ┌──────────────────────┐
-                                  │     osmo-bts-trx     │   ← real BTS stack
-                                  │  + osmo-msc/hlr/bsc  │   ← real core network
-                                  └──────────────────────┘
+BTS (osmo-bts-trx)
+   │ UDP : TRXC 5701, TRXD 5702, CLK 5700
+   ▼
+bridge.py
+   │ PTY / UART (sercomm DLCI 4 = bursts, DLCI 5 = L1CTL)
+   ▼
+QEMU Calypso
+   ├── ARM946 (firmware layer1.highram.elf)
+   ├── DSP C54x (calypso_c54x.c, ~6000 lignes)
+   ├── Peripherals (UART, INTH, SPI/TWL3025, SIM, TPU, TSP, ULPD, IOTA, BSP)
+   ▼
+Unix socket /tmp/osmocom_l2_1 (L1CTL length-prefix)
+   ▼
+mobile / ccch_scan (OsmocomBB host tools)
 ```
 
-Full GSM stack, end to end, running in software, with the DSP doing actual
-correlation work on actual I/Q bursts coming from an actual GSM core network.
-
----
-
-## Where the project is right now (2026-05-15)
-
-| Layer                                              | Status                                          |
-|----------------------------------------------------|-------------------------------------------------|
-| QEMU SoC + ARM946 + C54x DSP cores                 | ✅ stable                                       |
-| TPU → TSP → IOTA → BSP gating                      | ✅ stable                                       |
-| Bridge BTS↔BSP (UDP 5700-5702 / 6702)              | ✅ 24 997 DL bursts forwarded/run               |
-| DSP boot + DARAM overlay + interrupt vectoring     | ✅ POPM fixed (05-08), INTM transitions clean   |
-| DSP FB-det compute (Goertzel/DFT)                  | ✅ converges (~3 min uptime)                    |
-| **DSP→ARM API RAM mirror**                         | **✅ fixed 2026-05-15 (5-line patch)**          |
-| FBSB success on real path (no synth)               | ✅ achieved at least once                       |
-| `task_md=24` (DSP_TASK_ALLC) firing                | ✅ 73× in deterministic bench                   |
-| DSP writes `a_cd[]` (CCCH demod result buffer)     | ✅ 251 writes/run observed                      |
-| ARM L1 `prim_rx_nb::l1s_nb_resp` invoked           | ✅ 60+ calls/run (was zero before fix)          |
-| `d_task_d` set to `DSP_TASK_ALLC` (24) at task end | ❌ never observed → **current wall**            |
-| `L1CTL_DATA_IND` forwarded to mobile               | ❌ 0 (blocked by above)                         |
-| Mobile decodes SI1-SI4                             | ⏭ pending DATA_IND                              |
-| RACH / Immediate Assignment / SDCCH / LU Accept    | ⏭ pending                                       |
-
-**Test harness**: 49 pytest milestones, **26 PASS stable**, 3 SKIP, 19 XFAIL,
-1 FAIL (the current wall). Each milestone is a discrete, measurable bascule
-point — they flip from XFAIL → PASS one at a time as the pipeline unlocks.
-
----
-
-## The 2026-05-15 breakthrough — DSP↔ARM mirror
-
-A bug that had silently blocked the project for ~6 months was localized and
-fixed in **5 lines**.
-
-### Symptom
-
-After two months of probes investigating "the data path is broken / BSP DMA
-doesn't write where the correlator reads", the real story turned out to be very
-different. The DSP **was** computing correctly. It **was** producing real
-Goertzel results (`0xbd2e`, `0x2014`, `0x3bb6` from PC=0x8217 op=0x9ab1, a STH
-instruction). The values were being written to `d_fb_det` at `0x08F8`. The ARM
-firmware was reading `d_fb_det` 192 times per FBSB cycle, looking for
-`d_fb_det != 0`.
-
-ARM was always seeing zero. 187 out of 192 reads returned `0x0000` despite the
-DSP setting non-zero values mid-window.
-
-### Root cause
-
-`calypso_dsp_read()` was reading from `s->dsp_ram[]` (an array embedded in the
-`CalypsoTRX` state). `calypso_dsp_write()` was writing both to `s->dsp_ram[]`
-*and* mirroring into `s->dsp->data[]` (the C54x state's data RAM). But the
-read path never had a corresponding mirror in the reverse direction. The DSP
-write path went to `s->dsp->data[]`, not `s->dsp_ram[]`.
-
-Result: every DSP write to the entire API RAM region (NDB at DSP `0x0800+`)
-was invisible to the ARM read path. The two arrays drifted apart from boot
-onward.
-
-### Fix
-
-`hw/arm/calypso/calypso_trx.c:163`:
-
-```c
-/* === FIX 2026-05-15 : DSP→ARM mirror was missing ===
- *
- * s->dsp_ram[] et s->dsp->data[] sont deux arrays distincts.
- * Le write path (calypso_dsp_write) mirror ARM→DSP, mais le read path
- * lisait seulement dsp_ram[] → toutes les écritures DSP étaient invisibles
- * pour ARM. Verrouille tout le projet depuis ~6 mois.
- */
-uint16_t *src = (s->dsp && s->dsp->data)
-                ? &s->dsp->data[offset/2 + 0x0800]
-                : &s->dsp_ram[offset/2];
-uint64_t val = (size == 2) ? src[0] :
-               (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
-               ((uint8_t *)src)[offset & 1];
-```
-
-### Effect
-
-Immediate, measurable on the same build:
-
-| Metric                            | Before fix      | After fix                  |
-|-----------------------------------|-----------------|----------------------------|
-| ARM RD `d_fb_det` non-zero ratio  | 0.5 %           | 2.9 %                      |
-| `task_md=5` (FB-det retries)      | 782             | 90 (down 8×)               |
-| `task_md=24` (DSP_TASK_ALLC)      | 0               | 20+                        |
-| FBSB success on real path         | never           | yes, deterministic w/synth |
-
-Real-path FBSB worked **for the first time in the history of the project**.
-Mobile transitioned from "blocked pre-FBSB" to "demanding CCCH mode".
+QEMU est **clock master** : il génère TINT0 toutes les 4.615 ms (une frame TDMA),
+envoie un paquet FN au bridge, le bridge sert de relais wall-paced vers la BTS.
 
 ---
 
 ## Quick start
 
 ```bash
-# Deterministic bench (what you want for downstream debugging)
-CALYPSO_ICOUNT=off CALYPSO_FBSB_SYNTH=1 ./run.sh
+# Build
+cd qemu && mkdir build && cd build
+../configure --target-list=arm-softmmu && ninja
 
-# Real DSP path (variance ~1-2 successful runs per 5)
-CALYPSO_ICOUNT=off CALYPSO_FBSB_SYNTH=0 ./run.sh
+# Lancement (orchestré, tmux session "calypso")
+docker exec osmo-operator-1 /opt/GSM/qemu-src/run.sh
 
-# Full deterministic (under active development, exposes INTM dwell bug)
-CALYPSO_ICOUNT=auto CALYPSO_FORCE_RX_DONE=1 CALYPSO_FBSB_SYNTH=1 ./run.sh
+# Variantes
+CALYPSO_FBSB_SYNTH=1 ./run.sh                              # synth FB/SB pour débloquer mobile en gsm322
+CALYPSO_ICOUNT=off CALYPSO_FBSB_SYNTH=1 ./run.sh           # bench déterministe
+CALYPSO_FORCE_RX_DONE=1 CALYPSO_FBSB_SYNTH=1 ./run.sh      # workaround SIM busy-poll
 ```
 
-Container: `bastienbaranoff/free-bb:latest` ships the whole GSM toolchain
-pre-built (osmocom-bb, osmo-bts-trx, osmo-msc/bsc/hlr/mgw, osmocon, mobile)
-plus the QEMU build tree at `/opt/GSM/qemu-src/build/`.
+Container `trying` (image `osmo-qemu`). Source `/opt/GSM/qemu-src/`,
+build `cd /opt/GSM/qemu-src/build && ninja qemu-system-arm`.
 
 ---
 
-## Environment variables
+## Architecture — composants
 
-| Variable                       | Default       | Effect                                                                                                        |
-|--------------------------------|---------------|---------------------------------------------------------------------------------------------------------------|
-| `CALYPSO_ICOUNT`               | `auto`        | QEMU `-icount` mode. `auto` exposes the INTM dwell bug, `off` lives with timing variance.                     |
-| `CALYPSO_FBSB_SYNTH`           | `0`           | `1` publishes synthetic FB/SB into NDB to unblock FBSB deterministically. Use `0` to exercise real path.      |
-| `CALYPSO_FORCE_RX_DONE`        | `0`           | Required workaround for a TCG bug on conditional STR @ 0x8224ac (SIM busy-poll) under `-icount=auto`.         |
-| `CALYPSO_W1C_LATCH`            | `0`           | `1` latches `a_sync_demod` values (DSP-write/ARM-read race mitigation).                                       |
-| `CALYPSO_BSP_DARAM_ADDR`       | `0x3fb0`      | DARAM target address for BSP DMA. Doesn't affect FB-det (AR init is firmware-imposed).                        |
-| `CALYPSO_DSP_IDLE_FF`          | `1`           | Fast-forward DSP idle dispatcher (pure host optimization, no semantic change).                                |
-| `CALYPSO_DSP_FBDET_SKIP`       | `0`           | Diagnostic option to skip FB-det inner loop entirely.                                                         |
-| `CALYPSO_NDB_D_RACH_OFFSET`    | `0x01CB`      | Override word index of `d_rach` in NDB (DSP version-dependent).                                               |
-| `CALYPSO_RACH_FORCE_BSIC`      | unset         | Force BSIC in RACH encoder (0-63). Match `osmo-bsc.cfg base_station_id_code`.                                 |
-| `BRIDGE_CLK_FROM_QEMU`         | `0`           | `1` → CLK IND driven by QEMU FN. Pair with `-icount` for fully virtual time.                                  |
-| `BRIDGE_DL_FN_REWRITE`         | `slot`        | DL FN rewrite policy (slot-aware vs naive).                                                                   |
-| `BRIDGE_DL_FN_LOOKAHEAD`       | `32`          | Lookahead margin for DL FN rewrite.                                                                           |
-| `BRIDGE_UL_FN_REWRITE`         | `slot`        | UL FN rewrite policy.                                                                                         |
-| `CALYPSO_DSP_ROM`              | `calypso_dsp.txt` | Path to DSP ROM dump.                                                                                     |
-| `CALYPSO_SIM_CFG`              | `~/.osmocom/bb/sim.cfg` | SIM IMSI/Ki config.                                                                                 |
-| `L1CTL_SOCK`                   | `/tmp/osmocom_l2` | Mobile↔QEMU L1CTL Unix socket.                                                                          |
+### Fichiers hardware QEMU
 
----
+| Fichier | Rôle |
+|---|---|
+| `hw/arm/calypso/calypso_mb.c` | Machine board (CPU, RAM, Flash, boot) |
+| `hw/arm/calypso/calypso_soc.c` | SoC, instancie les périphériques |
+| `hw/arm/calypso/calypso_trx.c` | TRX bridge, DSP API, TPU, TSP, SIM, ULPD |
+| `hw/arm/calypso/calypso_c54x.c` | Émulateur DSP TMS320C54x |
+| `hw/arm/calypso/calypso_bsp.c` | BSP DMA + UDP 6702 |
+| `hw/arm/calypso/calypso_iota.c` | IOTA BDLENA gating |
+| `hw/arm/calypso/calypso_fbsb.c` | Helper FB/SB synth ARM-side |
+| `hw/arm/calypso/calypso_sim.c` | SIM ISO 7816 |
+| `hw/arm/calypso/calypso_tint0.c` | Master clock 4.615 ms |
+| `hw/arm/calypso/sercomm_gate.c` | Sercomm DLCI router |
+| `hw/arm/calypso/l1ctl_sock.c` | L1CTL Unix socket |
+| `hw/char/calypso_uart.c` | UART 16550-like avec sercomm |
+| `hw/intc/calypso_inth.c` | Interrupt controller level-sensitive |
+| `hw/ssi/calypso_spi.c` | SPI + TWL3025 ABB |
+| `hw/timer/calypso_timer.c` | Timers HW |
 
-## Architecture
+### Scripts & bridge
 
-### Memory map (DSP side)
-
-| Range            | Type                   | Content                                                |
-|------------------|------------------------|--------------------------------------------------------|
-| `0x0000-0x007F`  | Boot ROM stubs         | `LDMM SP,B` + `RET` at 0x0000, NOP elsewhere           |
-| `0x0080-0x27FF`  | DARAM overlay (OVLY)   | Code + data, loaded by `MVPD` at boot                  |
-| `0x0800-0x27FF`  | API RAM (shared)       | NDB, db_buf_w (ARM→DSP), db_buf_r (DSP→ARM)            |
-| `0x2800-0x6FFF`  | Unmapped               | Reads as `0x0000`                                      |
-| `0x7000-0xDFFF`  | PROM0                  | DSP ROM                                                |
-| `0xE000-0xFF7F`  | PROM1 mirror           | Mirrored from page 1 (0x18000+)                        |
-| `0xFF80-0xFFFF`  | Interrupt vectors      | From PROM1, IPTR=0x1FF                                 |
-
-### Interrupt vectors
-
-`vec = imr_bit + 16`. `addr = 0xFF80 + vec * 4`
-
-| IRQ                | Vec | IMR bit | Address  |
-|--------------------|-----|---------|----------|
-| INT3 (frame)       | 19  | 3       | `0xFFCC` |
-| TINT0              | 20  | 4       | `0xFFD0` |
-| BRINT0 (BSP)       | 21  | 5       | `0xFFD4` |
-
-### Repository layout
-
-```
-qemu-calypso/
-├── hw/arm/calypso/                ← Calypso SoC + DSP emulator
-│   ├── calypso_c54x.c             ← C54x DSP core (~6000 lines)
-│   ├── calypso_trx.c              ← TRX/TPU/TSP/TDMA + DSP↔ARM mirror
-│   ├── calypso_bsp.c              ← BSP DMA + UDP 6702
-│   ├── calypso_iota.c             ← IOTA BDLENA gating
-│   ├── calypso_fbsb.c             ← FB/SB helper (ARM-side synth)
-│   ├── calypso_sim.c              ← SIM ISO 7816
-│   ├── l1ctl_sock.c               ← L1CTL Unix socket
-│   ├── sercomm_gate.c             ← Sercomm DLCI router
-│   └── doc/
-│       ├── PROJECT_STATUS.md      ← detailed project state
-│       ├── TODO.md                ← next actions
-│       ├── opcodes/
-│       │   └── tic54x_hi8_map.md  ← tic54x reference (binutils 2.21.1)
-│       └── spru172c.pdf           ← TI C54x reference manual
-├── hw/{intc,char,timer,ssi}/      ← peripherals
-├── tests/                         ← pytest milestone harness (49 tests)
-│   ├── test_calypso_milestones.py
-│   └── test_run_observability.py
-├── bridge.py                      ← BTS UDP ↔ BSP relay
-├── run.sh                         ← launch orchestration
-├── calypso_dsp.txt                ← DSP ROM dump (132K words)
-├── calypso.md                     ← Pipeline + sequence diagrams
-└── CLAUDE.md                      ← AI-assistant context
-```
+| Fichier | Rôle |
+|---|---|
+| `bridge.py` | Relay sercomm/PTY ↔ L1CTL unix + UDP TRX (CLK/TRXC/TRXD) + GMSK |
+| `run.sh` | Orchestration : kill → QEMU → bridge → osmo-bts-trx → mobile |
+| `calypso_dsp.txt` | DSP ROM dump (Motorola C1xx via osmocon + ESP32) |
 
 ---
 
-## Runtime probes
+## Memory map
 
-The binary embeds **runtime-activable probes** that emit on QEMU stderr.
-Designed to be cheap when fired sparsely, with throttling to prevent log spam.
-This is the difference between "the project is stuck" and "the project tells
-you why it is stuck".
+### ARM (côté firmware)
 
-| Tag                         | Target                                  | What it tells you                              |
-|-----------------------------|-----------------------------------------|------------------------------------------------|
-| `PC-HIST-3FB`               | reads of `[0x3fb0..0x3fbf]`             | Top PCs reading BSP DMA zone                   |
-| `PC-HIST-3DD`               | reads of `[0x3dcf..0x3dd5]`             | Top PCs reading dominant scratch zone          |
-| `WATCH-WRITE 0x3dd2`        | writes to `0x3dd2`                      | Writer identity + values                       |
-| `INTM-TRANS`                | INTM 0↔1 transitions                    | Cause of SSBX/RSBX/STM ST1                     |
-| `WAIT-A21A`                 | PC=`0xa21a`                             | INTM/IMR/IFR/ST0/ST1/SP snapshot               |
-| `ENTER-7740`                | PC=`0x7740`                             | Caller chain + AR + insn                       |
-| `ST1-WR`                    | STM #lk, ST1 (op 0x7707)                | All ST1 writes                                 |
-| `POST-BOOTSTUB-RET`         | RET from PC ≤ 0x0008                    | Task PC popped after boot stub                 |
-| `D_FB_DET-WR-SITE`          | PC=`0x8f51`                             | AR0..AR7 + data[AR0/1/2] + BK + A              |
-| `D_FB_DET SET / OVERRIDE`   | writes to `0x08F8`                      | Value + PC + delta-to-clear                    |
-| `D_BURST_D-WR / SUMMARY`    | writes to `0x0829` / `0x083D`           | Sequence + transition matrix                   |
-| `D_TASK_D-WR`               | writes to `0x0828` / `0x083C`           | Task status set by DSP at task end             |
-| `ARM RD a_cd / d_fb_det`    | ARM reads of NDB                        | Confirms whether mirror works DSP→ARM          |
-| `A_CD-WR / BY-BURST`        | DSP writes to `0x09D0..0x09DE`          | CCCH demod result buffer + per-burst histogram |
-| `STATE-DUMP / SP-RING`      | every N insn                            | PC + ST0/ST1 + IMR/IFR/INTM + SP + AR snapshot |
+| Adresse | Taille | Rôle |
+|---|---|---|
+| `0x00000000` | 4 MiB | Flash (pflash_cfi01, Intel 28F320J3) |
+| `0x00800000` | 256 KiB | IRAM (aliasable via CNTL) |
+| `0x01000000` | 8 MiB | XRAM |
+| `0xFFD00000` | 64 KiB | DSP API RAM (partagée avec C54x) |
+| `0xFFFE0000` | 0x100 | SIM controller |
+| `0xFFFE3000` | 0x100 | SPI + TWL3025 ABB |
+| `0xFFFE3800/3C00` | 0x100 | Timers 1/2 |
+| `0xFFFF0000` | 0x2000 | DSP API RAM (mirror) |
+| `0xFFFF1000` | 0x100 | TPU registers |
+| `0xFFFF5000/5800` | 0x100 | UART IrDA / Modem |
+| `0xFFFF9000` | 0x800 | TPU RAM |
+| `0xFFFFA800` | 0x100 | ULPD |
+| `0xFFFFB000` | 0x100 | TSP |
+| `0xFFFFFA00` | 0x100 | INTH |
+
+### DSP (côté C54x)
+
+| Plage | Type | Contenu |
+|---|---|---|
+| `0x0000-0x007F` | Boot ROM stubs | `LDMM SP,B` + `RET` à 0x0000, NOP ailleurs |
+| `0x0080-0x27FF` | DARAM overlay (OVLY) | Code + data, chargé par MVPD au boot |
+| `0x0800-0x27FF` | API RAM shared | NDB, db_buf_w (ARM→DSP), db_buf_r (DSP→ARM) |
+| `0x2800-0x6FFF` | Unmapped | Reads → 0x0000 |
+| `0x7000-0xDFFF` | PROM0 | DSP ROM |
+| `0xE000-0xFF7F` | PROM1 mirror | Mirror de la page 1 (0x18000+) |
+| `0xFF80-0xFFFF` | Interrupt vectors | depuis PROM1, IPTR=0x1FF |
+
+### DSP ROM sections (dans `calypso_dsp.txt`)
+
+| Section | Plage | Words | Chargée dans |
+|---|---|---|---|
+| Registers | `0x00000-0x0005F` | 96 | `data[0x00-0x5F]` |
+| DROM | `0x09000-0x0DFFF` | 20480 | `data[0x9000-0xDFFF]` |
+| PDROM | `0x0E000-0x0FFFF` | 8192 | `data[0xE000-0xFFFF]` |
+| PROM0 | `0x07000-0x0DFFF` | 28672 | `prog[0x7000-0xDFFF]` |
+| PROM1 | `0x18000-0x1FFFF` | 32768 | `prog[0x18000-0x1FFFF]` + mirror `prog[0x8000-0xFFFF]` |
+| PROM2 | `0x28000-0x2FFFF` | 32768 | `prog[0x28000-0x2FFFF]` |
+| PROM3 | `0x38000-0x39FFF` | 8192 | `prog[0x38000-0x39FFF]` |
+
+### Adresses DSP clés (API RAM / NDB)
+
+| Adresse | Contenu |
+|---|---|
+| `0x08D4` | `d_dsp_page` (NDB offset 0) |
+| `0x08D5` | `d_error_status` |
+| `0x0800-0x0813` | Write page 0 |
+| `0x0814-0x0827` | Write page 1 |
+| `0x0828-0x083B` | Read page 0 |
+| `0x083C-0x084F` | Read page 1 |
+| `0x08F8` | `d_fb_det` (NDB+36 words = ARM 0xFFD001F0) |
+| `0x09D0+` | `a_cd[]` (CCCH demod result buffer) |
+| `0x3FC0-0x3FFF` | BSP DMA target (DARAM) |
+
+### IRQ map (ARM)
+
+| IRQ | Périphérique |
+|---|---|
+| 0 | Watchdog |
+| 1 | Timer 1 |
+| 2 | Timer 2 |
+| 4 | TPU Frame |
+| 5 | DSP API |
+| 7 | UART Modem |
+| 8 | SIM |
+| 13 | SPI |
+| 18 | UART IrDA |
+
+### Vecteurs d'interruption DSP
+
+`vec = imr_bit + 16`, `addr = 0xFF80 + vec × 4`.
+
+| IRQ DSP | Vec | IMR bit | Adresse |
+|---|---|---|---|
+| INT3 (frame) | 19 | 3 | `0xFFCC` |
+| TINT0 | 20 | 4 | `0xFFD0` |
+| BRINT0 (BSP) | 21 | 5 | `0xFFD4` |
+
+### Wake table
+
+| Wake | Vec | IMR bit | Source | Gate |
+|---|---|---|---|---|
+| SINT17 | 19 | 3 | `calypso_trx.c` `calypso_tint0_do_tick` | `dsp_init_done && idle` |
+| BRINT0 | 21 | 5 | `calypso_bsp.c` `bsp_rx_burst` | `dsp->idle && dsp_init_done` |
+| TINT0 | 20 | 4 | masked by firmware | inactive |
 
 ---
 
-## Test harness (pytest)
-
-49 tests across two files, mapped to the L1 pipeline milestones:
+## Pipeline GSM L1 — flux L1CTL
 
 ```
-PHASE 1 — Infrastructure
-  test_all_expected_processes_present, test_qemu_log_is_fresh, ...     [PASS]
-PHASE 2 — DSP boot + opcode integrity
-  test_popm_decoder_active, test_tier_a_decoder_fixes_present, ...     [PASS]
-PHASE 3 — DSP compute convergence
-  test_d_fb_det_data_no_longer_zero, test_a_cd_writes_nonzero, ...     [PASS]
-PHASE 4 — FBSB
-  test_synth_zero_path_active                                          [XFAIL]
-  test_fb0_att_nonzero                                                 [XFAIL]
-PHASE 5 — CCCH / DATA_IND
-  test_l1ctl_data_ind_received                                         [XFAIL → wall]
-  test_l1ctl_data_ind_rate_vs_alc
-PHASE 6 — RR / MM / LU
-  test_immediate_assignment_decoded, test_rach_emitted,
-  test_rr_sdcch_established, test_location_updating_request_sent,
-  test_location_updating_accept_received                               [XFAIL]
+L23 → SOCK : RESET_REQ
+SOCK → UART : sercomm DLCI5
+UART → ARM : IRQ
+ARM → SOCK : RESET_CONF → L23
+
+L23 → ARM : PM_REQ
+ARM → DSP : d_task_md=1 (PM)
+DSP → ARM : a_pm[]
+ARM → L23 : PM_CONF
+
+L23 → ARM : FBSB_REQ
+ARM → DSP : d_task_md=5 (FB)
+BTS → BSP : DL burst (5702→6702)
+BSP → DSP : DMA + BRINT0 (gated dsp_init_done)
+DSP → ARM : d_fb_det=1
+ARM → L23 : FBSB_CONF
 ```
 
-Each milestone has **three semantic states**:
+Path UL : `DSP → BSP (DARAM 0x0900) → bridge → BTS (UDP 6802→5802)`.
 
-- **PASS** — milestone unlocked, measured value matches assertion
-- **XFAIL** — milestone known-not-met, upstream conditions absent
-- **FAIL** — milestone previously unlocked, has regressed (canary)
+### L1CTL message types (length-prefix BE16)
 
-The harness uses container-side env detection so that `synth=0` and `synth=1`
-runs are interpreted differently. UTF-8-safe subprocess wrappers handle binary
-bytes in `qemu.log` (STATE-DUMP raw memory dumps).
+| Type | Nom |
+|---|---|
+| 0x01 | FBSB_REQ |
+| 0x02 | FBSB_CONF (result 0=succès, 255=échec) |
+| 0x03 | DATA_IND |
+| 0x04 | RACH_REQ |
+| 0x05 | DM_EST_REQ |
+| 0x07 | RESET_IND (boot) |
+| 0x08 | PM_REQ |
+| 0x09 | PM_CONF |
+| 0x0D | RESET_REQ |
+| 0x0E | RESET_CONF |
+| 0x10 | CCCH_MODE_REQ |
+| 0x11 | CCCH_MODE_CONF |
+
+### TRXD v0 (BTS ↔ bridge)
+
+DL (BTS→MS) : `TN(1) FN(4 BE) RSSI(1) TOA(2 BE) soft_bits(148)`
+UL (MS→BTS) : `TN(1) FN(4 BE) PWR(1) hard_bits(148)`
 
 ---
 
-## The current wall — DATA_IND
+## Historique des bugs majeurs
 
-After the 2026-05-15 mirror fix, the pipeline runs end-to-end up to here:
+### Session 2026-04-03 — 0xEA = LD #k9,DP
+
+`0xEA` était décodé comme **BANZ** (faux). En réalité, BANZ = `0x6C/0x6E` ;
+`0xEA00/0xFE00` = `LD #k9, DP`. 202 occurrences dans le ROM. Sans le fix,
+le DSP branchait sur des adresses DARAM aléatoires. Après le fix : DSP exécute
+197M instructions de boot (avant : 86K), DARAM correctement peuplée,
+`task_md=5` (FB search) dispatché vers le DSP.
+
+### Session 2026-04-04 — 22 bugs INTH/UART/DSP
+
+- INTH **level-sensitive** (le bug le plus important — firmware ne fait
+  jamais d'acknowledge IRQ_CTRL)
+- IDLE wake sur n'importe quelle interruption
+- UART address mapping, sercomm DLCI filter
+- PROM1 mirror, OVLY range
+- Bootloader protocol, F8xx branch, XPC dans `prog_fetch`
+- 12 fix opcodes from SPRU172C
+
+### Session 2026-04-05 night 4 — Audit opcode complet (17 bugs)
+
+Audit massif de `calypso_c54x.c` contre `tic54x-opc.c` (binutils 2.21.1).
+
+| Fix | Opcode | Avant | Après |
+|---|---|---|---|
+| 1 | F0xx | READA | ADD/SUB/LD/AND/OR/XOR #lk,shift,src,dst |
+| 2 | F4Bx | NOP | RSBX ST0 |
+| 3 | F5Bx | RPT #0xBx | SSBX ST0 |
+| 4 | F6Bx | MVDD Xmem,Ymem | RSBX ST1 |
+| 5 | F7Bx | LD #k8→AR7 | SSBX ST1 |
+| 6 | FC00 | LD #k<<16,B | RET |
+| 7 | FE00 | LD #k,B | RETD |
+| 8 | F073 | RET | B pmad (2-mot) |
+| 9 | F074 | RETE | CALL pmad (2-mot) |
+| 10 | F072 | FRET | RPTB pmad |
+| 11 | F070 | RET catch-all | RPT #lku |
+| 12 | F071 | RET catch-all | RPTZ dst,#lku |
+| 13 | F274 | CALLD push PC+2 | push PC+4 |
+| 14 | F4E4 | IDLE | FRET |
+| 15 | F4E1 | NOP | IDLE (le vrai) |
+| 16 | F4E5 | NOP | FRETE |
+| 17 | TINT0 | IFR bit 4 vec 20 | bit 3 vec 19 |
+
+Résultat : DSP boot en 173 instructions, `IMR=0x002D` configurée, dispatch
+loop active. Restait : SP drift, INTM=1 stuck (handler `0x7710` set INTM
+mais ne clear pas).
+
+### Session 2026-04-07 — Pipeline FBSB et wedge 0x76FE
+
+- Module `calypso_fbsb.c/h` créé, branché dans `calypso_trx.c`
+- Hook `on_dsp_task_change` publie `d_fb_det=1` + `a_sync_demod[]`
+  dès que ARM écrit `d_task_md=FB_DSP_TASK`
+- Offsets NDB validés (`d_fb_det = NDB+36 words = dsp_ram[0xF8]`)
+- Découverte `CALYPSO_BSP_DARAM_ADDR=0x3FC0` : 99.7% des reads DSP dans
+  cette zone, hardcodé par défaut
+- **Blocage final identifié** : boucle MVDD `f6b9` à `PROM0 0x76FE` corrompt
+  IMR à 0x0000. BRC=63, `ar1` finit par valoir 0 (= adresse MMR IMR),
+  les writes MVDD écrasent IMR. Tous les interrupts DSP masqués → BRINT0
+  ignoré → pas de FB_DET → FBSB échoue (`result=255`)
+- Opcodes manquants identifiés sur le chemin critique FB-det :
+  `MVPD 0x75xx`, F2xx `0xf210`, BC group 1 (cond=0x42/0x44/0x45/0x4d),
+  `0xf58e` F5xx hors dispatch
+
+### Session 2026-05-08 — POPM fix + audit hi8 complet
+
+**INTM=1 dwell perpétuel résolu.** L'émulateur DSP avait 9 opcodes
+misclassifiés depuis le début. Le critique : **`0x8A00` décodé en MVDK
+Smem,dmad alors que tic54x-opc.c l'identifie comme POPM MMR**. Le pattern
+PSHM/POPM symétrique du firmware (sauve ST1, entre zone critique avec
+INTM=1, restore ST1) ne marchait jamais → ST1 jamais restauré → INTM stuck.
+
+| Opcode | qemu-calypso (avant) | tic54x officiel | Statut |
+|---|---|---|---|
+| `0x8A` | MVDK Smem,dmad (2-mot) | **popm MMR** (1-mot) | **fixé** |
+| `0x8B` | MVDK long-addr (2-mot) | popd Smem | stub NOP |
+| `0xAA/AB` | STLM duplicate | ld variant | stub NOP |
+| `0xC5` | PSHM MMR | st parallel | stub NOP (sp-- fantôme) |
+| `0xCD` | POPM MMR | st parallel | stub NOP (sp++ fantôme) |
+| `0xCE` | FRAME #k | st parallel | stub NOP |
+| `0xDD` | POPD Smem | st parallel | stub NOP (sp++ fantôme = **SP runaway**) |
+| `0xDE` | POPD dmad | st parallel | stub NOP |
+| `0x80` | MVDD Smem,Smem | stl src,Smem | stub NOP |
+
+Référence créée : `hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md` — table
+complète hi8→mnémonique pour les 256 valeurs (binutils 2.21.1).
+
+**Symptômes débloqués :**
+- WAIT-A21A : 5.7M iters bloquées → 0
+- ENTER-7740 : 37k figés → 0
+- DSP throughput : **×5 plus rapide** (4.3B insn / 44s)
+
+**Restant après cette session :**
+- `fb0_att` / `L1CTL_DATA_IND` toujours 0
+- Le correlator FB-det lit une zone vide : AR3 monte `0x0000→0x03A3`
+  par stride +19, AR2/AR7 wrappent `[0xfc5d..0xffed]` stride −19 ;
+  aucun AR n'atteint la zone BSP DMA target. Mismatch structurel
+  entre init AR du firmware et adresse de livraison BSP.
+
+---
+
+## État actuel
+
+### Ce qui marche
+- Boot complet du firmware osmocom-bb non patché
+- Console debug sercomm DLCI 10
+- UART TX/RX level-sensitive
+- SPI/ABB, SIM (injection ATR), DSP boot + re-boot
+- TPU TDMA 4.615 ms, IRQ TPU_FRAME
+- TRX bridge UDP compatible osmo-bts-trx
+- `bridge.py` relais sercomm ↔ `/tmp/osmocom_l2`
+- Mobile connecté, envoie `L1CTL_RESET_REQ`, reçoit `RESET_CONF`
+- DSP atteint IDLE proprement (post-Session 2026-05-08)
+- `task_md=24` (DSP_TASK_ALLC) fire correctement (CCCH demod dispatché)
+- Sous `CALYPSO_FBSB_SYNTH=1` : mobile passe FBSB, atteint
+  gsm322 cell selection (DSC=90)
+
+### Ce qui ne marche pas encore
+- `L1CTL_DATA_IND` = 0 (mur principal actuel)
+- Vrai correlator FB-det : `fb0_att=0`, seuil de décision non franchi
+- ARM `prim_rx_nb::l1s_nb_resp` invoqué mais `d_task_d` jamais set à 24
+- Mobile L23 sous `FBSB_SYNTH=0` : bloqué pré-FBSB
+
+### Blocage actuel — DATA_IND / `d_task_d`
 
 ```
 DSP CCCH demod fires (task_md=24)              ✓  73× / run
 DSP writes a_cd[0..14] result buffer           ✓  251 writes / run
-ARM L1 prim_rx_nb::l1s_nb_resp invoked         ✓  60+ calls / run
+ARM L1 prim_rx_nb::l1s_nb_resp invoqué         ✓  60+ calls / run
 ARM reads dsp_api.db_r->d_task_d               ✓
                                                    ↓
                                             d_task_d == 0  →  puts("EMPTY")
                                                               return 0
 ```
 
-**60 `EMPTY` printfs observed per minute of run** — `d_task_d` at `0x0828` is
-never set to `DSP_TASK_ALLC` (24) at the end of the DSP CCCH task. Some PCs
-in the DSP scheduler zone (`0x787d`, `0x7a03`, `0x79f1`, `0x7817`) write
-*garbage* values (`0x8dd6`, `0xfef7`, …) to that cell via what looks like
-parasitic indirect addressing.
+Plusieurs PCs DSP (`0x787d`, `0x7a03`, `0x79f1`, `0x7817`) écrivent des
+**valeurs garbage** (`0x8dd6`, `0xfef7`, …) à la cellule `d_task_d` (0x0828)
+via ce qui ressemble à des modes d'adressage indirect mis-décodés. Pattern
+identique au fix POPM : opcode mal classifié → mauvaise adresse effective.
 
-Similarly `d_burst_d` at `0x0829` is corrupted with `0x8286` by PC=`0x8216`
-(in the FB-det compute zone), producing 24 `BURST ID 33414!=N` printfs per
-minute.
-
-The pattern is identical to the `0x8A00 → POPM` fix of 2026-05-08: opcodes
-likely misclassified in our C54x decoder are writing to the wrong address.
-Audit ongoing.
+`d_burst_d` à `0x0829` est aussi corrompu par `PC=0x8216` (zone FB-det).
+Audit en cours.
 
 ---
 
-## Methodology
+## Patches en cours
 
-A few principles that have repeatedly paid off:
+### CONFIRMED — à appliquer
 
-**No stubs in critical paths.** The DSP runs the real ROM. The BSP is gated
-by the real TPU→TSP→IOTA chain. The mobile goes through a real QEMU PTY.
-Every shortcut taken in the past (BCCH inject, FBDET-SKIP, INTM force-clear,
-SI3 fallback hardcode) was eventually purged because each was hiding the
-real bug. The "no hacks" rule is enforced on commits.
+- **C-1.** Dédup `RETD` handler (F273) : deux implémentations byte-identiques,
+  la 2e est dead code (`calypso_c54x.c` lignes 1701-1705).
+- **C-2.** Dédup `CALLD` handler (F274) : pareil, lignes 1691-1699.
+- **C-3.** Dédup `RPTBD` handler (F272) : cinq implémentations à auditer
+  (1461, 1680, 2258, 3408, 3469).
+- **C-4.** Fix `prev_sp` initial du SP-OOR tracer : `0xEEFF` → `s->sp`
+  (tracer DBG_SP, risque nul).
 
-**Verify opcodes against tic54x-opc.c (binutils) before patching.** The
-`hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md` reference catches our
-decoder where we previously had POPM misclassified as MVDK. Always cross-check.
+### SPECULATIVE — non appliqué
 
-**QEMU is clock master.** The bridge is the slave, the BTS receives CLK IND
-wall-paced. This eliminates the wall-clock vs virtual-clock desync class of
-bugs that plagued earlier attempts.
-
-**Hypothesis decomposition.** When stuck for two days on "the data path
-is broken", we ran probes that ruled out four hypotheses (BSP DMA target,
-ROM coeffs table read, DSP compute convergence, Tier B opcode overwrite)
-before arriving at "DSP→ARM mirror missing in read path". The fix was
-trivial *because* the diagnosis was precise.
-
-**Deterministic bench for downstream debugging.** When the upstream layer
-has variance, replace it with a synth (e.g. `CALYPSO_FBSB_SYNTH=1`) so that
-exactly one variable changes per run. Don't try to debug two layers of
-non-determinism at once.
-
-**Test after every edit.** Build in Docker, verify DSP idle + SP + IMR +
-RETE count, then run pytest. The harness flags regressions immediately.
+- **S-1.** SP runaway PROM0 `0xb906` (F074/F274) : 6/10 runs baseline ont
+  un SP runaway de ~13000 events, tous à `prev_PC=0xb906 prev_op=0xf074`.
+  SP descend de `0x5AC8` vers `0x0000`, atteint `0x08F8` (= `d_fb_det`),
+  écrase avec return addresses. Trois hypothèses (self-loop firmware,
+  CALL dans RPTB, bug prog_fetch) non vérifiées.
+- **S-2.** F5E3 SP runaway PROM0 `0xc12a` — symptôme similaire.
 
 ---
 
-## Historique des sessions
+## Variables d'environnement
 
-### 2026-05-15 — Bug racine DSP→ARM mirror identifié et corrigé
-
-- `calypso_dsp_read()` lisait `s->dsp_ram[]` (array séparé) au lieu de
-  `s->dsp->data[]`. Toutes les écritures DSP étaient invisibles côté ARM
-  pour la zone API RAM. Bug en place depuis l'introduction du dual-buffer.
-- Fix : 5 lignes dans `calypso_trx.c:163`
-- Effet : FBSB success real path pour la première fois ; `task_md=24` passe
-  de 0 à 20+ ; cascade débloquée jusqu'au mur `d_task_d`
-- Pytest harnais étendu à 49 milestones, 26 PASS stables
-- Test `icount=auto` exploratoire : architecture viable mais expose un
-  bug INTM dwell systématique (à attaquer en session dédiée)
-
-### 2026-05-08 — POPM fix + opcode audit
-
-- `0x8A00` était décodé en `MVDK Smem,dmad` ; tic54x-opc.c l'identifie
-  comme `POPM MMR`
-- Conséquence : INTM stuck à 1 perpétuel après ~98M insn, depuis avril 2026
-- Audit complet hi8 → mnémonique tic54x (binutils 2.21.1) créé en
-  `doc/opcodes/tic54x_hi8_map.md`
-- 8 opcodes additionnels stubés en NOP (`0x8B`, `0xAA/AB`, `0xC5`, `0xCD`,
-  `0xCE`, `0xDD`, `0xDE`, `0x80`) pour stopper les writes parasites
-- DSP throughput ×5
-
-### 2026-05-07 — Purge des hacks
-
-- `rsl_si_tap.py`, `CALYPSO_BCCH_INJECT`, `CALYPSO_SI_MMAP_PATH` supprimés
-- `BOURRIN-FBDET-SKIP` supprimé
-- `DIAG-HACK INTM force-clear` supprimé
-- `si3_fallback[]` hardcode supprimé
-- `allc_burst_idx` static cycle remplacé par `fn & 3`
-
-### 2026-04-29 — Opcode dispatch baseline
-
-5 fixes structurels validés empiriquement, ~2530 sites firmware débloqués :
-
-| # | Fix | Impact |
+| Variable | Default | Effet |
 |---|---|---|
-| 1 | Reset silicon-aligné (PMST=0xFFA8, ST0=0x181F, ST1=0x2900) | DSP entre PROM1 init zone |
-| 2 | `0x6F00` ext dispatch | Wedge PC=0x8353 (2.2G iter) éliminé |
-| 3 | `0x68-0x6E` handlers (ANDM/ORM/XORM/ADDM/BANZ/BANZD) | 1563 sites unblocked |
-| 4 | APTS misnomer fix (PMST bit 4 = AVIS, pas stack) | Stack leak 1.96M events → 0 |
-| 5 | `F3xx` complet (AND/OR/XOR/SFTL + #lk variants) | 364 sites, wedge PC=0x8eb9 |
-
-Sessions antérieures : voir `hw/arm/calypso/doc/SESSION_*.md`.
+| `CALYPSO_ICOUNT` | `auto` | Mode `-icount` QEMU. `auto` expose le bug INTM dwell ; `off` vit avec timing variance |
+| `CALYPSO_FBSB_SYNTH` | `0` | `1` publie FB/SB synth dans NDB pour passer FBSB déterministe |
+| `CALYPSO_FORCE_RX_DONE` | `0` | Workaround TCG bug sur STR conditionnel `0x8224ac` (SIM busy-poll) sous `icount=auto` |
+| `CALYPSO_W1C_LATCH` | `0` | `1` latche valeurs `a_sync_demod` (mitigation race DSP-write/ARM-read) |
+| `CALYPSO_BSP_DARAM_ADDR` | `0x3fb0` | Adresse DARAM cible des DMA RX BSP (sans effet sur le FB-det actuel — AR init firmware-dependent) |
+| `CALYPSO_DSP_IDLE_FF` | `1` | Fast-forward DSP idle dispatcher (optim host-side) |
+| `CALYPSO_DSP_FBDET_SKIP` | `0` | Option diag — skip FB-det inner loop |
+| `CALYPSO_NDB_D_RACH_OFFSET` | `0x01CB` | Override word index `d_rach` (DSP version-dependent) |
+| `CALYPSO_RACH_FORCE_BSIC` | unset | Force BSIC RACH (0-63) |
+| `BRIDGE_CLK_FROM_QEMU` | `0` | `1` : CLK IND piloté par FN QEMU |
+| `BRIDGE_DL_FN_REWRITE` | `slot` | Politique de réécriture FN DL (slot-aware vs naïve) |
+| `BRIDGE_DL_FN_LOOKAHEAD` | `32` | Marge lookahead réécriture FN DL |
+| `CALYPSO_DSP_ROM` | `calypso_dsp.txt` | Chemin du dump DSP ROM |
+| `L1CTL_SOCK` | `/tmp/osmocom_l2` | Mobile↔QEMU L1CTL Unix socket |
 
 ---
 
-## Build
+## Probes runtime (qemu.log)
+
+| Tag | Cible | Émet |
+|---|---|---|
+| `PC-HIST-3FB` | reads de `[0x3fb0..0x3fbf]` | Top PCs lisant zone BSP DMA |
+| `PC-HIST-3DD` | reads de `[0x3dcf..0x3dd5]` | Top PCs scratch dominant |
+| `WATCH-WRITE 0x3dd2` | writes à `0x3dd2` | Identité writer + valeurs |
+| `INTM-TRANS` | transitions INTM 0↔1 | Cause SSBX/RSBX/STM ST1 |
+| `WAIT-A21A` | PC=`0xa21a` | Snapshot INTM/IMR/IFR/ST0/ST1/SP |
+| `ENTER-7740` | PC=`0x7740` | Caller chain + AR + insn |
+| `ST1-WR` | STM #lk, ST1 (op 0x7707) | Tous les writes ST1 |
+| `D_FB_DET-WR-SITE` | PC=`0x8f51` | AR0..AR7 + data[AR0/1/2] + BK + A |
+| `D_FB_DET SET / OVERRIDE` | writes à `0x08F8` | Valeur + PC + delta-to-clear |
+| `D_BURST_D-WR / SUMMARY` | writes à `0x0829 / 0x083D` | Séquence + transition matrix |
+| `D_TASK_D-WR` | writes à `0x0828 / 0x083C` | Task status fin de task |
+| `ARM RD a_cd / d_fb_det` | ARM reads NDB | Confirme mirror DSP→ARM |
+| `A_CD-WR / BY-BURST` | writes DSP `0x09D0..0x09DE` | Buffer CCCH demod + histogramme |
+| `STATE-DUMP / SP-RING` | toutes les N insn | PC + ST0/ST1 + IMR/IFR/INTM + SP + AR |
+
+### Commandes diagnostic utiles
 
 ```bash
-docker exec CONTAINER bash -c "cd /opt/GSM/qemu-src/build && ninja qemu-system-arm"
-```
+# Corruptions IMR
+grep -c "IMR change" /tmp/qemu.log
 
-Workaround `-lm` link (intermittent) :
+# Top PCs source corruptions
+grep "IMR change" /tmp/qemu.log | awk '{print $NF}' | sort | uniq -c | sort -rn | head
 
-```bash
-cd /opt/GSM/qemu-src/build
-ninja -t commands qemu-system-arm | tail -1 > /tmp/link.sh
-sed -i 's|$| -lm|' /tmp/link.sh && bash /tmp/link.sh
+# Dernier état DSP
+grep "TINT0:" /tmp/qemu.log | tail -3
+
+# Stats bridge
+tail /tmp/bridge.log
+
+# IRQ DSP (vec 21 = BRINT0)
+grep -E "c54x.*IRQ vec" /tmp/qemu.log | tail
 ```
 
 ---
 
 ## Conventions
 
-- **No stubs in critical paths.** No `#ifdef QEMU`. No "good enough"
-  shortcuts that hide the real bug.
-- **Verify opcodes against `tic54x-opc.c`** before patching. See
-  [`hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md`](hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md).
-- **QEMU is clock master.** Bridge is slave. BTS gets CLK IND wall-paced.
-- **Test after every edit.** Build, run pytest, verify no regression on
-  the 26 stable PASS milestones.
-- **Document workarounds** in [`hw/arm/calypso/doc/TODO.md`](hw/arm/calypso/doc/TODO.md)
-  with explicit removal criteria.
+- **No stubs in critical paths.** No `#ifdef QEMU`. Tous les shortcuts
+  passés (BCCH inject, FBDET-SKIP, INTM force-clear, SI3 fallback) ont
+  été purgés. Chacun masquait le vrai bug.
+- **Verify opcodes against `tic54x-opc.c`** (binutils 2.21.1) avant tout
+  patch. Référence : `hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md`.
+- **QEMU est clock master.** Le bridge est slave. La BTS reçoit CLK IND
+  wall-paced. Élimine le wall-clock vs virtual-clock desync.
+- **Test après chaque edit.** Build Docker → vérifier DSP idle + SP + IMR
+  + RETE count → pytest (49 milestones, 26 PASS stables).
+- **Document workarounds** dans `hw/arm/calypso/doc/TODO.md` avec critères
+  de retrait explicites.
+
+---
+
+## Roadmap
+
+1. Solveur du mur `d_task_d` actuel — audit opcode des PCs `0x787d`,
+   `0x7a03`, `0x79f1`, `0x7817`, `0x8216`.
+2. Cascade L1 d'aval : `DATA_IND → RACH → Immediate Assignment → SDCCH
+   → LU Accept`. Chaque étape va débloquer de nouveaux bugs.
+3. `icount=auto` stable sans `FORCE_RX_DONE` (le bug INTM dwell résiduel).
+4. DSP path réel sans `FBSB_SYNTH=1` : déterminisme 5/5 (actuellement
+   1-2/5).
+5. Performance : un run CI doit prendre des secondes, pas des minutes.
+6. Compatibilité versions QEMU upstream + osmocom-bb.
+7. Image Docker propre, packaging, install une commande.
+8. Doc d'usage : "debug osmocom-bb avec qemu-calypso".
+9. Tests CI publics (GitHub Actions), badge green.
+10. Refacto pour respecter le style QEMU si ambition upstream.
+11. Présentation OsmoDevCon — slide deck + démo live.
 
 ---
 
 ## License & attribution
 
-- **QEMU base** : GPL-2.0-or-later (upstream QEMU)
+- **QEMU base** : GPL-2.0-or-later
 - **Calypso emulator additions** : GPL-2.0-or-later
-- **osmocom-bb firmware** : GPL (used as-is, not redistributed here)
-- **Calypso DSP ROM** (`calypso_dsp.txt`) : TI proprietary. Physical device
-  dump for research and interoperability purposes (osmocom DSP dumper).
-  Not commercially redistributable without TI authorization.
-
----
-
-## Related projects
-
-- [osmocom-bb](https://osmocom.org/projects/baseband/) — the open-source GSM
-  baseband stack this emulator runs unmodified
-- [osmo-bts](https://osmocom.org/projects/osmobts/) — open-source GSM BTS
-  (paired in the bridge architecture)
-- [osmo-cn](https://osmocom.org/projects/cellular-infrastructure/) —
-  open-source cellular core network
-- [QEMU](https://www.qemu.org/) — generic emulation framework this is built on
-- [tic54x binutils](https://sourceware.org/binutils/) — TMS320C54x assembler
-  reference used for opcode audit
-
----
-
-## Contact
-
-Issues, patches, hardware questions: open an issue or get in touch.
-
-For commercial licensing of the GSM-over-LoRa / baseband emulation work this
-project enables, contact directly.
-
----
-
-> *If a piece of hardware exists, it can be emulated.*
-> *If a protocol exists, it can be simulated.*
-> *If a chip's ROM is dumpable, its firmware can run anywhere.*
->
-> *Six months of dwell. Five lines to unlock.*
+- **osmocom-bb firmware** : GPL (utilisé tel quel, pas redistribué)
+- **Calypso DSP ROM** (`calypso_dsp.txt`) : TI propriétaire. Dump physique
+  pour recherche et interopérabilité (osmocom DSP dumper). Non redistribuable
+  commercialement sans autorisation TI.
