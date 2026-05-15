@@ -507,9 +507,38 @@ def _try_render_mermaid(mmd_path: Path, png_path: Path) -> bool:
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Write mermaid diagrams + coherent markdown report + bundle zip."""
+    """Write mermaid diagrams + coherent markdown report + bundle zip.
+
+    Skip output entirely if no test actually ran (e.g. `--collect-only` or
+    a fully-deselected run). Rotate older bundles : keep latest N (default 5,
+    override via `CALYPSO_TEST_KEEP`).
+    """
+    # 0. Skip if nothing ran — avoids polluting /tmp with empty bundles on
+    #    every `--collect-only` invocation.
+    if not _MERMAID_RESULTS:
+        terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminal is not None:
+            terminal.write_sep("=", "Mermaid report skipped (no tests ran)", purple=True)
+        return
+
     out_dir = Path(os.environ.get("CALYPSO_TEST_OUT", "/tmp"))
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 0b. Rotate : delete old test_results_* artifacts before creating new one.
+    keep_n = int(os.environ.get("CALYPSO_TEST_KEEP", "5"))
+    old_dirs = sorted(out_dir.glob("test_results_2*"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    old_zips = sorted(out_dir.glob("test_results_2*.zip"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in old_dirs[keep_n:]:
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+        else:
+            try: stale.unlink()
+            except Exception: pass
+    for stale in old_zips[keep_n:]:
+        try: stale.unlink()
+        except Exception: pass
 
     # Per-run folder + zip
     ts_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
