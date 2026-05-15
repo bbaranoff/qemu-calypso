@@ -394,9 +394,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
              * state machine which publishes synthetic FB/SB results
              * into NDB so ARM can progress past l1s_fbdet_resp. */
             if (!g_fbsb_inited) {
-                calypso_fbsb_init(&g_fbsb, s->dsp_ram, 0x0800);
+                /* 2026-05-15 fix : pointer le synth sur s->dsp->data[] qui
+                 * est désormais la source de vérité pour ARM reads (cf fix
+                 * DSP→ARM mirror dans calypso_dsp_read). Sinon le synth écrit
+                 * dans s->dsp_ram[] (ARM-side legacy array) qu'ARM ne lit
+                 * plus → publish_fb_found/sb_found invisibles à firmware. */
+                uint16_t *ndb_target = (s->dsp && s->dsp->data)
+                                       ? &s->dsp->data[0x0800]
+                                       : s->dsp_ram;
+                calypso_fbsb_init(&g_fbsb, ndb_target, 0x0800);
                 g_fbsb_inited = true;
-                TRX_LOG("fbsb init ok ndb_base=0x0800");
+                TRX_LOG("fbsb init ok ndb_base=0x0800 target=%s",
+                        (s->dsp && s->dsp->data) ? "dsp->data" : "dsp_ram (fallback)");
             }
             if (g_fbsb_inited) {
                 TRX_LOG("fbsb hook fired task=%u fn=%u",
