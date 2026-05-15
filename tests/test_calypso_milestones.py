@@ -446,9 +446,10 @@ def test_no_d_fb_det_wr_site_anomaly(container_alive, log_offset):
     """
     r = docker_exec([
         "sh", "-c",
-        f"grep -c 'D_FB_DET-WR-SITE' {QEMU_LOG_CONTAINER} 2>/dev/null || echo 0"
+        f"grep -c 'D_FB_DET-WR-SITE' {QEMU_LOG_CONTAINER} 2>/dev/null || true"
     ])
-    n = int(r.stdout.strip() or "0")
+    n_str = r.stdout.strip()
+    n = int(n_str) if n_str.isdigit() else 0
     assert n >= 50, (
         f"D_FB_DET-WR-SITE seulement {n} hits — sweep FB-det ne s'exécute pas. "
         f"Régression structurelle, le DSP n'atteint plus PC=0x8f51."

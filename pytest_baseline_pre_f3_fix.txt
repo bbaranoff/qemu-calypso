@@ -1,0 +1,77 @@
+# Baseline pytest pré-fix F3xx — 2026-05-15 fin journée
+# Environnement de référence : icount=off + synth=1 + FORCE_RX_DONE=0 + W1C_LATCH=1
+#
+# 49 tests collected
+# Result : 26 PASS / 3 SKIP / 19 XFAIL / 1 FAIL
+# Durée : ~80s
+
+## PASS (26)
+test_calypso_milestones.py::test_popm_decoder_active
+test_calypso_milestones.py::test_tier_a_decoder_fixes_present
+test_calypso_milestones.py::test_intm_dwell_no_regression   ← stable hors icount=auto
+test_calypso_milestones.py::test_dsp_throughput_5x
+test_calypso_milestones.py::test_bsp_dma_target_matches_correlator_read_zone
+test_calypso_milestones.py::test_no_d_fb_det_wr_site_anomaly
+test_run_observability.py::test_all_expected_processes_present
+test_run_observability.py::test_no_zombie_or_defunct
+test_run_observability.py::test_qemu_log_is_fresh
+test_run_observability.py::test_mobile_pcap_growing
+test_run_observability.py::test_volumes_mounted
+test_run_observability.py::test_no_wait_a21a_on_window      ← stable hors icount=auto
+test_run_observability.py::test_no_enter_7740_dwell
+test_run_observability.py::test_intm_reaches_zero
+test_run_observability.py::test_dsp_throughput_above_threshold
+test_run_observability.py::test_bsp_daram_write_distribution
+test_run_observability.py::test_d_fb_det_data_no_longer_zero  ← XFAIL→PASS aujourd'hui
+test_run_observability.py::test_bridge_log_shows_traffic
+test_run_observability.py::test_bridge_dl_lookahead_respected
+test_run_observability.py::test_neigh_pm_req_loop_alive
+test_run_observability.py::test_a_cd_writes_nonzero
+test_run_observability.py::test_a_cd_write_pc_includes_ccch_demod
+test_run_observability.py::test_mobile_vty_reachable
+test_run_observability.py::test_mobile_imsi_loaded
+test_run_observability.py::test_mobile_mm_state_is_null_or_idle
+test_run_observability.py::test_run_summary_snapshot
+
+## XFAIL (19) — comportements attendus en l'état
+test_calypso_milestones.py::test_fb0_att_nonzero
+test_calypso_milestones.py::test_synth_zero_path_active            (synth=1 actif)
+test_calypso_milestones.py::test_c54x_interrupt_ex_called_nonzero
+test_calypso_milestones.py::test_isr_entered_implies_rete
+test_calypso_milestones.py::test_no_pending_irq_gated
+test_calypso_milestones.py::test_l1ctl_data_ind_received           (task=24=0 au check)
+test_calypso_milestones.py::test_neigh_pm_req_response_unchanged
+test_calypso_milestones.py::test_rach_emitted
+test_calypso_milestones.py::test_immediate_assignment_decoded
+test_calypso_milestones.py::test_rr_sdcch_established
+test_calypso_milestones.py::test_location_updating_request_sent
+test_calypso_milestones.py::test_location_updating_accept_received
+test_calypso_milestones.py::test_rxdoneflag_no_longer_blocks
+test_run_observability.py::test_bridge_fn_drift_under_threshold
+test_run_observability.py::test_l1ctl_data_ind_received
+test_run_observability.py::test_a_cd_write_pc_includes_ccch_demod  (XFAIL parfois — variance)
+test_run_observability.py::test_rach_attempted
+test_run_observability.py::test_interrupt_ex_called_counter_exposed
+test_run_observability.py::test_isr_entered_matches_rete
+test_run_observability.py::test_no_pending_irq_gating
+
+## SKIP (3)
+test_calypso_milestones.py::test_ar3_init_source_identified
+test_calypso_milestones.py::test_ar4_init_source_identified
+test_run_observability.py::test_l1ctl_data_ind_rate_vs_alc  (task=24=0 au check)
+
+## FAIL (1)
+test_run_observability.py::test_d_fb_det_pattern_unchanged
+  → AR4=['0x1007', '0x1008', '0x1009'] au lieu de [0x2bc0..0x2bff]
+  → Attendu sous synth=1 (FB-det compute bypass), fix conditional appliqué
+  → Post-rebuild devrait XFAIL au lieu de FAIL
+
+## Cibles post-F3-fix (banc d'essai synth=1 déterministe)
+- EMPTY printf osmocon          : 8  → attendu 0
+- BURST ID printf osmocon       : 24 → attendu 0
+- D_TASK_D-WR val=0x0018 (TASK_ALLC=24) : 0 → attendu >0
+- D_BURST_D séquence 0→1→2→3 propre     : non observé → attendu observé
+- ARM RD a_cd[]                 : 0  → attendu >0
+- L1CTL_DATA_IND                : 0  → attendu >0
+- task=24 fire                  : ~65-121 (déterministe) → idem ou plus
+- A_CD-WR                       : ~250-470 → idem

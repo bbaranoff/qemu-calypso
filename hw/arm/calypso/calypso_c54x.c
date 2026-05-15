@@ -2879,7 +2879,16 @@ static int c54x_exec_one(C54xState *s)
              * (we treat both via ACC compare for now since dispatcher uses
              * cmp-style behaviour). The full F8xx range is BC per binutils
              * but historically the firmware tolerates the legacy decode
-             * for the other sub-codes — surgical override here only. */
+             * for the other sub-codes — surgical override here only.
+             *
+             * REVERTED 2026-05-15 nuit : tentative de fix vers SPRU172C-strict
+             * cond eval (cond=0x20=NTC, cond=0x30=TC) a cassé le firmware DSP
+             * Calypso (DSP stuck à PC=0xcc51 / 0xfa95 selon régime, task=24
+             * tombait à 0). Le binaire DSP semble utiliser une convention
+             * dialectale où F82x/F83x s'attend au comportement ACC-based.
+             * Hypothèse alternative : BITF (0x61) émulé incorrectement, TC
+             * jamais set correctement → cond NTC/TC ne donne pas le bon
+             * résultat. Investiguer BITF avant de retenter le fix BC strict. */
             if (sub == 0x2 || sub == 0x3) {
                 op2 = prog_fetch(s, s->pc + 1);
                 consumed = 2;
@@ -2894,24 +2903,6 @@ static int c54x_exec_one(C54xState *s)
                 else /* sub==0x3 */  take = (acc_signed == 0);
                 if (take) { s->pc = op2; return 0; }
                 return consumed + s->lk_used;
-            }
-            if (sub == 0x2) {
-                /* Unreachable now — kept for clarity in case we revert. */
-                op2 = prog_fetch(s, s->pc + 1);
-                consumed = 2;
-                s->rea = op2;
-                s->rsa = (uint16_t)(s->pc + 2);
-                s->rptb_active = true;
-                s->st1 |= ST1_BRAF;
-                return consumed + s->lk_used;
-            }
-            if (sub == 0x3) {
-                /* Unreachable now. */
-                op2 = prog_fetch(s, s->pc + 1);
-                s->rpt_count = op2;
-                s->rpt_active = true;
-                s->pc += 2;
-                return 0;
             }
             /* Per tic54x-opc.c:
              *   F880-F8FF mask FF80 = FB pmad (FAR branch unconditional)
@@ -3476,6 +3467,11 @@ static int c54x_exec_one(C54xState *s)
                 s->delay_slots = 2;
                 return consumed + s->lk_used;
             }
+            /* REVERTED 2026-05-15 nuit : tentative de cond eval pour
+             * FA00-FA7F (BCD NEAR delayed branch) cassait le firmware
+             * (DSP stuck loops). Le binaire DSP Calypso semble dépendre
+             * du comportement "branch always" pour ces opcodes. Cf comment
+             * sur F820/F830 BC handler. */
             /* NEAR FAxx fallback: simplified treat as branch */
             s->pc = op2;
             return 0;
@@ -3999,6 +3995,22 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, mmr, op2);
             return consumed + s->lk_used;
         }
+        /* REVERTED 2026-05-15 nuit : handlers 0x72/0x73 (MVDM/MVMD per
+         * binutils tic54x-opc.c) RETIRÉS d'ici. Le fix sémantiquement
+         * correct révèle un bug compensateur upstream du firmware qu'on n'a
+         * pas le temps d'attaquer maintenant. Régressions empiriques :
+         *   - A_CD-WR : 244 → 6 (-97%)
+         *   - D_TASK_D val=1 : 2/run → 0
+         *   - INT3 fire : 1583/min → 1 total
+         *   - DSP busy state : compute path → reset vector loop
+         * Voir doc/REVERT_MVMD_KNOWLEDGE.md pour analyse complète,
+         * criteria de re-application, et plan d'attaque future.
+         *
+         * Le fallthrough vers `(op & 0xF800) == 0x7000` (= STL src,Smem)
+         * est restoré, qui catch 0x72xx/0x73xx avec ce mask 0xF800.
+         * Notamment site critique PC=0x8208 op=0x7317 redevient mis-décodé
+         * comme STL B,*(DP+0x17) avec son side-effect compensatoire que
+         * le firmware exploite. */
         /* LD / ST operations */
         if ((op & 0xF800) == 0x7000) {
             /* 70xx: STL src, Smem */
@@ -4042,9 +4054,38 @@ static int c54x_exec_one(C54xState *s)
             addr = resolve_smem(s, op, &ind);
             uint16_t mask = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
             uint16_t mem_val = data_read(s, addr);
+            bool tc_before = (s->st0 & ST0_TC) != 0;
             if (mem_val & mask) s->st0 |= ST0_TC;
             else                s->st0 &= ~ST0_TC;
+            bool tc_after = (s->st0 & ST0_TC) != 0;
             consumed = 2;
+            /* BITF instrumentation (2026-05-15 nuit) — pour confirmer si TC
+             * est set correctement. Hypothèse : si BITF appelle souvent mais
+             * tc_after=1 rarement → masque/mem_val pattern empêche TC=1,
+             * ce qui fait que BC NTC branche toujours et `ST #1, d_task_d`
+             * à PROM 0x9ab1 n'est jamais atteint. Format :
+             *   BITF-PROBE #N PC=0xXXXX addr=0xXXXX mem=0xXXXX mask=0xXXXX
+             *               tc_before=N tc_after=N
+             * Cap 200 + 1/1000 ensuite. */
+            {
+                static uint64_t bitf_total;
+                static uint64_t bitf_tc_set;
+                static uint64_t bitf_tc_clear;
+                bitf_total++;
+                if (tc_after) bitf_tc_set++;
+                else          bitf_tc_clear++;
+                if (bitf_total <= 200 || (bitf_total % 1000) == 0) {
+                    fprintf(stderr,
+                            "[c54x] BITF-PROBE #%llu PC=0x%04x addr=0x%04x "
+                            "mem=0x%04x mask=0x%04x tc_before=%d tc_after=%d "
+                            "(total=%llu set=%llu clear=%llu)\n",
+                            (unsigned long long)bitf_total, s->last_exec_pc,
+                            addr, mem_val, mask, tc_before, tc_after,
+                            (unsigned long long)bitf_total,
+                            (unsigned long long)bitf_tc_set,
+                            (unsigned long long)bitf_tc_clear);
+                }
+            }
             return consumed + s->lk_used;
         }
         if ((op & 0xF800) == 0x6000) {
@@ -4820,7 +4861,14 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, prog_read(s, op2));
             return consumed + s->lk_used;
         }
-        /* 86xx: MVDM dmad, MMR */
+        /* REVERTED 2026-05-15 nuit : handlers 0x72/0x73 RETIRÉS.
+         * Voir doc/REVERT_MVMD_KNOWLEDGE.md et premier emplacement revert
+         * ci-dessus (avant le bloc `(op & 0xF800) == 0x7000`). 0x86/0x87
+         * restent comme avant (DUPLICATE MVDM/MVMD au lieu de STH A/B ASM
+         * vrai — non swappés). */
+
+        /* 86xx: MVDM dmad, MMR — DUPLICATE per current emulation
+         * (vrai 0x86 per binutils = STH A, ASM, Smem — TODO swap) */
         if (hi8 == 0x86) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
@@ -4828,7 +4876,8 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, mmr, data_read(s, op2));
             return consumed + s->lk_used;
         }
-        /* 87xx: MVMD MMR, dmad */
+        /* 87xx: MVMD MMR, dmad — DUPLICATE per current emulation
+         * (vrai 0x87 per binutils = STH B, ASM, Smem — TODO swap) */
         if (hi8 == 0x87) {
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
@@ -4836,22 +4885,30 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, op2, data_read(s, mmr));
             return consumed + s->lk_used;
         }
-        /* 81xx: STL src, ASM, Smem (store with shift) */
+        /* AUDIT FIX 2026-05-15 fin journée : 0x81/0x82/0x83 mal décodés.
+         * Per tic54x-opc.c + SPRU172C :
+         *   stl 0x8000 / 0xFE00 → 0x80..0x81 STL src,Smem (no shift)
+         *   sth 0x8200 / 0xFE00 → 0x82..0x83 STH src,Smem (no shift)
+         *   stl 0x8400 / 0xFE00 → 0x84..0x85 STL src,ASM,Smem (with shift) [TODO]
+         *   sth 0x8600 / 0xFE00 → 0x86..0x87 STH src,ASM,Smem (with shift) [TODO]
+         * bit 8 = src (0=A, 1=B). Old code applied asm_shift incorrectly
+         * to 0x81/0x82 (basic variants — no shift) AND used s->a for 0x81
+         * (should be s->b). Le bug causait toutes les STL B / STH * vers
+         * adressing indirect *ARn à écrire la mauvaise valeur ; en particulier
+         * d_burst_d (DSP word 0x0829/0x083D) et d_task_d (0x0828/0x083C) du
+         * NDB CCCH demod ARM bail dans prim_rx_nb.c::l1s_nb_resp avec
+         * "EMPTY" et "BURST ID 33414!=N" sous synth=1 banc d'essai. */
+
+        /* 0x81xx: STL B, Smem  (src=B, no shift) */
         if (hi8 == 0x81) {
             addr = resolve_smem(s, op, &ind);
-            int shift = asm_shift(s);
-            int64_t v = s->a;
-            if (shift >= 0) v <<= shift; else v >>= (-shift);
-            data_write(s, addr, (uint16_t)(v & 0xFFFF));
+            data_write(s, addr, (uint16_t)(s->b & 0xFFFF));
             return consumed + s->lk_used;
         }
-        /* 82xx: STH src, ASM, Smem */
+        /* 0x82xx: STH A, Smem  (src=A, no shift) */
         if (hi8 == 0x82) {
             addr = resolve_smem(s, op, &ind);
-            int shift = asm_shift(s);
-            int64_t v = s->a;
-            if (shift >= 0) v <<= shift; else v >>= (-shift);
-            data_write(s, addr, (uint16_t)((v >> 16) & 0xFFFF));
+            data_write(s, addr, (uint16_t)((s->a >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
         /* 89xx: ST src, Smem with shift or MVDK variants */
@@ -4877,15 +4934,25 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, op2, data_read(s, addr));
             return consumed + s->lk_used;
         }
-        /* 83xx: WRITA Smem (write A to prog), 84xx: READA Smem */
+        /* AUDIT FIX 2026-05-15 fin journée : 0x83 misclassifié comme WRITA
+         * (qui est en réalité 0x7F per tic54x-opc.c). Vrai 0x83 = STH B, Smem.
+         * Et 0x84 misclassifié comme READA (vrai = 0x7E). Vrai 0x84 = STL A,
+         * ASM, Smem (with shift). 0x85..0x87 idem TODO. */
+        /* 0x83xx: STH B, Smem  (src=B, no shift) */
         if (hi8 == 0x83) {
             addr = resolve_smem(s, op, &ind);
-            prog_write(s, (uint16_t)(s->a & 0xFFFF), data_read(s, addr));
+            data_write(s, addr, (uint16_t)((s->b >> 16) & 0xFFFF));
             return consumed + s->lk_used;
         }
+        /* 0x84xx: STL A, ASM, Smem (src=A, with ASM shift) — TODO compléter
+         * variantes 0x85 (STL B), 0x86 (STH A), 0x87 (STH B) with ASM shift.
+         * Pour l'instant fix uniquement 0x84 vers la sémantique tic54x correcte. */
         if (hi8 == 0x84) {
             addr = resolve_smem(s, op, &ind);
-            data_write(s, addr, prog_read(s, (uint16_t)(s->a & 0xFFFF)));
+            int shift = asm_shift(s);
+            int64_t v = s->a;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, addr, (uint16_t)(v & 0xFFFF));
             return consumed + s->lk_used;
         }
         /* 91xx: MVKD dmad, Smem (another encoding) */
@@ -5627,6 +5694,348 @@ int c54x_run(C54xState *s, int n_insns)
         sp_ring[sp_ring_idx & 63].pc   = s->pc;
         sp_ring[sp_ring_idx & 63].sp   = s->sp;
         sp_ring_idx++;
+    }
+
+    /* XPC tracking probe (2026-05-15 nuit, per Claude web Q1).
+     * Hypothèse à valider : le path completion CCCH demod passe par PROM1
+     * (XPC=1) via le B 0x9ab1 à 0x19aac. Si XPC=1 jamais atteint → bug
+     * dans le route initial. Si atteint mais PC pas dans 0x9aac+ → entrée
+     * OK mais pas cette zone. Tracking :
+     *   - insn count par XPC (0..3)
+     *   - dernier PC visité par XPC
+     *   - first_visit_insn par XPC (= quand on entre en XPC=N pour la 1ère fois)
+     *   - ring buffer 16 derniers PCs visités sous XPC=1 (zone d'intérêt)
+     */
+    {
+        static uint64_t xpc_insn_count[4] = {0};
+        static uint16_t xpc_last_pc[4]    = {0};
+        static uint64_t xpc_first_insn[4] = {0,0,0,0};
+        static uint16_t xpc1_pc_ring[16];
+        static unsigned xpc1_pc_ring_idx = 0;
+        static unsigned xpc1_pc_ring_count = 0;
+        static unsigned next_xpc_dump = 100000000u;  /* 100M */
+        uint8_t cur_xpc = s->xpc & 0x3;
+        xpc_insn_count[cur_xpc]++;
+        xpc_last_pc[cur_xpc] = s->pc;
+        if (xpc_first_insn[cur_xpc] == 0)
+            xpc_first_insn[cur_xpc] = s->insn_count;
+        if (cur_xpc == 1) {
+            xpc1_pc_ring[xpc1_pc_ring_idx & 15] = s->pc;
+            xpc1_pc_ring_idx++;
+            xpc1_pc_ring_count++;
+        }
+        if (s->insn_count >= next_xpc_dump) {
+            next_xpc_dump += 100000000u;
+            fprintf(stderr,
+                    "[c54x] XPC-STATS insn=%u counts: 0=%llu 1=%llu 2=%llu 3=%llu | "
+                    "first_insn: 0=%llu 1=%llu 2=%llu 3=%llu | last_pc: 0=0x%04x 1=0x%04x 2=0x%04x 3=0x%04x\n",
+                    s->insn_count,
+                    (unsigned long long)xpc_insn_count[0],
+                    (unsigned long long)xpc_insn_count[1],
+                    (unsigned long long)xpc_insn_count[2],
+                    (unsigned long long)xpc_insn_count[3],
+                    (unsigned long long)xpc_first_insn[0],
+                    (unsigned long long)xpc_first_insn[1],
+                    (unsigned long long)xpc_first_insn[2],
+                    (unsigned long long)xpc_first_insn[3],
+                    xpc_last_pc[0], xpc_last_pc[1], xpc_last_pc[2], xpc_last_pc[3]);
+            if (xpc1_pc_ring_count > 0) {
+                /* Dernier 16 PCs visités sous XPC=1 (ring buffer) */
+                fprintf(stderr,
+                        "[c54x] XPC1-PC-RING count=%u last16: "
+                        "%04x %04x %04x %04x %04x %04x %04x %04x "
+                        "%04x %04x %04x %04x %04x %04x %04x %04x\n",
+                        xpc1_pc_ring_count,
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-16)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-15)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-14)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-13)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-12)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-11)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-10)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-9)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-8)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-7)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-6)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-5)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-4)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-3)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-2)&15],
+                        xpc1_pc_ring[(xpc1_pc_ring_idx-1)&15]);
+            }
+        }
+    }
+
+    /* DISPATCH-CALLER probe (2026-05-15 nuit, per Claude web).
+     * Les 3 callers de 0x9aaf identifiés par scan PROM :
+     *   PC=0x8815 : f074 9aaf  (B 0x9aaf depuis table @0x8810)
+     *   PC=0x9296 : f274 9aaf  (BD 0x9aaf depuis routine spécifique)
+     *   PC=0x9418 : f274 9aaf  (BD 0x9aaf depuis autre routine)
+     * Log A, AR0..2, data[0x0828/9] à chaque hit. */
+    if (s->pc == 0x8815 || s->pc == 0x9296 || s->pc == 0x9418) {
+        static unsigned hit_counts[3] = {0, 0, 0};
+        int idx = (s->pc == 0x8815) ? 0 : (s->pc == 0x9296) ? 1 : 2;
+        hit_counts[idx]++;
+        if (hit_counts[idx] <= 20 || hit_counts[idx] % 100 == 0) {
+            fprintf(stderr,
+                    "[c54x] DISPATCH-CALLER hit=%u pc=0x%04x "
+                    "A=0x%010llx AR0=0x%04x AR1=0x%04x AR2=0x%04x "
+                    "data[0x0828]=0x%04x data[0x0829]=0x%04x "
+                    "data[0x083c]=0x%04x data[0x083d]=0x%04x insn=%u\n",
+                    hit_counts[idx], s->pc,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    s->ar[0], s->ar[1], s->ar[2],
+                    s->data[0x0828], s->data[0x0829],
+                    s->data[0x083c], s->data[0x083d],
+                    s->insn_count);
+        }
+    }
+
+    /* AR7-INIT-CHAIN + MVMD-AR7-BRC + RPTB-ARMED probe (Claude web 2026-05-15
+     * nuit étape 3). Diagnostic : valeur AR7 au moment du MVMD AR7,BRC à
+     * PC=0x8208, sa chaîne causale (16 derniers writes AR7), et l'état BRC
+     * post-RPTBD setup. */
+    {
+        static uint16_t prev_ar7 = 0xFFFF;
+        static struct {
+            uint16_t pc;
+            uint16_t old_val;
+            uint16_t new_val;
+            uint64_t insn;
+            uint8_t  xpc;
+        } ar7_history[16] = {{0}};
+        static unsigned ar7_hist_idx = 0;
+
+        if (s->ar[7] != prev_ar7) {
+            ar7_history[ar7_hist_idx & 15].pc = s->pc;
+            ar7_history[ar7_hist_idx & 15].old_val = prev_ar7;
+            ar7_history[ar7_hist_idx & 15].new_val = s->ar[7];
+            ar7_history[ar7_hist_idx & 15].insn = s->insn_count;
+            ar7_history[ar7_hist_idx & 15].xpc = s->xpc & 0x3;
+            ar7_hist_idx++;
+            prev_ar7 = s->ar[7];
+        }
+
+        /* (b) Snapshot complet à chaque hit de PC=0x8208 (MVMD AR7, BRC) */
+        if (s->pc == 0x8208) {
+            static unsigned mvmd_hits = 0;
+            mvmd_hits++;
+            if (mvmd_hits <= 20 || (mvmd_hits % 100) == 0) {
+                fprintf(stderr,
+                        "[c54x] MVMD-AR7-BRC #%u AR7=0x%04x BRC_before=0x%04x "
+                        "AR0=0x%04x AR1=0x%04x AR2=0x%04x AR6=0x%04x DP=%d insn=%u\n",
+                        mvmd_hits, s->ar[7], s->brc,
+                        s->ar[0], s->ar[1], s->ar[2], s->ar[6], dp(s),
+                        s->insn_count);
+                int n_hist = ar7_hist_idx < 16 ? ar7_hist_idx : 16;
+                for (int i = 0; i < n_hist; i++) {
+                    int slot = (ar7_hist_idx - n_hist + i) & 15;
+                    fprintf(stderr,
+                            "[c54x]   AR7-HIST[%d] pc=XPC%u:0x%04x 0x%04x->0x%04x insn=%llu\n",
+                            i, ar7_history[slot].xpc, ar7_history[slot].pc,
+                            ar7_history[slot].old_val, ar7_history[slot].new_val,
+                            (unsigned long long)ar7_history[slot].insn);
+                }
+            }
+        }
+
+        /* (c) État RPTB après setup (PC=0x820c = delay slot post-RPTBD) */
+        if (s->pc == 0x820c) {
+            static unsigned rptb_hits = 0;
+            rptb_hits++;
+            if (rptb_hits <= 20 || (rptb_hits % 100) == 0) {
+                fprintf(stderr,
+                        "[c54x] RPTB-ARMED #%u BRC=0x%04x RSA=0x%04x REA=0x%04x "
+                        "ST1=0x%04x (INTM=%d) insn=%u\n",
+                        rptb_hits, s->brc, s->rsa, s->rea, s->st1,
+                        (s->st1 >> 11) & 1, s->insn_count);
+            }
+        }
+    }
+
+    /* INT3-BLOCKED probe (Claude web 2026-05-15 nuit, étape 2).
+     * Sample 1/1000 du context (PC/ST1/BRC/XPC) quand INT3 pending + INTM=1.
+     * Discrimine : (a) opcode set INTM=1 sans clear (variante POPM),
+     * (b) RPTB long non-interruptible (BRC > 0 partout),
+     * (c) STM ST1 / MVDM ST1 brut. Cf matrice Claude web. */
+    {
+        static uint64_t blocked_count = 0;
+        static uint16_t sample_pcs[32] = {0};
+        static uint16_t sample_st1s[32] = {0};
+        static uint16_t sample_brcs[32] = {0};
+        static uint8_t  sample_xpcs[32] = {0};
+        static unsigned sample_idx = 0;
+        static unsigned next_blocked_dump = 100000000u;
+
+        bool int3_pending_now = (s->ifr & 0x08) != 0;
+        bool intm_set_now = ((s->st1 >> 11) & 1) != 0;
+
+        if (int3_pending_now && intm_set_now) {
+            blocked_count++;
+            if ((blocked_count % 1000) == 0) {
+                sample_pcs[sample_idx & 31] = s->pc;
+                sample_st1s[sample_idx & 31] = s->st1;
+                sample_brcs[sample_idx & 31] = s->brc;
+                sample_xpcs[sample_idx & 31] = s->xpc & 0x3;
+                sample_idx++;
+            }
+        }
+
+        if (s->insn_count >= next_blocked_dump) {
+            next_blocked_dump += 100000000u;
+            fprintf(stderr,
+                    "[c54x] INT3-BLOCKED insn=%u blocked_total=%llu blocked_samples=%u\n",
+                    s->insn_count,
+                    (unsigned long long)blocked_count,
+                    sample_idx);
+            int n = sample_idx < 32 ? sample_idx : 32;
+            for (int i = 0; i < n; i++) {
+                int slot = (sample_idx - n + i) & 31;
+                fprintf(stderr,
+                        "[c54x] INT3-BLOCKED-SAMPLE pc=XPC%u:0x%04x st1=0x%04x brc=0x%04x\n",
+                        sample_xpcs[slot], sample_pcs[slot],
+                        sample_st1s[slot], sample_brcs[slot]);
+            }
+        }
+    }
+
+    /* IRQ-FRAME-HEALTH probe (Claude web 2026-05-15 nuit, étape 1).
+     * Diagnostic timing TDMA vs wall-clock : INT3 = frame interrupt
+     * (IMR bit 3, vec 19, addr 0xFFCC). Mesure fire/serviced/missed/latency.
+     * Discrimine : ISR mal vectorisée (service<fire), TPU/TSP fail (fire=0),
+     * compute trop lent (missed>0). Cause root LOST 3468 + variance XPC. */
+    {
+        static uint64_t int3_fire_count = 0;
+        static uint64_t int3_serviced_count = 0;
+        static uint64_t int3_missed_count = 0;
+        static uint64_t last_int3_fire_insn = 0;
+        static uint64_t last_int3_service_insn = 0;
+        static uint64_t total_service_latency_insn = 0;
+        static bool int3_pending_prev = false;
+        static unsigned next_irq_dump = 200000000u;
+
+        bool int3_now_pending = (s->ifr & 0x08) != 0;
+        bool int3_just_fired = int3_now_pending && !int3_pending_prev;
+        /* ISR enter approximation : INT3 cleared from IFR while INTM=0 */
+        bool int3_just_serviced = !int3_now_pending && int3_pending_prev &&
+                                  ((s->st1 >> 11) & 1) == 0;
+
+        if (int3_just_fired) {
+            int3_fire_count++;
+            if (int3_pending_prev) {
+                int3_missed_count++;
+            }
+            last_int3_fire_insn = s->insn_count;
+        }
+        if (int3_just_serviced) {
+            int3_serviced_count++;
+            if (last_int3_fire_insn > last_int3_service_insn) {
+                total_service_latency_insn += (s->insn_count - last_int3_fire_insn);
+            }
+            last_int3_service_insn = s->insn_count;
+        }
+        int3_pending_prev = int3_now_pending;
+
+        if (s->insn_count >= next_irq_dump) {
+            next_irq_dump += 200000000u;
+            uint64_t avg_latency = int3_serviced_count > 0
+                ? total_service_latency_insn / int3_serviced_count : 0;
+            double service_ratio = int3_fire_count > 0
+                ? (double)int3_serviced_count / int3_fire_count : 0.0;
+            fprintf(stderr,
+                    "[c54x] IRQ-FRAME-HEALTH insn=%u int3_fire=%llu int3_serviced=%llu "
+                    "int3_missed=%llu avg_latency_insn=%llu service_ratio=%.2f\n",
+                    s->insn_count,
+                    (unsigned long long)int3_fire_count,
+                    (unsigned long long)int3_serviced_count,
+                    (unsigned long long)int3_missed_count,
+                    (unsigned long long)avg_latency,
+                    service_ratio);
+        }
+    }
+
+    /* EXIT-COMPUTE + IRQ-DURING-COMPUTE probe (Claude web 2026-05-15 nuit).
+     * Le DSP tourne en XPC=2 dans zone hot 0xdf80..0xdfc0 (CCCH demod MAC loop).
+     * Discrimine entre 3 hypothèses :
+     *   (1) compute jamais exit (threshold non franchi)
+     *   (2) IRQ jamais fire (TPU/TSP source manquante)
+     *   (3) IRQ fire mais pas serviced (INTM stuck ou ISR mal vectorisée)
+     * Matrice de décision basée sur exits_count + irq_pending_in_compute. */
+    {
+        static uint16_t last_pc_sample = 0;
+        static uint8_t  last_xpc_sample = 0;
+        static unsigned exits_count = 0;
+        static unsigned irqs_pending_during_compute = 0;
+        static unsigned int3_pending_during_compute = 0;
+        static uint64_t insns_in_compute = 0;
+        static unsigned next_compute_dump = 200000000u;
+
+        bool in_compute_now = ((s->xpc & 0x3) == 2 &&
+                               s->pc >= 0xdf80 && s->pc <= 0xdfc0);
+        bool was_in_compute = (last_xpc_sample == 2 &&
+                               last_pc_sample >= 0xdf80 && last_pc_sample <= 0xdfc0);
+
+        if (was_in_compute && !in_compute_now) {
+            exits_count++;
+            if (exits_count <= 30 || exits_count % 200 == 0) {
+                fprintf(stderr,
+                        "[c54x] EXIT-COMPUTE #%u from=XPC%u:0x%04x to=XPC%u:0x%04x "
+                        "A=0x%010llx IFR=0x%04x INTM=%d insn=%u\n",
+                        exits_count,
+                        last_xpc_sample, last_pc_sample,
+                        s->xpc & 0x3, s->pc,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        s->ifr, (s->st1 >> 11) & 1, s->insn_count);
+            }
+        }
+
+        if (in_compute_now) {
+            insns_in_compute++;
+            if (s->ifr != 0) {
+                irqs_pending_during_compute++;
+                if (s->ifr & 0x08) int3_pending_during_compute++;
+            }
+        }
+
+        if (s->insn_count >= next_compute_dump) {
+            next_compute_dump += 200000000u;
+            fprintf(stderr,
+                    "[c54x] COMPUTE-STATS insn=%u in_compute=%llu exits=%u "
+                    "irq_pending_in_compute=%u int3_pending_in_compute=%u\n",
+                    s->insn_count,
+                    (unsigned long long)insns_in_compute,
+                    exits_count,
+                    irqs_pending_during_compute,
+                    int3_pending_during_compute);
+        }
+
+        last_pc_sample = s->pc;
+        last_xpc_sample = s->xpc & 0x3;
+    }
+
+    /* DISPATCH-ENTRY probe (per Claude web option 3 hybride).
+     * Le dispatcher caller saute vers 0x8810 + task_id*3, où chaque entry =
+     * { 0xf4e4 (FRET ou padding), 0xf074 (B opcode), <target> }.
+     * On probe le PC qui correspond au début d'un entry (PC = 0x8810 + N*3).
+     * task_id estimé = (PC - 0x8810) / 3.
+     * Si entry exec OK → on lit data[PC+2] qui est le target. */
+    if (s->pc >= 0x8810 && s->pc < 0x8900 && ((s->pc - 0x8810) % 3) == 0) {
+        static unsigned entry_hits = 0;
+        entry_hits++;
+        if (entry_hits <= 50 || entry_hits % 200 == 0) {
+            uint16_t entry_idx = (s->pc - 0x8810) / 3;
+            uint16_t header = s->prog[s->pc];     /* normally 0xf4e4 */
+            uint16_t branch = s->prog[s->pc + 1]; /* normally 0xf074 */
+            uint16_t target = s->prog[s->pc + 2];
+            fprintf(stderr,
+                    "[c54x] DISPATCH-ENTRY #%u pc=0x%04x entry_idx=%u "
+                    "header=0x%04x branch=0x%04x target=0x%04x "
+                    "A=0x%010llx insn=%u\n",
+                    entry_hits, s->pc, entry_idx,
+                    header, branch, target,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    s->insn_count);
+        }
     }
 
     /* Periodic DSP state dump (every 500M insns, starting at 500M).

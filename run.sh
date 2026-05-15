@@ -90,9 +90,33 @@ QEMU_LOG="/root/qemu.log"
 BRIDGE_LOG="/tmp/bridge.log"
 OSMOCON_LOG="/tmp/osmocon.log"
 MOBILE_LOG="/tmp/mobile.log"
+L2_LOG="/tmp/l2_client.log"
 MON_SOCK="/tmp/qemu-calypso-mon.sock"
 L1CTL_SOCK="/tmp/osmocom_l2"
 QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
+
+# ---------- L2 client selection (menu) ----------
+# Choix de l'application L23/L2 qui consomme L1CTL via /tmp/osmocom_l2 :
+#   1. mobile    : osmocom-bb mobile complet (stack L23 + VTY) — default
+#   2. ccch_scan : ccch_scan -a 1 (scan CCCH ARFCN 1, dump SI/IA)
+#   3. cell_log  : cell_log (scan toutes les cells, mesures de power)
+# Set CALYPSO_L2_CLIENT=mobile|ccch_scan|cell_log to override the prompt.
+CALYPSO_L2_CLIENT="${CALYPSO_L2_CLIENT:-}"
+if [ -z "$CALYPSO_L2_CLIENT" ]; then
+    echo
+    echo "===== L2 client selection ====="
+    echo "  1) mobile     (osmocom-bb mobile, full L23 stack + VTY)"
+    echo "  2) ccch_scan  (ccch_scan -a 1, scan CCCH ARFCN 1)"
+    echo "  3) cell_log   (cell_log, scan toutes cells + power)"
+    echo "==============================="
+    read -r -p "Choix [1/2/3] (default 1) : " L2_CHOICE
+    case "${L2_CHOICE:-1}" in
+        2) CALYPSO_L2_CLIENT=ccch_scan ;;
+        3) CALYPSO_L2_CLIENT=cell_log ;;
+        *) CALYPSO_L2_CLIENT=mobile ;;
+    esac
+fi
+echo "L2 client = $CALYPSO_L2_CLIENT"
 
 # ---------- cleanup ----------
 rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" \
@@ -172,10 +196,27 @@ tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
 sleep 2
 
-# ---------- 5. mobile ----------
-tmux new-window -t "$SESSION" -n mobile
-tmux send-keys -t "$SESSION:mobile" \
-    "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
+# ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------
+tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
+case "$CALYPSO_L2_CLIENT" in
+    mobile)
+        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+            "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
+        ;;
+    ccch_scan)
+        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+            "sleep 3 && ccch_scan -a 1 2>&1 | tee $L2_LOG" C-m
+        ;;
+    cell_log)
+        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+            "sleep 3 && cell_log 2>&1 | tee $L2_LOG" C-m
+        ;;
+    *)
+        echo "WARN — CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
+        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+            "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
+        ;;
+esac
 
 # ---------- 6. gsmtap capture (any iface — covers eth0 mobile/BTS + eth1) ----------
 tmux new-window -t "$SESSION" -n gsmtap
