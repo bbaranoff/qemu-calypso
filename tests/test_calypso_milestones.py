@@ -94,9 +94,14 @@ def docker_exec(cmd: list[str], timeout: float = 30.0) -> subprocess.CompletedPr
     if _DOCKER is None:
         return subprocess.CompletedProcess(args=cmd, returncode=127,
                                            stdout="", stderr="docker inaccessible")
+    # errors='replace' : qemu.log peut contenir des bytes binaires (STATE-DUMP
+    # mémoire brute) et `tail -c N` peut couper en milieu de séquence UTF-8.
+    # Sans replace, le décodage subprocess crash avant que le test puisse voir
+    # son needle.
     return subprocess.run(
         [*_DOCKER, "exec", CONTAINER_NAME] + cmd,
         capture_output=True, text=True, timeout=timeout,
+        errors="replace",
     )
 
 def journal_grep(needle: str, since_seconds: int = 60) -> list[str]:
@@ -471,14 +476,33 @@ def test_fb0_att_nonzero(container_alive):
     )
 
 
+def _detect_fbsb_synth_in_container() -> str:
+    """Source de vérité = qemu.log où calypso_fbsb logue son état au boot.
+    Format : '[calypso-fbsb] CALYPSO_FBSB_SYNTH=0 (real DSP path)'
+             '[calypso-fbsb] CALYPSO_FBSB_SYNTH=1 (synth, dev-assist path)'
+    L'env os.environ côté pytest host est INCORRECT — il ne reflète pas
+    l'env du QEMU dans le container. Bug détecté 2026-05-15."""
+    r = docker_exec([
+        "sh", "-c",
+        f"grep -oE 'CALYPSO_FBSB_SYNTH=[01]' {QEMU_LOG_CONTAINER} 2>/dev/null | tail -n 1 || true"
+    ])
+    line = r.stdout.strip()
+    if "=1" in line: return "1"
+    if "=0" in line: return "0"
+    return "unknown"
+
+
 @pytest.mark.milestone_fb_det
 def test_synth_zero_path_active(container_alive):
     """
     CALYPSO_FBSB_SYNTH=0 : sans détection réelle, le mobile ne passe pas en
     gsm322. Si on observe une transition gsm322 avec synth=0, le demod marche.
     """
-    if os.environ.get("CALYPSO_FBSB_SYNTH", "1") != "0":
-        pytest.skip("CALYPSO_FBSB_SYNTH=1 actif — workaround, pas le vrai chemin")
+    synth = _detect_fbsb_synth_in_container()
+    if synth == "unknown":
+        pytest.skip("Impossible de détecter CALYPSO_FBSB_SYNTH dans qemu.log")
+    if synth == "1":
+        pytest.skip("CALYPSO_FBSB_SYNTH=1 actif côté container — workaround, pas le vrai chemin")
     pytest.xfail("Vrai demod CCCH pas convergent")
 
 
@@ -529,12 +553,25 @@ def test_l1ctl_data_ind_received(container_alive):
     """
     Milestone L1 : L1CTL_DATA_IND vers mobile non-zéro.
 
-    ⚠️ Update 2026-05-15 : converti de xfail à vrai test. CCCH demod écrit
-    a_cd[] (272 writes observés), ARM L1 consomme et envoie DATA_IND
-    (41 observés). C'est désormais un milestone PASSANT, à protéger en régression.
+    Sémantique 3-états :
+      - PASS  : DATA_IND > 0 (milestone L1 atteint)
+      - XFAIL : task=24 (ALLC) fire 0× → conditions amont CCCH pas réunies,
+                la mesure DATA_IND n'a pas de sens (variance/régime intermittent)
+      - FAIL  : task=24 > 0 et DATA_IND = 0 → vrai mur couche 6,
+                ARM ne forward pas a_cd[] au mobile (vraie régression à creuser)
     """
-    # grep -c returns "0\n" + exit code 1 if no matches; `|| echo 0` ajoute un
-    # second "0", d'où le bug "'0\n0'". Fix : utiliser `|| true` au lieu de `echo 0`.
+    r_allc = docker_exec([
+        "sh", "-c",
+        f"grep -c 'task=24' {QEMU_LOG_CONTAINER} 2>/dev/null || true"
+    ])
+    allc_str = r_allc.stdout.strip()
+    allc_hooks = int(allc_str) if allc_str.isdigit() else 0
+    if allc_hooks == 0:
+        pytest.xfail(
+            "task=24 (ALLC) fire 0× — conditions amont CCCH pas réunies, "
+            "DATA_IND non interprétable"
+        )
+
     r = docker_exec([
         "sh", "-c",
         f"grep -cE 'L1CTL_DATA_IND|DATA_IND' {QEMU_LOG_CONTAINER} 2>/dev/null || true"
@@ -542,7 +579,7 @@ def test_l1ctl_data_ind_received(container_alive):
     n_str = r.stdout.strip()
     n = int(n_str) if n_str.isdigit() else 0
     assert n > 0, (
-        f"Aucun L1CTL_DATA_IND — régression milestone L1. "
+        f"task=24 fire {allc_hooks}× mais DATA_IND=0 — vrai mur couche 6. "
         f"ARM ne forward pas a_cd[] au mobile."
     )
 

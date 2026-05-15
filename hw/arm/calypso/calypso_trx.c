@@ -250,6 +250,25 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
                     (unsigned)val, size, s->fn, arm_rd_log);
         }
     }
+
+    /* ARM-read trace on a_cd[0..14] : CCCH demod result buffer (15 words).
+     *   DSP words 0x09D0..0x09DE → ARM bytes 0x03A0..0x03BD.
+     * Goal : confirmer si ARM L1 prim_rx_nb consomme effectivement a_cd[]
+     * quand task=24 (ALLC) fire et A_CD-WR remplit le buffer. Si compteur=0
+     * mais A_CD-WR>0, le mur DATA_IND est avant la lecture (firmware ne
+     * s'arme pas sur l'event CCCH). Si compteur>0 mais DATA_IND=0, le
+     * mur est downstream (check db_r->d_burst_d ou autre dans
+     * prim_rx_nb.c::l1s_nb_resp). */
+    if (offset >= 0x03A0 && offset <= 0x03BD && (offset & 1) == 0) {
+        static unsigned arm_rd_a_cd = 0;
+        arm_rd_a_cd++;
+        if (arm_rd_a_cd <= 200 || (arm_rd_a_cd % 1000) == 0) {
+            unsigned word_idx = (unsigned)((offset - 0x03A0) / 2);
+            TRX_LOG("ARM RD a_cd[%u] [arm=0x%04x dsp_word=0x%04x] = 0x%04x sz=%d fn=%u #%u",
+                    word_idx, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
+                    (unsigned)val, size, s->fn, arm_rd_a_cd);
+        }
+    }
     return val;
 }
 

@@ -802,6 +802,38 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             fprintf(stderr, "\n");
         }
     }
+    /* D_TASK_D probe (2026-05-15 fin journée) — watch d_task_d à 0x0828
+     * (page 0) et 0x083C (page 1), READ side de la struct db_buf_r.
+     * ARM L1 prim_rx_nb lit ce champ via dsp_api.db_r->d_task_d et bail
+     * avec puts("EMPTY") si == 0. 60 EMPTY printf observés sous synth=1
+     * banc d'essai déterministe : DSP n'écrit jamais cette cellule (ou
+     * écrit 0). Cette probe trace : qui écrit ? quand ? avec quelle valeur ?
+     * Distinguer entre :
+     *   - DSP ne touche jamais 0x0828/0x083C
+     *   - DSP écrit val=0 (clear/init seulement)
+     *   - DSP écrit val=24 (DSP_TASK_ALLC) mais ARM lit avant le write
+     */
+    if (addr == 0x0828 || addr == 0x083C) {
+        static uint64_t dt_total[2];
+        static uint16_t dt_prev[2];
+        static uint64_t dt_last_log[2];
+        int page = (addr == 0x083C) ? 1 : 0;
+        uint16_t exec_pc = s->last_exec_pc;
+        uint16_t prev_val = dt_prev[page];
+        uint16_t curr_val = val;
+        dt_total[page]++;
+        dt_prev[page] = curr_val;
+        bool should_log = dt_total[page] <= 200
+            || (s->insn_count - dt_last_log[page]) > 100000;
+        if (should_log) {
+            fprintf(stderr,
+                    "[c54x] D_TASK_D-WR page=%d #%llu addr=0x%04x val=0x%04x "
+                    "exec_pc=0x%04x prev=0x%04x insn=%u\n",
+                    page, (unsigned long long)dt_total[page], addr, val,
+                    exec_pc, prev_val, s->insn_count);
+            dt_last_log[page] = s->insn_count;
+        }
+    }
     /* DATA-W-MMR : log every write into the low MMR window (addr <= 0x1F)
      * with full attribution context. Goal : disambiguate the IMR-W trace
      * cascade observed at PC=0x8eb9 (op=0xf3e1) and PC=0x9ad0 (op=0x8192).
