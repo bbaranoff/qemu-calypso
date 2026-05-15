@@ -79,8 +79,214 @@ static inline int asm_shift(C54xState *s)
 /* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
 static uint16_t prog_read(C54xState *s, uint32_t addr);
 
+/* === Generic watch-write zone helper (2026-05-15 matin) ===
+ *
+ * Factorisation du pattern COEFFS-WR / A_CD-WR / ... : pour chaque zone
+ * mémoire surveillée, maintient per-PC counter + log throttled + summary
+ * périodique. La 4e+ instrumentation devient triviale au call site.
+ *
+ * Cost : 512 KB de statique par zone (per_pc[0x10000] × uint64_t). Acceptable
+ * pour debug. */
+typedef struct {
+    uint64_t per_pc[0x10000];
+    uint64_t total;
+    uint64_t last_log_insn;
+    uint64_t last_summary_insn;
+    uint16_t last_exec_pc;
+} WatchWriteState;
+
+static bool watch_write_zone_check(C54xState *s, uint16_t addr, uint16_t val,
+                                   const char *name,
+                                   uint16_t lo, uint16_t hi,
+                                   WatchWriteState *st)
+{
+    if (addr < lo || addr > hi) return false;
+    uint16_t exec_pc = s->last_exec_pc;
+    st->per_pc[exec_pc]++;
+    st->total++;
+    bool should_log =
+        st->total <= 500
+        || exec_pc != st->last_exec_pc
+        || (s->insn_count - st->last_log_insn) > 100000;
+    if (should_log) {
+        const char *wk_name[] = {
+            "UNK", "F3", "8x", "77", "76", "PSHM",
+            "RET", "IRQ_ACK", "ARM_MMIO", "RES_AR", "OTHER"
+        };
+        uint8_t wk = s->writer_kind;
+        const char *wkn = (wk < sizeof(wk_name)/sizeof(wk_name[0]))
+                          ? wk_name[wk] : "??";
+        fprintf(stderr,
+                "[c54x] %s-WR #%llu addr=0x%04x val=0x%04x "
+                "exec_pc=0x%04x cur_pc=0x%04x cur_op=0x%04x wk=%s "
+                "AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                name, (unsigned long long)st->total, addr, val,
+                exec_pc, s->pc, s->prog[s->pc], wkn,
+                s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        st->last_exec_pc = exec_pc;
+        st->last_log_insn = s->insn_count;
+    }
+    if (s->insn_count - st->last_summary_insn >= 5000000) {
+        st->last_summary_insn = s->insn_count;
+        /* Format `<NAME>-WR-SUMMARY` (avec -WR- infix) pour cohérence avec
+         * les per-hit lines `<NAME>-WR #N` et backward-compat regex tests. */
+        fprintf(stderr, "[c54x] %s-WR-SUMMARY insn=%u total=%llu",
+                name, s->insn_count, (unsigned long long)st->total);
+        for (int p = 0; p < 0x10000; p++) {
+            if (st->per_pc[p]) {
+                fprintf(stderr, " pc[0x%04x]=%llu",
+                        p, (unsigned long long)st->per_pc[p]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    return true;
+}
+
+/* === FB-det timing/content stats (2026-05-14 night) ===
+ *
+ * Captures sur les ~928 fires de 0x8f51 (au lieu du cap 50 actuel) :
+ *   - AR4 dans/hors zone [0x2bc0..0x2bff] → addressing vs timing
+ *   - delta insn depuis dernier write par cluster (compute/clear/pattern)
+ *   - histogramme val[AR4] : zero / 0xfffe sentinel / other
+ *
+ * Verdict :
+ *   ar4_in_zone < 100% → bug d'addressing (AR4 pointe hors zone)
+ *   delta_clear < delta_compute systématique → timing race (clear gagne)
+ *   delta_compute >> 1M → compute jamais dans la fenêtre du fire
+ *   other > 0 → certains sweeps voient des données — creuser ces fires
+ */
+static struct {
+    /* Timing trackers (mis à jour dans data_write côté 0x2bc0..0x2bff) */
+    uint64_t last_compute_insn;
+    uint16_t last_compute_addr;
+    uint64_t last_clear_insn;
+    uint16_t last_clear_addr;
+    uint64_t last_pattern_insn;
+    uint16_t last_pattern_addr;
+    /* Stats au moment du fire 0x8f51 */
+    uint64_t fb_det_total;
+    uint64_t fb_det_ar4_in_zone;
+    uint64_t fb_det_ar4_outside;
+    uint64_t fb_det_dar4_zero;
+    uint64_t fb_det_dar4_sentinel;
+    uint64_t fb_det_dar4_other;
+    /* Sweep tracking : un sweep = 50 fires 0x8f51 consécutifs avec AR3
+     * progressant 0..0x3A3 stride+19. Wrap (ar3 < last_ar3) = nouveau sweep. */
+    uint16_t last_ar3_at_fire;
+    uint64_t sweep_id;
+    uint64_t sweep_nonzero_count;
+} g_fb_det_timing;
+
+/* === DSP throughput emission (2026-05-14 evening) ===
+ *
+ * Émet `[c54x] INSN-COUNT-STATS total=N delta=N elapsed_ms=N rate=N/s` toutes
+ * les 1M insn. Lu en stéréo par :
+ *   - test_dsp_throughput_5x (milestones, static)
+ *   - test_dsp_throughput_above_threshold (observability, runtime)
+ * Seuil pytest : 50M/s (marge ×2 sous les 100M/s historiques). */
+#include <time.h>
+static struct {
+    uint64_t last_logged_insn;
+    struct timespec last_logged_ts;
+} g_throughput;
+
+static inline void throughput_tick(uint64_t insn_count)
+{
+    if (insn_count - g_throughput.last_logged_insn < 1000000) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (g_throughput.last_logged_ts.tv_sec == 0 &&
+        g_throughput.last_logged_ts.tv_nsec == 0) {
+        g_throughput.last_logged_ts = now;
+        g_throughput.last_logged_insn = insn_count;
+        return;
+    }
+    int64_t delta_ns =
+        (int64_t)(now.tv_sec - g_throughput.last_logged_ts.tv_sec) * 1000000000LL +
+        (int64_t)(now.tv_nsec - g_throughput.last_logged_ts.tv_nsec);
+    uint64_t delta_insn = insn_count - g_throughput.last_logged_insn;
+    uint64_t rate = (delta_ns > 0)
+        ? (delta_insn * 1000000000ULL / (uint64_t)delta_ns) : 0;
+    fprintf(stderr,
+            "[c54x] INSN-COUNT-STATS total=%llu delta=%llu elapsed_ms=%lld rate=%llu/s\n",
+            (unsigned long long)insn_count,
+            (unsigned long long)delta_insn,
+            (long long)(delta_ns / 1000000),
+            (unsigned long long)rate);
+    g_throughput.last_logged_ts = now;
+    g_throughput.last_logged_insn = insn_count;
+}
+
+/* === Read-by-range tracking for FB-det path analysis (2026-05-14 evening) ===
+ *
+ * Cible : identifier la zone DARAM lue par la routine FB-det sans préjuger.
+ * Compteurs cumulatifs par plage + snapshot/delta à chaque "trigger PC"
+ * (sites qui écrivent d_fb_det, identifiés par grep ZERO-WR + WR-SITE).
+ *
+ * Plages mutuellement exclusives :
+ *   RR_MMRS   [0x0000..0x005F]  registres MMR C54x
+ *   RR_LOW    [0x0060..0x03A3]  zone correlator linéaire (hypothèse 05-14)
+ *   RR_APIRAM [0x0800..0x27FF]  API RAM partagée ARM/DSP (hypothèse β)
+ *   RR_TARGET [0x3FB0..0x3FFF]  où BSP DMA écrit par défaut
+ *   RR_WRAP   [0xFC5D..0xFFED]  zone correlator wrap BK=176 (AR2/AR7)
+ *   RR_OTHER  tout le reste (incluant overlay 0x80..7FF, debord 0x4000+, etc.)
+ *
+ * Trigger PCs : 5 sites observés écrivant d_fb_det (4 ZERO-WR rares + 0x8f51
+ * en boucle 50 fois). Le delta entre 2 triggers consécutifs = reads
+ * cumulés dans la fenêtre amont. Cap à 200 triggers loggés pour ne pas
+ * flooder. */
+enum { RR_MMRS, RR_LOW, RR_APIRAM, RR_TARGET, RR_WRAP, RR_OTHER, RR_NUM };
+
+static struct {
+    uint64_t cumulative[RR_NUM];
+    uint64_t snapshot[RR_NUM];
+    uint64_t trigger_count;
+} g_read_stats;
+
+static inline void read_stats_record(uint16_t addr)
+{
+    int r;
+    if      (addr <= 0x005F)                    r = RR_MMRS;
+    else if (addr <= 0x03A3)                    r = RR_LOW;
+    else if (addr >= 0x0800 && addr <= 0x27FF)  r = RR_APIRAM;
+    else if (addr >= 0x3FB0 && addr <= 0x3FFF)  r = RR_TARGET;
+    else if (addr >= 0xFC5D && addr <= 0xFFED)  r = RR_WRAP;
+    else                                        r = RR_OTHER;
+    g_read_stats.cumulative[r]++;
+}
+
+static void read_stats_trigger_check(C54xState *s)
+{
+    /* Trigger PC réduit à 0x8f51 uniquement (FB-det compute loop, 50 hits/sweep).
+     * 2026-05-14 — Run précédent : trigger list large {0x8f51, 0x778a, 0x9ac0,
+     * 0x9ad0, 0x9b00, 0x821a} → 0x821a en boot mailbox poll loop (14 insns
+     * entre hits) a dévoré les 200 lignes de cap avant que 0x8f51 ne fire.
+     * Les autres PCs étaient init/reset (1-3 hits chacun sur tout le run).
+     * Cap remonté à 5000 pour couvrir plusieurs sweeps FB-det. */
+    if (s->pc != 0x8f51) return;
+    g_read_stats.trigger_count++;
+    if (g_read_stats.trigger_count > 5000) return;
+    uint64_t delta[RR_NUM];
+    for (int r = 0; r < RR_NUM; r++) {
+        delta[r] = g_read_stats.cumulative[r] - g_read_stats.snapshot[r];
+        g_read_stats.snapshot[r] = g_read_stats.cumulative[r];
+    }
+    fprintf(stderr,
+            "[c54x] READ-AMONT #%llu PC=0x%04x insn=%u "
+            "mmrs=%llu low=%llu apiram=%llu target=%llu wrap=%llu other=%llu\n",
+            (unsigned long long)g_read_stats.trigger_count, s->pc, s->insn_count,
+            (unsigned long long)delta[RR_MMRS],
+            (unsigned long long)delta[RR_LOW],
+            (unsigned long long)delta[RR_APIRAM],
+            (unsigned long long)delta[RR_TARGET],
+            (unsigned long long)delta[RR_WRAP],
+            (unsigned long long)delta[RR_OTHER]);
+}
+
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    read_stats_record(addr);
     /* PC-histogram pour identifier la routine PM. Deux ranges :
      *   [0x3fb0..0x3fbf] = buffer BSP (samples I/Q)
      *   [0x3dcf..0x3dd5] = buffer scratch dominant (78k+52k reads observés)
@@ -431,6 +637,55 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* COEFFS-WR probe : watch-write sur la zone [0x2bc0..0x2bff] (64 mots).
+     * 2026-05-14 evening — COEFFS-DUMP a montré une séquence init→clear→use :
+     *   insn=2M  PC=0x9b05  vraies coeffs (f320, a660, ...)
+     *   insn=3M  PC=0x9abc  pattern uniforme 0x0001 (suspect)
+     *   insn=4M  PC=0x9abd  ALL ZERO (clear)
+     *   insn=9M+ PC=0x8f51  ALL ZERO toujours (read par correlator)
+     *
+     * v2 (run précédent cap 200) : 3 clusters identifiés —
+     *   0x8216 (wk=OTHER, 23 hits) = vraies coeffs
+     *   0x9ace (wk=8, 64 hits)    = clear partiel
+     *   0x9abf (wk=8x, 113 hits)  = pattern 0x0001
+     * Cap atteint à insn=1.65M. On veut savoir si 0x8216 refire après.
+     *
+     * v3 (ce patch) :
+     *   - Per-PC counter global sur tout le run (jamais capé)
+     *   - Throttled log : 500 premiers + transitions PC + 1/100k insns
+     *   - Summary périodique tous les 5M insns dump tous les PCs avec count>0
+     * Tranche (1) re-fire 0x8216 manqué vs (2) one-shot définitif. */
+    /* Timing trackers par cluster (utilisés par la sonde 0x8f51) — gardés
+     * en dehors du helper car cluster-specific. Le watch_write_zone_check
+     * factorise le compteur per-PC + log + summary. */
+    if (addr >= 0x2bc0 && addr <= 0x2bff) {
+        uint16_t exec_pc = s->last_exec_pc;
+        if (exec_pc == 0x8216 || exec_pc == 0x8217 || exec_pc == 0x8218) {
+            g_fb_det_timing.last_compute_insn = s->insn_count;
+            g_fb_det_timing.last_compute_addr = addr;
+        } else if (exec_pc == 0x9ace) {
+            g_fb_det_timing.last_clear_insn = s->insn_count;
+            g_fb_det_timing.last_clear_addr = addr;
+        } else if (exec_pc == 0x9abf) {
+            g_fb_det_timing.last_pattern_insn = s->insn_count;
+            g_fb_det_timing.last_pattern_addr = addr;
+        }
+    }
+    {
+        static WatchWriteState wws_coeffs;
+        watch_write_zone_check(s, addr, val, "COEFFS", 0x2bc0, 0x2bff, &wws_coeffs);
+    }
+    /* A_CD-WR : a_cd[15] in NDB starts at DSP word 0x09D0 (= API byte 0x03A0,
+     * = NDB byte offset 0x1F8). 15 words = [0x09D0..0x09DE].
+     * Cible : tracker si le DSP CCCH demod (DSP_TASK_ALLC) écrit ses résultats.
+     * Verdict (au choix après run) :
+     *   total=0      → DSP n'entre jamais dans CCCH demod ou échoue avant store
+     *   total>0 val=0 → CCCH demod tourne mais sort 0/pattern bizarre
+     *   total>0 val varié → CCCH demod produit, bug ARM-side L1 ne consomme pas */
+    {
+        static WatchWriteState wws_a_cd;
+        watch_write_zone_check(s, addr, val, "A_CD", 0x09d0, 0x09de, &wws_a_cd);
+    }
     /* DATA-W-MMR : log every write into the low MMR window (addr <= 0x1F)
      * with full attribution context. Goal : disambiguate the IMR-W trace
      * cascade observed at PC=0x8eb9 (op=0xf3e1) and PC=0x9ad0 (op=0x8192).
@@ -1251,18 +1506,114 @@ static int c54x_exec_one(C54xState *s)
          *     structurel : DSP attend les samples ailleurs que là où le
          *     BSP les écrit. Suite : tracer init AR, table coeffs, ou
          *     MAC sur autre buffer. */
+        /* COEFFS-TABLE-DUMP : 1× au tout début + à chaque sweep FB-det.
+         * Dump data[0x2bc0..0x2bcF] (zone censée contenir les coefficients
+         * du correlator selon AR4 observé). 2026-05-14 : capture étendue
+         * D_FB_DET-WR-SITE a révélé data[AR4]=0x0000 sur 50 hits → la table
+         * de coeffs est VIDE en mémoire. Vérifier ici si elle l'est aussi
+         * en boot et si quelqu'un l'écrit jamais. */
+        {
+            static int coeffs_log_n;
+            static uint64_t coeffs_last_insn;
+            bool first_call = (coeffs_log_n == 0);
+            bool periodic = (s->insn_count - coeffs_last_insn > 1000000);
+            bool at_8f51 = (s->pc == 0x8f51);
+            if ((first_call || periodic || at_8f51) && coeffs_log_n < 30) {
+                coeffs_log_n++;
+                coeffs_last_insn = s->insn_count;
+                C54_LOG("COEFFS-DUMP #%d insn=%u PC=0x%04x "
+                        "data[0x2bc0..0x2bcF]= %04x %04x %04x %04x %04x %04x %04x %04x "
+                        "%04x %04x %04x %04x %04x %04x %04x %04x",
+                        coeffs_log_n, s->insn_count, s->pc,
+                        s->data[0x2bc0], s->data[0x2bc1], s->data[0x2bc2], s->data[0x2bc3],
+                        s->data[0x2bc4], s->data[0x2bc5], s->data[0x2bc6], s->data[0x2bc7],
+                        s->data[0x2bc8], s->data[0x2bc9], s->data[0x2bca], s->data[0x2bcb],
+                        s->data[0x2bcc], s->data[0x2bcd], s->data[0x2bce], s->data[0x2bcf]);
+            }
+        }
         if (s->pc == 0x8f51) {
+            /* Cap bumpé 50 → 500 (2026-05-14 night) pour couvrir plusieurs
+             * sweeps FB-det au lieu du seul premier. + stats agrégées sur
+             * tous les fires (cap n'est que pour le log per-fire). */
             static int dfbwr_n;
-            if (dfbwr_n++ < 50) {
+            g_fb_det_timing.fb_det_total++;
+            uint16_t ar4 = s->ar[4];
+            uint16_t dAR4 = s->data[ar4];
+            uint16_t ar3 = s->ar[3];
+            bool ar4_in_zone = (ar4 >= 0x2bc0 && ar4 <= 0x2bff);
+            if (ar4_in_zone) g_fb_det_timing.fb_det_ar4_in_zone++;
+            else             g_fb_det_timing.fb_det_ar4_outside++;
+            if (dAR4 == 0x0000)      g_fb_det_timing.fb_det_dar4_zero++;
+            else if (dAR4 == 0xfffe) g_fb_det_timing.fb_det_dar4_sentinel++;
+            else                     g_fb_det_timing.fb_det_dar4_other++;
+            /* Sweep boundary detection : AR3 retombe en dessous de la
+             * dernière valeur observée → nouveau sweep commence.
+             * Log le sweep précédent (count non-zero + A final + insn). */
+            uint64_t A_lo = (uint64_t)(s->a & 0xFFFFFFFFFFULL);
+            if (ar3 < g_fb_det_timing.last_ar3_at_fire
+                && g_fb_det_timing.last_ar3_at_fire > 0) {
+                C54_LOG("D_FB_DET-SWEEP id=%llu nonzero=%llu/50 "
+                        "A_final=0x%010llx insn=%u",
+                        (unsigned long long)g_fb_det_timing.sweep_id,
+                        (unsigned long long)g_fb_det_timing.sweep_nonzero_count,
+                        (unsigned long long)A_lo, s->insn_count);
+                g_fb_det_timing.sweep_id++;
+                g_fb_det_timing.sweep_nonzero_count = 0;
+            }
+            g_fb_det_timing.last_ar3_at_fire = ar3;
+            if (dAR4 != 0) g_fb_det_timing.sweep_nonzero_count++;
+            int64_t delta_compute = (int64_t)s->insn_count -
+                                    (int64_t)g_fb_det_timing.last_compute_insn;
+            int64_t delta_clear   = (int64_t)s->insn_count -
+                                    (int64_t)g_fb_det_timing.last_clear_insn;
+            int64_t delta_pattern = (int64_t)s->insn_count -
+                                    (int64_t)g_fb_det_timing.last_pattern_insn;
+            if (dfbwr_n++ < 500) {
                 C54_LOG("D_FB_DET-WR-SITE #%d AR0..AR7=%04x %04x %04x %04x %04x %04x %04x %04x "
-                        "data[AR0]=%04x data[AR1]=%04x data[AR2]=%04x BK=%04x A=0x%010llx insn=%u",
+                        "data[AR0]=%04x data[AR1]=%04x data[AR2]=%04x "
+                        "data[AR3]=%04x data[AR4]=%04x data[AR5]=%04x "
+                        "data[AR6]=%04x data[AR7]=%04x "
+                        "BK=%04x A=0x%010llx "
+                        "ar4_in_zone=%d dcompute=%lld dclear=%lld dpattern=%lld "
+                        "last_compute_addr=0x%04x last_clear_addr=0x%04x "
+                        "last_pattern_addr=0x%04x "
+                        "insn=%u",
                         dfbwr_n, s->ar[0], s->ar[1], s->ar[2], s->ar[3],
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7],
                         s->data[s->ar[0]], s->data[s->ar[1]], s->data[s->ar[2]],
+                        s->data[s->ar[3]], s->data[s->ar[4]], s->data[s->ar[5]],
+                        s->data[s->ar[6]], s->data[s->ar[7]],
                         s->bk, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        ar4_in_zone ? 1 : 0,
+                        (long long)delta_compute, (long long)delta_clear,
+                        (long long)delta_pattern,
+                        g_fb_det_timing.last_compute_addr,
+                        g_fb_det_timing.last_clear_addr,
+                        g_fb_det_timing.last_pattern_addr,
                         s->insn_count);
             }
+            /* Stats summary toutes les 100 fires de 0x8f51 — distribution
+             * AR4-in-zone + histogramme val[AR4] sur tout l'historique. */
+            if ((g_fb_det_timing.fb_det_total % 100) == 0) {
+                C54_LOG("D_FB_DET-STATS total=%llu "
+                        "ar4_in_zone=%llu outside=%llu "
+                        "dar4_zero=%llu sentinel=%llu other=%llu",
+                        (unsigned long long)g_fb_det_timing.fb_det_total,
+                        (unsigned long long)g_fb_det_timing.fb_det_ar4_in_zone,
+                        (unsigned long long)g_fb_det_timing.fb_det_ar4_outside,
+                        (unsigned long long)g_fb_det_timing.fb_det_dar4_zero,
+                        (unsigned long long)g_fb_det_timing.fb_det_dar4_sentinel,
+                        (unsigned long long)g_fb_det_timing.fb_det_dar4_other);
+            }
         }
+        /* READ-AMONT probe : à chaque trigger PC (sites d_fb_det), émet delta
+         * des reads par plage depuis le trigger précédent. Tranche entre :
+         *   - dominant LOW    → correlator lit la zone [0..0x3A3]
+         *   - dominant APIRAM → samples viennent via API RAM (ARM-driven)
+         *   - dominant WRAP   → correlator tourne sur le wrap PROM1 mirror
+         *   - dominant OTHER  → zone non cataloguée à identifier */
+        read_stats_trigger_check(s);
+        throughput_tick(s->insn_count);
         /* WAIT-A21A probe : à PC=0xa21a, snapshot INTM + IMR + IFR.
          * Tranche H1/H2/H3 :
          *   INTM=1 + IFR=0  + IMR plein → H3 strict, hardware silencieux
