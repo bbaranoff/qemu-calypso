@@ -40,6 +40,17 @@ def pytest_configure(config):
         "drift:                drift temporel inter-couches via timestamps logs",
         # test_timer_invariants.py
         "timer_invariant:      compteurs timers QEMU ([tdma]/[frame_irq]/[kick]) + CSV log_timeline",
+        # test_gdb_stub.py (Phase 2)
+        "runtime_gdb:          GDB stub :1234 — handshake, regs, mem, PC, NDB",
+        # extension monitor (Phase 2)
+        "runtime_monitor:      QEMU monitor HMP — info status/chardev/qtree/mtree/qom-tree",
+        # test_irda_channel.py (Phase 2)
+        "runtime_irda:         canal IrDA fw debug — PTY, boot marker, throughput",
+        # compléments observabilité (Phase 2)
+        "runtime_net:          ports listening QEMU (1234 gdb, 4247 mobile VTY)",
+        "runtime_fs:           FD usage qemu, log size cap, disk space container",
+        # test_log_grep.py (Phase 2)
+        "runtime_log_grep:     grep invariants + blockers sur tous les logs (qemu/bridge/osmocon/mobile/fw-irda)",
     ):
         config.addinivalue_line("markers", marker)
 
@@ -55,17 +66,31 @@ def pytest_runtest_makereport(item, call):
     out = yield
     rep = out.get_result()
     if rep.when != "call":
-        # Only the "call" phase carries the real outcome. Skip setup/teardown
-        # except when setup itself was skipped (covers @pytest.skip in fixture).
         if not (rep.when == "setup" and rep.outcome == "skipped"):
             return
+    # Extract short error message if test failed/skipped — for annex section.
+    err_short = ""
+    if rep.outcome in ("failed", "skipped") or hasattr(rep, "wasxfail"):
+        try:
+            lr = getattr(rep, "longreprtext", "") or str(getattr(rep, "longrepr", "") or "")
+            # Garder la 1ère ligne non-vide significative (souvent AssertionError msg)
+            for line in lr.splitlines():
+                s = line.strip()
+                if s and not s.startswith(("def ", "_ ", "@", ">")):
+                    err_short = s[:200]
+                    break
+            if not err_short and lr:
+                err_short = lr.strip().splitlines()[0][:200]
+        except Exception:
+            pass
     _MERMAID_RESULTS.append({
         "nodeid": item.nodeid,
         "name": item.name,
-        "outcome": rep.outcome,           # passed | failed | skipped
+        "outcome": rep.outcome,
         "markers": sorted({m.name for m in item.iter_markers()}),
         "duration_s": getattr(rep, "duration", 0.0),
         "wasxfail": hasattr(rep, "wasxfail"),
+        "err_short": err_short,
     })
 
 
@@ -118,6 +143,13 @@ _MARKER_TAXONOMY = {
     "drift":                 ("Timing", "Drift"),
     # Timer counters
     "timer_invariant":       ("Timing", "Timers"),
+    # Phase 2 : GDB stub / QEMU monitor / IrDA / net / fs
+    "runtime_gdb":           ("Runtime", "GDB-introspect"),
+    "runtime_monitor":       ("Runtime", "Monitor-extended"),
+    "runtime_irda":          ("Runtime", "IrDA-channel"),
+    "runtime_net":           ("Runtime", "Net"),
+    "runtime_fs":            ("Runtime", "FS"),
+    "runtime_log_grep":      ("Runtime", "Log-grep"),
 }
 
 
@@ -136,15 +168,22 @@ def _classify(markers: list[str]) -> tuple[str, str]:
 # Pipeline order : ordre logique du flux GSM Calypso. Utilisé pour
 # détecter automatiquement où la chaîne se rompt (1ère étape avec 0 pass).
 _PIPELINE_ORDER = [
-    "Infra",         # processus container alive
-    "DSP",           # DSP boot / IRQ / FB-det converge
-    "L1-data",       # BSP DMA / bursts DL bridge
-    "L1-ctrl",       # SERCOMM L1CTL bus
-    "Timers",        # TDMA / TINT0 / kick
-    "NDB",           # injection NDB direct via gdb-stub
-    "ARM-feedback",  # ARM L1 lit les cells injectées
-    "L3-MM",         # mobile fait LU jusqu'au bout
-    "Mgmt",          # VTY osmocom/mobile
+    "Infra",            # processus container alive
+    "GDB-introspect",   # GDB stub :1234 — surface d'introspection ARM
+    "Monitor-extended", # QEMU monitor HMP — état QEMU lui-même
+    "DSP",              # DSP boot / IRQ / FB-det converge
+    "L1-data",          # BSP DMA / bursts DL bridge
+    "L1-ctrl",          # SERCOMM L1CTL bus
+    "Timers",           # TDMA / TINT0 / kick
+    "Drift",            # drift inter-couches
+    "NDB",              # injection NDB direct via gdb-stub
+    "ARM-feedback",     # ARM L1 lit les cells injectées
+    "IrDA-channel",     # canal IrDA fw debug — diagnostique le mur task=24→DATA_IND=0
+    "L3-MM",            # mobile fait LU jusqu'au bout
+    "Mgmt",             # VTY osmocom/mobile
+    "Net",              # ports listening
+    "FS",               # FD/disk/log size
+    "Log-grep",         # grep invariants + blockers sur tous les logs
     "Summary",
     "Infra,Misc",
 ]
@@ -180,6 +219,8 @@ def _build_mermaid() -> str:
     tree: dict[str, dict[str, list[dict]]] = {}
     for r in _MERMAID_RESULTS:
         cat, layer = _classify(r["markers"])
+        r["category"] = cat
+        r["layer"] = layer
         tree.setdefault(cat, {}).setdefault(layer, []).append(r)
 
     # Build flat layer→tests for pipeline view (across categories)
@@ -339,11 +380,14 @@ ne peut pas être validé tant qu'elle n'est pas verte.
 
 {layers_commentary}
 
-## Diagramme détaillé (catégorie → couche → test)
+## Diagramme détaillé — un graphe par catégorie
 
-```mermaid
-{detail_mermaid}
-```
+Chaque catégorie est rendue dans un graphe séparé pour lisibilité (un seul
+gros graphe avec subgraphs imbriqués devient illisible >50 tests). Les
+catégories sont indépendantes côté layout — pas de chaîne causale entre
+elles dans le détail (voir le pipeline plus haut pour ça).
+
+{detail_per_category}
 
 ## Skipped / xfailed
 
@@ -443,6 +487,18 @@ if (!requireNamespace("ggplot2", quietly=TRUE) ||
 ```
 
 </details>
+
+## Plan IrDA debug channel (Phase 2)
+
+Statut auto-détecté depuis l'état du run.
+
+{irda_plan_status}
+
+Réf. `PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md`.
+
+## Annexe — Détail complet de tous les tests
+
+{full_test_annex}
 
 ## Reproduction
 
@@ -655,6 +711,135 @@ def _gen_test_catalog(results: list[dict]) -> str:
             src = r["nodeid"].split("::")[0]
             out.append(f"| {icon} {status} | `{r['name']}` | {r['duration_s']:.2f}s | `{src}` |")
         out.append("")
+    return "\n".join(out)
+
+
+def _gen_full_annex(results: list[dict]) -> str:
+    """Annexe complète : un tableau exhaustif de tous les tests avec
+    nodeid, marker, outcome, durée, et message d'erreur court si fail/skip.
+
+    Format markdown auto-pasteable. Trie par catégorie/couche puis par nom.
+    """
+    if not results:
+        return "_(no tests collected)_"
+    rows_by_cat: dict[str, list[dict]] = {}
+    for r in results:
+        cat, layer = _classify(r["markers"])
+        key = f"{cat} / {layer}"
+        rows_by_cat.setdefault(key, []).append(r)
+    out = []
+    icons = {"passed": "✅", "failed": "❌", "skipped": "⏭️"}
+    for key in sorted(rows_by_cat):
+        rs = rows_by_cat[key]
+        passed = sum(1 for r in rs if r["outcome"] == "passed")
+        out.append(f"### {key} — {passed}/{len(rs)}\n")
+        out.append("| | Test | Markers | Durée | Erreur / raison (si non-pass) |")
+        out.append("|---|---|---|---:|---|")
+        for r in sorted(rs, key=lambda x: (x["outcome"], x["name"])):
+            icon = "⚠️" if r["wasxfail"] else icons.get(r["outcome"], "?")
+            mark = ",".join(r["markers"]) or "—"
+            err = (r.get("err_short", "") or "").replace("|", "\\|").replace("\n", " ")
+            if not err and r["outcome"] == "passed" and not r["wasxfail"]:
+                err = ""
+            out.append(f"| {icon} | `{r['name']}` | {mark} | {r['duration_s']:.2f}s | {err} |")
+        out.append("")
+    # Also append a flat list with full nodeids for completeness
+    out.append("### Tous les nodeids (référence)")
+    out.append("")
+    out.append("<details>")
+    out.append("<summary>Cliquer pour déplier — liste exhaustive nodeid → outcome</summary>")
+    out.append("")
+    out.append("```")
+    for r in sorted(results, key=lambda x: x["nodeid"]):
+        st = "XFAIL" if r["wasxfail"] else r["outcome"].upper()
+        out.append(f"{st:8} {r['nodeid']}")
+    out.append("```")
+    out.append("")
+    out.append("</details>")
+    return "\n".join(out)
+
+
+def _gen_irda_plan_status() -> str:
+    """Détecte le statut de chaque phase du plan IrDA depuis l'état du run.
+
+    Cf. PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md.
+    Statuts dérivés :
+      - Phase 0 (reco) : toujours ✅ (déjà fait)
+      - Phase 0.5 (smoke test) : ✅ si "fw-irda boot" trouvé dans /tmp/fw-irda.log
+      - Phase 1+2 (QEMU+fw mapping) : ✅ caduc (déjà en place via UART_IRDA)
+      - Phase 3 (capture host) : ✅ si /tmp/irda_capture.pid existe
+      - Phase 4 (tests integration) : ✅ si test_irda_channel.py existe
+      - Phase 5 (instrumentation fw) : ✅ si > 100 bytes/min dans fw-irda.log
+      - Phase 6 (viz Quarto) : 🔧 manuel
+    """
+    import subprocess
+    container = os.environ.get("CALYPSO_CONTAINER", "trying")
+    inside = os.path.exists("/.dockerenv")
+
+    def _cat_ct(path: str) -> str:
+        if inside:
+            try: return Path(path).read_text(errors="replace")
+            except Exception: return ""
+        try:
+            r = subprocess.run(["docker", "exec", container, "cat", path],
+                               capture_output=True, text=True, timeout=3)
+            return r.stdout if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    def _exists_ct(path: str) -> bool:
+        if inside:
+            return Path(path).exists()
+        try:
+            r = subprocess.run(["docker", "exec", container, "test", "-e", path],
+                               capture_output=True, timeout=3)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # Phase 0.5
+    fwirda_text = _cat_ct("/tmp/fw-irda.log")
+    has_boot = "fw-irda boot" in fwirda_text or "boot OK" in fwirda_text
+    # Phase 3
+    has_capture_pid = _exists_ct("/tmp/irda_capture.pid")
+    has_fwirda_log = _exists_ct("/tmp/fw-irda.log")
+    # Phase 5 (proxy : taille fw-irda.log > 100 octets sur run > 1min)
+    sustained = len(fwirda_text) > 100
+    # Phase 4 (tests présents)
+    has_tests = (Path(__file__).parent / "test_irda_channel.py").exists()
+
+    rows = [
+        ("Phase 0",   "Reconnaissance UART_IRDA mapped + fw driver",
+         "✅ done", "QEMU `calypso_soc.c:231-247`, fw `compal_e88/init.c:105`"),
+        ("Phase 0.5", "Smoke test cons_puts boot marker",
+         "✅" if has_boot else "🔧 à faire",
+         "ajouter `cons_puts(\"=== fw-irda boot OK ===\\r\\n\")` après `cons_bind_uart(UART_IRDA)`"),
+        ("Phase 1",   "QEMU side mapping chardev → UART_IRDA",
+         "⏸️ caduc", "déjà en place via `-serial pty -serial pty` + `serial_hd(1)`"),
+        ("Phase 2",   "Firmware side wrapper IrDA",
+         "⏸️ caduc", "déjà en place via driver osmocom-bb existant"),
+        ("Phase 3",   "Capture host `irda_capture.py` → `/tmp/fw-irda.log`",
+         "✅" if has_capture_pid else ("🟡 script créé" if has_fwirda_log else "🔧 lancer le script"),
+         "`python3 tools/irda_capture.py /dev/pts/3 &` (auto-lancé par run.sh à terme)"),
+        ("Phase 4",   "Tests integration (`test_irda_channel.py`, marker runtime_irda)",
+         "✅" if has_tests else "🔧",
+         "8 tests gradés selon état (boot/produces/throughput/...)"),
+        ("Phase 5",   "Instrumentation fw `cons_puts(UART_IRDA, ...)` dans hot path",
+         "✅" if sustained else "🔧 à faire",
+         "diagnostiquer le mur `task=24 → DATA_IND=0` — events `EVT_TASK24_*`"),
+        ("Phase 6",   "Plot Quarto stacked area des events fw",
+         "🔧 manuel", "extension R chunk dans `log_timeline.csv` parser fw-irda events"),
+    ]
+    out = [
+        "| Phase | Objectif | Statut | Action / notes |",
+        "|---|---|---|---|",
+    ]
+    for ph, obj, st, act in rows:
+        out.append(f"| **{ph}** | {obj} | {st} | {act} |")
+    out.append("")
+    out.append(f"_Détection auto basée sur : `/tmp/fw-irda.log` ({'présent' if has_fwirda_log else 'absent'}, "
+               f"{len(fwirda_text)} bytes), `irda_capture.pid` ({'oui' if has_capture_pid else 'non'}), "
+               f"boot marker ({'détecté' if has_boot else 'absent'})._")
     return "\n".join(out)
 
 
@@ -875,6 +1060,9 @@ def pytest_sessionfinish(session, exitstatus):
         log_timeline_table  = log_timeline_table,
         log_timeline_bucket = "10",
         test_catalog        = _gen_test_catalog(_MERMAID_RESULTS),
+        irda_plan_status    = _gen_irda_plan_status(),
+        full_test_annex     = _gen_full_annex(_MERMAID_RESULTS),
+        detail_per_category = _gen_detail_per_category_md(tree),
     )
     md = _REPORT_SKELETON.format(**fmt_kwargs)
     md_path = folder / "test_results.md"
@@ -925,7 +1113,7 @@ def pytest_sessionfinish(session, exitstatus):
     qmd_detail   = _mermaid_for_quarto(detail_only)
     qmd_kwargs = dict(fmt_kwargs)
     qmd_kwargs["pipeline_mermaid"] = qmd_pipeline
-    qmd_kwargs["detail_mermaid"]   = qmd_detail
+    qmd_kwargs["detail_per_category"] = _gen_detail_per_category_qmd(tree)
     qmd_body = _REPORT_SKELETON.format(**qmd_kwargs)
     # Quarto's YAML provides the title — drop the redundant first H1.
     lines = qmd_body.splitlines(keepends=True)
@@ -997,6 +1185,106 @@ def _build_pipeline_only_mermaid(flat_layer: dict) -> str:
             broken = True
         prev = pid
     return "\n".join(lines)
+
+
+def _build_detail_per_category(tree: dict) -> dict[str, str]:
+    """Retourne un dict {category_name: mermaid_block} — un graphe par catégorie.
+
+    Format : un seul nœud racine = la catégorie, sous lequel pendent
+    directement les tests (pas de hiérarchie par couche dans le détail —
+    la couche reste affichée comme label secondaire sur chaque test pour
+    ne pas perdre l'info). Les tests passing sont fusionnés en un seul
+    nœud `PASS N` pour réduire la densité.
+    """
+    out: dict[str, str] = {}
+    counter_base = 0
+
+    header = [
+        "  classDef pass    fill:#bef5b1,stroke:#1f7a1f,color:#0a3d0a;",
+        "  classDef partial fill:#fde79c,stroke:#b07a00,color:#3a2c00;",
+        "  classDef fail    fill:#fbb4b4,stroke:#a31a1a,color:#5a0000;",
+        "  classDef skip    fill:#e0e0e0,stroke:#6a6a6a,color:#333;",
+        "  classDef xfail   fill:#fde79c,stroke:#b07a00,color:#3a2c00;",
+    ]
+
+    for cat in sorted(tree):
+        cid = "C_" + _sanitize_node_id(cat)
+        body: list[str] = ["flowchart TB"] + header
+        class_assigns: list[str] = []
+        counter = counter_base
+        cat_tests = [t for layer in tree[cat].values() for t in layer]
+        cstatus, cp, cn = _layer_status(cat_tests)
+        ccls = {"pass":"pass","partial":"partial","fail":"fail"}.get(cstatus,"skip")
+        body.append(f'  {cid}["{_label(cat)}<br/>{cp}/{cn}"]')
+        class_assigns.append(f"  class {cid} {ccls};")
+        passing = [r for r in cat_tests if r["outcome"] == "passed" and not r["wasxfail"]]
+        non_pass = [r for r in cat_tests if not (r["outcome"] == "passed" and not r["wasxfail"])]
+        if passing:
+            counter += 1
+            pid = f"T_{counter:03d}_pass_grp_" + _sanitize_node_id(cat)
+            total_d = sum(r["duration_s"] for r in passing)
+            body.append(f'  {cid} --> {pid}["PASS {len(passing)}<br/>{total_d:.1f}s"]')
+            class_assigns.append(f"  class {pid} pass;")
+        for r in non_pass:
+            counter += 1
+            tid = f"T_{counter:03d}_" + _sanitize_node_id(r["name"])
+            short = _label(r["name"][:38])
+            marker_short = _label(",".join(r["markers"][:1]))
+            layer_short = _label(r.get("layer", ""))
+            label_txt = f"{short}<br/>{layer_short} · {marker_short}<br/>{r['duration_s']:.2f}s"
+            cls = ("xfail" if r["wasxfail"]
+                   else "fail" if r["outcome"] == "failed"
+                   else "skip")
+            body.append(f'  {cid} --> {tid}["{label_txt}"]')
+            class_assigns.append(f"  class {tid} {cls};")
+        out[cat] = "\n".join(body + class_assigns)
+        counter_base = counter
+    return out
+
+
+def _gen_detail_per_category_md(tree: dict) -> str:
+    """Markdown : `### <Category> N/M` + bloc ` ```mermaid ` pour chaque catégorie."""
+    graphs = _build_detail_per_category(tree)
+    out = []
+    for cat in sorted(graphs):
+        cat_tests = [t for layer in tree[cat].values() for t in layer]
+        cstatus, cp, cn = _layer_status(cat_tests)
+        icon = {"pass":"✅","partial":"🟡","fail":"🛑"}.get(cstatus,"·")
+        out.append(f"### {icon} `{cat}` — {cp}/{cn}\n")
+        out.append("```mermaid")
+        out.append(graphs[cat])
+        out.append("```")
+        out.append("")
+    return "\n".join(out)
+
+
+def _gen_detail_per_category_qmd(tree: dict) -> str:
+    """Variante Quarto : ` ```{mermaid} ` + transformation pour HTML-safe."""
+    graphs = _build_detail_per_category(tree)
+    out = []
+    import re as _re_q
+    def _to_qmd(block: str) -> str:
+        lines = []
+        for line in block.splitlines():
+            line = line.replace("<br/>", " ").replace("<br>", " ")
+            line = _re_q.sub(r'\["([^"\n]*?)"\]', lambda m: f'[{m.group(1)}]', line)
+            line = _re_q.sub(r'\|🛑\|', '|BREAK|', line)
+            line = _re_q.sub(
+                r'\[([^\[\]\n]*)\]',
+                lambda m: '[' + m.group(1).replace('(', ' ').replace(')', ' ') + ']',
+                line)
+            lines.append(line)
+        return "\n".join(lines)
+    for cat in sorted(graphs):
+        cat_tests = [t for layer in tree[cat].values() for t in layer]
+        cstatus, cp, cn = _layer_status(cat_tests)
+        icon = {"pass":"✅","partial":"🟡","fail":"🛑"}.get(cstatus,"·")
+        out.append(f"### {icon} `{cat}` — {cp}/{cn}\n")
+        out.append("```{mermaid}")
+        out.append(_to_qmd(graphs[cat]))
+        out.append("```")
+        out.append("")
+    return "\n".join(out)
 
 
 def _build_detail_only_mermaid(tree: dict) -> str:

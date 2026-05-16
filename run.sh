@@ -152,7 +152,9 @@ rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" \
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 killall -9 qemu-system-arm osmo-bts-trx mobile osmocon 2>/dev/null || true
 pkill -9 -f bridge.py 2>/dev/null || true
+pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
+rm -f /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
 # Drop the legacy mmap from previous runs — no longer used, but lying
 # around in /dev/shm could confuse forensic forensics on old runs.
 rm -f /dev/shm/calypso_si.bin
@@ -207,6 +209,48 @@ if [ -z "$PTY_MODEM" ]; then
     exit 1
 fi
 echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
+
+# ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
+# Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
+# le firmware compal_e88 fait déjà `cons_bind_uart(UART_IRDA)` (init.c:105),
+# donc tout `printf()` côté fw passe par UART_IRDA. Ici on consomme le PTY
+# serial1 alloué par QEMU et on l'archive dans /tmp/fw-irda.log avec le même
+# préfixe timestamp que les autres logs.
+#
+# Désactivable via CALYPSO_IRDA_CAPTURE=0 (rare — utile si saturation diag).
+CALYPSO_IRDA_CAPTURE="${CALYPSO_IRDA_CAPTURE:-1}"
+if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
+    echo -n "Waiting for QEMU PTY serial1 (UART_IRDA) allocation..."
+    PTY_IRDA=""
+    for i in $(seq 1 15); do
+        if grep -q 'redirected to /dev/pts/.* (label serial1)' "$QEMU_LOG" 2>/dev/null; then
+            PTY_IRDA=$(grep 'redirected to /dev/pts/.* (label serial1)' "$QEMU_LOG" \
+                        | sed -E 's/.*redirected to (\/dev\/pts\/[0-9]+).*/\1/' | head -1)
+            break
+        fi
+        sleep 0.5; echo -n "."
+    done
+    if [ -n "$PTY_IRDA" ]; then
+        echo " OK ($PTY_IRDA)"
+        ln -sf "$PTY_IRDA" /tmp/irda.pty.link
+        : > /tmp/fw-irda.log
+        tmux new-window -t "$SESSION" -n irda
+        tmux send-keys -t "$SESSION:irda" \
+            "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=/tmp/fw-irda.log python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>&1 | tee /tmp/irda_capture.stderr.log" C-m
+        echo -n "Waiting for irda_capture to register pid..."
+        for i in $(seq 1 20); do
+            [ -f /tmp/irda_capture.pid ] && break
+            sleep 0.3; echo -n "."
+        done
+        if [ -f /tmp/irda_capture.pid ]; then
+            echo " OK (pid=$(cat /tmp/irda_capture.pid))"
+        else
+            echo " WARN — pidfile absent (capture peut-être pas lancé)"
+        fi
+    else
+        echo " WARN — no serial1 PTY detected → IrDA capture skipped"
+    fi
+fi
 
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
@@ -301,6 +345,10 @@ echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG
 echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
 echo "  CALYPSO_FORCE_RX_DONE       = ${CALYPSO_FORCE_RX_DONE}"
+echo "  CALYPSO_IRDA_CAPTURE        = $CALYPSO_IRDA_CAPTURE  (1=consume serial1 PTY → /tmp/fw-irda.log)"
+if [ "$CALYPSO_IRDA_CAPTURE" = "1" ] && [ -n "${PTY_IRDA:-}" ]; then
+    echo "  IrDA channel                = $PTY_IRDA → /tmp/irda.pty.link → /tmp/fw-irda.log"
+fi
 echo
 echo "Manual warm-start (debug, if BSC unavailable) :"
 echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
