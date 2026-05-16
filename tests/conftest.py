@@ -854,6 +854,11 @@ def pytest_sessionfinish(session, exitstatus):
     log_timeline_table, _csv_ok = _run_log_timeline(folder, bucket_s=10.0)
 
     # Markdown report — GitHub-flavored (```mermaid blocks render natively)
+    # Note : les edges entre catégories / layers utilisent `-.->` (dashed
+    # visible discret) au lieu de `~~~` invisible. Pourquoi : GitHub Mermaid
+    # parse `~~~` mais ne respecte pas le hint de layout vertical → les
+    # subgraphs s'étalent horizontalement. Le `-.->` est visible mais
+    # préserve l'ordre TB sur tous les renderers (GitHub, Quarto, mermaid.live).
     ts_start = datetime.datetime.now().isoformat(timespec="seconds")
     fmt_kwargs = dict(
         timestamp        = ts_start,
@@ -892,6 +897,7 @@ def pytest_sessionfinish(session, exitstatus):
     # Le .md GitHub garde la version riche (<br/>, emojis, quotes) qui s'y
     # rend nativement.
     import re as _re
+
     def _mermaid_for_quarto(block: str) -> str:
         out = []
         for line in block.splitlines():
@@ -1035,7 +1041,7 @@ def _build_detail_only_mermaid(tree: dict) -> str:
             class_assigns.append(f"  class {lid} {lcls};")
             # Invisible edge between consecutive layers forces vertical stacking.
             if prev_lid is not None:
-                body.append(f"    {prev_lid} ~~~ {lid}")
+                body.append(f"    {prev_lid} -.-> {lid}")
             prev_lid = lid
             passing = [r for r in lt if r["outcome"] == "passed" and not r["wasxfail"]]
             non_pass = [r for r in lt if not (r["outcome"] == "passed" and not r["wasxfail"])]
@@ -1061,6 +1067,6 @@ def _build_detail_only_mermaid(tree: dict) -> str:
         # stacked vertically (Mermaid doesn't enforce TB layout for siblings
         # without edges, even with flowchart TB at the top).
         if prev_cat_sgid is not None:
-            body.append(f"  {prev_cat_sgid} ~~~ {sgid}")
+            body.append(f"  {prev_cat_sgid} -.-> {sgid}")
         prev_cat_sgid = sgid
     return "\n".join(head + body + class_assigns)

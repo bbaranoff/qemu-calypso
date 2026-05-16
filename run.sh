@@ -235,14 +235,19 @@ if grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null; then echo " OK"; else echo " T
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
-# Sync barrier : attendre que osmo-bts-trx soit en train d'écouter (port TRX
-# côté bridge) — proxy : log du bridge montrant que TRX a connecté.
+# Sync barrier : attendre que osmo-bts-trx ait commencé à pousser des DL
+# bursts au bridge — proxy fiable : `bridge: DL #` dans bridge.log
+# (le bridge.py imprime ça à chaque burst TRXDv0 reçu de bts-trx).
 echo -n "Waiting for osmo-bts-trx to attach to bridge..."
 for i in $(seq 1 30); do
-    grep -q "TRX peer learned\|trxc connected\|trxd connected" "$BRIDGE_LOG" 2>/dev/null && break
+    grep -qE 'bridge: DL #|bridge: tick' "$BRIDGE_LOG" 2>/dev/null && break
     sleep 1; echo -n "."
 done
-echo " OK (or timeout)"
+if grep -qE 'bridge: DL #|bridge: tick' "$BRIDGE_LOG" 2>/dev/null; then
+    echo " OK"
+else
+    echo " TIMEOUT (bts-trx pas attaché en 30s)"
+fi
 
 # ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------
 # Sync barrier inline dans la cmd tmux : attendre que la socket l1ctl existe
