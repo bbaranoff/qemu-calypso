@@ -496,6 +496,22 @@ Statut auto-détecté depuis l'état du run.
 
 Réf. `PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md`.
 
+## Annexe — Diag snapshot (état runtime au moment des tests)
+
+Snapshot rapide produit par `make_diag.sh` au cours de la session pytest.
+Pour un bundle complet (tar.gz avec tous les logs filtrés + dumps DSP), utiliser
+`./make_diag_bundle.sh`.
+
+{diag_snapshot}
+
+## Annexe — Bundle make_diag_bundle.sh
+
+Bundle généré pendant la session via `make_diag_bundle.sh` (inventaire + digests
+texte embarqués). Les logs bruts (qemu_diag, bridge, osmocon, etc.) sont listés
+seulement — récupérer le tar.gz pour les contenus complets.
+
+{diag_bundle_annex}
+
 ## Annexe — Détail complet de tous les tests
 
 {full_test_annex}
@@ -712,6 +728,102 @@ def _gen_test_catalog(results: list[dict]) -> str:
             out.append(f"| {icon} {status} | `{r['name']}` | {r['duration_s']:.2f}s | `{src}` |")
         out.append("")
     return "\n".join(out)
+
+
+def _gen_diag_bundle_annex() -> str:
+    """Annexe bundle : appelle `make_diag_bundle.sh` puis embarque les
+    *digests* texte du tar (parse_summary, source_excerpts, static_decode,
+    env_boot) dans des `<details>` markdown. Les logs bruts (qemu_diag,
+    bridge, osmocon, mobile, fw-irda, frame_irq, pc_hist) sont seulement
+    listés avec leur taille — pas embarqués, pour ne pas exploser le report.
+    Le tar complet reste dispo via `./make_diag_bundle.sh` à la main.
+    """
+    import os as _os
+    import subprocess as _sp
+    import tarfile as _tar
+    import tempfile as _tmp
+    script = Path(__file__).resolve().parent.parent / "make_diag_bundle.sh"
+    if not script.exists():
+        return "_`make_diag_bundle.sh` introuvable à la racine du repo._\n"
+    try:
+        td = _tmp.mkdtemp(prefix="diag_bundle_annex_")
+        env = {**_os.environ, "OUT_DIR": td, "TAG": "annex"}
+        r = _sp.run(["bash", str(script)], env=env,
+                    capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            return (f"_make_diag_bundle.sh exit={r.returncode}._\n\n"
+                    f"```\n{r.stderr[:800]}\n```\n")
+        tar_files = sorted(Path(td).glob("*.tar.gz"))
+        if not tar_files:
+            return "_aucun tarball produit (script terminé sans erreur)._\n"
+        tarball = tar_files[0]
+        out = [f"_Bundle complet : `{tarball.name}` "
+               f"({tarball.stat().st_size:,} bytes). Régénérer à la main : "
+               f"`./make_diag_bundle.sh`._\n"]
+        with _tar.open(tarball) as tf:
+            members = sorted(tf.getmembers(), key=lambda m: m.name)
+            # Inventaire
+            out.append("\n### Inventaire du bundle\n")
+            out.append("| Fichier | Bytes |")
+            out.append("|---|---:|")
+            for m in members:
+                if m.isfile():
+                    out.append(f"| `{m.name}` | {m.size:,} |")
+            out.append("")
+            # TOUS les logs bruts en <details> dépliables
+            out.append("\n### Logs bruts (dépliables)\n")
+            for m in members:
+                if not m.isfile():
+                    continue
+                fp = tf.extractfile(m)
+                if fp is None:
+                    continue
+                try:
+                    txt = fp.read().decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                lines = txt.splitlines()
+                n = len(lines)
+                # Tronquage proportionnel : gros fichiers = head + tail
+                if m.size > 500_000:
+                    body = ("\n".join(lines[:300]) +
+                            f"\n\n[... {n-400} lines truncated "
+                            f"(file too large : {m.size:,} bytes) ...]\n\n" +
+                            "\n".join(lines[-100:]))
+                elif m.size > 200_000:
+                    body = ("\n".join(lines[:500]) +
+                            f"\n\n[... {n-700} lines truncated ...]\n\n" +
+                            "\n".join(lines[-200:]))
+                else:
+                    body = txt
+                out.append(f"<details><summary><code>{m.name}</code> "
+                           f"({m.size:,} bytes, {n} lignes)"
+                           f"</summary>\n\n```\n{body}\n```\n\n</details>\n")
+        return "\n".join(out)
+    except Exception as e:
+        return f"_exception en générant l'annexe bundle : {type(e).__name__}: {e}_\n"
+
+
+def _gen_diag_snapshot() -> str:
+    """Annexe diag : snapshot rapide de l'état du run au moment des tests
+    (processes, log sizes, grep counts, blockers, tail des logs critiques).
+
+    Délègue à `make_diag.sh` à la racine du repo. Si le script est absent ou
+    Docker indisponible, retourne un placeholder explicite.
+    """
+    import subprocess as _sp
+    script = Path(__file__).resolve().parent.parent / "make_diag.sh"
+    if not script.exists():
+        return "_diag : `make_diag.sh` introuvable à la racine du repo._\n"
+    try:
+        r = _sp.run(["bash", str(script)],
+                    capture_output=True, text=True, timeout=20)
+        out = r.stdout
+        if r.returncode != 0:
+            out += f"\n_diag : exit code {r.returncode}, stderr :_\n```\n{r.stderr[:600]}\n```\n"
+        return out or "_diag : `make_diag.sh` n'a rien produit._\n"
+    except Exception as e:
+        return f"_diag : exception en appelant `make_diag.sh` — {type(e).__name__}: {e}_\n"
 
 
 def _gen_full_annex(results: list[dict]) -> str:
@@ -1063,6 +1175,8 @@ def pytest_sessionfinish(session, exitstatus):
         irda_plan_status    = _gen_irda_plan_status(),
         full_test_annex     = _gen_full_annex(_MERMAID_RESULTS),
         detail_per_category = _gen_detail_per_category_md(tree),
+        diag_snapshot       = _gen_diag_snapshot(),
+        diag_bundle_annex   = _gen_diag_bundle_annex(),
     )
     md = _REPORT_SKELETON.format(**fmt_kwargs)
     md_path = folder / "test_results.md"
@@ -1267,6 +1381,11 @@ def _gen_detail_per_category_qmd(tree: dict) -> str:
         lines = []
         for line in block.splitlines():
             line = line.replace("<br/>", " ").replace("<br>", " ")
+            # Mermaid 10.2 (Quarto built-in) parse mal certains chars dans
+            # labels sans guillemets : `·` (U+00B7) → rejeté, `|` → consommé
+            # comme délimiteur de edge label, `(` `)` → stadium shape. Le
+            # séparateur safe est `-` simple (rien qui ne soit syntaxe mermaid).
+            line = line.replace(" · ", " - ")
             line = _re_q.sub(r'\["([^"\n]*?)"\]', lambda m: f'[{m.group(1)}]', line)
             line = _re_q.sub(r'\|🛑\|', '|BREAK|', line)
             line = _re_q.sub(

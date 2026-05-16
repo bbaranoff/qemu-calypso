@@ -90,6 +90,7 @@ QEMU_LOG="/root/qemu.log"
 BRIDGE_LOG="/tmp/bridge.log"
 OSMOCON_LOG="/tmp/osmocon.log"
 MOBILE_LOG="/tmp/mobile.log"
+BTS_LOG="/tmp/bts.log"
 L2_LOG="/tmp/l2_client.log"
 MON_SOCK="/tmp/qemu-calypso-mon.sock"
 L1CTL_SOCK="/tmp/osmocom_l2"
@@ -146,7 +147,7 @@ fi
 echo "L2 client = $CALYPSO_L2_CLIENT"
 
 # ---------- cleanup ----------
-rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" \
+rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -235,8 +236,11 @@ if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
         ln -sf "$PTY_IRDA" /tmp/irda.pty.link
         : > /tmp/fw-irda.log
         tmux new-window -t "$SESSION" -n irda
+        # Lance irda_capture en background (silencieux — il pose ses bytes
+        # dans /tmp/fw-irda.log directement, pas sur stdout) puis suit le
+        # log en live dans la fenêtre tmux pour debug visuel.
         tmux send-keys -t "$SESSION:irda" \
-            "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=/tmp/fw-irda.log python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>&1 | tee /tmp/irda_capture.stderr.log" C-m
+            "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=/tmp/fw-irda.log python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>/tmp/irda_capture.stderr.log & sleep 0.5 && echo '--- live tail /tmp/fw-irda.log ---' && tail -F /tmp/fw-irda.log" C-m
         echo -n "Waiting for irda_capture to register pid..."
         for i in $(seq 1 20); do
             [ -f /tmp/irda_capture.pid ] && break
@@ -251,6 +255,13 @@ if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
         echo " WARN — no serial1 PTY detected → IrDA capture skipped"
     fi
 fi
+
+# Note : le marker `=== fw-irda boot OK ===` émis par cons_puts() ligne 119
+# de compal_e88/init.c peut être perdu si irda_capture s'attache au slave PTY
+# après que QEMU ait écrit (race window ~0.5–1.5s). Solution durable : passer
+# par Phase 5 du plan IrDA (beacon hot path dans la main loop, qui ré-émet
+# régulièrement et garantit la capture). Ne PAS tenter `-S` + `cont` ici : ça
+# perturbe la séquence osmocon→firmware (le mobile ne camp plus sur la cell).
 
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
@@ -278,7 +289,8 @@ if grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null; then echo " OK"; else echo " T
 
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
-tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
+tmux send-keys -t "$SESSION:bts" \
+    "osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
 # Sync barrier : attendre que osmo-bts-trx ait commencé à pousser des DL
 # bursts au bridge — proxy fiable : `bridge: DL #` dans bridge.log
 # (le bridge.py imprime ça à chaque burst TRXDv0 reçu de bts-trx).
@@ -320,9 +332,39 @@ case "$CALYPSO_L2_CLIENT" in
 esac
 
 # ---------- 6. gsmtap capture (any iface — covers eth0 mobile/BTS + eth1) ----------
+# `--print` affiche en live ET continue d'écrire le pcap ; `-U` flush par paquet
+# pour que le pcap soit utilisable immédiatement (sinon buffer 4KB).
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
-    "sleep 5 && tcpdump -i any -w /root/mobile-gsmtap.pcap udp port 4729" C-m
+    "sleep 5 && tcpdump -i any -U --print -w /root/mobile-gsmtap.pcap udp port 4729" C-m
+
+# ---------- 7. window 'all' — agrège les 6 premières en 6 panes ----------
+# Vue unique pour superviser qemu / irda / osmocon / bridge / bts / L2 client
+# côte à côte. Chaque pane fait juste `tail -F` du log correspondant. Layout
+# tiled = grille 2×3 par défaut. Les logs n'existent peut-être pas encore au
+# moment de la création des panes — `tail -F` (majuscule) gère ce cas (suit
+# le fichier dès qu'il apparaît) sans crash.
+case "$CALYPSO_L2_CLIENT" in
+    ccch_scan|cell_log) L2_TAIL_LOG="$L2_LOG" ;;
+    *)                  L2_TAIL_LOG="$MOBILE_LOG" ;;
+esac
+# Création séquentielle : `select-layout tiled` après chaque split pour
+# redistribuer l'espace, sinon la 3e/4e pane devient trop étroite et tmux
+# rejette le split suivant avec "no space for new pane".
+tmux new-window -t "$SESSION" -n all \
+    "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
+for spec in \
+    "irda|/tmp/fw-irda.log" \
+    "osmocon|$OSMOCON_LOG" \
+    "bridge|$BRIDGE_LOG" \
+    "bts|$BTS_LOG" \
+    "$CALYPSO_L2_CLIENT|$L2_TAIL_LOG"
+do
+    name="${spec%%|*}"; log="${spec##*|}"
+    tmux split-window -t "$SESSION:all" \
+        "clear; echo '=== $name ==='; tail -F $log"
+    tmux select-layout -t "$SESSION:all" tiled
+done
 
 # ---------- shell + attach ----------
 tmux new-window -t "$SESSION" -n shell

@@ -65,9 +65,18 @@ skip bridge   || cp -a "$PROC_ROOT/tmp/bridge.log"   "$WORK/bridge.log"   2>/dev
 skip osmocon  || cp -a "$PROC_ROOT/tmp/osmocon.log"  "$WORK/osmocon.log"  2>/dev/null || true
 skip frame_irq|| cp -a "$PROC_ROOT/tmp/frame_irq.log" "$WORK/frame_irq.log" 2>/dev/null || true
 skip mobile   || cp -a "$PROC_ROOT/tmp/mobile.log"   "$WORK/mobile.log"   2>/dev/null || true
+skip bts      || cp -a "$PROC_ROOT/tmp/bts.log"      "$WORK/bts.log"      2>/dev/null || true
 skip tdma_profile || cp -a "$PROC_ROOT/tmp/tdma_profile.log" "$WORK/tdma_profile.log" 2>/dev/null || true
 skip tdma_tick    || cp -a "$PROC_ROOT/tmp/tdma_tick.log"    "$WORK/tdma_tick.log"    2>/dev/null || true
 skip qemu-fw      || cp -a "$PROC_ROOT/tmp/qemu-fw-console.log" "$WORK/qemu-fw-console.log" 2>/dev/null || true
+# IrDA debug channel (Phase 3 PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md) :
+# fw-irda.log = capture du PTY serial1 (UART_IRDA, 0xFFFF5000), tracé par
+# tools/irda_capture.py via /tmp/irda.pty.link. Vide tant que Phase 0.5
+# (cons_puts au boot) pas appliquée — utile quand-même pour confirmer que
+# la capture tourne et que le canal n'est pas saturé.
+skip fw-irda  || cp -a "$PROC_ROOT/tmp/fw-irda.log"  "$WORK/fw-irda.log"  2>/dev/null || true
+skip fw-irda  || cp -a "$PROC_ROOT/tmp/irda_capture.stderr.log" "$WORK/irda_capture.stderr.log" 2>/dev/null || true
+skip fw-irda  || cp -a "$PROC_ROOT/tmp/irda_capture.pid" "$WORK/irda_capture.pid" 2>/dev/null || true
 
 raw_size=$(wc -c < "$WORK/qemu_full.log")
 echo "[bundle] qemu.log raw size: $((raw_size/1024)) KB"
@@ -178,3 +187,6 @@ chown "$OWNER" "$OUT_DIR/$TARBALL" 2>/dev/null || true
 echo "[bundle] DONE"
 echo "  → $OUT_DIR/$TARBALL ($SIZE, owner $OWNER)"
 ls -la "$OUT_DIR/$TARBALL"
+echo
+echo "[bundle] contents :"
+tar tzvf "$OUT_DIR/$TARBALL" | awk '{printf "  %10s  %s\n", $3, $NF}' | sort -k1 -n -r
