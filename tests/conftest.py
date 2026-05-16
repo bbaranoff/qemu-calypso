@@ -16,6 +16,66 @@ from pathlib import Path
 import pytest
 
 
+# ─── In-container shim : si on tourne dans le container `trying` (`/.dockerenv`
+# existe), tous les `docker exec CONTAINER cmd...` deviennent un appel direct
+# `cmd...` sans préfixe docker. Idem `docker inspect`/`docker ps`/`docker test`
+# retournent des stubs raisonnables. Permet à `--gen-doc-local` de lancer
+# pytest dans le container sans que les tests aient besoin de patcher leurs
+# subprocess.run individuellement.
+if os.path.exists("/.dockerenv"):
+    _orig_subprocess_run = subprocess.run
+
+    def _calypso_local_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args")
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "docker":
+            sub = cmd[1]
+            if sub == "exec":
+                # "docker exec NAME [-e ENV=...] cmd...". Skip name + env flags.
+                rest = list(cmd[2:])
+                while rest and rest[0].startswith("-"):
+                    flag = rest.pop(0)
+                    if flag in ("-e", "--env", "-w", "--workdir", "-u", "--user"):
+                        if rest:
+                            rest.pop(0)
+                if rest:
+                    rest.pop(0)  # container name
+                if not rest:
+                    return _orig_subprocess_run(["true"], **{k: v for k, v in kwargs.items() if k != "args"})
+                new_args = (rest,) + tuple(args[1:])
+                return _orig_subprocess_run(*new_args, **kwargs)
+            if sub == "info":
+                # Faux succès : laisser les tests croire que docker marche
+                # (ils enchaînent ensuite avec `docker exec NAME cmd...` qui
+                # est lui aussi shimé). Sans ce returncode=0, _docker_cmd_or_none()
+                # de test_calypso_milestones renvoie None et tous les tests skip.
+                return subprocess.CompletedProcess(cmd, 0, stdout="Server:\n", stderr="")
+            if sub == "inspect":
+                # In-container = container tourne forcément (on est dedans).
+                # Si le test demande `-f "{{.State.Running}}"`, répondre "true".
+                if any(a == "{{.State.Running}}" for a in cmd):
+                    return subprocess.CompletedProcess(cmd, 0, stdout="true\n", stderr="")
+                if any(a == "{{.State.Pid}}" for a in cmd):
+                    return subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="[]\n", stderr="")
+            if sub == "ps":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if sub == "cp":
+                # `docker cp` dans le container : copie locale simple
+                src = cmd[2].split(":", 1)[-1] if ":" in cmd[2] else cmd[2]
+                dst = cmd[3].split(":", 1)[-1] if ":" in cmd[3] else cmd[3]
+                return _orig_subprocess_run(["cp", "-a", src, dst], **kwargs)
+            # Toutes les autres subcommands docker (info, version, image, …) :
+            # retourne exit≠0 SANS appeler le vrai binaire (qui n'existe pas
+            # dans le container), pour que les tests qui détectent docker via
+            # `subprocess.run([...]).returncode != 0` skippent proprement.
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr=f"docker shim: subcommand '{sub}' not supported in-container\n")
+        return _orig_subprocess_run(*args, **kwargs)
+
+    subprocess.run = _calypso_local_run
+
+
 def pytest_configure(config):
     for marker in (
         # test_calypso_milestones.py
@@ -51,6 +111,9 @@ def pytest_configure(config):
         "runtime_fs:           FD usage qemu, log size cap, disk space container",
         # test_log_grep.py (Phase 2)
         "runtime_log_grep:     grep invariants + blockers sur tous les logs (qemu/bridge/osmocon/mobile/fw-irda)",
+        # test_firmware_state.py
+        "runtime_firmware:     état firmware live (PC, rxDoneFlag, pas de busy-wait)",
+        "runtime_osmocon:      progression osmocon (download → L1CTL/Layer 1, pas de LOST spam)",
     ):
         config.addinivalue_line("markers", marker)
 
@@ -70,6 +133,7 @@ def pytest_runtest_makereport(item, call):
             return
     # Extract short error message if test failed/skipped — for annex section.
     err_short = ""
+    err_long  = ""
     if rep.outcome in ("failed", "skipped") or hasattr(rep, "wasxfail"):
         try:
             lr = getattr(rep, "longreprtext", "") or str(getattr(rep, "longrepr", "") or "")
@@ -81,6 +145,9 @@ def pytest_runtest_makereport(item, call):
                     break
             if not err_short and lr:
                 err_short = lr.strip().splitlines()[0][:200]
+            # Stack trace complet (cap à 4 KB pour ne pas exploser le report
+            # quand un test plante violemment avec un long traceback)
+            err_long = lr[:4096]
         except Exception:
             pass
     _MERMAID_RESULTS.append({
@@ -91,6 +158,7 @@ def pytest_runtest_makereport(item, call):
         "duration_s": getattr(rep, "duration", 0.0),
         "wasxfail": hasattr(rep, "wasxfail"),
         "err_short": err_short,
+        "err_long":  err_long,
     })
 
 
@@ -150,6 +218,8 @@ _MARKER_TAXONOMY = {
     "runtime_net":           ("Runtime", "Net"),
     "runtime_fs":            ("Runtime", "FS"),
     "runtime_log_grep":      ("Runtime", "Log-grep"),
+    "runtime_firmware":      ("Runtime", "Firmware-state"),
+    "runtime_osmocon":       ("Runtime", "Osmocon"),
 }
 
 
@@ -171,6 +241,8 @@ _PIPELINE_ORDER = [
     "Infra",            # processus container alive
     "GDB-introspect",   # GDB stub :1234 — surface d'introspection ARM
     "Monitor-extended", # QEMU monitor HMP — état QEMU lui-même
+    "Firmware-state",   # PC ARM bouge, pas de busy-wait SIM
+    "Osmocon",          # romload download → sercomm L1CTL passthrough
     "DSP",              # DSP boot / IRQ / FB-det converge
     "L1-data",          # BSP DMA / bursts DL bridge
     "L1-ctrl",          # SERCOMM L1CTL bus
@@ -359,6 +431,14 @@ _REPORT_SKELETON = """\
 
 {global_status_block}
 
+## Variables d'environnement du run
+
+Toutes les variables Calypso/pipeline manipulées par `run.sh` (extraites du
+script + os.environ). `env` = passée explicitement au lancement ; `default` =
+valeur fallback de `run.sh`.
+
+{env_block}
+
 ## Pipeline — où ça casse
 
 Le pipeline ci-dessous trace le flux logique GSM Calypso, étape par étape.
@@ -496,13 +576,38 @@ Statut auto-détecté depuis l'état du run.
 
 Réf. `PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md`.
 
+## Chapitre — Blockers détaillés
+
+Pour chaque test en échec : catégorie, couche, marker, message d'assertion,
+audit Python dynamique (greps des keywords du message contre tous les logs
+container), et stack trace complet dépliable.
+
+{blockers_chapter}
+
+## Annexe — Audit indépendant (`abstract.py`)
+
+Re-compute peer-level produit par `abstract.py` (script racine du repo) à
+partir de `results.json` + `log_timeline.csv` du dossier de run. Ne fait pas
+confiance au markdown généré — donne une 2ème lecture indépendante des
+mêmes données.
+
+<details markdown="1"><summary>Déplier — audit `abstract.py`</summary>
+
+{abstract_audit}
+
+</details>
+
 ## Annexe — Diag snapshot (état runtime au moment des tests)
 
 Snapshot rapide produit par `make_diag.sh` au cours de la session pytest.
 Pour un bundle complet (tar.gz avec tous les logs filtrés + dumps DSP), utiliser
 `./make_diag_bundle.sh`.
 
+<details markdown="1"><summary>Déplier — diag snapshot</summary>
+
 {diag_snapshot}
+
+</details>
 
 ## Annexe — Bundle make_diag_bundle.sh
 
@@ -510,11 +615,19 @@ Bundle généré pendant la session via `make_diag_bundle.sh` (inventaire + dige
 texte embarqués). Les logs bruts (qemu_diag, bridge, osmocon, etc.) sont listés
 seulement — récupérer le tar.gz pour les contenus complets.
 
+<details markdown="1"><summary>Déplier — bundle make_diag_bundle.sh</summary>
+
 {diag_bundle_annex}
+
+</details>
 
 ## Annexe — Détail complet de tous les tests
 
+<details markdown="1"><summary>Déplier — table complète de tous les tests</summary>
+
 {full_test_annex}
+
+</details>
 
 ## Reproduction
 
@@ -666,11 +779,222 @@ def _gen_blockers_block(results: list[dict], flat_layer: dict) -> str:
     for i, r in enumerate(sorted(failed, key=_key), 1):
         cat, layer = _classify(r["markers"])
         prefix = "🔴" if i == 1 else "🔻"
+        err = (r.get("err_short") or "").strip()
         parts.append(
             f"{prefix} **{i}. `{r['name']}`** — {cat} / {layer} — "
             f"marker(s): {','.join(r['markers']) or '_aucun_'} — "
             f"durée {r['duration_s']:.2f}s\n  - `{r['nodeid']}`"
         )
+        if err:
+            parts.append(f"  - ❗ `{err}`")
+    return "\n".join(parts)
+
+
+def _gen_env_block() -> str:
+    """Liste **toutes** les variables d'environnement que `run.sh` manipule
+    (extrait du run.sh lui-même via parsing `X="${X:-default}"`). Pour chaque :
+    valeur courante (si dans os.environ) sinon valeur par défaut, et la source
+    (`env` = passée explicitement, `default` = fallback de run.sh).
+    """
+    import re as _re_env
+    PREFIXES = ("CALYPSO_", "BRIDGE_", "FW_", "IRDA_", "QEMU_")
+    run_sh = Path(__file__).resolve().parent.parent / "run.sh"
+    run_vars: dict = {}
+    if run_sh.exists():
+        # Pattern : NAME="${NAME:-default}"  (avec ou sans quotes finales)
+        pat = _re_env.compile(
+            r'^([A-Z][A-Z0-9_]*)=\"?\$\{\1:-([^}]*)\}\"?\s*$',
+            _re_env.MULTILINE)
+        for m in pat.finditer(run_sh.read_text()):
+            name, default = m.group(1), m.group(2)
+            if name.startswith(PREFIXES):
+                run_vars[name] = default
+    # Union : noms définis dans run.sh + noms dans environ commençant par PREFIXES
+    all_names = set(run_vars) | {k for k in os.environ if k.startswith(PREFIXES)}
+    if not all_names:
+        return "_Aucune variable Calypso/pipeline détectée._\n"
+    rows = []
+    for name in sorted(all_names):
+        if name in os.environ:
+            v = os.environ[name]
+            src = "env"
+        else:
+            v = run_vars.get(name, "(unset)")
+            src = "default"
+        if len(v) > 200:
+            v = v[:197] + "..."
+        v_md = v.replace("|", "\\|")
+        rows.append(f"| `{name}` | `{v_md}` | {src} |")
+    return ("| Variable | Valeur | Source |\n|---|---|---|\n"
+            + "\n".join(rows) + "\n")
+
+
+def _gen_machine_report(md_full: str) -> str:
+    """Distille le rapport markdown complet en un `report.md` LLM-friendly :
+    on conserve uniquement les sections utiles à un agent (Stats, Pipeline,
+    Blockers, Chapitre blockers détaillés, Audit indépendant, Diag snapshot,
+    Plan IrDA, Log invariants si présent). On supprime mermaid blocks (illisible
+    en texte), `<details>` (verbose), et sections décoratives (Catalogue, Skip
+    list, Reproduction dupliquée, Détail complet de tous les tests, Bundle
+    annexe). Préfixe : « machine-friendly ».
+    """
+    SKIP_SECTIONS = (
+        "Diagramme détaillé",
+        "Skipped / xfailed",
+        "Catalogue des tests",
+        "Cadence des logs",
+        "Résultats bruts pytest",
+        "Annexe — Bundle make_diag_bundle.sh",
+        "Annexe — Détail complet de tous les tests",
+        "Reproduction",
+    )
+    lines = md_full.splitlines()
+    out, keep = [], True
+    in_mm, in_det = False, False
+    det_depth = 0  # supporte <details> imbriqués
+
+    for line in lines:
+        stripped = line.strip()
+        # Mermaid blocks
+        if stripped.startswith("```mermaid") or stripped.startswith("```{mermaid}"):
+            in_mm = True
+            continue
+        if in_mm:
+            if stripped == "```":
+                in_mm = False
+            continue
+        # <details>…</details> imbriqués
+        if "<details" in line.lower():
+            det_depth += line.lower().count("<details")
+            in_det = det_depth > 0
+            continue
+        if "</details>" in line.lower():
+            det_depth -= line.lower().count("</details>")
+            if det_depth <= 0:
+                det_depth = 0
+                in_det = False
+            continue
+        if in_det:
+            continue
+        # Niveau 2 = nouvelle section
+        if line.startswith("## "):
+            section = line[3:].strip()
+            keep = not any(section.startswith(k) for k in SKIP_SECTIONS)
+        if keep:
+            out.append(line)
+
+    body = "\n".join(out).rstrip() + "\n"
+    header = ("> _Rapport condensé (machine-friendly) extrait de "
+              "`test_results.md`. Pour la version complète : voir le `.md` ou "
+              "`.qmd` à côté._\n\n")
+    return header + body
+
+
+def _audit_blocker(r: dict) -> str:
+    """Audit Python dynamique d'un blocker : extrait les keywords distinctifs
+    du message d'assertion, puis grep ces keywords dans tous les logs du
+    container. Retourne un tableau markdown des comptes + dernier match.
+    """
+    import re as _re_a
+    import shlex as _sh
+    import subprocess as _sp_a
+    err = (r.get("err_short") or "").strip()
+    if not err:
+        return ""
+    # Keywords : tokens alphanum >= 4 chars. On exclut les très communs.
+    STOP = {"assert", "True", "False", "None", "self", "test", "tests",
+            "AssertionError", "ValueError", "TypeError", "Error"}
+    kws = []
+    seen = set()
+    for tok in _re_a.findall(r'[A-Za-z_][A-Za-z0-9_]{3,}', err):
+        if tok in STOP or tok in seen:
+            continue
+        seen.add(tok); kws.append(tok)
+        if len(kws) >= 5:
+            break
+    # Aussi : tokens numériques notables (task=24, fn=N, etc.) — extrait paires
+    nums = _re_a.findall(r'\b([a-z_]+)=(\d+)', err)
+    if nums:
+        kws.extend([f"{k}={v}" for k, v in nums[:3] if f"{k}={v}" not in seen])
+    if not kws:
+        return ""
+    LOGS = [("qemu", "/root/qemu.log"),
+            ("bridge", "/tmp/bridge.log"),
+            ("osmocon", "/tmp/osmocon.log"),
+            ("mobile", "/tmp/mobile.log"),
+            ("bts", "/tmp/bts.log"),
+            ("fw-irda", "/tmp/fw-irda.log")]
+    # Une seule commande docker exec pour tout : économise le RTT
+    parts_bash = []
+    for kw in kws:
+        for label, path in LOGS:
+            parts_bash.append(
+                f"echo '___ROW___|{kw}|{label}|'$(grep -c -F {_sh.quote(kw)} {path} 2>/dev/null || echo 0)"
+            )
+    bash_cmd = " ; ".join(parts_bash)
+    try:
+        rb = _sp_a.run(["docker", "exec", "trying", "bash", "-c", bash_cmd],
+                       capture_output=True, text=True, timeout=15)
+        rows = {}
+        for line in rb.stdout.splitlines():
+            if line.startswith("___ROW___|"):
+                _, kw, lbl, cnt = line.split("|", 3)
+                rows.setdefault(kw, {})[lbl] = cnt.strip() or "0"
+    except Exception as e:
+        return f"_Audit dynamique : exception {type(e).__name__}._\n"
+    out = ["**Audit dynamique** (greps `docker exec` des keywords du message"
+           " d'assertion contre les logs du run actif) :", "",
+           "| Keyword | qemu | bridge | osmocon | mobile | bts | fw-irda |",
+           "|---|---:|---:|---:|---:|---:|---:|"]
+    for kw in kws:
+        r2 = rows.get(kw, {})
+        out.append("| `{}` | {} | {} | {} | {} | {} | {} |".format(
+            kw,
+            r2.get("qemu", "?"), r2.get("bridge", "?"),
+            r2.get("osmocon", "?"), r2.get("mobile", "?"),
+            r2.get("bts", "?"),    r2.get("fw-irda", "?")))
+    return "\n".join(out) + "\n"
+
+
+def _gen_blockers_chapter(results: list[dict]) -> str:
+    """Chapitre dédié : un sous-chapitre par test en échec avec assertion
+    courte + audit Python dynamique + traceback complet en `<details>`.
+    """
+    failed = [r for r in results if r["outcome"] == "failed" and not r["wasxfail"]]
+    if not failed:
+        return "_Aucun test en échec — pas de chapitre à générer._\n"
+    layer_order = {layer: i for i, layer in enumerate(_PIPELINE_ORDER)}
+    def _key(r):
+        cat, layer = _classify(r["markers"])
+        return (layer_order.get(layer, 999), layer, r["nodeid"])
+    parts = [f"_{len(failed)} test(s) en échec, triés par ordre pipeline (le premier"
+             f" est l'upstream le plus en amont). Chaque entrée inclut un audit"
+             f" dynamique des keywords du message d'assertion._\n"]
+    for i, r in enumerate(sorted(failed, key=_key), 1):
+        cat, layer = _classify(r["markers"])
+        err  = (r.get("err_short") or "").strip()
+        long = (r.get("err_long")  or "").strip()
+        parts.append(f"### 🛑 {i}. `{r['name']}`\n")
+        parts.append(f"- **Catégorie / couche** : {cat} / {layer}")
+        parts.append(f"- **Marker(s)** : {','.join(r['markers']) or '_aucun_'}")
+        parts.append(f"- **Durée** : {r['duration_s']:.2f}s")
+        parts.append(f"- **Nodeid** : `{r['nodeid']}`")
+        if err:
+            parts.append(f"- **Assertion** : `{err}`")
+        audit = _audit_blocker(r)
+        if audit:
+            parts.append("")
+            parts.append(audit)
+        if long:
+            parts.append("")
+            parts.append("<details><summary>Stack trace complet (dépliable)</summary>")
+            parts.append("")
+            parts.append("```")
+            parts.append(long)
+            parts.append("```")
+            parts.append("")
+            parts.append("</details>")
+        parts.append("")
     return "\n".join(parts)
 
 
@@ -728,6 +1052,26 @@ def _gen_test_catalog(results: list[dict]) -> str:
             out.append(f"| {icon} {status} | `{r['name']}` | {r['duration_s']:.2f}s | `{src}` |")
         out.append("")
     return "\n".join(out)
+
+
+def _gen_abstract_audit(folder: Path) -> str:
+    """Annexe audit : exécute `abstract.py <folder>` qui recompute des stats
+    peer-level depuis `results.json` + `log_timeline.csv`. Sortie console
+    embarquée en bloc code.
+    """
+    import subprocess as _sp
+    script = Path(__file__).resolve().parent.parent / "abstract.py"
+    if not script.exists():
+        return "_`abstract.py` introuvable à la racine du repo._\n"
+    try:
+        r = _sp.run(["python3", str(script), str(folder)],
+                    capture_output=True, text=True, timeout=30)
+        body = r.stdout or "(no output)"
+        if r.returncode != 0:
+            body += f"\n\n[stderr]\n{r.stderr[:600]}"
+        return f"```\n{body}\n```\n"
+    except Exception as e:
+        return f"_exception en exécutant `abstract.py` : {type(e).__name__}: {e}_\n"
 
 
 def _gen_diag_bundle_annex() -> str:
@@ -1110,10 +1454,14 @@ def pytest_sessionfinish(session, exitstatus):
     folder = out_dir / f"test_results_{ts_id}"
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Derive structures
+    # Derive structures (annotation `category`/`layer` sur chaque record pour
+    # que results.json soit consommable par abstract.py et autres outils
+    # externes qui lisent t["layer"] directement).
     tree: dict[str, dict[str, list[dict]]] = {}
     for r in _MERMAID_RESULTS:
         cat, layer = _classify(r["markers"])
+        r["category"] = cat
+        r["layer"] = layer
         tree.setdefault(cat, {}).setdefault(layer, []).append(r)
     flat_layer: dict[str, list[dict]] = {}
     for cat, layers in tree.items():
@@ -1123,6 +1471,12 @@ def pytest_sessionfinish(session, exitstatus):
     for r in _MERMAID_RESULTS:
         if r["wasxfail"]: counts["xfailed"] += 1
         else: counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+
+    # Write results.json EARLY — _gen_abstract_audit() lit ce fichier pendant
+    # la construction du markdown ; sans ça abstract.py reçoit folder vide.
+    (folder / "results.json").write_text(
+        json.dumps({"counts": counts, "tests": _MERMAID_RESULTS},
+                   indent=2, default=str))
 
     # Build diagrams
     full_diagram = _build_mermaid()
@@ -1177,10 +1531,32 @@ def pytest_sessionfinish(session, exitstatus):
         detail_per_category = _gen_detail_per_category_md(tree),
         diag_snapshot       = _gen_diag_snapshot(),
         diag_bundle_annex   = _gen_diag_bundle_annex(),
+        abstract_audit      = _gen_abstract_audit(folder),
+        blockers_chapter    = _gen_blockers_chapter(_MERMAID_RESULTS),
+        env_block           = _gen_env_block(),
     )
     md = _REPORT_SKELETON.format(**fmt_kwargs)
+
+    # Distillation : `report.md` (machine-friendly, sans mermaid ni details).
+    # On le construit à partir du md complet, puis on l'ajoute aussi en annexe
+    # finale du md/qmd (avec h2→h3 demote pour ne pas casser la hiérarchie).
+    import re as _re_rep
+    report_md = _gen_machine_report(md)
+    report_md_demoted = _re_rep.sub(
+        r'^(#+) ', r'#\1 ', report_md, flags=_re_rep.MULTILINE)
+    annex_section = (
+        "\n\n## Annexe — Report condensé (machine-friendly)\n\n"
+        '<details markdown="1"><summary>Déplier — report condensé</summary>\n\n'
+        + report_md_demoted +
+        "\n\n</details>\n"
+    )
+    md = md + annex_section
+
     md_path = folder / "test_results.md"
     md_path.write_text(md)
+    # Standalone copies (top-level + per-run folder) pour collage rapide
+    (folder / "report.md").write_text(report_md)
+    (out_dir / "report.md").write_text(report_md)
 
     # Quarto report (.qmd) — uses ```{mermaid} blocks + YAML front-matter so
     # RStudio / `quarto render` produit du HTML interactif avec les diagrammes
@@ -1235,6 +1611,28 @@ def pytest_sessionfinish(session, exitstatus):
         qmd_body = "".join(lines[1:]).lstrip()
     # Replace GitHub-style mermaid fences with Quarto-style executable blocks
     qmd_body = qmd_body.replace("```mermaid\n", "```{mermaid}\n")
+    # Idem md : annexe report condensé (utilise le report_md déjà calculé)
+    qmd_body = qmd_body + annex_section
+    # Quarto/Pandoc ferme implicitement les <details> dès qu'il rencontre un
+    # `## heading` à l'intérieur (le markdown="1" attribute n'aide pas). On
+    # transforme donc les <details markdown="1">…</details> top-level en
+    # Quarto callouts collapsibles, qui acceptent du markdown imbriqué sans
+    # fermeture implicite.
+    import re as _re_d
+    _det_pat = _re_d.compile(
+        r'<details markdown="1">\s*<summary>([^<]*)</summary>(.+?)</details>',
+        _re_d.DOTALL)
+    def _to_callout(m):
+        title = m.group(1).strip()
+        content = m.group(2).strip()
+        # Report condensé = priorité haute, déplié par défaut. Autres annexes
+        # (logs, audit, bundle) collapsé par défaut pour ne pas noyer.
+        collapse = "false" if "report condensé" in title.lower() else "true"
+        return (f"::: {{.callout-note collapse=\"{collapse}\"}}\n"
+                f"## {title}\n\n"
+                f"{content}\n"
+                ":::")
+    qmd_body = _det_pat.sub(_to_callout, qmd_body)
     qmd = _QMD_FRONTMATTER + qmd_body
     qmd_path = folder / "test_results.qmd"
     qmd_path.write_text(qmd)
@@ -1244,9 +1642,8 @@ def pytest_sessionfinish(session, exitstatus):
     (folder / "pipeline.qmd.mmd").write_text(qmd_pipeline)
     (folder / "detail.qmd.mmd").write_text(qmd_detail)
 
-    # Raw JSON results for machine consumption
-    (folder / "results.json").write_text(
-        json.dumps({"counts": counts, "tests": _MERMAID_RESULTS}, indent=2, default=str))
+    # (results.json est écrit plus haut, avant la construction du markdown,
+    # parce que `_gen_abstract_audit()` en a besoin pour son audit.)
 
     # Stable top-level copies (so pytest -v can be pointed at them deterministically)
     (out_dir / "test_results.md").write_text(md)
@@ -1258,6 +1655,21 @@ def pytest_sessionfinish(session, exitstatus):
         for entry in folder.iterdir():
             zf.write(entry, arcname=entry.name)
     (out_dir / "test_results_latest.zip").write_bytes(zip_path.read_bytes())
+
+    # Si on tourne dans le container Calypso, /tmp est tmpfs (volatile) mais
+    # /root est bind-monté sur /home/nirvana/myconfigs/osmo_root/ côté host.
+    # On écrit donc une copie stable du zip dans /root/ pour qu'elle soit
+    # accessible directement côté host sans `docker cp`. Override possible
+    # via CALYPSO_HOST_PERSIST_DIR (path container côté bind-mount).
+    persist_dir = Path(os.environ.get("CALYPSO_HOST_PERSIST_DIR", "/root"))
+    if persist_dir.exists() and persist_dir.is_dir():
+        try:
+            persist_zip = persist_dir / "test_results_latest.zip"
+            persist_zip.write_bytes(zip_path.read_bytes())
+            persist_report = persist_dir / "report.md"
+            persist_report.write_text(report_md)
+        except Exception:
+            pass
 
     terminal = session.config.pluginmanager.get_plugin("terminalreporter")
     if terminal is not None:

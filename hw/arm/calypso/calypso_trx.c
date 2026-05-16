@@ -1024,10 +1024,17 @@ static void calypso_kick_cb(void *o){
     {
         const char *env = getenv("CALYPSO_FORCE_RX_DONE");
         if (env && env[0] == '1') {
+            /* Adresse rxDoneFlag — override via CALYPSO_RXDONE_ADDR (hex),
+             * default 0x008302a0 (build 2026-05-16). Cohérent avec
+             * calypso_sim.c. */
+            static uint32_t rxdone_addr;
+            if (!rxdone_addr) {
+                const char *aenv = getenv("CALYPSO_RXDONE_ADDR");
+                rxdone_addr = aenv ? (uint32_t)strtoul(aenv, NULL, 0)
+                                   : 0x008302a0;
+            }
             const uint32_t one = 1;
-            cpu_physical_memory_write(0x00830510, &one, sizeof(one));
-            /* No need to log every kick (every 5ms = 200/s); cpu_exit
-             * is done unconditionally below. */
+            cpu_physical_memory_write(rxdone_addr, &one, sizeof(one));
         }
     }
 

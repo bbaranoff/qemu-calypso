@@ -43,12 +43,12 @@ import pytest
 # ---------------------------------------------------------------------------
 
 CONTAINER_NAME = os.environ.get("CALYPSO_CONTAINER", "trying")
-HOST_ROOT      = Path(os.environ.get("CALYPSO_HOST_ROOT", "/home/nirvana/myconfigs/osmo_root"))
+HOST_ROOT      = Path(os.environ.get("CALYPSO_HOST_ROOT", "/root"))
 QEMU_LOG_CONTAINER = "/root/qemu.log"   # canonical, lecture via docker exec
 QEMU_LOG       = HOST_ROOT / "qemu.log" # backup mount, peut être stale
 MOBILE_PCAP    = HOST_ROOT / "mobile-gsmtap.pcap"
 
-REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/home/nirvana/qemu-calypso"))
+REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/opt/GSM/qemu-src"))
 DSP_ROM_TXT    = Path(os.environ.get("CALYPSO_DSP_ROM", str(REPO_ROOT / "calypso_dsp.txt")))
 
 # Sondes connues (rapport 05-14)

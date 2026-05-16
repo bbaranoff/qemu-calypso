@@ -29,14 +29,44 @@ FW_IRDA_LOG = os.environ.get("FW_IRDA_LOG", "/tmp/fw-irda.log")
 IRDA_BAUD   = int(os.environ.get("IRDA_BAUD", "115200"))
 
 
+def _set_raw_termios(fd: int) -> None:
+    """Mode raw : pas de buffering canonical, pas d'écho, pas de translation
+    \\r↔\\n, pas de signals (intr/quit/...). Indispensable sinon le PTY slave
+    bufferise jusqu'à \\n (mode canonical) et filtre les bytes spéciaux —
+    fw-irda.log reste vide même quand QEMU push 1+ MB côté master.
+    """
+    try:
+        import termios, tty
+        tty.setraw(fd, termios.TCSANOW)
+        # Ajout : nettoyage explicite des flags d'input qui peuvent perturber
+        attrs = termios.tcgetattr(fd)
+        # iflag : disable IXON/IXOFF (XON/XOFF flow control), ICRNL, INLCR
+        attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL
+                      | termios.INLCR | termios.IGNCR)
+        # lflag : disable ECHO, ECHONL, ICANON, ISIG, IEXTEN
+        attrs[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
+                      | termios.ISIG | termios.IEXTEN)
+        # cc : VMIN=1 (au moins 1 byte avant retour), VTIME=0 (pas de timeout)
+        attrs[6][termios.VMIN]  = 1
+        attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception as e:
+        sys.stderr.write(f"irda_capture: termios raw setup failed ({e}) — continuing\n")
+
+
 def _open_pty():
-    """Ouvre le PTY en bytes non-bufférisé. Préfère pyserial si dispo, sinon raw."""
+    """Ouvre le PTY en bytes non-bufférisé + bascule en mode raw via termios.
+    Préfère pyserial si dispo (qui fait déjà raw), sinon ouverture directe."""
     try:
         import serial
-        return serial.Serial(IRDA_PTY, IRDA_BAUD, timeout=0.5)
+        s = serial.Serial(IRDA_PTY, IRDA_BAUD, timeout=0.5)
+        # pyserial fait déjà raw + IGNBRK + cflag CLOCAL|CREAD, RAS
+        return s
     except ImportError:
-        # Fallback : ouvrir en bytes raw, lire avec select
-        return open(IRDA_PTY, "rb", buffering=0)
+        # Fallback : ouverture directe + force raw via termios.
+        f = open(IRDA_PTY, "rb", buffering=0)
+        _set_raw_termios(f.fileno())
+        return f
 
 
 def main():

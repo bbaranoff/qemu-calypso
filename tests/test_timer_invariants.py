@@ -216,18 +216,23 @@ def _csv_exists() -> tuple[bool, str]:
     return (False, "none")
 
 def _generate_csv() -> str:
-    """Tente de produire le CSV (local ou container). Returns stderr/error str."""
-    script_local = Path(__file__).resolve().parent.parent / "log_timeline.py"
-    if script_local.exists() and os.path.exists("/root/qemu.log"):
-        r = subprocess.run(
-            ["python3", str(script_local), "--bucket-s", "10", "--csv", CSV_PATH],
-            capture_output=True, text=True, timeout=20)
-        return r.stderr or r.stdout[:200]
-    if _has_docker():
+    """Tente de produire le CSV. Priorité : container si docker dispo
+    (qemu.log canonique côté container), sinon local SEULEMENT si in-container.
+    Évite la race où on lit un /root/qemu.log host stale.
+    """
+    # 1) Container path (priorité) — sauf si on EST dans le container
+    if _has_docker() and not INSIDE:
         r = subprocess.run(
             ["docker", "exec", CONTAINER, "python3",
              "/opt/GSM/qemu-src/log_timeline.py",
              "--bucket-s", "10", "--csv", CSV_PATH],
+            capture_output=True, text=True, timeout=20)
+        return r.stderr or r.stdout[:200]
+    # 2) Local (in-container : /root/qemu.log est canonique)
+    script_local = Path(__file__).resolve().parent.parent / "log_timeline.py"
+    if script_local.exists() and Path("/root/qemu.log").exists():
+        r = subprocess.run(
+            ["python3", str(script_local), "--bucket-s", "10", "--csv", CSV_PATH],
             capture_output=True, text=True, timeout=20)
         return r.stderr or r.stdout[:200]
     return "no path to run log_timeline.py"

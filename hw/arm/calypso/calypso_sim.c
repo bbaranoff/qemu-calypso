@@ -617,14 +617,23 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
             const char *env = getenv("CALYPSO_FORCE_RX_DONE");
             if (env && env[0] == '1') {
                 static unsigned force_n;
+                static uint32_t rxdone_addr;
+                /* Adresse du symbole `rxDoneFlag` ; varie selon le build
+                 * firmware. Override via CALYPSO_RXDONE_ADDR (hex). Defaults
+                 * sur la valeur observée du build courant (2026-05-16). */
+                if (!rxdone_addr) {
+                    const char *aenv = getenv("CALYPSO_RXDONE_ADDR");
+                    rxdone_addr = aenv ? (uint32_t)strtoul(aenv, NULL, 0)
+                                       : 0x008302a0;
+                }
                 const uint32_t one = 1;
-                cpu_physical_memory_write(0x00830510, &one, sizeof(one));
+                cpu_physical_memory_write(rxdone_addr, &one, sizeof(one));
                 CPUState *cpu = first_cpu;
                 if (cpu) cpu_exit(cpu);
                 if (force_n++ < 30)
                     SIM_LOG("XXX HACK FORCE_RX_DONE on SIM_IT-read #%u "
-                            "(IT=0x%04x) → write 1 to 0x830510 + cpu_exit",
-                            force_n, v);
+                            "(IT=0x%04x) → write 1 to 0x%08x + cpu_exit",
+                            force_n, v, rxdone_addr);
             }
         }
         /* Lighter instrumentation : just IT bits + FIFO state, no PC read.

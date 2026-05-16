@@ -12,6 +12,198 @@
 set -euo pipefail
 
 SESSION="calypso"
+
+# ---- args : --gen-doc / --help -----------------------------------------------
+# --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne déjà dans le
+# container et lance pytest pour produire la doc (report.md condensé +
+# test_results.md/qmd complets). Crée une fenêtre tmux `gen-doc` dans la session
+# `calypso` existante et y bascule pour montrer le run pytest en direct.
+GEN_DOC_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --gen-doc-local) GEN_DOC_MODE=1 ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--gen-doc-local]
+
+Default : launch the full Calypso pipeline (QEMU + osmocon + bridge + bts +
+mobile + gsmtap + irda capture) in a tmux session and attach to it.
+
+--gen-doc-local : skip pipeline launch, run pytest in the container "trying"
+            (no requirement that qemu-system-arm be running — tests can
+            still fail/skip if dependencies missing). Output lands in a new
+            tmux window 'gen-doc' of the calypso session (if it exists);
+            otherwise streamed to the current terminal.
+            Artefacts (inside container):
+              /tmp/report.md           (machine-friendly summary)
+              /tmp/test_results.md     (full GitHub-flavored)
+              /tmp/test_results.qmd    (Quarto source)
+              /tmp/test_results_<ts>/  (per-run folder with mmd, csv, json)
+            Host copy: /tmp/calypso_report.md
+EOF
+            exit 0 ;;
+    esac
+done
+
+# `--gen-doc-local` = synonyme de "lance le pipeline normal ET force la
+# génération de doc auto" (qui se déclenche T+30s après QEMU launch dans une
+# fenêtre tmux dédiée). Pas de mode "skip pipeline" : si tu veux régénérer la
+# doc sans relancer, lance directement pytest dans le container.
+if [ "$GEN_DOC_MODE" = "1" ]; then
+    CALYPSO_AUTO_GEN_DOC=1
+    export CALYPSO_AUTO_GEN_DOC
+fi
+
+# Détection pytest réutilisée par la fenêtre gen-doc auto plus bas.
+detect_pytest() {
+    local override="${CALYPSO_PYTEST:-}"
+    if [ -n "$override" ]; then echo "$override"; return; fi
+    for cand in /tmp/calypso-venv/bin/pytest \
+                /opt/GSM/calypso-venv/bin/pytest \
+                /opt/calypso-venv/bin/pytest \
+                /root/.venv/bin/pytest \
+                /usr/local/bin/pytest \
+                /usr/bin/pytest \
+                pytest; do
+        if [ -x "$cand" ] || command -v "$cand" >/dev/null 2>&1; then
+            echo "$cand"; return
+        fi
+    done
+    if python3 -c "import pytest" >/dev/null 2>&1; then
+        echo "python3 -m pytest"; return
+    fi
+    echo ""
+}
+
+if false; then  # ancien bloc gen-doc-local, conservé désactivé pour référence
+
+    # In-container mode : `/.dockerenv` présent → on est DANS le container,
+    # lance pytest direct sans préfixe docker.
+    if [ -f /.dockerenv ]; then
+        echo "=== --gen-doc-local : in-container mode (no docker prefix) ==="
+
+        # Deps Python pour pytest + tests QEMU upstream (functional/, guest-debug/)
+        pip_install_one() {
+            local pkg="$1"
+            python3 -c "import $pkg" 2>/dev/null && return 0
+            (pip install "$pkg" 2>&1 \
+             || pip3 install "$pkg" 2>&1 \
+             || python3 -m pip install "$pkg" 2>&1 \
+             || pip install --break-system-packages "$pkg" 2>&1) | tail -2
+            python3 -c "import $pkg" 2>/dev/null && return 0
+            return 1
+        }
+        PYTEST_BIN=$(detect_pytest)
+        if [ -z "$PYTEST_BIN" ]; then
+            echo "pytest absent — tentative d'installation..."
+            pip_install_one pytest
+            PYTEST_BIN=$(detect_pytest)
+        fi
+        if [ -z "$PYTEST_BIN" ]; then
+            echo "ERR: pytest introuvable et install pip échouée." >&2
+            echo "     Installer manuellement : pip install pytest" >&2
+            echo "     Ou définir CALYPSO_PYTEST=/path/to/pytest" >&2
+            exit 1
+        fi
+        # pycotap : requis par functional/qemu_test/testcase.py
+        python3 -c "import pycotap" 2>/dev/null \
+            || { echo "Installing pycotap..."; pip_install_one pycotap; }
+        # gdb : module Python qui vient avec GDB system (pas via pip).
+        # On vérifie que `gdb` (le binaire) est dispo, sinon apt install.
+        if ! command -v gdb >/dev/null 2>&1; then
+            echo "gdb absent — tentative d'installation via apt..."
+            (apt-get update -qq 2>&1 && apt-get install -y -qq gdb 2>&1) | tail -3 || true
+        fi
+        echo "Using pytest: $PYTEST_BIN"
+        # Construit la commande pytest avec ses env + ignores
+        PYTEST_CMD="cd /opt/GSM/qemu-src/tests && \
+CALYPSO_TEST_OUT=/tmp \
+CALYPSO_REPO=\"\${CALYPSO_REPO:-/opt/GSM/qemu-src}\" \
+CALYPSO_HOST_ROOT=\"\${CALYPSO_HOST_ROOT:-/root}\" \
+$PYTEST_BIN -v --tb=short --color=yes \
+    --ignore=functional --ignore=guest-debug \
+    --ignore=qemu-iotests --ignore=qtest --ignore=unit \
+    --ignore=tcg --ignore=migration --ignore=vm \
+    --ignore=avocado --ignore=fp ; \
+echo ; echo '=== Artefacts ===' ; \
+ls -la /tmp/report.md /tmp/test_results.md /tmp/test_results.qmd 2>/dev/null ; \
+echo ; echo '=== Dernier per-run folder ===' ; \
+ls -dt /tmp/test_results_*/ 2>/dev/null | head -1 ; \
+echo ; echo '[gen-doc done] Press <Enter> to keep this window open.' ; read -r _"
+
+        # Si tmux est dispo et qu'on a une session 'calypso' existante : fenêtre dédiée.
+        # Si tmux dispo mais pas de session : on en crée une 'gen-doc-session'.
+        # Si pas de tmux du tout : on exécute en foreground.
+        if command -v tmux >/dev/null 2>&1; then
+            if tmux has-session -t "$SESSION" 2>/dev/null; then
+                TARGET="$SESSION"
+            else
+                TARGET="gen-doc-session"
+                tmux new-session -d -s "$TARGET" -n shell 2>/dev/null || true
+            fi
+            tmux kill-window -t "$TARGET:gen-doc" 2>/dev/null || true
+            tmux new-window -t "$TARGET" -n gen-doc
+            tmux send-keys -t "$TARGET:gen-doc" "$PYTEST_CMD" C-m
+            tmux select-window -t "$TARGET:gen-doc"
+            echo "=== --gen-doc-local lancé dans tmux '$TARGET:gen-doc' ==="
+            if [ "$TARGET" = "gen-doc-session" ]; then
+                echo "Attach : tmux attach -t $TARGET"
+                # Si terminal interactif, attach directement
+                [ -t 0 ] && exec tmux attach -t "$TARGET"
+            else
+                echo "Attach (si pas déjà dedans) : tmux attach -t $TARGET"
+            fi
+            exit 0
+        else
+            echo "=== tmux absent — exécution foreground ==="
+            eval "$PYTEST_CMD"
+            exit $?
+        fi
+    fi
+
+    # Host mode : pytest dans le container via docker exec.
+    CONTAINER="${CALYPSO_CONTAINER:-trying}"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+        echo "ERR: container '$CONTAINER' not running." >&2
+        exit 1
+    fi
+    GEN_DOC_CMD=$(cat <<EOF
+echo '=== --gen-doc-local : pytest dans container $CONTAINER (pipeline pas requis) ==='
+docker exec -e CALYPSO_TEST_OUT=/tmp $CONTAINER bash -c '
+    cd /opt/GSM/qemu-src/tests && \
+    /tmp/calypso-venv/bin/pytest -v --tb=short --color=yes
+'
+rc=\$?
+echo
+echo '=== Artefacts (dans le container) ==='
+docker exec $CONTAINER ls -la /tmp/report.md /tmp/test_results.md /tmp/test_results.qmd 2>/dev/null
+echo
+echo '=== Dernier per-run folder ==='
+docker exec $CONTAINER bash -c 'ls -dt /tmp/test_results_*/ 2>/dev/null | head -1'
+echo
+if docker exec $CONTAINER test -f /tmp/report.md 2>/dev/null; then
+    docker exec $CONTAINER cat /tmp/report.md > /tmp/calypso_report.md
+    echo "Host copy : /tmp/calypso_report.md (\$(wc -l < /tmp/calypso_report.md) lignes)"
+fi
+echo
+echo "[exit=\$rc] Press <Enter> to keep this window open."
+EOF
+)
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        tmux kill-window -t "$SESSION:gen-doc" 2>/dev/null || true
+        tmux new-window -t "$SESSION" -n gen-doc
+        tmux send-keys -t "$SESSION:gen-doc" "$GEN_DOC_CMD; read -r _" C-m
+        tmux select-window -t "$SESSION:gen-doc"
+        echo "=== --gen-doc-local lancé dans tmux '$SESSION:gen-doc' ==="
+        echo "Attach (si pas déjà dedans) : tmux attach -t $SESSION"
+        exit 0
+    else
+        echo "=== tmux session '$SESSION' absente — exécution directe ==="
+        eval "$GEN_DOC_CMD"
+        exit $?
+    fi
+fi  # ancien bloc gen-doc-local — désactivé par `if false; then` plus haut
+
 FW_ELF="/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
 FW_BIN="/opt/GSM/firmware/board/compal_e88/layer1.highram.bin"
 QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
@@ -28,6 +220,23 @@ export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG
 
 # ---- Env-gated dev assists (default OFF = real path) ----
 # Set =1 in the calling environment to enable. Cf. README.md "Env vars".
+# CALYPSO_RXDONE_ADDR : auto-détection via nm sur le firmware elf. Permet de
+# survivre aux rebuilds firmware qui shiftent l'adresse BSS de rxDoneFlag.
+# Override via env si besoin (force une valeur fixe).
+if [ -z "${CALYPSO_RXDONE_ADDR:-}" ]; then
+    NM="/root/gnuarm/install/bin/arm-elf-nm"
+    [ -x "$NM" ] || NM="arm-elf-nm"
+    if command -v "$NM" >/dev/null 2>&1 || [ -x "$NM" ]; then
+        _rxd_addr=$("$NM" -n "$FW_ELF" 2>/dev/null \
+                    | awk '$3 == "rxDoneFlag" { print "0x"$1 ; exit }')
+        if [ -n "$_rxd_addr" ]; then
+            CALYPSO_RXDONE_ADDR="$_rxd_addr"
+            echo "[run.sh] auto-detected CALYPSO_RXDONE_ADDR=$CALYPSO_RXDONE_ADDR (from nm $FW_ELF)"
+        fi
+    fi
+fi
+export CALYPSO_RXDONE_ADDR
+
 CALYPSO_FBSB_SYNTH="${CALYPSO_FBSB_SYNTH:-0}"
 CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
@@ -77,7 +286,7 @@ export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
 #   auto              shift dynamic, wall-clock aligned (recommended)
 #   shift=N,sleep=on  fixed shift (1<<N instr ≈ 1ns), explicit sleep
 #   off               disable (legacy default-clock mode)
-CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"
 export CALYPSO_ICOUNT
 if [ "$CALYPSO_ICOUNT" = "off" ]; then
     QEMU_ICOUNT_FLAG=""
@@ -280,12 +489,12 @@ tmux new-window -t "$SESSION" -n bridge
 tmux send-keys -t "$SESSION:bridge" \
     "python3 $BRIDGE 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
 
-echo -n "Waiting for bridge to receive QEMU ticks..."
-for i in $(seq 1 30); do
-    grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null && break
-    sleep 1; echo -n "."
-done
-if grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null; then echo " OK"; else echo " TIMEOUT"; fi
+# Pas de wait `QEMU tick` ici : avec le hack CALYPSO_FORCE_RX_DONE, le
+# firmware peut prendre du temps à libérer le polling SIM (plusieurs ops
+# SELECT/READ_BINARY successifs), ce qui retarde le premier CLK IND. Le
+# bridge et osmo-bts-trx ci-dessous gèrent l'attente naturellement
+# (bridge n'émet CLK IND qu'après POWERON de bts-trx, et bts-trx
+# patiente que bridge soit prêt).
 
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
@@ -336,7 +545,7 @@ esac
 # pour que le pcap soit utilisable immédiatement (sinon buffer 4KB).
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
-    "sleep 5 && tcpdump -i any -U --print -w /root/mobile-gsmtap.pcap udp port 4729" C-m
+    "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap.pcap udp port 4729" C-m
 
 # ---------- 7. window 'all' — agrège les 6 premières en 6 panes ----------
 # Vue unique pour superviser qemu / irda / osmocon / bridge / bts / L2 client
@@ -354,17 +563,62 @@ esac
 tmux new-window -t "$SESSION" -n all \
     "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
 for spec in \
-    "irda|/tmp/fw-irda.log" \
+    "tcpdump|__TCPDUMP__" \
     "osmocon|$OSMOCON_LOG" \
     "bridge|$BRIDGE_LOG" \
     "bts|$BTS_LOG" \
     "$CALYPSO_L2_CLIENT|$L2_TAIL_LOG"
 do
     name="${spec%%|*}"; log="${spec##*|}"
-    tmux split-window -t "$SESSION:all" \
-        "clear; echo '=== $name ==='; tail -F $log"
+    if [ "$log" = "__TCPDUMP__" ]; then
+        # Live tcpdump hex + ASCII (sans -w pour ne pas dupliquer le pcap
+        # canonique géré par la fenêtre `gsmtap`).
+        cmd="clear; echo '=== $name ==='; sleep 5 && tcpdump -i any -X udp port 4729"
+    else
+        cmd="clear; echo '=== $name ==='; tail -F $log"
+    fi
+    tmux split-window -t "$SESSION:all" "$cmd"
     tmux select-layout -t "$SESSION:all" tiled
 done
+
+# ---------- 8. gen-doc auto (30s après QEMU launch) ----------
+# Une fenêtre tmux dédiée qui attend 30s que le pipeline se stabilise puis
+# lance pytest in-container pour produire la doc en arrière-plan. Pas de
+# rappel récursif à run.sh — on inline la commande pytest avec ses ignores
+# et env vars. Désactivable via CALYPSO_AUTO_GEN_DOC=0.
+CALYPSO_AUTO_GEN_DOC="${CALYPSO_AUTO_GEN_DOC:-1}"
+if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
+    # Pré-install des deps Python (silencieux, idempotent)
+    pip_install_silent() {
+        python3 -c "import $1" 2>/dev/null && return 0
+        (pip install "$1" 2>&1 \
+         || pip3 install "$1" 2>&1 \
+         || python3 -m pip install "$1" 2>&1) >/dev/null
+        python3 -c "import $1" 2>/dev/null
+    }
+    pip_install_silent pytest  || true
+    pip_install_silent pycotap || true
+
+    GEN_DOC_PYTEST=$(detect_pytest)
+    [ -z "$GEN_DOC_PYTEST" ] && GEN_DOC_PYTEST="python3 -m pytest"
+
+    tmux new-window -t "$SESSION" -n gen-doc
+    tmux send-keys -t "$SESSION:gen-doc" \
+        "echo '[gen-doc] waiting 60s for pipeline to stabilize…'; sleep 60; \
+         echo '[gen-doc] launching pytest in-container'; \
+         cd /opt/GSM/qemu-src/tests && \
+         CALYPSO_TEST_OUT=/tmp \
+         CALYPSO_REPO=/opt/GSM/qemu-src \
+         CALYPSO_HOST_ROOT=/root \
+         $GEN_DOC_PYTEST -v --tb=short --color=yes \
+            --ignore=functional --ignore=guest-debug \
+            --ignore=qemu-iotests --ignore=qtest --ignore=unit \
+            --ignore=tcg --ignore=migration --ignore=vm \
+            --ignore=avocado --ignore=fp; \
+         echo; echo '=== Artefacts ==='; \
+         ls -la /tmp/report.md /tmp/test_results.md /tmp/test_results.qmd 2>/dev/null; \
+         echo; echo '[gen-doc] done. Press <Enter> to keep window open.'; read -r _" C-m
+fi
 
 # ---------- shell + attach ----------
 tmux new-window -t "$SESSION" -n shell
@@ -396,5 +650,5 @@ echo "Manual warm-start (debug, if BSC unavailable) :"
 echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
 echo
 
-tmux select-window -t "$SESSION:qemu"
+tmux select-window -t "$SESSION:all" 2>/dev/null || tmux select-window -t "$SESSION:qemu"
 exec tmux attach -t "$SESSION"

@@ -46,7 +46,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 CONTAINER       = os.environ.get("CALYPSO_CONTAINER", "trying")
-HOST_ROOT       = Path(os.environ.get("CALYPSO_HOST_ROOT", "/home/nirvana/myconfigs/osmo_root"))
+HOST_ROOT       = Path(os.environ.get("CALYPSO_HOST_ROOT", "/root"))
 
 # Canonical: les logs runtime sont écrits dans le container à /root/qemu.log.
 # Le host mount existe (/home/nirvana/myconfigs/osmo_root/qemu.log) mais on lit
@@ -77,9 +77,13 @@ EXPECTED_PROCESSES = {
 # QEMU monitor (unix socket dans le container)
 QEMU_MON_SOCK = "/tmp/qemu-calypso-mon.sock"
 
-# Mobile VTY (probablement 4247, à confirmer dans mobile_group1.cfg)
-MOBILE_VTY_HOST = "127.0.0.1"
-MOBILE_VTY_PORT = 4247
+# Mobile VTY. In-container : 127.0.0.1:4247 directement. Depuis host : passer
+# par l'IP du container (override via CALYPSO_MOBILE_VTY="host:port").
+MOBILE_VTY_DEFAULT = "127.0.0.1:4247" if os.path.exists("/.dockerenv") \
+                     else "172.20.0.11:4247"
+_vty = os.environ.get("CALYPSO_MOBILE_VTY", MOBILE_VTY_DEFAULT)
+MOBILE_VTY_HOST, _p = _vty.rsplit(":", 1)
+MOBILE_VTY_PORT = int(_p)
 
 # Fenêtres d'échantillonnage
 SAMPLE_WINDOW_SHORT = 10.0    # health checks

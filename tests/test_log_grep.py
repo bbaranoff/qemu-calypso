@@ -27,21 +27,28 @@ MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/tmp/mobile.log")
 FW_IRDA_LOG = os.environ.get("CALYPSO_FW_IRDA_LOG", "/tmp/fw-irda.log")
 
 
-def _grep_count(path: str, pattern: str, tail: int = 100000) -> int:
-    """Count regex matches in last `tail` lines of `path`."""
+def _grep_count(path: str, pattern: str, tail: int = 0) -> int:
+    """Count regex matches in `path`. tail=0 (default) → grep tout le fichier
+    (important pour les markers de boot qui sont dans les 1ères lignes ;
+    qemu.log peut faire >100k lignes pendant un run long et les markers
+    sont écrasés par un `tail -n 100000` trop strict).
+    Si tail>0, restreint aux N dernières lignes (utile pour les events
+    récents, e.g. erreurs en fin de run).
+    """
+    cmd_grep = f"grep -cE '{pattern}' {path} 2>/dev/null" if tail == 0 else \
+               f"tail -n {tail} {path} 2>/dev/null | grep -cE '{pattern}'"
     if INSIDE:
         try:
             r = subprocess.run(
-                ["bash", "-c", f"tail -n {tail} {path} 2>/dev/null | grep -cE '{pattern}'"],
-                capture_output=True, text=True, timeout=4)
+                ["bash", "-c", cmd_grep],
+                capture_output=True, text=True, timeout=8)
             return int(r.stdout.strip() or "0")
         except Exception:
             return 0
     try:
         r = subprocess.run(
-            ["docker", "exec", CONTAINER, "bash", "-c",
-             f"tail -n {tail} {path} 2>/dev/null | grep -cE '{pattern}'"],
-            capture_output=True, text=True, timeout=5)
+            ["docker", "exec", CONTAINER, "bash", "-c", cmd_grep],
+            capture_output=True, text=True, timeout=10)
         return int(r.stdout.strip() or "0")
     except Exception:
         return 0

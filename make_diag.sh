@@ -15,11 +15,21 @@ set -u
 CONTAINER="${CONTAINER:-trying}"
 TAIL_LINES="${TAIL_LINES:-10}"
 
-_dexec() { docker exec "$CONTAINER" "$@" 2>/dev/null; }
+# Si on tourne IN-CONTAINER, _dexec exécute directement (pas de prefix docker).
+INSIDE_CONTAINER=0
+[ -f /.dockerenv ] && INSIDE_CONTAINER=1
 
-if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
-    echo "_diag: container \`$CONTAINER\` n'est pas running — snapshot impossible._"
-    exit 0
+if [ "$INSIDE_CONTAINER" = "1" ]; then
+    _dexec() { "$@" 2>/dev/null; }
+else
+    _dexec() { docker exec "$CONTAINER" "$@" 2>/dev/null; }
+fi
+
+if [ "$INSIDE_CONTAINER" != "1" ]; then
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+        echo "_diag: container \`$CONTAINER\` n'est pas running — snapshot impossible._"
+        exit 0
+    fi
 fi
 
 echo

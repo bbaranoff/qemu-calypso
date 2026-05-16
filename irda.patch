@@ -1,0 +1,80 @@
+# irda.patch — Support IrDA (UART_IRDA) pour le firmware Calypso compal_e88.
+#
+# Deux modifs sur le firmware osmocom-bb compal_e88 :
+#
+# 1. **Boot marker** (board_init → init.c) — un `cons_puts` qui émet
+#    `=== fw-irda boot OK ===` sur UART_IRDA juste après l'init du UART.
+#    Lu par `tools/irda_capture.py` (capture du PTY serial1) puis asserté
+#    par `tests/test_irda_channel.py::test_irda_boot_marker_present`.
+#
+# 2. **Beacon périodique** (main loop → apps/layer1/main.c) — un
+#    `cons_puts("[fw-beacon]\r\n")` toutes les ~131k itérations de la main
+#    loop. Permet à `tools/irda_capture.py` de recevoir du trafic continu
+#    même si le marker initial est perdu (race window PTY/capture). Lu par
+#    `tests/test_irda_channel.py::test_irda_channel_produces_bytes` et
+#    `test_irda_throughput_below_saturation`.
+#
+# Le UART_IRDA est routé par `cons_bind_uart(UART_IRDA)` (ligne 105 d'init.c,
+# déjà présent en upstream). Tout appel à `cons_puts`/`cons_putchar` part
+# alors sur ce canal au lieu d'UART_MODEM (qui est réservé pour sercomm).
+#
+# Phase 0.5 + Phase 5 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md.
+#
+# IMPORTANT — cons ring buffer (4 KB) saturation :
+# `cons_puts` peut bloquer via `__rb_flush_wait` → `uart_putchar_wait` si
+# le PTY UART_IRDA ne drain pas (irda_capture pas attaché à temps). En
+# pratique observé : aucun freeze avec le hack CALYPSO_FORCE_RX_DONE actif
+# côté QEMU (qui débloque le polling SIM, vrai blocker du pipeline). Si
+# saturation observée à nouveau, augmenter la période du beacon :
+#   `(++beacon_n) & 0x1FFFF` → `& 0xFFFFFF`  (×128 fois moins fréquent)
+#
+# Application :
+#   cd /opt/GSM/osmocom-bb
+#   patch -p1 < /opt/GSM/qemu-src/irda.patch
+#   cd src/target/firmware
+#   make CROSS_COMPILE=arm-elf- board/compal_e88/layer1.highram.bin
+#   cp board/compal_e88/layer1.highram.bin /opt/GSM/firmware/board/compal_e88/
+#   cp board/compal_e88/layer1.highram.elf /opt/GSM/firmware/board/compal_e88/
+#
+# Revert : `patch -p1 -R < irda.patch`
+
+--- a/src/target/firmware/apps/layer1/main.c
++++ b/src/target/firmware/apps/layer1/main.c
+@@ -18,6 +18,7 @@
+
+ #include <stdint.h>
+ #include <stdio.h>
++#include <console.h>
+
+ #include <debug.h>
+ #include <memory.h>
+@@ -109,6 +110,14 @@ int main(void)
+ 	tpu_frame_irq_en(1, 1);
+
+ 	while (1) {
++		static uint32_t beacon_n = 0;
++		/* Phase 5 IrDA beacon — émet périodiquement via UART_IRDA pour
++		   que tools/irda_capture.py reçoive du trafic même si le marker
++		   initial `=== fw-irda boot OK ===` de board_init() est perdu
++		   (race window PTY/capture). Lu par tests/test_irda_channel.py.
++		   Période ~0.1s sur les loops typiques du Layer 1. */
++		if (((++beacon_n) & 0x1FFFF) == 0)
++			cons_puts("[fw-beacon]\r\n");
+ 		l1a_compl_execute();
+ 		osmo_timers_update();
+ 		sim_handler();
+
+--- a/src/target/firmware/board/compal_e88/init.c
++++ b/src/target/firmware/board/compal_e88/init.c
+@@ -113,6 +113,11 @@ void board_init(int with_irq)
+ 	uart_init(UART_IRDA, with_irq);
+ 	uart_baudrate(UART_IRDA, UART_115200);
+
++	/* fw-irda boot marker — read by tools/irda_capture.py and asserted by
++	   tests/test_irda_channel.py::test_irda_boot_marker_present. Phase 0.5
++	   of PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md. */
++	cons_puts("=== fw-irda boot OK ===\r\n");
++
+ 	/* Initialize hardware timers */
+ 	hwtimer_init();
+

@@ -31,9 +31,14 @@ TAIL_LINES="${TAIL_LINES:-4000}"
 OWNER="${OWNER:-nirvana:nirvana}"
 
 # --- preflight checks ------------------------------------------------
-if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
-    echo "ERR: container '$CONTAINER' not running" >&2
-    exit 1
+INSIDE_CONTAINER=0
+[ -f /.dockerenv ] && INSIDE_CONTAINER=1
+
+if [ "$INSIDE_CONTAINER" != "1" ]; then
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+        echo "ERR: container '$CONTAINER' not running" >&2
+        exit 1
+    fi
 fi
 if [[ ! -d "$OUT_DIR" ]]; then
     echo "ERR: output dir '$OUT_DIR' does not exist" >&2
@@ -50,12 +55,16 @@ skip() { [[ " $SKIP " == *" $1 "* ]]; }
 
 # --- 1. Pull logs from container ------------------------------------
 echo "[bundle] pulling logs from container..."
-PROC_PID=$(docker inspect --format '{{.State.Pid}}' "$CONTAINER" 2>/dev/null)
-PROC_ROOT="/proc/$PROC_PID/root"
-
-if [[ ! -d "$PROC_ROOT" ]]; then
-    echo "ERR: cannot access /proc/$PROC_PID/root" >&2
-    exit 1
+# In-container : PROC_ROOT="" (paths absolus directs). Out : via /proc/N/root.
+if [ "$INSIDE_CONTAINER" = "1" ]; then
+    PROC_ROOT=""
+else
+    PROC_PID=$(docker inspect --format '{{.State.Pid}}' "$CONTAINER" 2>/dev/null)
+    PROC_ROOT="/proc/$PROC_PID/root"
+    if [[ ! -d "$PROC_ROOT" ]]; then
+        echo "ERR: cannot access /proc/$PROC_PID/root" >&2
+        exit 1
+    fi
 fi
 
 cp -a "$PROC_ROOT/root/qemu.log" "$WORK/qemu_full.log" 2>/dev/null || \
@@ -131,7 +140,11 @@ echo "[bundle] static prog dumps for: $ZONES"
         fi
         for off in $(seq 0 31); do
             addr=$(printf '0x%04x' $((zone_int + off)))
-            docker exec "$CONTAINER" bash /opt/GSM/qemu-src/dsp_read.sh "$section" "$addr" 2>&1
+            if [ "$INSIDE_CONTAINER" = "1" ]; then
+                bash /opt/GSM/qemu-src/dsp_read.sh "$section" "$addr" 2>&1
+            else
+                docker exec "$CONTAINER" bash /opt/GSM/qemu-src/dsp_read.sh "$section" "$addr" 2>&1
+            fi
         done
         echo
     done
