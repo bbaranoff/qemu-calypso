@@ -1,0 +1,724 @@
+{
+  "counts": {
+    "passed": 34,
+    "failed": 14,
+    "skipped": 3,
+    "xfailed": 19
+  },
+  "tests": [
+    {
+      "nodeid": "test_calypso_milestones.py::test_popm_decoder_active",
+      "name": "test_popm_decoder_active",
+      "outcome": "passed",
+      "markers": [
+        "milestone_dsp_decoder"
+      ],
+      "duration_s": 0.0006512199906865135,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_tier_a_decoder_fixes_present",
+      "name": "test_tier_a_decoder_fixes_present",
+      "outcome": "passed",
+      "markers": [
+        "milestone_dsp_decoder"
+      ],
+      "duration_s": 0.0017717470036586747,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_intm_dwell_no_regression",
+      "name": "test_intm_dwell_no_regression",
+      "outcome": "passed",
+      "markers": [
+        "milestone_dsp_decoder"
+      ],
+      "duration_s": 30.571563064993825,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_dsp_throughput_5x",
+      "name": "test_dsp_throughput_5x",
+      "outcome": "passed",
+      "markers": [
+        "milestone_dsp_decoder"
+      ],
+      "duration_s": 0.1316050260065822,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_ar3_init_source_identified",
+      "name": "test_ar3_init_source_identified",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_bsp_dma"
+      ],
+      "duration_s": 0.006673113006399944,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_ar4_init_source_identified",
+      "name": "test_ar4_init_source_identified",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_bsp_dma"
+      ],
+      "duration_s": 0.0050358060107100755,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_bsp_dma_target_matches_correlator_read_zone",
+      "name": "test_bsp_dma_target_matches_correlator_read_zone",
+      "outcome": "passed",
+      "markers": [
+        "milestone_bsp_dma"
+      ],
+      "duration_s": 0.06458597799064592,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_no_d_fb_det_wr_site_anomaly",
+      "name": "test_no_d_fb_det_wr_site_anomaly",
+      "outcome": "passed",
+      "markers": [
+        "milestone_bsp_dma"
+      ],
+      "duration_s": 0.16858306800713763,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_fb0_att_nonzero",
+      "name": "test_fb0_att_nonzero",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_fb_det"
+      ],
+      "duration_s": 0.0003906739875674248,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_synth_zero_path_active",
+      "name": "test_synth_zero_path_active",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_fb_det"
+      ],
+      "duration_s": 0.11143485699722078,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_c54x_interrupt_ex_called_nonzero",
+      "name": "test_c54x_interrupt_ex_called_nonzero",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_irq"
+      ],
+      "duration_s": 5.084100121166557e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_isr_entered_implies_rete",
+      "name": "test_isr_entered_implies_rete",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_irq"
+      ],
+      "duration_s": 5.148700438439846e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_no_pending_irq_gated",
+      "name": "test_no_pending_irq_gated",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_irq"
+      ],
+      "duration_s": 4.945899127051234e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_l1ctl_data_ind_received",
+      "name": "test_l1ctl_data_ind_received",
+      "outcome": "failed",
+      "markers": [
+        "milestone_l1ctl"
+      ],
+      "duration_s": 0.16363406300661154,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_neigh_pm_req_response_unchanged",
+      "name": "test_neigh_pm_req_response_unchanged",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_l1ctl"
+      ],
+      "duration_s": 5.011800385545939e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_rach_emitted",
+      "name": "test_rach_emitted",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_mm_lu"
+      ],
+      "duration_s": 4.7255001845769584e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_immediate_assignment_decoded",
+      "name": "test_immediate_assignment_decoded",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_mm_lu"
+      ],
+      "duration_s": 4.630499461200088e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_rr_sdcch_established",
+      "name": "test_rr_sdcch_established",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_mm_lu"
+      ],
+      "duration_s": 5.031500768382102e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_location_updating_request_sent",
+      "name": "test_location_updating_request_sent",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_mm_lu"
+      ],
+      "duration_s": 4.4742002501152456e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_location_updating_accept_received",
+      "name": "test_location_updating_accept_received",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_mm_lu"
+      ],
+      "duration_s": 4.70140075776726e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_calypso_milestones.py::test_rxdoneflag_no_longer_blocks",
+      "name": "test_rxdoneflag_no_longer_blocks",
+      "outcome": "skipped",
+      "markers": [
+        "milestone_dsp_decoder"
+      ],
+      "duration_s": 4.4840999180451035e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_probe_ndb",
+      "name": "test_probe_ndb",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.28867087299295235,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_clear_ndb",
+      "name": "test_clear_ndb",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.2894646909990115,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_fbsb_fb_found",
+      "name": "test_inject_fbsb_fb_found",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.6167823529976886,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_fbsb_sb_found",
+      "name": "test_inject_fbsb_sb_found",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.5352532730030362,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[1]",
+      "name": "test_inject_si[1]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.32942267699399963,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[2]",
+      "name": "test_inject_si[2]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.32933007199608255,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[3]",
+      "name": "test_inject_si[3]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.3306949620018713,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[4]",
+      "name": "test_inject_si[4]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.33049907100212295,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[5]",
+      "name": "test_inject_si[5]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.3707511590037029,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_si[6]",
+      "name": "test_inject_si[6]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.329262187005952,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_a_cd_pattern_23B",
+      "name": "test_inject_a_cd_pattern_23B",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.3306340949930018,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_a_cd_pattern_30B",
+      "name": "test_inject_a_cd_pattern_30B",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.3302446629968472,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_a_cd_invalid_length",
+      "name": "test_inject_a_cd_invalid_length",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames"
+      ],
+      "duration_s": 0.000601755004026927,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_task[5-0]",
+      "name": "test_inject_d_task[5-0]",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.04134623700520024,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_task[6-1]",
+      "name": "test_inject_d_task[6-1]",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.04148273200553376,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_task[24-0]",
+      "name": "test_inject_d_task[24-0]",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.04192233299545478,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_task[28-1]",
+      "name": "test_inject_d_task[28-1]",
+      "outcome": "failed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.043025259001296945,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_burst[0]",
+      "name": "test_inject_d_burst[0]",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.04343801800860092,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_inject_d_burst[1]",
+      "name": "test_inject_d_burst[1]",
+      "outcome": "passed",
+      "markers": [
+        "inject_frames",
+        "parametrize"
+      ],
+      "duration_s": 0.04180138200172223,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_efficacy_arm_reads_d_fb_det_1",
+      "name": "test_efficacy_arm_reads_d_fb_det_1",
+      "outcome": "failed",
+      "markers": [
+        "inject_efficacy",
+        "inject_frames"
+      ],
+      "duration_s": 3.151354130997788,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_inject_frames.py::test_efficacy_arm_reads_a_cd",
+      "name": "test_efficacy_arm_reads_a_cd",
+      "outcome": "skipped",
+      "markers": [
+        "inject_efficacy",
+        "inject_frames"
+      ],
+      "duration_s": 3.111664115000167,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_all_expected_processes_present",
+      "name": "test_all_expected_processes_present",
+      "outcome": "passed",
+      "markers": [
+        "runtime_health"
+      ],
+      "duration_s": 0.12174676801078022,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_no_zombie_or_defunct",
+      "name": "test_no_zombie_or_defunct",
+      "outcome": "passed",
+      "markers": [
+        "runtime_health"
+      ],
+      "duration_s": 0.05381169499014504,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_qemu_log_is_fresh",
+      "name": "test_qemu_log_is_fresh",
+      "outcome": "passed",
+      "markers": [
+        "runtime_health"
+      ],
+      "duration_s": 3.109358126006555,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_mobile_pcap_growing",
+      "name": "test_mobile_pcap_growing",
+      "outcome": "passed",
+      "markers": [
+        "runtime_health"
+      ],
+      "duration_s": 10.000359783996828,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_volumes_mounted",
+      "name": "test_volumes_mounted",
+      "outcome": "passed",
+      "markers": [
+        "runtime_health"
+      ],
+      "duration_s": 0.07884691499930341,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_no_wait_a21a_on_window",
+      "name": "test_no_wait_a21a_on_window",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.07095613700221293,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_no_enter_7740_dwell",
+      "name": "test_no_enter_7740_dwell",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.0789268130029086,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_intm_reaches_zero",
+      "name": "test_intm_reaches_zero",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.06592988698685076,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_dsp_throughput_above_threshold",
+      "name": "test_dsp_throughput_above_threshold",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.06552594499953557,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_d_fb_det_pattern_unchanged",
+      "name": "test_d_fb_det_pattern_unchanged",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.06422479399770964,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_bsp_daram_write_distribution",
+      "name": "test_bsp_daram_write_distribution",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.08322074900206644,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_d_fb_det_data_no_longer_zero",
+      "name": "test_d_fb_det_data_no_longer_zero",
+      "outcome": "passed",
+      "markers": [
+        "runtime_dsp"
+      ],
+      "duration_s": 0.07593955101037864,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_bridge_log_shows_traffic",
+      "name": "test_bridge_log_shows_traffic",
+      "outcome": "passed",
+      "markers": [
+        "runtime_bridge"
+      ],
+      "duration_s": 0.05131141099263914,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_bridge_fn_drift_under_threshold",
+      "name": "test_bridge_fn_drift_under_threshold",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_bridge"
+      ],
+      "duration_s": 0.00010453999857418239,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_bridge_dl_lookahead_respected",
+      "name": "test_bridge_dl_lookahead_respected",
+      "outcome": "passed",
+      "markers": [
+        "runtime_bridge"
+      ],
+      "duration_s": 0.050983241002541035,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_neigh_pm_req_loop_alive",
+      "name": "test_neigh_pm_req_loop_alive",
+      "outcome": "passed",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 0.18901657100650482,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_l1ctl_data_ind_received",
+      "name": "test_l1ctl_data_ind_received",
+      "outcome": "failed",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 0.17349923300207593,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_a_cd_writes_nonzero",
+      "name": "test_a_cd_writes_nonzero",
+      "outcome": "passed",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 0.08789997900021262,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_a_cd_write_pc_includes_ccch_demod",
+      "name": "test_a_cd_write_pc_includes_ccch_demod",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 0.19321265199687332,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_l1ctl_data_ind_rate_vs_alc",
+      "name": "test_l1ctl_data_ind_rate_vs_alc",
+      "outcome": "failed",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 0.24033405100635719,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_rach_attempted",
+      "name": "test_rach_attempted",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_l1ctl"
+      ],
+      "duration_s": 5.111399514134973e-05,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_mobile_vty_reachable",
+      "name": "test_mobile_vty_reachable",
+      "outcome": "passed",
+      "markers": [
+        "runtime_vty"
+      ],
+      "duration_s": 1.611705704999622,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_mobile_imsi_loaded",
+      "name": "test_mobile_imsi_loaded",
+      "outcome": "passed",
+      "markers": [
+        "runtime_vty"
+      ],
+      "duration_s": 1.621448395002517,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_mobile_mm_state_is_null_or_idle",
+      "name": "test_mobile_mm_state_is_null_or_idle",
+      "outcome": "passed",
+      "markers": [
+        "runtime_vty"
+      ],
+      "duration_s": 1.7306717859901255,
+      "wasxfail": false
+    },
+    {
+      "nodeid": "test_run_observability.py::test_interrupt_ex_called_counter_exposed",
+      "name": "test_interrupt_ex_called_counter_exposed",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_irq"
+      ],
+      "duration_s": 0.06319150800118223,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_isr_entered_matches_rete",
+      "name": "test_isr_entered_matches_rete",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_irq"
+      ],
+      "duration_s": 0.1301416209898889,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_no_pending_irq_gating",
+      "name": "test_no_pending_irq_gating",
+      "outcome": "skipped",
+      "markers": [
+        "runtime_irq"
+      ],
+      "duration_s": 0.15952931699575856,
+      "wasxfail": true
+    },
+    {
+      "nodeid": "test_run_observability.py::test_run_summary_snapshot",
+      "name": "test_run_summary_snapshot",
+      "outcome": "passed",
+      "markers": [
+        "runtime_summary"
+      ],
+      "duration_s": 30.67651417500747,
+      "wasxfail": false
+    }
+  ]
+}

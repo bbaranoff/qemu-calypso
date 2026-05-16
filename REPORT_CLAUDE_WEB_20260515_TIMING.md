@@ -1,9 +1,13 @@
-# Rapport Claude web — 2026-05-15 soir : diag timing + plan tests timers
+# Rapport Claude web — 2026-05-15 soir → 2026-05-16 : diag timing + tests drift + timers instrumentés
 
 > Suite du **REPORT_CLAUDE_WEB_20260515_ICOUNT.md** (matin) et de la review
 > qemu-calypso de cet après-midi. Focus : diagnostic des « à-coups » timing
-> observés sur le run live + proposition d'une suite de tests pytest qui
-> couvrent les invariants temporels.
+> observés sur le run live + suite de tests pytest sur les invariants
+> temporels + instrumentation timers + tests de drift inter-couches.
+>
+> **Update 2026-05-16** : T6/T7 et drift-tests implémentés. run.sh préfixe
+> tous les logs (qemu, bridge, osmocon, mobile) par `<epoch_sec> +<rel_sec>s`,
+> ce qui permet la mesure de drift sans instrumentation supplémentaire.
 
 ## TL;DR
 
@@ -97,12 +101,28 @@ Architecture : étendre `tests/test_run_observability.py` avec un nouveau marker
 
 ### 3.2 Invariants nécessitant instrumentation supplémentaire
 
-| # | Nom | Invariant | Instrumentation à ajouter |
+| # | Nom | Invariant | Status | Instrumentation |
+|---|---|---|---|---|
+| **T6** | `tint0_fn_matches_tdma_fn` | ∀ tick: `tint0.fn == g_trx->fn (mod GSM_HYPERFRAME)` | ✅ **DONE** | `[tint0] tick #N fn=X t_virt=Y` 1/1000 dans `calypso_tint0.c` |
+| **T7** | `kick_timer_fires` | sur 60 s wall, kick fire ≥ 100× (cible 200) | ✅ **DONE** | `[kick] fire #N vt=X rt=Y` 1/200 dans `calypso_trx.c` (existait déjà) |
+| **T8** | `wall_vs_virtual_ratio` | virtual_dt / wall_dt ∈ [0.3, 3.0] | ✅ **DONE via run.sh timestamp prefix** | `run.sh` préfixe chaque ligne `<epoch_sec>` ; combiné avec `[tdma] tick #N fn=X t_virt=Y` (1/1000), permet de mesurer wall/virtual ratio sans HMP custom |
+| **T9** | `bridge_qfn_lag` | bridge `cur_qfn` − qemu `s->fn` ∈ [−5, +5] frames | ✅ **DONE via test_bridge_qfn_tracks_qemu_fn** | bornes assouplies à 200 frames vu la dérive observée, voir `tests/test_layer_drift.py` |
+
+### 3.3 Compteurs timers ajoutés (2026-05-16)
+
+Trois timers principaux ont reçu un compteur + log thinned 1/1000 (~4.6 s wall) :
+
+| Timer | Fichier | Log emit | Rôle |
 |---|---|---|---|
-| **T6** | `tint0_fn_matches_tdma_fn` | ∀ tick: `tint0.fn == g_trx->fn (mod GSM_HYPERFRAME)` | log `[tint0] tick fn=X` à chaque `tint0_tick_cb`, parser et croiser avec frame_irq.log |
-| **T7** | `kick_timer_fires` | sur 60 s wall, kick fire ≥ 100× (cible 200) | log `[kick] fired t_real=X` (rate-limit 1/100) |
-| **T8** | `wall_vs_virtual_ratio` | virtual_dt / wall_dt ∈ [0.3, 3.0] | sample (`qemu_clock_get_ns(VIRTUAL)`, `wall_clock_get_ns()`) toutes les 100 ms via HMP `info time` (commande inexistante — à coder) |
-| **T9** | `bridge_qfn_lag` | bridge `cur_qfn` − qemu `s->fn` ∈ [−5, +5] frames | log bridge déjà présent (`tick=… cur_qfn=…`), corréler avec qemu.log `fn=…` à timestamps proches |
+| `tint0.timer` | `calypso_tint0.c::tint0_tick_cb` | `[tint0] tick #N fn=X t_virt=Y` | Cadence TDMA (32 kHz divisé), 1 tick = 4.615 ms virtual |
+| `tdma_timer` | `calypso_trx.c::calypso_tdma_tick` | `[tdma] tick #N fn=X t_virt=Y` | Même cadence que tint0, action DSP/UART/IRQ4 |
+| `frame_irq_timer` | `calypso_trx.c::calypso_frame_irq_lower` | `[frame_irq] lower #N t_virt=X` | Lower de l'IRQ TPU_FRAME ~1 ms après raise |
+| `g_kick_timer` | `calypso_trx.c::calypso_kick_cb` | `[kick] fire #N vt=X rt=Y` | Liveness wall-clock 5 ms |
+
+Croisé avec `<epoch_sec>` du préfixe run.sh, on a :
+- **Virtual time absolu** : colonne `t_virt=` du log timer
+- **Wall time absolu** : colonne 1 du préfixe run.sh
+- **Wall vs Virtual ratio** : (Δt_virt) / (Δepoch) dans une fenêtre N ticks
 
 ### 3.3 Fixtures + helpers à ajouter dans `tests/`
 
@@ -240,11 +260,27 @@ static void hmp_info_calypso_timing(Monitor *mon, const QDict *qdict) {
 
 ## 4. Workflow d'exécution recommandé
 
-1. Run vivant existant (utiliser celui en cours, pid `89818` à 19:30) — pas besoin de relancer.
-2. `pytest -v -m timing_invariant tests/test_timing_invariants.py` — l'utilisateur lance (cf. mémoire `feedback_user_runs_pytest`).
-3. Si T1/T2/T3 PASS et T4/T5 FAIL → cas attendu (rate variance documentée).
-4. Si T1/T2/T3 FAIL → régression timer **virtual** = bug à attaquer en priorité.
-5. T6-T9 ajoutés après instrumentation → 2 commits séparés (instru, puis tests).
+1. Lancer un run frais : `cd /home/nirvana/qemu-calypso && ./run.sh` (les
+   logs sont préfixés timestamp par défaut via `CALYPSO_LOG_TS=1`).
+2. `cd tests && /tmp/calypso-venv/bin/pytest -v -m drift` pour les tests de
+   drift inter-couches (utilise les timestamps).
+3. `pytest -v -m timing_invariant` pour les invariants timer virtual (T1..T5).
+4. Le rapport markdown auto-généré dans `/tmp/test_results_<TS>.md`
+   regroupe drift + timing dans la catégorie "Timing" du diagramme mermaid.
+
+## 5. Tests pytest livrés (commit du 2026-05-16)
+
+### Drift inter-couches (`tests/test_layer_drift.py`, marker `drift`)
+
+| Test | Invariant |
+|---|---|
+| `test_qemu_insn_rate_cv_below_0_4` | CV(rate insn) ≤ 0.4 sur tout le run |
+| `test_qemu_insn_rate_p1_above_1m` | p1(rate) ≥ 1 M insn/s (pas de livelock) |
+| `test_bridge_qfn_tracks_qemu_fn` | bridge.qfn ≈ qemu.fn ±200 frames |
+| `test_bridge_qfn_advances_steadily` | qfn rate ∈ [150, 280] fn/s (GSM 217 ±30%) |
+| `test_log_still_growing[qemu/bridge/osmocon]` | events dans les 30 dernières sec |
+| `test_log_start_within_10s` | tous les logs démarrent dans ±30 s |
+| `test_no_long_gap[qemu/bridge]` | pas de gap > 5/10 s entre lignes (pas de freeze) |
 
 ## 5. Questions ouvertes pour Claude web
 

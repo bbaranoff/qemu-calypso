@@ -95,6 +95,33 @@ MON_SOCK="/tmp/qemu-calypso-mon.sock"
 L1CTL_SOCK="/tmp/osmocom_l2"
 QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
 
+# ---- Log timestamping ----
+# Chaque ligne des logs (qemu.log, bridge.log, osmocon.log, mobile.log) est
+# préfixée par `<epoch_sec> +<rel_sec>s ` (epoch_sec = horloge mur depuis 1970,
+# rel_sec = secondes depuis le démarrage du wrapper). Permet de détecter les
+# drifts temporels entre logs en comparant les timestamps colonne 1+2.
+# Désactiver via CALYPSO_LOG_TS=0.
+# Note : grep -E des tests n'est pas perturbé (le prefix est en début de
+# ligne, les patterns sont en milieu).
+CALYPSO_LOG_TS="${CALYPSO_LOG_TS:-1}"
+TSLOG_SCRIPT=/tmp/calypso_tslog.py
+cat > "$TSLOG_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+"""Préfixe stdin avec `<epoch_sec> +<rel_sec>s ` et flush ligne par ligne."""
+import sys, time
+t0 = time.time()
+for line in sys.stdin:
+    t = time.time()
+    sys.stdout.write(f"{t:.3f} +{t-t0:.3f}s {line}")
+    sys.stdout.flush()
+PYEOF
+chmod +x "$TSLOG_SCRIPT"
+if [ "$CALYPSO_LOG_TS" = "1" ]; then
+    TSLOG="python3 -u $TSLOG_SCRIPT"
+else
+    TSLOG="cat"
+fi
+
 # ---------- L2 client selection (menu) ----------
 # Choix de l'application L23/L2 qui consomme L1CTL via /tmp/osmocom_l2 :
 #   1. mobile    : osmocom-bb mobile complet (stack L23 + VTY) — default
@@ -161,7 +188,7 @@ L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \
     -kernel "$FW_ELF" \
-    > "$QEMU_LOG" 2>&1 &
+    > >($TSLOG > "$QEMU_LOG") 2>&1 &
 QEMU_PID=$!
 tmux send-keys -t "$SESSION:qemu" "tail -f $QEMU_LOG" C-m
 
@@ -184,7 +211,7 @@ echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
 tmux send-keys -t "$SESSION:osmocon" \
-    "$OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | tee $OSMOCON_LOG" C-m
+    "$OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
 
 echo -n "Waiting for osmocon to expose $L1CTL_SOCK..."
 for i in $(seq 1 30); do
@@ -196,7 +223,7 @@ if [ -S "$L1CTL_SOCK" ]; then echo " OK"; else echo " WARN — socket missing"; 
 # ---------- 3. bridge.py ----------
 tmux new-window -t "$SESSION" -n bridge
 tmux send-keys -t "$SESSION:bridge" \
-    "python3 $BRIDGE 2>&1 | tee $BRIDGE_LOG" C-m
+    "python3 $BRIDGE 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
 
 echo -n "Waiting for bridge to receive QEMU ticks..."
 for i in $(seq 1 30); do
@@ -208,27 +235,38 @@ if grep -q "QEMU tick" "$BRIDGE_LOG" 2>/dev/null; then echo " OK"; else echo " T
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" "osmo-bts-trx -c $BTS_CFG" C-m
-sleep 2
+# Sync barrier : attendre que osmo-bts-trx soit en train d'écouter (port TRX
+# côté bridge) — proxy : log du bridge montrant que TRX a connecté.
+echo -n "Waiting for osmo-bts-trx to attach to bridge..."
+for i in $(seq 1 30); do
+    grep -q "TRX peer learned\|trxc connected\|trxd connected" "$BRIDGE_LOG" 2>/dev/null && break
+    sleep 1; echo -n "."
+done
+echo " OK (or timeout)"
 
 # ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------
+# Sync barrier inline dans la cmd tmux : attendre que la socket l1ctl existe
+# (créée par osmocon après son handshake romload avec le firmware) avant de
+# lancer mobile. Évite le `sleep 3` arbitraire et le 51s spread observé.
+L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done'
 tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
 case "$CALYPSO_L2_CLIENT" in
     mobile)
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
+            "$L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
         ;;
     ccch_scan)
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "sleep 3 && ccch_scan -a 1 2>&1 | tee $L2_LOG" C-m
+            "$L1CTL_WAIT && ccch_scan -a 1 2>&1 | $TSLOG | tee $L2_LOG" C-m
         ;;
     cell_log)
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "sleep 3 && cell_log 2>&1 | tee $L2_LOG" C-m
+            "$L1CTL_WAIT && cell_log 2>&1 | $TSLOG | tee $L2_LOG" C-m
         ;;
     *)
         echo "WARN — CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "sleep 3 && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | tee $MOBILE_LOG" C-m
+            "$L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
         ;;
 esac
 

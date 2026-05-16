@@ -37,6 +37,12 @@ static void tint0_tick_cb(void *opaque)
 {
     tint0.fn = (tint0.fn + 1) % GSM_HYPERFRAME;
 
+    /* Removed 2026-05-16 : compteur `[tint0]` retiré — dans la machine
+     * Calypso actuelle, calypso_tint0_start() n'est jamais appelé
+     * (le tick virtual est piloté par calypso_tdma_tick dans
+     * calypso_trx.c). Si tu armes tint0 plus tard pour de vrai, remets
+     * un compteur ici. Voir REPORT_CLAUDE_WEB_20260515_TIMING.md. */
+
     /* No forced page tic-toc here: the DSP itself writes d_dsp_page
      * each frame (PC=0xf321 / 0xf5ec) — the trx api hook mirrors the
      * value into ARM space. We let the firmware drive the toggle. */

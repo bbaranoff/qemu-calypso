@@ -646,7 +646,17 @@ static const MemoryRegionOps calypso_sim_ops = {
 };
 
 /* ---- TDMA ---- */
-static void calypso_frame_irq_lower(void *o){qemu_irq_lower(((CalypsoTRX*)o)->irqs[CALYPSO_IRQ_TPU_FRAME]);}
+static void calypso_frame_irq_lower(void *o){
+    /* Frame IRQ lower counter — log thinned 1/1000 pour drift detection. */
+    static uint64_t firq_lower_n = 0;
+    firq_lower_n++;
+    if ((firq_lower_n % 1000) == 0) {
+        fprintf(stderr, "[frame_irq] lower #%llu t_virt=%lld\n",
+                (unsigned long long)firq_lower_n,
+                (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    qemu_irq_lower(((CalypsoTRX*)o)->irqs[CALYPSO_IRQ_TPU_FRAME]);
+}
 
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
@@ -654,6 +664,13 @@ static void calypso_tdma_tick(void *opaque) {
     int64_t t_clk = 0, t_uart = 0, t_dspboot = 0, t_dspirq = 0,
             t_bsp = 0, t_ul = 0;
     s->fn = (s->fn+1) % GSM_HYPERFRAME;
+
+    /* TDMA tick counter — log thinned 1/1000 (~4.6s wall) pour drift detection.
+     * Variables locales pour cumul DSP insn (utilisées plus bas). */
+    static uint64_t tdma_ticks = 0;
+    static uint64_t dsp_insn_total = 0;
+    tdma_ticks++;
+    int dsp_n_exec_2 = 0, dsp_n_exec_5 = 0; /* updated by c54x_run calls */
 
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
     if (s->clk_fd >= 0) {
@@ -675,9 +692,23 @@ static void calypso_tdma_tick(void *opaque) {
     t_uart = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 2. DSP boot phase ── */
+    /* DSP budget per c54x_run call. 256000 ≈ 1 frame nominale du c54x réel
+     * (≈104 MHz × 4.615 ms = 480k cycles total, ici budget par appel × 2 appels).
+     * Sous DSP-overload (fb-det compute), 2× ce budget = ~18.6 ms wall sur le
+     * tdma_tick alors que la frame GSM dure 4.615 ms → drift wall/qfn 3.6×.
+     * Override via CALYPSO_DSP_BUDGET pour mesurer A/B sans recompiler. Voir
+     * REPORT_CLAUDE_WEB_20260516_DSP_OVERRUN.md. */
+    static int dsp_budget = -1;
+    if (dsp_budget < 0) {
+        const char *e = getenv("CALYPSO_DSP_BUDGET");
+        dsp_budget = (e && *e) ? atoi(e) : 256000;
+        if (dsp_budget < 1000) dsp_budget = 1000;
+        TRX_LOG("CALYPSO_DSP_BUDGET = %d insn/c54x_run (default 256000)",
+                dsp_budget);
+    }
     if (s->dsp && s->dsp->running && !s->dsp_init_done) {
         if (!s->dsp->idle)
-            c54x_run(s->dsp, 256000);
+            dsp_n_exec_2 = c54x_run(s->dsp, dsp_budget);
         if (s->dsp->idle) {
             s->dsp_init_done = true;
             TRX_LOG("DSP init complete (first IDLE reached)");
@@ -719,9 +750,12 @@ static void calypso_tdma_tick(void *opaque) {
             /* periodic_armed: do NOT clear — hardware-persistent enable. */
         }
 
-        /* ── 5. Run DSP ── */
+        /* ── 5. Run DSP (RX path : FBSB demod, BCCH/CCCH decode) ──
+         * Budget partagé avec section 2 via static `dsp_budget` (env var
+         * CALYPSO_DSP_BUDGET). NE PAS supprimer ce 2e appel — il porte le
+         * compute RX critique (Claude web review 2026-05-16). */
         if (!s->dsp->idle) {
-            c54x_run(s->dsp, 256000);
+            dsp_n_exec_5 = c54x_run(s->dsp, dsp_budget);
         }
 
         /* Do NOT clear tasks here — the firmware's l1s_compl() does
@@ -735,6 +769,28 @@ static void calypso_tdma_tick(void *opaque) {
         }
     }
     t_dspirq = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* [tdma] log : drift detection + budget DSP réel consommé par tick.
+     * Cadence 1/1000 ticks (~4.6s wall en steady state). Indique :
+     *   - tick #N (compteur cumulé)
+     *   - fn (frame number)
+     *   - t_virt (entry timestamp en ns virtual)
+     *   - dsp_n_exec_2 (insn DSP exec dans section 2 — DSP boot/idle phase)
+     *   - dsp_n_exec_5 (insn DSP exec dans section 5 — RX path post-IRQ)
+     *   - budget = CALYPSO_DSP_BUDGET (default 256000)
+     * Si dsp_n_exec_* << dsp_budget en steady state, ça signifie que le
+     * DSP atteint IDLE avant d'épuiser son budget — on peut réduire le
+     * budget sans dégrader. Si dsp_n_exec_* == dsp_budget en steady state,
+     * le DSP est saturé et réduire le budget va casser fb-det. */
+    dsp_insn_total += (uint64_t)(dsp_n_exec_2 + dsp_n_exec_5);
+    if ((tdma_ticks % 1000) == 0) {
+        fprintf(stderr,
+                "[tdma] tick #%llu fn=%u t_virt=%lld "
+                "dsp_n_exec_2=%d dsp_n_exec_5=%d dsp_insn_total=%llu budget=%d\n",
+                (unsigned long long)tdma_ticks, s->fn, (long long)entry_t,
+                dsp_n_exec_2, dsp_n_exec_5,
+                (unsigned long long)dsp_insn_total, dsp_budget);
+    }
 
     /* ── 6. Deliver buffered DL bursts to DSP ──
      * Bursts from BTS arrive via UDP in real time, but BDLENA windows

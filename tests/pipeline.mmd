@@ -1,0 +1,34 @@
+graph LR
+  classDef pass    fill:#bef5b1,stroke:#1f7a1f,color:#0a3d0a;
+  classDef partial fill:#fde79c,stroke:#b07a00,color:#3a2c00;
+  classDef fail    fill:#fbb4b4,stroke:#a31a1a,color:#5a0000;
+  classDef skip    fill:#e0e0e0,stroke:#6a6a6a,color:#333;
+  classDef break_  fill:#ff5252,stroke:#990000,color:#fff,stroke-width:3px;
+  P_Infra["Infra<br/>5/5"]
+  class P_Infra pass;
+  P_DSP["DSP<br/>10/20"]
+  class P_DSP partial;
+  P_Infra --> P_DSP
+  P_L1_data["L1-data<br/>4/7"]
+  class P_L1_data partial;
+  P_DSP --> P_L1_data
+  P_L1_ctrl["L1-ctrl<br/>2/8"]
+  class P_L1_ctrl partial;
+  P_L1_data --> P_L1_ctrl
+  P_NDB["NDB<br/>9/19"]
+  class P_NDB partial;
+  P_L1_ctrl --> P_NDB
+  P_ARM_feedback["ARM-feedback<br/>0/2"]
+  class P_ARM_feedback fail;
+  P_NDB --> P_ARM_feedback
+  P_ARM_feedback -.->|🛑| BREAK_ARM_feedback["BREAK HERE<br/>ARM-feedback 0% pass"]
+  class BREAK_ARM_feedback break_;
+  P_L3_MM["L3-MM<br/>0/5"]
+  class P_L3_MM fail;
+  P_ARM_feedback --> P_L3_MM
+  P_Mgmt["Mgmt<br/>3/3"]
+  class P_Mgmt pass;
+  P_L3_MM --> P_Mgmt
+  P_Summary["Summary<br/>1/1"]
+  class P_Summary pass;
+  P_Mgmt --> P_Summary
