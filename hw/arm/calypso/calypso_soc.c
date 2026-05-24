@@ -17,8 +17,13 @@
 #include "hw/arm/calypso/calypso_soc.h"
 #include "hw/arm/calypso/calypso_trx.h"
 
-/* Global reference for TDMA tick to kick UART RX */
+/* Global references for TDMA tick to kick UART RX (both channels).
+ * g_uart_irda must be polled too — under -icount, the per-UART REALTIME
+ * rx_poll_timer fires at wall rate but CPU runs at virtual rate, so PTY
+ * data backs up. Polling from tdma_tick (VIRTUAL clock) keeps IRDA RX
+ * drained in lockstep with the rest of the emulator. */
 CalypsoUARTState *g_uart_modem;
+CalypsoUARTState *g_uart_irda;
 #include "chardev/char-fe.h"
 #include "chardev/char.h"
 #include "qemu/error-report.h"
@@ -247,6 +252,7 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart_irda), 0, CALYPSO_UART_IRDA);
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->uart_irda), 0,
                            INTH_IRQ(IRQ_UART_IRDA));
+        g_uart_irda = &s->uart_irda;
     }
 
     /* ---- TRX bridge (pure hardware) ---- */

@@ -997,13 +997,15 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                 if (imr_log++ < 50 || to_zero) {
                     fprintf(stderr,
                             "[c54x] IMR-W %s 0x%04x → 0x%04x PC=0x%04x "
-                            "op=0x%04x prev_op=0x%04x SP=0x%04x INTM=%d insn=%u\n",
+                            "op=0x%04x prev_op=0x%04x SP=0x%04x INTM=%d "
+                            "AR6=0x%04x AR7=0x%04x insn=%u\n",
                             to_zero ? "*ZERO*" : "      ",
                             s->imr, val, s->pc,
                             s->prog[s->pc],
                             s->prog[(uint16_t)(s->pc - 1)],
                             s->sp,
                             !!(s->st1 & ST1_INTM),
+                            s->ar[6], s->ar[7],
                             s->insn_count);
                 }
             }
@@ -1213,6 +1215,78 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             g_a_sync_SNR_latch = val;
             g_a_sync_valid     = true;
         }
+
+        /* === Direct d_fb_det + a_sync_demod latch trigger (2026-05-23) ===
+         *
+         * Phase 1 (initial fix) : direct latch sur d_fb_det. ARM consume
+         * empirique confirmé (LATCH-CONSUME = 0x001e fn=164). Mais FBSB
+         * RESP result=255 (fail) parce que d_fb_mode + a_sync_TOA/PM/ANG/SNR
+         * tous lus à 0 — pcap : "FBSB RESP: result=255".
+         *
+         * Phase 2 (extension this commit) : latch chaque cellule individu-
+         * ellement quand DSP write avec val != 0, any PC. Le clobber 0x821a
+         * (val=0) ne fire pas. Chaque cellule a son propre lifecycle
+         * indépendant : DSP write → latch, ARM read → consume & clear.
+         *
+         * Cellules couvertes :
+         *   0x08F8 d_fb_det     (FB detection magic value)
+         *   0x08F9 d_fb_mode    (FB detection mode, BSIC etc.)
+         *   0x08FA a_sync_TOA   (Time of Arrival)
+         *   0x08FB a_sync_PM    (Power Measurement)
+         *   0x08FC a_sync_ANG   (Angle/phase)
+         *   0x08FD a_sync_SNR   (Signal-to-Noise Ratio)
+         *
+         * Pour SB sync à converger, firmware lit les 6 cellules en
+         * séquence. Toutes doivent être valides post-FB-det iteration. */
+        if (calypso_w1c_latch_enabled() && val != 0) {
+            switch (addr) {
+            case 0x08F8: g_d_fb_det_latch   = val; g_a_sync_valid = true; break;
+            case 0x08F9: g_d_fb_mode_latch  = val; g_a_sync_valid = true; break;
+            case 0x08FA: g_a_sync_TOA_latch = val; g_a_sync_valid = true; break;
+            case 0x08FB: g_a_sync_PM_latch  = val; g_a_sync_valid = true; break;
+            case 0x08FC: g_a_sync_ANG_latch = val; g_a_sync_valid = true; break;
+            case 0x08FD: g_a_sync_SNR_latch = val; g_a_sync_valid = true; break;
+            }
+        }
+
+        /* === Phase 3 atomic snapshot (2026-05-23) ===
+         *
+         * Phase 2 latch chaque cellule indépendamment, mais empiriquement
+         * (pcap : FBSB RESP result=255 + firmware "TOA=0, Power=-138dBm"),
+         * le DSP au PC=0x778a écrit 4 cellules sur 6 — TOA et PM restent
+         * non-écrites (= cached old values, probablement 0).
+         *
+         * Le firmware lit TOA=0 + PM=0 → noise floor → FB jugé invalide.
+         *
+         * Phase 3 mimique le SNR-based trigger original : quand a_sync_SNR
+         * (dernière cellule de la séquence DSP fb-det) fire non-zero, snap-
+         * shot atomique des 6 cellules depuis s->data[] — même si TOA/PM
+         * y sont à 0 (capture l'état réel post-iteration DSP). Ça remplit
+         * tous les latches avec ce que DSP a effectivement écrit (et 0
+         * pour ce qui n'a pas été touché), donc firmware lit ces 0 mais
+         * AU MOINS les cellules qui ONT été écrites en Phase 2 sont
+         * préservées dans les latches individuels (l'OR des deux gates). */
+        if (calypso_w1c_latch_enabled() && addr == 0x08FD && val != 0) {
+            /* Atomic snapshot all 6 cells - PHASE 3 ANY PC trigger.
+             * Capture l'état DSP au moment où SNR (last cell) est écrit.
+             * Si DSP path incomplet (TOA/PM = 0 dans s->data), le latch
+             * capture quand même les zeros — le vrai fix est upstream
+             * (timer management / cascade), pas une synthesis ici. */
+            if (g_d_fb_det_latch   == 0) g_d_fb_det_latch   = s->data[0x08F8];
+            if (g_d_fb_mode_latch  == 0) g_d_fb_mode_latch  = s->data[0x08F9];
+            if (g_a_sync_TOA_latch == 0) g_a_sync_TOA_latch = s->data[0x08FA];
+            if (g_a_sync_PM_latch  == 0) g_a_sync_PM_latch  = s->data[0x08FB];
+            if (g_a_sync_ANG_latch == 0) g_a_sync_ANG_latch = s->data[0x08FC];
+            g_a_sync_SNR_latch = val;
+            g_a_sync_valid     = true;
+        }
+        /* Phase 3.5/3.6 RETIRÉES 2026-05-23 — étaient des synth hacks
+         * (PM=0x280 si nul, SNR=0x64 si bit haut). User redirection :
+         * "pas de hack, c'est la gestion du temps" — le vrai problème
+         * est timer/IRQ management côté DSP (IMR=0 → INT3 jamais
+         * servicé → DSP ne tourne pas ses tâches schedulées → FB-det
+         * incomplet, ALLC jamais firé, pas de SI). Fix upstream pas
+         * downstream. */
         /* Full a_sync_demod + d_fb_mode WR watch — every cell, no PC
          * filter (so we catch real-fb-det writes AND stomp candidates).
          * Stomp zone PC=0x06xx tagged for easy grep. */
@@ -1582,6 +1656,51 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
     }
 }
 
+/* SP ledger for IRQ-asymmetry diag (web 2026-05-23).
+ * Pushes/pops counted by SP delta sign in dispatch loop (c54x_run).
+ * IRQ entries counted explicitly in c54x_interrupt_ex with word count.
+ * Periodic dump in dispatch loop shows whether net_words ≈ 0 (balanced)
+ * or drifts (indicates push/pop word-count asymmetry, e.g. IRQ entry
+ * pushes 1 word but FRET pops 2 → drift -1/IRQ-cycle → SP wraps). */
+static struct {
+    uint64_t sp_pushes;        /* SP delta < 0 events */
+    uint64_t sp_pops;          /* SP delta > 0 events */
+    int64_t  net_words;        /* total words pushed - total words popped */
+    uint64_t irq_entries;      /* count of c54x_interrupt_ex actual dispatches */
+    uint64_t irq_words_pushed; /* words written by IRQ entry path (1 or 2 per APTS) */
+    uint64_t last_dump_insn;
+} g_sp_ledger;
+
+/* Xmem operand decode per binutils tic54x.h (XMEM/XMOD/XARX macros) :
+ *   XMEM(OP) = bits [7:4] of opcode (the Xmem 4-bit nibble)
+ *   XMOD    = nibble bits [3:2] : 0=*AR, 1=*AR-, 2=*AR+, 3=*AR+0%
+ *   XARX    = nibble bits [1:0] + 2 (= AR2..AR5 only, no AR0/AR1/AR6/AR7)
+ *
+ * Xmem is INDIRECT-ONLY (no DP-relative direct mode, unlike Smem). Using
+ * resolve_smem on an Xmem operand mis-decodes the low byte as Smem direct
+ * addressing whenever bit 7 is clear, which lands writes in MMR space
+ * (0x00-0x1F) — empirically observed at PC=0x8a46 op=0x9918 (STL B,*AR2)
+ * 2026-05-23, stomp SP=0x4800→0x0000 cascading to IMR=0 → DSP idle forever.
+ *
+ * Known debt : xmod=3 (*AR+0%) implemented as linear `addr + AR0`, not
+ * circular (modulo BK). Matches MVDD handler at L3724 which has same
+ * `(no circular here)` comment. Circular addressing for all Xmem handlers
+ * is tracked as known-open, to fix together. */
+static uint16_t resolve_xmem(C54xState *s, uint16_t op)
+{
+    uint8_t xmem  = (op >> 4) & 0xF;
+    int     xar   = (xmem & 0x3) + 2;
+    int     xmod  = (xmem & 0xC) >> 2;
+    uint16_t addr = s->ar[xar];
+    switch (xmod) {
+    case 0: break;
+    case 1: s->ar[xar] = addr - 1; break;
+    case 2: s->ar[xar] = addr + 1; break;
+    case 3: s->ar[xar] = addr + s->ar[0]; break; /* *AR+0% (no circular here) */
+    }
+    return addr;
+}
+
 /* ================================================================
  * Instruction execution
  * ================================================================ */
@@ -1688,6 +1807,211 @@ static int c54x_exec_one(C54xState *s)
                         s->ar[0], s->ar[1], s->ar[2], s->ar[3],
                         s->ar[4], s->ar[5], s->ar[6], s->ar[7],
                         s->insn_count);
+            }
+        }
+        /* === MVDD-CASCADE probe (env-gated CALYPSO_PROBE_BOOTSTUB=1) ===
+         * PC=0x8e8c op=0xe5ba = MVDD-family — documented cascade writer
+         * (`project_dtaskd_corruption_8e8x`) that writes garbage values
+         * into NDB cells (random vals at d_fb_det vs legitimate 0x001e).
+         * Track AR fields + B accumulator + source address read to find
+         * if it's true firmware compute or corrupted indirect addressing. */
+        if (s->pc == 0x8e8c) {
+            static int probe_mvdd = -1;
+            if (probe_mvdd < 0) {
+                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                probe_mvdd = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (probe_mvdd) {
+                static uint32_t e_mvdd;
+                e_mvdd++;
+                if (e_mvdd <= 50 || (e_mvdd % 1000) == 0) {
+                    fprintf(stderr,
+                            "[c54x] MVDD-CASCADE #%u PC=0x8e8c op=0x%04x SP=0x%04x "
+                            "A=0x%010llx B=0x%010llx T=0x%04x "
+                            "AR= %04x %04x %04x %04x %04x %04x %04x %04x "
+                            "data[AR4]=0x%04x data[AR5]=0x%04x "
+                            "trail: %04x %04x %04x %04x %04x %04x\n",
+                            e_mvdd, op, s->sp,
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                            s->t,
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                            s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            s->data[s->ar[4]], s->data[s->ar[5]],
+                            pc_ring[(pc_ring_idx-6)&255], pc_ring[(pc_ring_idx-5)&255],
+                            pc_ring[(pc_ring_idx-4)&255], pc_ring[(pc_ring_idx-3)&255],
+                            pc_ring[(pc_ring_idx-2)&255], pc_ring[(pc_ring_idx-1)&255]);
+                }
+            }
+        }
+
+        /* === DF92-LOOP probe (env-gated CALYPSO_PROBE_BOOTSTUB=1) ===
+         * Compute loop at PC=0xdf92-0xdfa3 = correlator accumulator with
+         * 15× unrolled ADD *AR7+. Called via CALL 0xdfb1 from 0xdf90.
+         * Probe at first PC=0xdf92 (loop entry) — log AR7, BRC, accumulator,
+         * caller (from stack[SP]). If AR7 is corrupted or BRC mis-set, the
+         * loop runs forever and blocks task=24 scheduling downstream.
+         * Fire only on entries from non-loop-internal predecessors. */
+        if (s->pc == 0xdf92 && (prev_pc < 0xdf90 || prev_pc > 0xdfa3)) {
+            static int probe_df = -1;
+            if (probe_df < 0) {
+                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                probe_df = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (probe_df) {
+                static uint32_t e_df;
+                e_df++;
+                if (e_df <= 30) {
+                    fprintf(stderr,
+                            "[c54x] DF92-LOOP #%u entry from PC=0x%04x prev_op=0x%04x "
+                            "SP=0x%04x ret_addr=stk[SP]=0x%04x "
+                            "A=0x%010llx B=0x%010llx "
+                            "AR7=0x%04x BK=0x%04x BRC=0x%04x  "
+                            "trail: %04x %04x %04x %04x %04x %04x\n",
+                            e_df, prev_pc, s->prog[prev_pc],
+                            s->sp, s->data[s->sp],
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                            s->ar[7], s->bk, s->brc,
+                            pc_ring[(pc_ring_idx-6)&255], pc_ring[(pc_ring_idx-5)&255],
+                            pc_ring[(pc_ring_idx-4)&255], pc_ring[(pc_ring_idx-3)&255],
+                            pc_ring[(pc_ring_idx-2)&255], pc_ring[(pc_ring_idx-1)&255]);
+                }
+            }
+        }
+
+        /* === BL-REENTRY probe (env-gated CALYPSO_PROBE_BOOTSTUB=1) ===
+         * The DSP bootloader at PC=0xb41c polls data[0x0fff] for cmd code
+         * 4 or 2. Legitimate loop entry comes from 0xb427 (BC NTC 0xb41c)
+         * or 0xb433 (CALL 0xb41c). Any OTHER entry path indicates the DSP
+         * has been routed back into the bootloader by mistake after boot
+         * has completed — that's the post-cascade blocker. Logs prev_pc,
+         * SP, stack contents, ARs, and a trail to identify the bad caller.
+         * Caps: 50 events to avoid log flood. */
+        if (s->pc == 0xb41c && prev_pc != 0xb427 && prev_pc != 0xb433) {
+            static int probe_bl = -1;
+            if (probe_bl < 0) {
+                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                probe_bl = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (probe_bl) {
+                static uint32_t e_bl;
+                e_bl++;
+                if (e_bl <= 50) {
+                    fprintf(stderr,
+                            "[c54x] BL-REENTRY #%u from PC=0x%04x prev_op=0x%04x "
+                            "SP=0x%04x stk[SP..+3]= %04x %04x %04x %04x "
+                            "data[0x0fff]=0x%04x data[0x0ffe]=0x%04x "
+                            "AR= %04x %04x %04x %04x %04x %04x %04x %04x "
+                            "trail: %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                            e_bl, prev_pc, s->prog[prev_pc],
+                            s->sp,
+                            s->data[(uint16_t)(s->sp+0)], s->data[(uint16_t)(s->sp+1)],
+                            s->data[(uint16_t)(s->sp+2)], s->data[(uint16_t)(s->sp+3)],
+                            s->data[0x0fff], s->data[0x0ffe],
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                            s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            pc_ring[(pc_ring_idx-8)&255], pc_ring[(pc_ring_idx-7)&255],
+                            pc_ring[(pc_ring_idx-6)&255], pc_ring[(pc_ring_idx-5)&255],
+                            pc_ring[(pc_ring_idx-4)&255], pc_ring[(pc_ring_idx-3)&255],
+                            pc_ring[(pc_ring_idx-2)&255], pc_ring[(pc_ring_idx-1)&255]);
+                }
+            }
+        }
+
+        /* === SEED-SOURCE probe (env-gated CALYPSO_PROBE_BOOTSTUB=1) ===
+         * Probe at PC=0xf8de (CALA B → 0x7700) — the SINGLE source event
+         * that spawns the entire boot-stub RET-loop cascade (per session
+         * 2026-05-24 BOOTSTUB-ENTRY analysis : 1 ENTER-7700 → 435 entries
+         * to PC=0x0000). Captures full state BEFORE the CALA fires :
+         *   - SP + stack contents (what subsequent POPs will pull)
+         *   - A, B (B = jump target)
+         *   - AR0..AR7, ST0, ST1
+         *   - 10-PC trail (extends visibility upstream of 0xf8de).
+         * Goal: identify whether the function containing 0xf8de was itself
+         * called with proper push, and what was supposed to be on stack
+         * when POPM ST0 + RCD UNC fire at dispatcher 0x7706/0x7707. */
+        if (s->pc == 0xf8de) {
+            static int probe_seed = -1;
+            if (probe_seed < 0) {
+                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                probe_seed = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (probe_seed) {
+                static uint32_t e_seed;
+                e_seed++;
+                if (e_seed <= 50) {
+                    fprintf(stderr,
+                            "[c54x] SEED-SOURCE #%u PC=0xf8de op=0x%04x "
+                            "SP=0x%04x  stk[SP..+7]= %04x %04x %04x %04x %04x %04x %04x %04x  "
+                            "A=0x%010llx B=0x%010llx "
+                            "AR= %04x %04x %04x %04x %04x %04x %04x %04x  "
+                            "ST0=0x%04x ST1=0x%04x  "
+                            "trail: %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x\n",
+                            e_seed, op, s->sp,
+                            s->data[(uint16_t)(s->sp+0)], s->data[(uint16_t)(s->sp+1)],
+                            s->data[(uint16_t)(s->sp+2)], s->data[(uint16_t)(s->sp+3)],
+                            s->data[(uint16_t)(s->sp+4)], s->data[(uint16_t)(s->sp+5)],
+                            s->data[(uint16_t)(s->sp+6)], s->data[(uint16_t)(s->sp+7)],
+                            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                            s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            s->st0, s->st1,
+                            pc_ring[(pc_ring_idx-10)&255], pc_ring[(pc_ring_idx-9)&255],
+                            pc_ring[(pc_ring_idx-8)&255],  pc_ring[(pc_ring_idx-7)&255],
+                            pc_ring[(pc_ring_idx-6)&255],  pc_ring[(pc_ring_idx-5)&255],
+                            pc_ring[(pc_ring_idx-4)&255],  pc_ring[(pc_ring_idx-3)&255],
+                            pc_ring[(pc_ring_idx-2)&255],  pc_ring[(pc_ring_idx-1)&255]);
+                }
+            }
+        }
+
+        /* === BOOTSTUB-ENTRY probe (env-gated CALYPSO_PROBE_BOOTSTUB=1) ===
+         * Traces every entry to PC=0x0000 (boot stub LDMM SP,B + RET).
+         * Boot stub re-entered at runtime is the documented-never-nailed
+         * seed of the SP-wrap → AR6=0 → IMR=0 cascade. Captures :
+         *   - prev_pc + op@prev_pc  → who jumped to 0x0000
+         *   - entry mechanism (RET-family / branch / other)
+         *   - B accumulator (becomes SP via LDMM SP,B at 0x0000)
+         *   - SP + stk[SP-1] (just-popped value if RET)
+         *   - 6-entry PC trail (caller context). */
+        if (s->pc == 0x0000) {
+            static int probe_bootstub = -1;
+            if (probe_bootstub < 0) {
+                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                probe_bootstub = (e && e[0] == '1') ? 1 : 0;
+                if (probe_bootstub)
+                    fprintf(stderr, "[c54x] PROBE-BOOTSTUB enabled\n");
+            }
+            if (probe_bootstub) {
+                static uint32_t e0;
+                e0++;
+                if (e0 <= 200 || (e0 % 500) == 0) {
+                    uint16_t prev_op = s->prog[prev_pc];
+                    const char *mech;
+                    if (prev_op == 0xFC00)                          mech = "RET";
+                    else if (prev_op == 0xF273)                     mech = "RETD";
+                    else if (prev_op == 0xF4EB || prev_op == 0xF4E3) mech = "RETE";
+                    else if (prev_op == 0xF4E4 || prev_op == 0xF4E5) mech = "FRET";
+                    else if ((prev_op & 0xFF00) == 0xF800)          mech = "B/CC";
+                    else if ((prev_op & 0xFF00) == 0xF000)          mech = "F0xx";
+                    else if (prev_op == 0xF074)                     mech = "CALL";
+                    else                                            mech = "OTHER";
+                    /* Just-popped slot is at SP-1 after RET (SP was incremented). */
+                    uint16_t stk_just_popped = s->data[(uint16_t)(s->sp - 1)];
+                    fprintf(stderr,
+                            "[c54x] BOOTSTUB-ENTRY #%u prev_PC=0x%04x prev_op=0x%04x "
+                            "mech=%s B=0x%010llx B[31:16]=0x%04x SP=0x%04x "
+                            "stk[SP-1]=0x%04x trail: %04x %04x %04x %04x %04x %04x\n",
+                            e0, prev_pc, prev_op, mech,
+                            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                            (unsigned)((s->b >> 16) & 0xFFFF),
+                            s->sp, stk_just_popped,
+                            pc_ring[(pc_ring_idx-6)&255], pc_ring[(pc_ring_idx-5)&255],
+                            pc_ring[(pc_ring_idx-4)&255], pc_ring[(pc_ring_idx-3)&255],
+                            pc_ring[(pc_ring_idx-2)&255], pc_ring[(pc_ring_idx-1)&255]);
+                }
             }
         }
         /* D_FB_DET-WR-SITE probe : à PC=0x8f51 (le PC qui écrit d_fb_det).
@@ -4638,16 +4962,23 @@ static int c54x_exec_one(C54xState *s)
          * decode from low nibble. Mirror swap : write low for 0x98/99,
          * write high for 0x9A/9B, src bit 8 selects A/B. */
         if (hi8 == 0x98 || hi8 == 0x99) {
-            /* STL src, SHFT, Xmem — store LOW (acc&0xFFFF) */
-            addr = resolve_smem(s, op, &ind);
+            /* STL src, SHFT, Xmem — store LOW (acc&0xFFFF).
+             * FIX 2026-05-23 : Xmem operand decoded via resolve_xmem (per
+             * binutils OP_Xmem), not resolve_smem. The latter mis-mapped
+             * low byte 0x00-0x1F with bit 7=0 to MMR space, clobbering SP/
+             * IMR/IFR. Empirical proof : PC=0x8a46 op=0x9918 stomp SP→0
+             * captured by existing SP-CATASTROPHE probe. */
+            addr = resolve_xmem(s, op);
             int src = hi8 & 1;
             int64_t acc = src ? s->b : s->a;
             data_write(s, addr, (uint16_t)(acc & 0xFFFF));
             return consumed + s->lk_used;
         }
         if (hi8 == 0x9A || hi8 == 0x9B) {
-            /* STH src, SHFT, Xmem — store HIGH (acc>>16) */
-            addr = resolve_smem(s, op, &ind);
+            /* STH src, SHFT, Xmem — store HIGH (acc>>16).
+             * FIX 2026-05-23 : same as STL above — Xmem decoded via
+             * resolve_xmem (per binutils), not resolve_smem. See STL block. */
+            addr = resolve_xmem(s, op);
             int src = hi8 & 1;
             int64_t acc = src ? s->b : s->a;
             data_write(s, addr, (uint16_t)((acc >> 16) & 0xFFFF));
@@ -5093,12 +5424,18 @@ ba_handler:
             return 1;
         }
         if (hi8 == 0xBA) {
-            /* LDMM MMR, dst */
+            /* LDMM MMR, dst — load MMR value into accumulator
+             * Per SPRU172C: dst[15:0] = MMR, dst[31:16] = sign-ext (SXM)/0
+             * BUG FIX 2026-05-24 : was `sext40(v << 16)` which put MMR in
+             * dst[31:16], wrong half. The boot-stub at 0x0000 (LDMM SP,B)
+             * is supposed to return B = current SP for caller's use ; with
+             * the << 16 bug, B[31:16] = SP, B[15:0] = 0, breaking any
+             * downstream caller that reads B as 16-bit SP value. */
             uint16_t mmr = op & 0x7F;
             int dst = (op >> 4) & 1;
             int64_t v = (int64_t)(int16_t)data_read(s, mmr);
-            if (dst) s->b = sext40(v << 16);
-            else     s->a = sext40(v << 16);
+            if (dst) s->b = sext40(v);
+            else     s->a = sext40(v);
             return consumed + s->lk_used;
         }
         if (hi8 == 0xA8 || hi8 == 0xA9) {
@@ -5670,6 +6007,65 @@ static bool dsp_idle_fast_forward(C54xState *s, int *consumed_out)
                 (unsigned long long)ff_hits, s->pc, s->sp);
     }
     return true;
+}
+
+/* === CALYPSO_TRAP_OOR hook (root-cause probe insn 10M..12M) ===
+ * Whitelist-complement on dispatch PC + edge-trigger on SP descent
+ * below 0x1000. Gated by env CALYPSO_TRAP_OOR=1 and insn_count >= 10M.
+ * One-shot latch. Dumps last 16 dispatch PCs, last 16 SP-change events,
+ * regs, RPTB state. Halts DSP via s->running=0. */
+static inline bool pc_is_legit(uint16_t pc) {
+    return  pc <  0x0080
+        || (pc >= 0x7700 && pc <  0x79A0)
+        || (pc >= 0x8000 && pc <  0x9000)
+        || (pc >= 0xA000 && pc <  0xA100)
+        || (pc >= 0xF000);
+}
+
+static struct {
+    unsigned insn; uint16_t old_sp, new_sp, exec_pc, exec_op;
+} g_sp_trail[16];
+static unsigned g_sp_trail_idx = 0;
+
+static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
+                          uint16_t sp_before, const char *trig)
+{
+    fprintf(stderr,
+        "[c54x] TRAP[%s] insn=%u exec_pc=0x%04x exec_op=0x%04x "
+        "next_pc=0x%04x sp_before=0x%04x sp_now=0x%04x INTM=%d\n",
+        trig, s->insn_count, exec_pc, exec_op, s->pc,
+        sp_before, s->sp, !!(s->st1 & ST1_INTM));
+    fprintf(stderr, "[c54x] TRAP pc_ring[-16..-1]:");
+    for (int i = 16; i >= 1; i--)
+        fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - i) & 255]);
+    fprintf(stderr, "\n[c54x] TRAP sp_trail[-16..-1] (insn old->new @pc op):\n");
+    for (int i = 16; i >= 1; i--) {
+        unsigned k = (g_sp_trail_idx - i) & 15;
+        fprintf(stderr, "  %u  %04x->%04x  pc=%04x op=%04x\n",
+                g_sp_trail[k].insn, g_sp_trail[k].old_sp,
+                g_sp_trail[k].new_sp, g_sp_trail[k].exec_pc,
+                g_sp_trail[k].exec_op);
+    }
+    fprintf(stderr,
+        "[c54x] TRAP regs A=%010llx B=%010llx T=%04x  "
+        "AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x  "
+        "BK=%04x ARP=%d DP=%d  ST0=%04x ST1=%04x PMST=%04x  "
+        "RSA=%04x REA=%04x BRC=%d  IFR=%04x IMR=%04x XPC=%d\n",
+        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+        s->t,
+        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+        s->bk, (s->st0 >> 13) & 7, s->st0 & 0x1FF,
+        s->st0, s->st1, s->pmst,
+        s->rsa, s->rea, s->brc, s->ifr, s->imr, s->xpc);
+    fprintf(stderr,
+        "[c54x] TRAP prog[exec_pc..+3]=%04x %04x %04x %04x  "
+        "prog[next_pc..+3]=%04x %04x %04x %04x\n",
+        s->prog[exec_pc], s->prog[(uint16_t)(exec_pc+1)],
+        s->prog[(uint16_t)(exec_pc+2)], s->prog[(uint16_t)(exec_pc+3)],
+        s->prog[s->pc], s->prog[(uint16_t)(s->pc+1)],
+        s->prog[(uint16_t)(s->pc+2)], s->prog[(uint16_t)(s->pc+3)]);
 }
 
 int c54x_run(C54xState *s, int n_insns)
@@ -6909,6 +7305,31 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
+        /* Feed sp_trail ring for TRAP-OOR dump (only when armed). */
+        {
+            static int trap_armed = -1;
+            if (trap_armed < 0) {
+                const char *e = getenv("CALYPSO_TRAP_OOR");
+                trap_armed = (e && *e == '1') ? 1 : 0;
+            }
+            if (trap_armed && s->sp != sp_before) {
+                unsigned k = g_sp_trail_idx & 15;
+                g_sp_trail[k].insn    = s->insn_count;
+                g_sp_trail[k].old_sp  = sp_before;
+                g_sp_trail[k].new_sp  = s->sp;
+                g_sp_trail[k].exec_pc = exec_pc;
+                g_sp_trail[k].exec_op = exec_op;
+                g_sp_trail_idx++;
+            }
+        }
+
+        /* SP-LEDGER + SP-INTO-MMR probes RETIRÉS 2026-05-23 :
+         * info diagnostic déjà extraite (irq_entries=1 sur 144s, SP wrap
+         * via stack-relative writes en MMR). Ces probes fire à CHAQUE
+         * instruction → overhead non-négligeable sur DSP throughput
+         * (mesuré 9.1M insn/s vs 10M required = 9% slow). Reviendront en
+         * cas de régression. SP-CATASTROPHE garde la haut |Δ|>256. */
+
         /* === SP catastrophic delta tracer ===
          * Diag v2 2026-05-08 : SP went from 0x9c1e → 0x0001 in one window
          * (lost ~40k stack words). The progressive-leak log above caps at
@@ -6939,6 +7360,33 @@ int c54x_run(C54xState *s, int n_insns)
                         s->insn_count);
             }
         }
+        /* === TRAP-OOR firing point ===
+         * T1: dispatch PC out of legit whitelist (after exec_one moved PC).
+         * T2: SP edge-crossed below 0x1000 this instruction.
+         * BOTH: single instruction caused both — likely RET/RETF pourri
+         *       or dual-op stack-relative writing SP+PC together.
+         * Gated insn>=10M (we know PC was sane at 10M from HIST). */
+        {
+            static int trap_armed = -1;
+            static int tripped = 0;
+            if (trap_armed < 0) {
+                const char *e = getenv("CALYPSO_TRAP_OOR");
+                trap_armed = (e && *e == '1') ? 1 : 0;
+            }
+            if (trap_armed && !tripped && s->insn_count >= 10000000) {
+                bool t1 = !pc_is_legit(s->pc);
+                bool t2 = (sp_before >= 0x1000 && s->sp < 0x1000);
+                if (t1 || t2) {
+                    const char *trig = (t1 && t2) ? "BOTH"
+                                     : t1         ? "PC_OOR"
+                                     :              "SP_LOW";
+                    tripped = 1;
+                    dsp_trap_dump(s, exec_pc, exec_op, sp_before, trig);
+                    s->running = 0;
+                }
+            }
+        }
+
         /* === DUAL-OP-INTERPRET diagnostic ===
          * Compare current decoder's AR field interpretation (3-bit fields)
          * with SPRU172C's dual-operand encoding (2-bit AR fields + offset 2,
@@ -7254,10 +7702,13 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             s->ifr &= ~(1 << imr_bit);
             s->sp--;
             data_write(s, s->sp, (uint16_t)(s->pc + 1));
+            g_sp_ledger.irq_words_pushed++;
             if (s->pmst & PMST_APTS) {
                 s->sp--;
                 data_write(s, s->sp, s->xpc);
+                g_sp_ledger.irq_words_pushed++;
             }
+            g_sp_ledger.irq_entries++;
             s->st1 |= ST1_INTM;
             uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
             s->pc = (iptr * 0x80) + vec * 4;
@@ -7271,10 +7722,13 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
+        g_sp_ledger.irq_words_pushed++;
         if (s->pmst & PMST_APTS) {
             s->sp--;
             data_write(s, s->sp, s->xpc);
+            g_sp_ledger.irq_words_pushed++;
         }
+        g_sp_ledger.irq_entries++;
         s->st1 |= ST1_INTM;
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;

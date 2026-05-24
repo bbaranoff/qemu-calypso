@@ -210,7 +210,10 @@ class Bridge:
         self._last_clk_fn_sent = None
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} ↔ BSP@6702", flush=True)
-        print(f"bridge: CLK IND source={'qfn (qemu-paced)' if CLK_FROM_QEMU else 'wall_fn (wall-paced 217 Hz)'}, "
+        clk_desc = ('hybrid (wall-paced emit, virtual_fn anchored to qfn)'
+                    if CLK_FROM_QEMU else
+                    'wall_fn (wall-paced 217 Hz)')
+        print(f"bridge: CLK IND source={clk_desc}, "
               f"period={CLK_IND_PERIOD} frames", flush=True)
         ul_desc = {
             "slot": "slot-aware (next RACH slot ≥ wall_fn — combined CCCH+SDCCH8)",
@@ -261,37 +264,66 @@ class Bridge:
             self.stats["clk"] += 1
             self._last_clk_fn_sent = clk_fn
             if self.stats["clk"] <= 5 or (self.stats["clk"] % 200) == 0:
-                src = "qfn" if CLK_FROM_QEMU else "wall_fn"
+                src = "hybrid" if CLK_FROM_QEMU else "wall_fn"
                 print(f"bridge: CLK IND #{self.stats['clk']} fn={clk_fn} ({src})",
                       flush=True)
         except OSError:
             pass
 
     def maybe_send_clk(self):
-        """CLK IND scheduler. Two modes:
+        """CLK IND scheduler. Three modes:
 
         wall-paced (default, CLK_FROM_QEMU=False)
           Send every CLK_IND_WALL_S seconds with clk_fn = wall_fn rounded
           to CLK_IND_PERIOD. BTS sees consistent ~235ms intervals.
 
-        qfn-paced (CLK_FROM_QEMU=True)
-          Send each time qfn has advanced by CLK_IND_PERIOD since last
-          send. clk_fn = qfn rounded down to CLK_IND_PERIOD. Wall-clock
-          interval between sends scales with QEMU emulation speed (slower
-          QEMU → longer wall gaps). BTS scheduler advances at qemu-rate.
+        qfn-paced (CLK_FROM_QEMU=True, legacy "1")
+          [deprecated when QEMU slow] Send each time qfn has advanced by
+          CLK_IND_PERIOD since last send. clk_fn = qfn rounded down. BTS
+          dies via clock-skew shutdown when QEMU rate << 217 Hz wall.
+          Kept only as discriminant / for fast emulator builds.
+
+        hybrid (CLK_FROM_QEMU=True, default since 2026-05-23)
+          Wall-paced emission (BTS-friendly cadence) BUT clk_fn = virtual
+          fn that ticks at 217 Hz wall rate, anchored to actual qfn at
+          startup. BTS sees consistent ~235ms intervals AND fn rate
+          matching its scheduler expectation. The slot-aware UL/DL FN
+          rewrite still uses self.fn (qfn) for slot alignment, so DSP-side
+          path is unaffected. Trade-off: virtual fn drifts from qfn as run
+          progresses (QEMU lag accumulates), but bursts are slot-rewritten
+          to match the virtual fn domain via existing logic.
         """
         if not self.powered:
             return
 
+        now = time.monotonic()
+
         if CLK_FROM_QEMU:
-            target = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
-            if self._last_clk_fn_sent is not None and \
-               target <= self._last_clk_fn_sent:
-                return  # qfn hasn't advanced enough — skip this poll
+            # Hybrid mode : wall-paced emit + qfn-anchored virtual fn
+            if not hasattr(self, '_hybrid_anchor_qfn'):
+                self._hybrid_anchor_qfn = self.fn
+                self._hybrid_anchor_wall = now
+                self._last_clk_wall = now - CLK_IND_WALL_S
+            if now - self._last_clk_wall < CLK_IND_WALL_S:
+                return
+            self._last_clk_wall += CLK_IND_WALL_S
+            if now - self._last_clk_wall > CLK_IND_WALL_S * 4:
+                self._last_clk_wall = now
+            # Virtual fn = anchor + wall_elapsed × 217 Hz. Monotonic ↑ ;
+            # never snap backward (BTS would reject fn going backward).
+            elapsed = now - self._hybrid_anchor_wall
+            virtual_fn = (self._hybrid_anchor_qfn
+                          + int(elapsed / GSM_TDMA_S)) % GSM_HYPERFRAME
+            target = (virtual_fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+            # Suppress duplicates : if virtual_fn hasn't crossed a new
+            # PERIOD boundary since last send, skip — BTS computes
+            # elapsed_fn=0 between identical fn values and triggers
+            # "GSM clock jitter" / "No clock since TRX started" shutdown.
+            if self._last_clk_fn_sent is not None and target == self._last_clk_fn_sent:
+                return
             self._send_clk_ind(target)
             return
 
-        now = time.monotonic()
         if not hasattr(self, '_last_clk_wall'):
             self._last_clk_wall = now - CLK_IND_WALL_S  # force first send
         if now - self._last_clk_wall < CLK_IND_WALL_S:

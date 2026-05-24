@@ -239,6 +239,13 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
             if (idx == 7) {
                 s->ilr[7] = (s->ilr[7] & ~0x1F) | (s->ilr[4] & 0x1F);
             }
+            /* Same fix for UART_IRDA (IRQ18) — under -icount the IRDA RX
+             * IRQ is starved by IRQ7 if left at firmware's default prio 31.
+             * IrDA is the firmware logging channel ; without it, fw-irda.log
+             * stays empty and the operator loses runtime visibility. */
+            if (idx == 18) {
+                s->ilr[18] = (s->ilr[18] & ~0x1F) | (s->ilr[4] & 0x1F);
+            }
         }
         break;
     }

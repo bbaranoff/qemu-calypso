@@ -25,9 +25,24 @@
 #include <unistd.h>
 
 extern CalypsoUARTState *g_uart_modem;
+extern CalypsoUARTState *g_uart_irda;
 
 #define TRX_LOG(fmt, ...) \
     fprintf(stderr, "[calypso-trx] " fmt "\n", ##__VA_ARGS__)
+
+/* CALYPSO_TIMER=1 enables timer-side fprintf tracing (frame_irq, tdma_tick,
+ * kick). =0 (default) drops the calls entirely so the run is silent and
+ * stderr-pipe backpressure (TSLOG → python flush-per-line) can't throttle
+ * the TCG main thread. Cached once via getenv. */
+static bool calypso_timer_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("CALYPSO_TIMER");
+        on = (e && (*e == '1' || *e == 'y')) ? 1 : 0;
+    }
+    return on;
+}
 
 #define DSP_API_W_PAGE0  0x0000
 #define DSP_API_W_PAGE1  0x0028
@@ -650,7 +665,7 @@ static void calypso_frame_irq_lower(void *o){
     /* Frame IRQ lower counter — log thinned 1/1000 pour drift detection. */
     static uint64_t firq_lower_n = 0;
     firq_lower_n++;
-    if ((firq_lower_n % 1000) == 0) {
+    if ((firq_lower_n % 1000) == 0 && calypso_timer_log()) {
         fprintf(stderr, "[frame_irq] lower #%llu t_virt=%lld\n",
                 (unsigned long long)firq_lower_n,
                 (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -688,6 +703,10 @@ static void calypso_tdma_tick(void *opaque) {
     if (g_uart_modem) {
         calypso_uart_poll_backend(g_uart_modem);
         calypso_uart_kick_rx(g_uart_modem);
+    }
+    if (g_uart_irda) {
+        calypso_uart_poll_backend(g_uart_irda);
+        calypso_uart_kick_rx(g_uart_irda);
     }
     t_uart = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
@@ -792,11 +811,12 @@ static void calypso_tdma_tick(void *opaque) {
                 (unsigned long long)dsp_insn_total, dsp_budget);
     }
 
-    /* ── 6. Deliver buffered DL bursts to DSP ──
-     * Bursts from BTS arrive via UDP in real time, but BDLENA windows
-     * open in virtual time (faster). This step pulls buffered bursts
-     * and delivers them when BDLENA windows are available. */
-    calypso_bsp_deliver_buffered(s->fn);
+    /* ── 6. BSP DL delivery is now driven by wall-clock drain timer in
+     * calypso_bsp.c (bsp_drain_cb @ 5ms REALTIME). Decoupling fix 2026-05-24:
+     * under icount=auto, tdma_tick fires too slowly (17 Hz) to drain the
+     * BTS UDP stream (217 Hz arrival) — bursts went stale before delivery.
+     * The drain timer runs at wall rate matching BTS, while DSP continues
+     * to process samples at its virtual-clock pace. */
     t_bsp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 6b. UL burst poll ──
@@ -860,7 +880,7 @@ static void calypso_tdma_tick(void *opaque) {
         static FILE *firq_log = NULL;
         static int firq_count = 0;
         static int64_t prev_firq_t = 0;
-        if (firq_count  < 2000) {  /* DISABLED for baseline — re-enable by setting >0 */
+        if (firq_count  < 2000 && calypso_timer_log()) {  /* DISABLED for baseline — re-enable by setting >0 */
             if (!firq_log) firq_log = fopen("/tmp/frame_irq.log", "w");
             if (firq_log) {
                 int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -908,7 +928,7 @@ static void calypso_tdma_tick(void *opaque) {
             }
         }
 
-        if (skipped > 0 && (s->fn % 100 == 0)) {
+        if (skipped > 0 && (s->fn % 100 == 0) && calypso_timer_log()) {
             fprintf(stderr, "[tdma-skip] fn=%u skipped=%d work_dt=%" PRId64 "\n",
                     s->fn, skipped, now - entry_t);
         }
@@ -920,7 +940,7 @@ static void calypso_tdma_tick(void *opaque) {
     {
         static FILE *tick_log = NULL;
         static int tick_count = 0;
-        if (tick_count < 500) {
+        if (tick_count < 500 && calypso_timer_log()) {
             if (!tick_log) tick_log = fopen("/tmp/tdma_tick.log", "w");
             if (tick_log) {
                 int64_t exit_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -1002,31 +1022,39 @@ static void calypso_kick_cb(void *o){
      * timer fires but cpu_exit/notify don't propagate to scheduler. */
     static unsigned kick_n;
     kick_n++;
-    if (kick_n <= 30 || (kick_n % 200) == 0) {
+    if ((kick_n <= 30 || (kick_n % 200) == 0) && calypso_timer_log()) {
         uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         uint64_t rt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         fprintf(stderr, "[kick] fire #%u vt=%lu rt=%lu\n",
                 kick_n, (unsigned long)vt, (unsigned long)rt);
     }
 
-    /* XXX HACK 2026-05-08 night — CALYPSO_FORCE_RX_DONE periodic enforcement.
+    /* === CALYPSO_FORCE_RX_DONE site A — RESTAURÉ 2026-05-23 ===
      *
-     * Each firmware SIM operation (ATR, SELECT, READ_BINARY, ...) calls
-     * calypso_sim_receive at 0x822588 which clears rxDoneFlag (firmware
-     * data @ 0x830510), then busy-polls. Under -icount auto, the conditional
-     * STR in sim_irq_handler @ 0x8224ac never commits (TCG bug Task #29).
+     * Premier retrait 2026-05-23 cleanup → osmocon stuck à "starting
+     * download" sous icount=auto. Hypothèse empirique : ce write a DEUX
+     * effets load-bearing, pas un seul :
      *
-     * Firing the workaround only on SIM_IT-read fires once per WT cycle
-     * which doesn't cover subsequent SIM ops. Periodic enforcement here
-     * (every 5ms wall via REALTIME kick) keeps rxDoneFlag = 1 reliably,
-     * regardless of which SIM op is in flight. cpu_exit forces ARM TB
-     * recompile so busy-loop @ 0x822b90 picks up the new value. */
+     *   (1) Set rxDoneFlag=1 → firmware exit busy-loop @ 0x822b90 (overcome
+     *       TCG STR bug à PC=0x8224ac, le STR conditionnel ne commit pas).
+     *
+     *   (2) `cpu_physical_memory_write` side-effect — sous icount=auto, le
+     *       firmware busy-loop accumule des insns sans yield au main loop ;
+     *       le write physique invalide les caches TB/load, forçant ré-lecture
+     *       fraîche de rxDoneFlag par le busy-loop ré-exécuté. cpu_exit
+     *       SEUL est insuffisant (interrompt la TB mais ne flush pas les
+     *       caches).
+     *
+     * Le retrait a tué l'effet (2), pas seulement (1) — d'où le block. À
+     * faire (Tier 2/3) : remplacer ce 200 Hz blind par PC-trap event-driven
+     * sur busy-loop entry (firmware-side), OU fix TCG STR commit (real fix).
+     * Voir REPORT_CLAUDE_WEB_20260523_FORCE_RX_DONE_CLEANUP.md.
+     *
+     * Pour l'instant : restoration tactique. Pivot 16 cette session
+     * (mon retrait précédent réfuté empiriquement par osmocon stuck). */
     {
         const char *env = getenv("CALYPSO_FORCE_RX_DONE");
         if (env && env[0] == '1') {
-            /* Adresse rxDoneFlag — override via CALYPSO_RXDONE_ADDR (hex),
-             * default 0x008302a0 (build 2026-05-16). Cohérent avec
-             * calypso_sim.c. */
             static uint32_t rxdone_addr;
             if (!rxdone_addr) {
                 const char *aenv = getenv("CALYPSO_RXDONE_ADDR");

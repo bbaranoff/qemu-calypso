@@ -243,8 +243,13 @@ CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
 CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"
 CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
+CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-0}"
 CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
+# CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) côté
+# calypso_trx.c. =0 (default) = runs silencieux, zéro stderr-pipe backpressure.
+# =1 = mêmes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
+CALYPSO_TIMER="${CALYPSO_TIMER:-0}"
 # BRIDGE_CLK_FROM_QEMU=0 (default): CLK IND wall-paced. BTS scheduler stays
 # happy (no clock-skew shutdown). Pair with BRIDGE_UL_FN_REWRITE=1/slot for
 # slot-aware UL rewrite that lands bursts in BTS RACH slot windows.
@@ -271,10 +276,14 @@ BRIDGE_DL_FN_LOOKAHEAD="${BRIDGE_DL_FN_LOOKAHEAD:-32}"
 # mobile to complete a Location Update cycle.
 # Set to 102 explicitly when QEMU runs near wall-clock (or in production).
 BRIDGE_CLK_PERIOD="${BRIDGE_CLK_PERIOD:-51}"
+CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}"
+CALYPSO_DSP_BUDGET="${CALYPSO_DSP_BUDGET:-256000}"
 export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
        CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
        CALYPSO_DSP_IDLE_FF CALYPSO_DSP_IDLE_RANGE \
-       CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE \
+       CALYPSO_FORCE_RX_DONE \
+       CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE CALYPSO_TIMER \
+       CALYPSO_PROBE_BOOTSTUB CALYPSO_DSP_BUDGET \
        BRIDGE_CLK_FROM_QEMU BRIDGE_CLK_PERIOD \
        BRIDGE_UL_FN_REWRITE BRIDGE_DL_FN_REWRITE BRIDGE_DL_FN_LOOKAHEAD
 
@@ -638,6 +647,7 @@ echo "  BRIDGE_UL_FN_REWRITE        = $BRIDGE_UL_FN_REWRITE  (slot=next RACH slo
 echo "  BRIDGE_DL_FN_REWRITE        = $BRIDGE_DL_FN_REWRITE  (slot=qfn matching bts_fn%51, naive=current qfn, off=passthrough — BSP rejects all)"
 echo "  BRIDGE_DL_FN_LOOKAHEAD      = $BRIDGE_DL_FN_LOOKAHEAD  (max qfn-future frames before drop, BSP window=64)"
 echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
+echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick → qemu.log, 0=silent)"
 echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
 echo "  CALYPSO_FORCE_RX_DONE       = ${CALYPSO_FORCE_RX_DONE}"

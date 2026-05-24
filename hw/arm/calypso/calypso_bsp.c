@@ -25,14 +25,14 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include "qemu/timer.h"
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 
-/* Forward-declared here to avoid pulling in the full calypso_trx.h
- * (which would drag in hw/irq.h and qemu internals not needed in this TU). */
-uint32_t calypso_trx_get_fn(void);
+/* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
 
 /* Forward decls for env-gated helpers used in calypso_bsp_init pre-warm. */
 static uint32_t d_rach_word_offset(void);
@@ -123,7 +123,17 @@ static struct {
     uint64_t   wr_other;
     uint64_t   wr_total;
     uint64_t   wr_last_logged;
+
+    /* Wall-clock drain timer (2026-05-24): decouple BSP→DSP DMA delivery
+     * from tdma_tick (virtual clock). Under icount=auto, tdma_tick runs at
+     * ~17 Hz wall (vs nominal 217 Hz) due to DSP emulator throughput, so
+     * delivery couplée au tick laissait les bursts BTS (arrivés à wall rate
+     * via UDP) stale/dropés en 3.7s wall avant que le tick virtuel ne les
+     * pull. Le drain REALTIME fire toutes les 5ms wall = match BTS rate. */
+    QEMUTimer *drain_timer;
 } bsp;
+
+#define BSP_DRAIN_PERIOD_MS  5
 
 /* Incrémente le bucket selon `addr` puis émet une ligne stats périodiquement.
  * Appelé à chaque write DARAM côté BSP (rx_burst direct + deliver_buffered). */
@@ -386,6 +396,19 @@ static void bsp_trxd_readable(void *opaque)
 
 /* ---- Init ---- */
 
+/* Wall-clock drain callback: pulls BSP UDP queue into DSP DMA at wall rate,
+ * independent of tdma_tick virtual cadence. Required under icount=auto where
+ * tdma_tick is too slow to drain the BTS sample stream. */
+static void bsp_drain_cb(void *opaque)
+{
+    if (bsp.dsp) {
+        uint32_t cur_fn = calypso_trx_get_fn();
+        calypso_bsp_deliver_buffered(cur_fn);
+    }
+    timer_mod(bsp.drain_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
+}
+
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
@@ -465,6 +488,13 @@ void calypso_bsp_init(C54xState *dsp)
      * had correlated runtime variability with LU success rate. */
     (void)d_rach_word_offset();
     (void)rach_force_bsic();
+
+    /* Arm wall-clock drain timer (decoupled from tdma_tick virtual cadence). */
+    bsp.drain_timer = timer_new_ms(QEMU_CLOCK_REALTIME, bsp_drain_cb, NULL);
+    timer_mod(bsp.drain_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
+    BSP_LOG("BSP drain timer armed: %dms wall period (REALTIME clock)",
+            BSP_DRAIN_PERIOD_MS);
 
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",
             (void *)dsp, bsp.daram_addr, bsp.daram_len,
