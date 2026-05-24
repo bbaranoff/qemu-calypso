@@ -6009,23 +6009,28 @@ static bool dsp_idle_fast_forward(C54xState *s, int *consumed_out)
     return true;
 }
 
-/* === CALYPSO_TRAP_OOR hook (root-cause probe insn 10M..12M) ===
- * Whitelist-complement on dispatch PC + edge-trigger on SP descent
- * below 0x1000. Gated by env CALYPSO_TRAP_OOR=1 and insn_count >= 10M.
- * One-shot latch. Dumps last 16 dispatch PCs, last 16 SP-change events,
- * regs, RPTB state. Halts DSP via s->running=0. */
-static inline bool pc_is_legit(uint16_t pc) {
-    return  pc <  0x0080
-        || (pc >= 0x7700 && pc <  0x79A0)
-        || (pc >= 0x8000 && pc <  0x9000)
-        || (pc >= 0xA000 && pc <  0xA100)
-        || (pc >= 0xF000);
-}
+/* === CALYPSO_TRAP_OOR hook v2 (root-cause probe SP descent 0..checkpoint) ===
+ * v2 redesign: T1/T2 dropped (scheduler exonerated → SP clobber lives in
+ * legit code, whitelist can't see it). Pure observability:
+ *   - g_sp_trail[256] : SP changes with |Δ|>32 (scheduler reloads, large
+ *     allocations) — skip push/pop ±1 noise.
+ *   - sp_low watermark : every new low logged (PC-coalesced power-of-10)
+ *     — catches BOTH absolute reloads AND push-drain runaway.
+ *   - Per-event A_low captured (= candidate STL A,Smem source).
+ *   - Halt at fixed checkpoint (env CALYPSO_TRAP_CHECKPOINT, default 4.2M
+ *     = just after the insn=4.09M SP recovery 0x0008→0x2900). */
 
 static struct {
-    unsigned insn; uint16_t old_sp, new_sp, exec_pc, exec_op;
-} g_sp_trail[16];
+    unsigned insn;
+    uint16_t old_sp, new_sp, exec_pc, exec_op, a_low;
+} g_sp_trail[256];
 static unsigned g_sp_trail_idx = 0;
+
+/* sp_low watermark — coalesced by PC */
+static uint16_t g_sp_low = 0xFFFF;
+static uint16_t g_sp_low_pc = 0xFFFF;
+static unsigned g_sp_low_hits_at_pc = 0;
+static unsigned g_sp_low_distinct_pcs = 0;
 
 static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
                           uint16_t sp_before, const char *trig)
@@ -6038,13 +6043,16 @@ static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
     fprintf(stderr, "[c54x] TRAP pc_ring[-16..-1]:");
     for (int i = 16; i >= 1; i--)
         fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - i) & 255]);
-    fprintf(stderr, "\n[c54x] TRAP sp_trail[-16..-1] (insn old->new @pc op):\n");
-    for (int i = 16; i >= 1; i--) {
-        unsigned k = (g_sp_trail_idx - i) & 15;
-        fprintf(stderr, "  %u  %04x->%04x  pc=%04x op=%04x\n",
+    fprintf(stderr, "\n[c54x] TRAP sp_low=0x%04x at last_pc=0x%04x hits_at_pc=%u distinct_pcs=%u\n",
+            g_sp_low, g_sp_low_pc, g_sp_low_hits_at_pc, g_sp_low_distinct_pcs);
+    fprintf(stderr, "[c54x] TRAP sp_trail[-256..-1] (|Δ|>32 only; insn old->new @pc op A_low):\n");
+    for (int i = 256; i >= 1; i--) {
+        unsigned k = (g_sp_trail_idx - i) & 255;
+        if (g_sp_trail[k].insn == 0 && g_sp_trail[k].exec_pc == 0) continue;
+        fprintf(stderr, "  %u  %04x->%04x  pc=%04x op=%04x A_low=%04x\n",
                 g_sp_trail[k].insn, g_sp_trail[k].old_sp,
                 g_sp_trail[k].new_sp, g_sp_trail[k].exec_pc,
-                g_sp_trail[k].exec_op);
+                g_sp_trail[k].exec_op, g_sp_trail[k].a_low);
     }
     fprintf(stderr,
         "[c54x] TRAP regs A=%010llx B=%010llx T=%04x  "
@@ -7305,21 +7313,58 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
-        /* Feed sp_trail ring for TRAP-OOR dump (only when armed). */
+        /* v2 SP observability — only when CALYPSO_TRAP_OOR=1.
+         * (a) sp_trail[256] : |Δ|>32 events (scheduler reloads + big allocs)
+         * (b) sp_low watermark : every new low, PC-coalesced power-of-10
+         * Gated to insn>33754 (after init stack 0x9022→0x5ac8 normal). */
         {
             static int trap_armed = -1;
             if (trap_armed < 0) {
                 const char *e = getenv("CALYPSO_TRAP_OOR");
                 trap_armed = (e && *e == '1') ? 1 : 0;
             }
-            if (trap_armed && s->sp != sp_before) {
-                unsigned k = g_sp_trail_idx & 15;
-                g_sp_trail[k].insn    = s->insn_count;
-                g_sp_trail[k].old_sp  = sp_before;
-                g_sp_trail[k].new_sp  = s->sp;
-                g_sp_trail[k].exec_pc = exec_pc;
-                g_sp_trail[k].exec_op = exec_op;
-                g_sp_trail_idx++;
+            if (trap_armed && s->sp != sp_before && s->insn_count > 33754) {
+                int16_t delta = (int16_t)(s->sp - sp_before);
+                uint16_t a_low = (uint16_t)(s->a & 0xFFFF);
+
+                /* (a) trail — only big jumps (skip push/pop ±1..32 noise) */
+                if (delta > 32 || delta < -32) {
+                    unsigned k = g_sp_trail_idx & 255;
+                    g_sp_trail[k].insn    = s->insn_count;
+                    g_sp_trail[k].old_sp  = sp_before;
+                    g_sp_trail[k].new_sp  = s->sp;
+                    g_sp_trail[k].exec_pc = exec_pc;
+                    g_sp_trail[k].exec_op = exec_op;
+                    g_sp_trail[k].a_low   = a_low;
+                    g_sp_trail_idx++;
+                }
+
+                /* (b) sp_low watermark — fires on any new low (incl Δ=-1). */
+                if (s->sp < g_sp_low) {
+                    g_sp_low = s->sp;
+                    if (exec_pc == g_sp_low_pc) {
+                        g_sp_low_hits_at_pc++;
+                        unsigned n = g_sp_low_hits_at_pc;
+                        bool milestone = (n == 1 || n == 10 || n == 100 ||
+                                          n == 1000 || n == 10000 || n == 100000);
+                        if (milestone) {
+                            fprintf(stderr,
+                                "[c54x] SP-LOW #%u @pc=0x%04x op=0x%04x "
+                                "sp 0x%04x->0x%04x A_low=0x%04x insn=%u\n",
+                                n, exec_pc, exec_op,
+                                sp_before, s->sp, a_low, s->insn_count);
+                        }
+                    } else {
+                        g_sp_low_pc = exec_pc;
+                        g_sp_low_hits_at_pc = 1;
+                        g_sp_low_distinct_pcs++;
+                        fprintf(stderr,
+                            "[c54x] SP-LOW NEW (#%u distinct) @pc=0x%04x op=0x%04x "
+                            "sp 0x%04x->0x%04x A_low=0x%04x insn=%u\n",
+                            g_sp_low_distinct_pcs, exec_pc, exec_op,
+                            sp_before, s->sp, a_low, s->insn_count);
+                    }
+                }
             }
         }
 
@@ -7360,30 +7405,27 @@ int c54x_run(C54xState *s, int n_insns)
                         s->insn_count);
             }
         }
-        /* === TRAP-OOR firing point ===
-         * T1: dispatch PC out of legit whitelist (after exec_one moved PC).
-         * T2: SP edge-crossed below 0x1000 this instruction.
-         * BOTH: single instruction caused both — likely RET/RETF pourri
-         *       or dual-op stack-relative writing SP+PC together.
-         * Gated insn>=10M (we know PC was sane at 10M from HIST). */
+        /* === v2 TRAP-OOR firing point — fixed checkpoint halt ===
+         * T1/T2 dropped (v1 v2 redesign: scheduler at 0xfd2a exonerated,
+         * SP clobber lives in legit code → no PC whitelist nor SP edge
+         * can catch it). Halt at fixed insn checkpoint, dump trail+sp_low
+         * for offline analysis of full descent.
+         * Checkpoint configurable via CALYPSO_TRAP_CHECKPOINT (default
+         * 4200000 = just after the insn=4.09M SP recovery 0x0008→0x2900). */
         {
             static int trap_armed = -1;
             static int tripped = 0;
+            static unsigned checkpoint = 0;
             if (trap_armed < 0) {
                 const char *e = getenv("CALYPSO_TRAP_OOR");
                 trap_armed = (e && *e == '1') ? 1 : 0;
+                const char *c = getenv("CALYPSO_TRAP_CHECKPOINT");
+                checkpoint = (c && *c) ? (unsigned)strtoul(c, NULL, 0) : 4200000u;
             }
-            if (trap_armed && !tripped && s->insn_count >= 10000000) {
-                bool t1 = !pc_is_legit(s->pc);
-                bool t2 = (sp_before >= 0x1000 && s->sp < 0x1000);
-                if (t1 || t2) {
-                    const char *trig = (t1 && t2) ? "BOTH"
-                                     : t1         ? "PC_OOR"
-                                     :              "SP_LOW";
-                    tripped = 1;
-                    dsp_trap_dump(s, exec_pc, exec_op, sp_before, trig);
-                    s->running = 0;
-                }
+            if (trap_armed && !tripped && s->insn_count >= checkpoint) {
+                tripped = 1;
+                dsp_trap_dump(s, exec_pc, exec_op, sp_before, "CHECKPOINT");
+                s->running = 0;
             }
         }
 

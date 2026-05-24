@@ -114,6 +114,13 @@ def pytest_configure(config):
         # test_firmware_state.py
         "runtime_firmware:     état firmware live (PC, rxDoneFlag, pas de busy-wait)",
         "runtime_osmocon:      progression osmocon (download → L1CTL/Layer 1, pas de LOST spam)",
+        # test_osmocom_workflow.py — alignement workflow OsmocomBB
+        "osmocom_compliant:    point du workflow OsmocomBB respecté par notre QEMU",
+        "osmocom_divergent:    point divergent (workflow non respecté ; xfail attendu)",
+        "osmocom_sim:          sémantique SIM controller (IT bits, FIFO, ATR)",
+        "osmocom_clock:        alignement clock domains (VIRTUAL vs REALTIME)",
+        "osmocom_bridge:       bridge.py timing et CLK IND jitter",
+        "osmocom_boot:         séquence boot ARM/DSP + handshake",
     ):
         config.addinivalue_line("markers", marker)
 

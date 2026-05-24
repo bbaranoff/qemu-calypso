@@ -124,16 +124,21 @@ static struct {
     uint64_t   wr_total;
     uint64_t   wr_last_logged;
 
-    /* Wall-clock drain timer (2026-05-24): decouple BSP→DSP DMA delivery
-     * from tdma_tick (virtual clock). Under icount=auto, tdma_tick runs at
-     * ~17 Hz wall (vs nominal 217 Hz) due to DSP emulator throughput, so
-     * delivery couplée au tick laissait les bursts BTS (arrivés à wall rate
-     * via UDP) stale/dropés en 3.7s wall avant que le tick virtuel ne les
-     * pull. Le drain REALTIME fire toutes les 5ms wall = match BTS rate. */
+    /* Virtual-clock drain timer (revised 2026-05-24 PM): decouple BSP→DSP
+     * DMA delivery from tdma_tick (which can be slow under icount=auto),
+     * but stay on QEMU_CLOCK_VIRTUAL so BSP and ARM cur_fn share the same
+     * time domain. Previously on REALTIME → drift ~1300 fr in 6 s wall
+     * vs ARM (BTS livré au rythme wall, ARM compté au rythme icount). */
     QEMUTimer *drain_timer;
 } bsp;
 
 #define BSP_DRAIN_PERIOD_MS  5
+/* 2026-05-24 fix drift BTS↔L1 : BSP drain timer passe REALTIME → VIRTUAL pour
+ * tourner sur la même horloge qu'ARM fn (via TINT0) et tdma_tick. Avec
+ * icount=auto, REALTIME avance ~9% plus vite que VIRTUAL → drift cumulatif
+ * (~1300 fr / 6 sec wall observé, "1 seconde d'écart BTS↔L1"). NS variant pour
+ * appairage avec QEMU_CLOCK_VIRTUAL (timer_new_ns / qemu_clock_get_ns). */
+#define BSP_DRAIN_PERIOD_NS  (BSP_DRAIN_PERIOD_MS * 1000000ULL)
 
 /* Incrémente le bucket selon `addr` puis émet une ligne stats périodiquement.
  * Appelé à chaque write DARAM côté BSP (rx_burst direct + deliver_buffered). */
@@ -396,9 +401,11 @@ static void bsp_trxd_readable(void *opaque)
 
 /* ---- Init ---- */
 
-/* Wall-clock drain callback: pulls BSP UDP queue into DSP DMA at wall rate,
- * independent of tdma_tick virtual cadence. Required under icount=auto where
- * tdma_tick is too slow to drain the BTS sample stream. */
+/* Virtual-clock drain callback: pulls BSP UDP queue into DSP DMA at virtual
+ * rate, locked to the same QEMU_CLOCK_VIRTUAL as TINT0/tdma_tick/ARM fn.
+ * Pre-2026-05-24 this timer ran on QEMU_CLOCK_REALTIME, which caused a
+ * cumulative drift vs ARM cur_fn under icount=auto (BTS delta grew ~1300 fr
+ * in 6 s wall). Locking to VIRTUAL eliminates the drift at the source. */
 static void bsp_drain_cb(void *opaque)
 {
     if (bsp.dsp) {
@@ -406,7 +413,7 @@ static void bsp_drain_cb(void *opaque)
         calypso_bsp_deliver_buffered(cur_fn);
     }
     timer_mod(bsp.drain_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
 }
 
 void calypso_bsp_init(C54xState *dsp)
@@ -489,11 +496,12 @@ void calypso_bsp_init(C54xState *dsp)
     (void)d_rach_word_offset();
     (void)rach_force_bsic();
 
-    /* Arm wall-clock drain timer (decoupled from tdma_tick virtual cadence). */
-    bsp.drain_timer = timer_new_ms(QEMU_CLOCK_REALTIME, bsp_drain_cb, NULL);
+    /* Arm virtual-clock drain timer — locked to QEMU_CLOCK_VIRTUAL like
+     * TINT0/tdma_tick/ARM fn. Fix 2026-05-24 e2e BTS↔L1 drift. */
+    bsp.drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bsp_drain_cb, NULL);
     timer_mod(bsp.drain_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_MS);
-    BSP_LOG("BSP drain timer armed: %dms wall period (REALTIME clock)",
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
+    BSP_LOG("BSP drain timer armed: %dms virtual period (VIRTUAL clock, drift-locked)",
             BSP_DRAIN_PERIOD_MS);
 
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",

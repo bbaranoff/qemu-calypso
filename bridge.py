@@ -561,7 +561,12 @@ class Bridge:
         while running:
             fds = [self.trxc_sock, self.trxd_sock, self.qemu_clk_sock]
             try:
-                readable, _, _ = select.select(fds, [], [], 0.05)
+                # Timeout 1ms (vs 50ms historique) — réduit le jitter de
+                # CLK IND vu par osmo-bts. Avec 50ms, l'émission CLK IND
+                # pouvait être retardée de ±50ms (~±10 frames GSM), causant
+                # les "We were 1 FN faster/slower than TRX" dans bts.log.
+                # 1ms = ±0.2 frame max, sous le seuil de compensation osmo-bts.
+                readable, _, _ = select.select(fds, [], [], 0.001)
             except (OSError, ValueError) as e:
                 print(f"bridge: select error: {e}", flush=True)
                 break

@@ -1029,37 +1029,36 @@ static void calypso_kick_cb(void *o){
                 kick_n, (unsigned long)vt, (unsigned long)rt);
     }
 
-    /* === CALYPSO_FORCE_RX_DONE site A — RESTAURÉ 2026-05-23 ===
+    /* === rxDoneFlag periodic refresh (5 ms wall TDMA kick) ===
      *
-     * Premier retrait 2026-05-23 cleanup → osmocon stuck à "starting
-     * download" sous icount=auto. Hypothèse empirique : ce write a DEUX
-     * effets load-bearing, pas un seul :
+     * Complément au write SIM-driven précis dans calypso_sim.c (sur IT_WT).
+     * Ce write périodique 200 Hz a deux fonctions distinctes :
      *
-     *   (1) Set rxDoneFlag=1 → firmware exit busy-loop @ 0x822b90 (overcome
-     *       TCG STR bug à PC=0x8224ac, le STR conditionnel ne commit pas).
+     *   (1) Couvre les busy-loops firmware qui se forment AVANT l'IT_WT
+     *       SIM (e.g., entre clear rxDoneFlag=0 et le premier IT_WT) —
+     *       garantit que le polling firmware finit toujours par voir 1.
      *
-     *   (2) `cpu_physical_memory_write` side-effect — sous icount=auto, le
-     *       firmware busy-loop accumule des insns sans yield au main loop ;
-     *       le write physique invalide les caches TB/load, forçant ré-lecture
-     *       fraîche de rxDoneFlag par le busy-loop ré-exécuté. cpu_exit
-     *       SEUL est insuffisant (interrompt la TB mais ne flush pas les
-     *       caches).
+     *   (2) Side-effect cpu_physical_memory_write : sous icount=auto, le
+     *       firmware busy-loop accumule des insns sans yield ; le write
+     *       physique invalide TB/load caches, forçant ré-lecture fraîche.
+     *       cpu_exit SEUL est insuffisant (interrompt la TB mais ne flush
+     *       pas les caches).
      *
-     * Le retrait a tué l'effet (2), pas seulement (1) — d'où le block. À
-     * faire (Tier 2/3) : remplacer ce 200 Hz blind par PC-trap event-driven
-     * sur busy-loop entry (firmware-side), OU fix TCG STR commit (real fix).
-     * Voir REPORT_CLAUDE_WEB_20260523_FORCE_RX_DONE_CLEANUP.md.
-     *
-     * Pour l'instant : restoration tactique. Pivot 16 cette session
-     * (mon retrait précédent réfuté empiriquement par osmocon stuck). */
+     * Par défaut ON. Désactiver via CALYPSO_FORCE_RX_DONE=0 pour test.
+     * Adresse rxDoneFlag = 0x008302d4 (nm 2026-05-24), override via
+     * CALYPSO_RXDONE_ADDR. Doit rester aligné avec calypso_sim.c. */
     {
-        const char *env = getenv("CALYPSO_FORCE_RX_DONE");
-        if (env && env[0] == '1') {
+        static int disabled = -1;
+        if (disabled < 0) {
+            const char *env = getenv("CALYPSO_FORCE_RX_DONE");
+            disabled = (env && env[0] == '0') ? 1 : 0;
+        }
+        if (!disabled) {
             static uint32_t rxdone_addr;
             if (!rxdone_addr) {
                 const char *aenv = getenv("CALYPSO_RXDONE_ADDR");
                 rxdone_addr = aenv ? (uint32_t)strtoul(aenv, NULL, 0)
-                                   : 0x008302a0;
+                                   : 0x008302d4;
             }
             const uint32_t one = 1;
             cpu_physical_memory_write(rxdone_addr, &one, sizeof(one));

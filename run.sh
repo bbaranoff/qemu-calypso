@@ -204,8 +204,10 @@ EOF
     fi
 fi  # ancien bloc gen-doc-local — désactivé par `if false; then` plus haut
 
-FW_ELF="/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
-FW_BIN="/opt/GSM/firmware/board/compal_e88/layer1.highram.bin"
+# Firmware paths configurable via env (FW_ELF/FW_BIN). Defaults to layer1
+# pour compal_e88. run_rssi.sh override these to lancer rssi.highram à la place.
+FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
+FW_BIN="${FW_BIN:-/opt/GSM/firmware/board/compal_e88/layer1.highram.bin}"
 QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
 BRIDGE="/opt/GSM/qemu-src/bridge.py"
 OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
@@ -243,7 +245,7 @@ CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
 CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"
 CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
-CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-0}"
+CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-1}"
 CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
 # CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) côté
