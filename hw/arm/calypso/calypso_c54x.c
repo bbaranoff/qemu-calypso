@@ -79,6 +79,7 @@ static inline int asm_shift(C54xState *s)
 
 /* Forward decl: used by data_write() VECDUMP at MMR_PMST. */
 static uint16_t prog_read(C54xState *s, uint32_t addr);
+static uint16_t prog_fetch(C54xState *s, uint16_t pc);
 
 /* Propagated by D_BURST_D probe, consumed by A_CD-BY-BURST correlation. */
 static uint16_t g_last_d_burst_d;
@@ -181,6 +182,334 @@ static struct {
     uint64_t sweep_id;
     uint64_t sweep_nonzero_count;
 } g_fb_det_timing;
+
+/* === AR4 write tracer with provenance (2026-05-25) ===
+ * Hooke chaque write vers MMR_AR4 (= 0x14) via data_write_locked.
+ * Logge (insn, PC, opcode courant, val écrite, ancien AR4) + tente une
+ * classification de provenance via decode opcode :
+ *   STM #lk, ARn  (0x77yx)  → immediate value depuis next prog word
+ *   STLM src,ARn  (0x84yx)  → from accumulator A/B low
+ *   MVDM dmad,ARn (0x86yx)  → from data memory absolute
+ *   MVDD/MVMM     (autres)  → from another register
+ * Flag SUSPECT si nouvelle valeur AR4 ∈ [0x2b80..0x2c00] (observed bug
+ * zone) ou [0x3fb0..0x3fbf] (BSP buffer area). Env CALYPSO_AR4_TRACE=1.
+ *
+ * Question critique (cf Claude web) : provenance = const/mem/register ?
+ * Si AR4 vient d'un mem load (LDM/MVDM), le corrupter remonte au TCB
+ * en mémoire — pas l'instruction qui charge AR4, mais le TCB lui-même
+ * (potentiellement uninitialized faute de re-init firmware sautée). */
+#define AR4_HIST_MAX 64
+typedef struct {
+    uint16_t pc;
+    uint16_t op_last;
+    uint16_t val_last;
+    uint32_t count;
+} Ar4Entry;
+static Ar4Entry g_ar4_hist[AR4_HIST_MAX];
+static unsigned g_ar4_used    = 0;
+static unsigned g_ar4_total   = 0;
+static int      g_ar4_enabled = -1;
+static unsigned g_ar4_log_cap = 50;
+
+static void ar4_write_track(C54xState *s, uint16_t new_val)
+{
+    if (g_ar4_enabled < 0) {
+        const char *e = getenv("CALYPSO_AR4_TRACE");
+        g_ar4_enabled = (e && *e == '1') ? 1 : 0;
+        if (g_ar4_enabled) {
+            fprintf(stderr, "[c54x] AR4-TRACE enabled, log_cap=%u hist_max=%u\n",
+                    g_ar4_log_cap, AR4_HIST_MAX);
+        }
+    }
+    if (g_ar4_enabled <= 0) return;
+    uint16_t old_val = s->ar[4];
+    /* Skip noise : pas de changement, ou changement uniquement par ±1/2
+     * (auto-modify type, irrelevant pour la chasse au saut). On garde
+     * seulement les |Δ|>3 pour signal/bruit. */
+    int32_t delta = (int32_t)new_val - (int32_t)old_val;
+    if (delta >= -3 && delta <= 3) return;
+
+    g_ar4_total++;
+
+    /* Tentative classification provenance depuis opcode courant */
+    uint16_t op = prog_fetch(s, s->pc);
+    const char *kind = "MISC";
+    if ((op & 0xFF80) == 0x7700) {
+        /* 0x77yx : STM #lk, Smem (Smem=AR4 here) → immediate from next word */
+        kind = "STM-#lk";
+    } else if ((op & 0xFF00) == 0x8400) {
+        kind = "STLM-A";   /* STLM A, AR4 = store A low into AR4 */
+    } else if ((op & 0xFF00) == 0x8600) {
+        kind = "MVDM-mem"; /* MVDM dmad, AR4 = mem absolute → AR4 */
+    } else if ((op & 0xFF00) == 0x8800) {
+        kind = "MVMM";     /* MVMM ARi, AR4 = register copy */
+    } else if ((op & 0xF800) == 0x8000) {
+        kind = "STL-A";    /* STL A,Smem with Smem=0x14 */
+    }
+
+    /* Per-PC histo */
+    unsigned i;
+    for (i = 0; i < g_ar4_used; i++) {
+        if (g_ar4_hist[i].pc == s->pc) {
+            g_ar4_hist[i].count++;
+            g_ar4_hist[i].val_last = new_val;
+            g_ar4_hist[i].op_last = op;
+            break;
+        }
+    }
+    if (i == g_ar4_used && g_ar4_used < AR4_HIST_MAX) {
+        g_ar4_hist[i].pc = s->pc;
+        g_ar4_hist[i].op_last = op;
+        g_ar4_hist[i].val_last = new_val;
+        g_ar4_hist[i].count = 1;
+        g_ar4_used++;
+    }
+
+    /* Verbatim log first N */
+    if (g_ar4_total <= g_ar4_log_cap) {
+        fprintf(stderr,
+            "[c54x] AR4-W #%u %s @insn=%u PC=0x%04x op=0x%04x  "
+            "AR4 %04x → %04x (Δ=%+d)  A=%010llx AR3=%04x AR5=%04x SP=%04x\n",
+            g_ar4_total, kind, s->insn_count, s->pc, op,
+            old_val, new_val, delta,
+            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+            s->ar[3], s->ar[5], s->sp);
+    }
+
+    /* Suspect flag : valeur dans zones bug observées */
+    if ((new_val >= 0x2b80 && new_val <= 0x2c00) ||
+        (new_val >= 0x3fb0 && new_val <= 0x3fbf)) {
+        fprintf(stderr,
+            "[c54x] AR4-W SUSPECT! @insn=%u PC=0x%04x op=0x%04x "
+            "AR4←0x%04x (zone bug, corrupter ?)\n",
+            s->insn_count, s->pc, op, new_val);
+    }
+}
+
+/* === SP absolute-write tracer (2026-05-25 — nohack hunt) ===
+ * Logge chaque write SP via STL/STM/STLM absolute, FRAME #imm, MVMM
+ * register transfer — c'est-à-dire les sites où SP est *téléporté* à une
+ * valeur arbitraire, par opposition aux PUSH/POP/CALL/RET qui sont des
+ * inc/dec de 1. Si un site téléporte SP=0x3fbe, on tient le corrupter
+ * exact du bootstub-entry observé à insn=3995013.
+ *
+ * Hooké aux 3 sites identifiés :
+ *   L1218 : data_write_locked case MMR_SP — STL/STM/STLM to MMR_SP
+ *   L3875 : F7Dx case 0xD — LD #k8u, SP
+ *   L4285 : MVMM register transfer — dst==8 (SP via MMR enc 3-bit)
+ *
+ * Env-gated CALYPSO_SP_ABS_TRACE=1, zéro coût si OFF.
+ * Limite N premiers writes verbatim + histo per-PC (cap SP_ABS_HIST_MAX). */
+#define SP_ABS_HIST_MAX 128
+typedef struct {
+    uint16_t pc;
+    uint16_t value_last;
+    uint32_t count;
+    uint8_t  site;   /* 0=MMR_SP, 1=LDK8, 2=MVMM */
+} SpAbsEntry;
+static SpAbsEntry g_sp_abs_hist[SP_ABS_HIST_MAX];
+static unsigned   g_sp_abs_used     = 0;
+static unsigned   g_sp_abs_total    = 0;
+static int        g_sp_abs_enabled  = -1;
+static unsigned   g_sp_abs_log_cap  = 50;
+
+static void sp_abs_track(C54xState *s, uint16_t new_val, uint8_t site)
+{
+    if (g_sp_abs_enabled < 0) {
+        const char *e = getenv("CALYPSO_SP_ABS_TRACE");
+        g_sp_abs_enabled = (e && *e == '1') ? 1 : 0;
+        if (g_sp_abs_enabled) {
+            fprintf(stderr, "[c54x] SP-ABS-TRACE enabled, log_cap=%u hist_max=%u\n",
+                    g_sp_abs_log_cap, SP_ABS_HIST_MAX);
+        }
+    }
+    if (g_sp_abs_enabled <= 0) return;
+    g_sp_abs_total++;
+    /* Per-PC histo */
+    unsigned i;
+    for (i = 0; i < g_sp_abs_used; i++) {
+        if (g_sp_abs_hist[i].pc == s->pc && g_sp_abs_hist[i].site == site) {
+            g_sp_abs_hist[i].count++;
+            g_sp_abs_hist[i].value_last = new_val;
+            break;
+        }
+    }
+    if (i == g_sp_abs_used && g_sp_abs_used < SP_ABS_HIST_MAX) {
+        g_sp_abs_hist[i].pc         = s->pc;
+        g_sp_abs_hist[i].value_last = new_val;
+        g_sp_abs_hist[i].count      = 1;
+        g_sp_abs_hist[i].site       = site;
+        g_sp_abs_used++;
+    }
+    /* Verbatim log first N */
+    if (g_sp_abs_total <= g_sp_abs_log_cap) {
+        const char *site_name = site == 0 ? "MMR_SP-W" :
+                                site == 1 ? "LD-#k8-SP" : "MVMM-SP";
+        int32_t delta = (int32_t)new_val - (int32_t)s->sp;
+        fprintf(stderr,
+            "[c54x] SP-ABS #%u %s @insn=%u PC=0x%04x SP %04x → %04x (Δ=%+d) "
+            "A=%010llx AR4=%04x\n",
+            g_sp_abs_total, site_name, s->insn_count, s->pc,
+            s->sp, new_val, delta,
+            (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->ar[4]);
+    }
+    /* Flag if SP lands in suspect zone (0x3fb0..0x3fbf = BSP read region
+     * OR 0x2b80..0x2c00 = 0xfd2a A=AR4 historical) */
+    if ((new_val >= 0x3fb0 && new_val <= 0x3fbf) ||
+        (new_val >= 0x2b80 && new_val <= 0x2c00)) {
+        fprintf(stderr,
+            "[c54x] SP-ABS SUSPECT! @insn=%u PC=0x%04x SP←0x%04x (corrupter ?)\n",
+            s->insn_count, s->pc, new_val);
+    }
+}
+
+/* === MVPD overlay occupancy trace (2026-05-25) ===
+ * Bucket writes à data[0x0080..0x27FF] en buckets de 0x80 words.
+ * Dump occupancy à la fin de la boot phase (insn cap) ou périodiquement.
+ * Objectif : identifier quelles sub-ranges de [0x0080..0x27FF] sont
+ * chargées par MVPD au boot (= code overlay). Critique pour décider si
+ * BSP buffer peut vivre dans la read-region [0x0000..0x03A3] sans
+ * écraser du code en cours d'exécution.
+ * Env gates :
+ *   CALYPSO_MVPD_TRACE=1       active (default OFF)
+ *   CALYPSO_MVPD_BOOT_LIMIT=N  cap insn pour dump (default 500000) */
+#define MVPD_BUCKET_BITS 7      /* 0x80 = 128 words per bucket */
+#define MVPD_BUCKET_SZ   (1u << MVPD_BUCKET_BITS)
+#define MVPD_RANGE_LO    0x0080
+#define MVPD_RANGE_HI    0x2800
+#define MVPD_BUCKETS_N   (((MVPD_RANGE_HI - MVPD_RANGE_LO) + MVPD_BUCKET_SZ - 1) / MVPD_BUCKET_SZ)
+static uint32_t g_mvpd_buckets[MVPD_BUCKETS_N];  /* 80 buckets */
+static int      g_mvpd_trace_enabled = -1;
+static unsigned g_mvpd_boot_limit    = 0;
+static int      g_mvpd_dumped        = 0;
+
+static void mvpd_trace_init_lazy(void)
+{
+    if (g_mvpd_trace_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_MVPD_TRACE");
+    g_mvpd_trace_enabled = (e && *e == '1') ? 1 : 0;
+    const char *l = getenv("CALYPSO_MVPD_BOOT_LIMIT");
+    g_mvpd_boot_limit = (l && *l) ? (unsigned)strtoul(l, NULL, 0) : 500000u;
+    if (g_mvpd_trace_enabled) {
+        fprintf(stderr,
+            "[c54x] MVPD-TRACE enabled, range=[0x%04x..0x%04x] bucket_sz=%u "
+            "buckets=%u boot_limit=%u\n",
+            MVPD_RANGE_LO, MVPD_RANGE_HI, MVPD_BUCKET_SZ, MVPD_BUCKETS_N,
+            g_mvpd_boot_limit);
+    }
+}
+
+static void mvpd_trace_record(uint16_t addr)
+{
+    if (g_mvpd_trace_enabled <= 0) return;
+    if (addr < MVPD_RANGE_LO || addr >= MVPD_RANGE_HI) return;
+    unsigned b = (addr - MVPD_RANGE_LO) >> MVPD_BUCKET_BITS;
+    if (b < MVPD_BUCKETS_N) g_mvpd_buckets[b]++;
+}
+
+static void mvpd_trace_dump_if_due(unsigned insn)
+{
+    if (g_mvpd_trace_enabled <= 0) return;
+    if (g_mvpd_dumped) return;
+    if (insn < g_mvpd_boot_limit) return;
+    g_mvpd_dumped = 1;
+    fprintf(stderr, "[c54x] MVPD-OCCUPANCY DUMP @insn=%u (boot phase end)\n", insn);
+    for (unsigned b = 0; b < MVPD_BUCKETS_N; b++) {
+        if (g_mvpd_buckets[b] == 0) continue;
+        uint16_t lo = MVPD_RANGE_LO + b * MVPD_BUCKET_SZ;
+        uint16_t hi = lo + MVPD_BUCKET_SZ - 1;
+        fprintf(stderr,
+            "[c54x] MVPD-BUCKET [0x%04x..0x%04x] writes=%u\n",
+            lo, hi, g_mvpd_buckets[b]);
+    }
+    /* Verdict pour decision buffer placement : si [0x0080..0x03A3]
+     * (correlator read region, bucket 0..6) a peu/zéro writes → safe
+     * pour BSP DMA. Sinon il faut une autre zone. */
+    unsigned bucket_0_to_6_total = 0;
+    for (unsigned b = 0; b < 7 && b < MVPD_BUCKETS_N; b++)
+        bucket_0_to_6_total += g_mvpd_buckets[b];
+    fprintf(stderr,
+        "[c54x] MVPD-VERDICT correlator_read_region [0x0080..0x03A3] "
+        "writes=%u → %s\n",
+        bucket_0_to_6_total,
+        bucket_0_to_6_total == 0
+            ? "EMPTY (safe pour BSP buffer placement ici)"
+            : bucket_0_to_6_total < 100
+            ? "lightly used (probably safe, audit specifics)"
+            : "HEAVILY USED (code overlay, NE PAS placer BSP buffer ici)");
+}
+
+/* === Correlator trace (2026-05-25 — pour run 0x6000 dual-purpose) ===
+ * Capture AR3/AR4/AR5 à l'entrée du correlator FB-det + les data reads
+ * pendant son exécution. Objectif : valider empiriquement que le firmware
+ * lit son input I/Q dans [0x0000..0x03A3] (assertion TODO.md:13 jamais
+ * exercée avec real data — l'A/B précédent mesurait WR-SITE pré-BSP).
+ * Env-gated CALYPSO_CORRELATOR_TRACE=1, zéro coût si OFF.
+ *
+ * Correlator range : [0x8d00..0x8f80] (FB-det handler PROM0).
+ * À l'entrée from-outside : log AR0..7, SP, ST0/1.
+ * Pendant exec : log les data_read addr (top N uniques, capped pour
+ * éviter explosion log sur runs longs). */
+#define CORR_READ_HIST_MAX 128
+typedef struct { uint16_t addr; uint32_t count; } CorrReadEntry;
+static CorrReadEntry g_corr_read_hist[CORR_READ_HIST_MAX];
+static unsigned    g_corr_read_used    = 0;
+static int         g_corr_trace_enabled = -1; /* -1 uninit, 0 off, 1 on */
+static unsigned    g_corr_entry_count  = 0;
+static unsigned    g_corr_entry_log_cap = 20;
+static uint64_t    g_corr_read_total   = 0;
+
+static void corr_trace_init_lazy(void)
+{
+    if (g_corr_trace_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_CORRELATOR_TRACE");
+    g_corr_trace_enabled = (e && *e == '1') ? 1 : 0;
+    if (g_corr_trace_enabled) {
+        fprintf(stderr, "[c54x] CORRELATOR-TRACE enabled, range=[0x8d00..0x8f80] "
+                        "hist_max=%u entry_log_cap=%u\n",
+                CORR_READ_HIST_MAX, g_corr_entry_log_cap);
+    }
+}
+
+static void corr_read_record(uint16_t addr)
+{
+    if (g_corr_trace_enabled <= 0) return;
+    g_corr_read_total++;
+    unsigned i;
+    for (i = 0; i < g_corr_read_used; i++) {
+        if (g_corr_read_hist[i].addr == addr) {
+            g_corr_read_hist[i].count++;
+            return;
+        }
+    }
+    if (g_corr_read_used < CORR_READ_HIST_MAX) {
+        g_corr_read_hist[g_corr_read_used].addr  = addr;
+        g_corr_read_hist[g_corr_read_used].count = 1;
+        g_corr_read_used++;
+    }
+}
+
+static void corr_read_dump(const char *trig)
+{
+    if (g_corr_trace_enabled <= 0) return;
+    fprintf(stderr, "[c54x] CORR-READ DUMP[%s] total=%llu uniq=%u\n",
+            trig, (unsigned long long)g_corr_read_total, g_corr_read_used);
+    /* Sort by count descending (simple selection sort, n<=128). */
+    for (unsigned k = 0; k < g_corr_read_used; k++) {
+        unsigned best = k;
+        for (unsigned i = k + 1; i < g_corr_read_used; i++) {
+            if (g_corr_read_hist[i].count > g_corr_read_hist[best].count)
+                best = i;
+        }
+        if (best != k) {
+            CorrReadEntry tmp = g_corr_read_hist[k];
+            g_corr_read_hist[k] = g_corr_read_hist[best];
+            g_corr_read_hist[best] = tmp;
+        }
+        fprintf(stderr, "[c54x] CORR-READ #%u addr=0x%04x count=%u\n",
+                k + 1, g_corr_read_hist[k].addr, g_corr_read_hist[k].count);
+    }
+}
 
 /* === DSP throughput emission (2026-05-14 evening) ===
  *
@@ -292,6 +621,13 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr);
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* Correlator read tracer (env-gated CALYPSO_CORRELATOR_TRACE=1).
+     * Record addr seulement quand PC ∈ [0x8d00..0x8f80] (FB-det range).
+     * Lazy-init ici plutôt qu'au top-of-loop pour rester centralisé.
+     * Coût quand OFF : 1 compare + 1 branch (g_corr_trace_enabled). */
+    if (g_corr_trace_enabled > 0 && s->pc >= 0x8d00 && s->pc < 0x8f80) {
+        corr_read_record(addr);
+    }
     /* MTTCG : protège DARAM access (DSP + ARM-OVLY peuvent racer).
      * Sans MTTCG : mutex non contesté (overhead minimal). */
     qemu_mutex_lock(&calypso_pcb_daram_lock);
@@ -695,6 +1031,11 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val);
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* MVPD overlay occupancy : count writes to [0x0080..0x27FF] during
+     * boot phase. Env-gated CALYPSO_MVPD_TRACE=1. */
+    if (g_mvpd_trace_enabled > 0) {
+        mvpd_trace_record(addr);
+    }
     /* MTTCG lock : voir data_read ci-dessus. */
     qemu_mutex_lock(&calypso_pcb_daram_lock);
     data_write_locked(s, addr, val);
@@ -900,6 +1241,37 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * Cas 2 : write boot only → init OK mais set steady-state manquant.
      * Cas 3 : writes périodiques avec valeur jamais matchée par le test
      *         à 0x75db → bug dans le compute en amont. */
+    /* WATCH-3FBE — observ. writes sur la zone [0x3fb0..0x3fbf] qui inclut
+     * 0x3fbe (le slot pop=0 du bootstub-entry insn=3995013). Le BSP DMA
+     * bypasse data_write_locked (direct s->data[]) donc ce hook ne voit
+     * QUE les writes via instructions DSP (STL/STM/STLM/STH). Si zéro
+     * write vu avant insn=3995013 → le firmware ne pousse jamais à cet
+     * addr → trajectoire SP divergente (RETD à 0x8ed1 sans CALL apparié).
+     * Env-gated CALYPSO_WATCH_3FBE=1, zéro coût sinon. */
+    if (addr >= 0x3fb0 && addr <= 0x3fbf) {
+        static int      w3fbe_enabled = -1;
+        static unsigned w3fbe_total = 0;
+        if (w3fbe_enabled < 0) {
+            const char *e = getenv("CALYPSO_WATCH_3FBE");
+            w3fbe_enabled = (e && *e == '1') ? 1 : 0;
+            if (w3fbe_enabled) {
+                fprintf(stderr,
+                    "[c54x] WATCH-3FBE enabled — range [0x3fb0..0x3fbf] "
+                    "(DSP-side writes only, BSP DMA bypassed)\n");
+            }
+        }
+        if (w3fbe_enabled > 0) {
+            w3fbe_total++;
+            if (w3fbe_total <= 100 || (w3fbe_total % 5000) == 0) {
+                fprintf(stderr,
+                    "[c54x] WATCH-3FBE #%u addr=0x%04x val=0x%04x "
+                    "(was 0x%04x) PC=0x%04x insn=%u\n",
+                    w3fbe_total, addr, val, s->data[addr],
+                    s->pc, s->insn_count);
+            }
+        }
+    }
+
     if (addr == 0x3dd2) {
         static unsigned w3dd2;
         w3dd2++;
@@ -1046,6 +1418,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_TRN:  s->trn = val; return;
         case MMR_AR0: case MMR_AR1: case MMR_AR2: case MMR_AR3:
         case MMR_AR4: case MMR_AR5: case MMR_AR6: case MMR_AR7:
+            if (addr == MMR_AR4) ar4_write_track(s, val);  /* probe avant write */
             s->ar[addr - MMR_AR0] = val; return;
         case MMR_SP:
             if (val >= 0x0800 && val < 0x0900) {
@@ -1055,6 +1428,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                         val, s->sp, s->pc);
                 return;
             }
+            sp_abs_track(s, val, 0);  /* site=0 : MMR_SP via STL/STM/STLM */
             s->sp = val;
             return;
         case MMR_BK:   s->bk = val; return;
@@ -3712,7 +4086,7 @@ static int c54x_exec_one(C54xState *s)
                 s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
             case 0xB: s->ar[7] = k; break; /* F7Bx: LD #k8, AR7 */
             case 0xC: s->bk = k; break;
-            case 0xD: s->sp = k; break;
+            case 0xD: sp_abs_track(s, k, 1); s->sp = k; break;  /* LD #k8u, SP */
             case 0xE: /* F7Ex: LD #k8, BRC */
                 s->brc = k; break;
             case 0xF: /* F7Fx: LD #k8, ... */
@@ -4122,7 +4496,7 @@ static int c54x_exec_one(C54xState *s)
             else if (src == 8) val = s->sp;
             else val = data_read(s, src + 0x10);
             if (dst <= 7) s->ar[dst] = val;
-            else if (dst == 8) s->sp = val;
+            else if (dst == 8) { sp_abs_track(s, val, 2); s->sp = val; }  /* MVMM SP-dest */
             else data_write(s, dst + 0x10, val);
             return consumed + s->lk_used;
         }
@@ -6100,16 +6474,37 @@ static int        g_sp_dec_dumped = 0;
 static unsigned   g_sp_dec_arm_insn = 0;   /* insn at which we armed */
 static uint16_t   g_sp_dec_arm_sp = 0;     /* SP value at arm */
 
-/* === Raw SP ring buffer (Patch 3 — 2026-05-25) ===
+/* === Raw SP ring buffer (Patch 3 — 2026-05-25, rev 2) ===
  * Per-iteration record of (insn, PC, SP, op) at top-of-loop, no filter,
- * no sign classification. Dumped edge-triggered when SP crosses below
- * the dump threshold (réutilise le trigger du histo, sans freeze).
- * Évite définitivement les bugs de wrap signé qui ont mordu l'histo
- * (underflow v3/v4, overflow v5/maintenant). Brut, donc honnête.
+ * no sign classification. Plusieurs triggers configurables.
+ *
+ * Rev 1 (floor-cross) : a montré que le « plongeon SP→0 » est en réalité
+ * un wrap-forward par pops dans un boot-stub spiral (PC=0x0000/0x0001
+ * en boucle, SP++ par RET). Le kill réel = un RET corrompu qui saute
+ * à 0x0000 BIEN AVANT le wrap, dans [3.5M, 4.09M] insns. Floor-cross
+ * arrive 600k insns trop tard, déjà dans le spiral.
+ *
+ * Rev 2 (bootstub-entry) : trigger sur l'EDGE prev_pc ∉ [0x00,0x7F] →
+ * s->pc ∈ [0x00,0x7F]. Capture la transition exacte = le RET fauteur
+ * + son SP + le mot poppé (mem[topgate_last_sp]). Discrimine 2 bugs
+ * radicalement différents :
+ *   - SP valide (~0x3fbb) + mem[SP]=0 → return slot écrasé par un
+ *     write sauvage. fd28-fd2a n'y change rien. À chasser autrement.
+ *   - SP en non-stack (~0x2bc0) → famille 0xfd2a A=AR4. fd28-fd2a
+ *     devient le fix.
+ *
  * Env gates :
- *   CALYPSO_SP_RING=1     active (default OFF, zéro coût sinon)
- *   CALYPSO_SP_RING_MAX=N cap nombre de dumps par run (default 4) */
-#define SP_RING_SZ 512  /* must be power of 2 */
+ *   CALYPSO_SP_RING=1          active (default OFF, zéro coût sinon)
+ *   CALYPSO_SP_RING_MAX=N      cap dumps par run (default 4)
+ *   CALYPSO_SP_RING_TRIG=mode  floor|bootstub|both (default bootstub)
+ *   CALYPSO_SP_RING_INSN_MIN=N skip first N insns (default 1000000 — le
+ *                              firmware Calypso fait des CALL légitimes
+ *                              au boot stub 0x0000/0x0001 en phase init,
+ *                              le 1er CALL captérait un faux positif et
+ *                              consommerait le one-shot. Le vrai bug
+ *                              observé est dans [3.5M, 4.09M] insns) */
+#define SP_RING_SZ 4096  /* must be power of 2 — bumped 512→4096 for
+                          * coverage des 1000s d'insns avant le spiral */
 typedef struct {
     unsigned insn;
     uint16_t pc;
@@ -6123,6 +6518,9 @@ static uint64_t    g_sp_ring_total = 0;
 static int         g_sp_ring_enabled = -1;
 static unsigned    g_sp_ring_dump_count = 0;
 static unsigned    g_sp_ring_dump_max = 0;
+/* Trigger mode (rev 2) : 1 = floor-cross, 2 = bootstub-entry, 3 = both */
+static int         g_sp_ring_trig_mode = 0;
+static unsigned    g_sp_ring_insn_min  = 0;  /* skip first N insns (boot phase) */
 
 static void sp_ring_record(unsigned insn, uint16_t pc, uint16_t sp, uint16_t op)
 {
@@ -6162,11 +6560,96 @@ static void sp_ring_init_lazy(void)
     g_sp_ring_enabled = (e && *e == '1') ? 1 : 0;
     const char *m = getenv("CALYPSO_SP_RING_MAX");
     g_sp_ring_dump_max = (m && *m) ? (unsigned)strtoul(m, NULL, 0) : 4u;
+    /* Trigger mode parse (rev 2). Default = bootstub (le seul utile post
+     * rev-1 — floor-cross firait dans le spiral, trop tard). */
+    const char *t = getenv("CALYPSO_SP_RING_TRIG");
+    if (!t || !*t || !strcmp(t, "bootstub")) g_sp_ring_trig_mode = 2;
+    else if (!strcmp(t, "floor"))            g_sp_ring_trig_mode = 1;
+    else if (!strcmp(t, "both"))             g_sp_ring_trig_mode = 3;
+    else                                     g_sp_ring_trig_mode = 2;
+    const char *im = getenv("CALYPSO_SP_RING_INSN_MIN");
+    g_sp_ring_insn_min = (im && *im) ? (unsigned)strtoul(im, NULL, 0) : 1000000u;
     if (g_sp_ring_enabled) {
         fprintf(stderr,
-            "[c54x] SP-RING enabled, sz=%u, max_dumps=%u\n",
-            SP_RING_SZ, g_sp_ring_dump_max);
+            "[c54x] SP-RING enabled, sz=%u, max_dumps=%u, trig=%s, "
+            "insn_min=%u\n",
+            SP_RING_SZ, g_sp_ring_dump_max,
+            g_sp_ring_trig_mode == 1 ? "floor" :
+            g_sp_ring_trig_mode == 2 ? "bootstub" :
+            g_sp_ring_trig_mode == 3 ? "both" : "?",
+            g_sp_ring_insn_min);
     }
+}
+
+/* Rev 2 : detect edge PC entry into boot stub area [0x0000, 0x007F].
+ * topgate_last_pc = PC of insn just executed (the RET that branched).
+ * cur_pc          = destination = popped return address.
+ * topgate_last_sp = SP before the RET pop.
+ * cur_sp          = SP after the RET pop (= topgate_last_sp + 1 if 1-word).
+ * Capture verbose state + dump ring to identify the corrupting RET.
+ * Static cap : one detailed dump per run (le 1er, qui contient le
+ * caller; subsequent fires sont des re-entries du même spiral). */
+static int g_bootstub_dumped = 0;
+static void sp_ring_check_bootstub_entry(C54xState *s,
+                                         uint16_t prev_pc, uint16_t prev_op,
+                                         uint16_t prev_sp, uint16_t cur_pc,
+                                         uint16_t cur_sp, unsigned insn)
+{
+    if (g_sp_ring_enabled <= 0) return;
+    if (!(g_sp_ring_trig_mode & 2)) return;
+    if (g_bootstub_dumped) return;
+    /* Skip boot phase : firmware fait des CALL légitimes au boot stub
+     * 0x0000-0x0001 pendant l'init (LDMM SP,B est documenté). Le 1er
+     * trigger sans gate fire à insn=145 et consomme le one-shot. */
+    if (insn < g_sp_ring_insn_min) return;
+    int was_inside = (prev_pc <= 0x007F);
+    int now_inside = (cur_pc  <= 0x007F);
+    if (was_inside || !now_inside) return;
+
+    g_bootstub_dumped = 1;
+    uint16_t popped = s->data[prev_sp & 0xFFFF];
+    uint16_t neighborhood[8];
+    for (int k = 0; k < 8; k++) {
+        neighborhood[k] = s->data[(uint16_t)(prev_sp + k) & 0xFFFF];
+    }
+    fprintf(stderr,
+        "[c54x] BOOTSTUB-ENTRY caught @insn=%u\n"
+        "[c54x]   prev_pc=0x%04x prev_op=0x%04x  (the RET site = corrupter)\n"
+        "[c54x]   cur_pc=0x%04x  (destination, in bootstub)\n"
+        "[c54x]   prev_sp=0x%04x  cur_sp=0x%04x  (delta=%+d)\n"
+        "[c54x]   mem[prev_sp]=0x%04x  (= popped return addr, must equal cur_pc)\n"
+        "[c54x]   AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x  ARP=%d DP=%d\n"
+        "[c54x]   ST0=0x%04x ST1=0x%04x INTM=%d XPC=%d\n"
+        "[c54x]   stack neighborhood mem[prev_sp..+7]: %04x %04x %04x %04x %04x %04x %04x %04x\n",
+        insn, prev_pc, prev_op, cur_pc,
+        prev_sp, cur_sp, (int)cur_sp - (int)prev_sp,
+        popped,
+        s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+        s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+        arp(s), dp(s),
+        s->st0, s->st1, !!(s->st1 & ST1_INTM), s->xpc,
+        neighborhood[0], neighborhood[1], neighborhood[2], neighborhood[3],
+        neighborhood[4], neighborhood[5], neighborhood[6], neighborhood[7]);
+
+    /* Diagnostic discriminator — match user's discrimination criteria :
+     *   SP valide (~0x3fbb plage observée) + popped==0 → return slot
+     *     écrasé par write sauvage. 0xfd2a est innocent.
+     *   SP en zone non-stack (~0x2bc0 ou similar buffer) → famille
+     *     0xfd2a A=AR4. fd28-fd2a est le fix. */
+    int sp_in_valid_stack = (prev_sp >= 0x3000 && prev_sp <= 0x5FFF);
+    int sp_in_buffer_area = (prev_sp >= 0x2000 && prev_sp <= 0x2FFF);
+    fprintf(stderr,
+        "[c54x] BOOTSTUB-ENTRY VERDICT: sp_in_valid_stack=%d "
+        "sp_in_buffer_area=%d popped_is_zero=%d\n"
+        "[c54x]   → %s\n",
+        sp_in_valid_stack, sp_in_buffer_area, (popped == 0),
+        sp_in_valid_stack && popped == 0
+            ? "RETURN SLOT OVERWRITTEN (sauvage write near SP), audit ailleurs"
+            : sp_in_buffer_area
+            ? "SP IN NON-STACK BUFFER (likely 0xfd2a family), audit fd28-fd2a"
+            : "INCONCLUSIVE — inspect ring + state above");
+
+    sp_ring_dump("bootstub-entry", insn, cur_sp);
 }
 
 static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
@@ -6317,11 +6800,12 @@ static void sp_hist_account(uint16_t exec_pc, uint16_t exec_op,
     /* DUMP : APRÈS l'accounting, vérifier seuil dump.
      * Patch 1 (2026-05-25) : edge-trigger only — dump quand SP croise
      * sous le floor (sp_before >= threshold && sp_now < threshold).
-     * Sans cet edge, sans le freeze, on dumperait à chaque iter une
-     * fois SP bas. Avec edge, on dump le plongeon mais pas les iters
-     * suivantes où SP reste bas. Si SP remonte puis re-plonge, on
-     * re-dump (utile pour observer recovery + re-descente). */
-    if (sp_before >= g_sp_dec_dump_threshold && sp_now < g_sp_dec_dump_threshold) {
+     * Rev 2 : gaté par g_sp_ring_trig_mode (bit 0 = floor). Par défaut
+     * bootstub seulement, parce que floor-cross fire dans le spiral
+     * (trop tard) — cf rev 1 finding. */
+    if ((g_sp_ring_trig_mode & 1) &&
+        sp_before >= g_sp_dec_dump_threshold &&
+        sp_now    <  g_sp_dec_dump_threshold) {
         sp_ring_dump("sp-floor-cross", insn, sp_now);
         sp_hist_dump("sp-floor-cross", insn, sp_now);
     }
@@ -6877,20 +7361,62 @@ int c54x_run(C54xState *s, int n_insns)
                 sp_hist_account(topgate_last_pc, topgate_last_op,
                                 topgate_last_sp, s->sp, s->insn_count);
             }
+
+            /* Patch 3 rev 2 : bootstub-entry trigger (le bon signal post
+             * rev 1). Détecte l'edge prev_pc ∉ bootstub → cur_pc ∈ bootstub
+             * = le RET corrompu qui a sauté à 0x00XX. Capture verbose +
+             * dump ring contenant ~4096 iters d'approche. */
+            if (topgate_valid) {
+                sp_ring_check_bootstub_entry(s,
+                    topgate_last_pc, topgate_last_op, topgate_last_sp,
+                    s->pc, s->sp, s->insn_count);
+            }
+
             topgate_last_sp = s->sp;
             topgate_last_pc = s->pc;
             topgate_last_op = prog_fetch(s, s->pc);
             topgate_valid   = 1;
 
-            /* Patch 3 (2026-05-25) : raw ring buffer record.
-             * Inconditionnel per-iter (pas de filtre Δ, pas de classification
-             * signée). Env-gated CALYPSO_SP_RING=1, zéro coût si OFF.
-             * Le ring est dumpé edge-triggered par sp_hist_account quand
-             * SP croise sous le floor — fournit les ~512 dernières
-             * (insn,PC,SP,op) AVANT le plongeon, donc la trajectoire
-             * d'approche et l'instruction exacte qui plonge. */
             sp_ring_init_lazy();
             sp_ring_record(s->insn_count, s->pc, s->sp, topgate_last_op);
+
+            /* MVPD overlay occupancy : lazy-init + dump-if-boot-phase-ended. */
+            mvpd_trace_init_lazy();
+            mvpd_trace_dump_if_due(s->insn_count);
+
+            /* Correlator entry trace : detect edge prev_pc ∉ [0x8d00..0x8f80]
+             * → cur_pc ∈ same range. Log full state (AR3/4/5 = buffer pointers
+             * probables) au moment de l'entrée. Dump des reads accumulés
+             * périodiquement (toutes 20 entrées) pour observer si pattern
+             * se stabilise vs varie entre runs. */
+            corr_trace_init_lazy();
+            if (g_corr_trace_enabled > 0 && topgate_valid) {
+                int prev_in = (topgate_last_pc >= 0x8d00 && topgate_last_pc < 0x8f80);
+                int cur_in  = (s->pc >= 0x8d00 && s->pc < 0x8f80);
+                if (!prev_in && cur_in) {
+                    g_corr_entry_count++;
+                    if (g_corr_entry_count <= g_corr_entry_log_cap) {
+                        fprintf(stderr,
+                            "[c54x] CORR-ENTRY #%u @insn=%u prev_pc=0x%04x → cur_pc=0x%04x\n"
+                            "[c54x]   AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x  "
+                            "ARP=%d DP=%d BK=0x%04x\n"
+                            "[c54x]   SP=0x%04x ST0=0x%04x ST1=0x%04x INTM=%d XPC=%d\n",
+                            g_corr_entry_count, s->insn_count,
+                            topgate_last_pc, s->pc,
+                            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                            s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                            arp(s), dp(s), s->bk,
+                            s->sp, s->st0, s->st1, !!(s->st1 & ST1_INTM), s->xpc);
+                    }
+                    /* Dump tous les 20 entrées pour observer si addr lues
+                     * stabilisent (correlator répète) ou varient. */
+                    if ((g_corr_entry_count % 20) == 0) {
+                        char tag[32];
+                        snprintf(tag, sizeof(tag), "every20-entry%u", g_corr_entry_count);
+                        corr_read_dump(tag);
+                    }
+                }
+            }
         }
 
         /* DSP idle fast-forward — see dsp_idle_fast_forward() comment.
@@ -7990,12 +8516,32 @@ void c54x_reset(C54xState *s)
 {
     g_boot_trace = 50;
     s->a = 0; s->b = 0;
+    /* AR registers aligned with silicon spec (doc/datasheets/README.md §3,
+     * 2026-05-25). Cross-checked 3 ROM dumps (3311/3416/3606) + local osmocom :
+     *   AR1=0x005F, AR2=0x0813, AR3=0x0014, AR4=0x0003, AR5=0x0014  (invariant)
+     *   AR0=0xFF75, BK=0xFFF6  (local osmocom dump values)
+     *   AR6, AR7 : non documenté invariant, garde 0
+     *
+     * Précédent : memset 0 = init shortcut, même problème que SP/IMR.
+     * Symptôme : STL A,*AR2 à PC=0x9ac0 avec AR2=0 écrivait à mem[0x00]=IMR
+     * → IMR cleared → toutes IRQ FRAME/BRINT0 masquées → DSP bloqué en df9x. */
     memset(s->ar, 0, sizeof(s->ar));
+    s->ar[0] = 0xFF75;  /* local osmocom */
+    s->ar[1] = 0x005F;
+    s->ar[2] = 0x0813;  /* API_RAM-related — clobber IMR si =0 (cf 2026-05-25) */
+    s->ar[3] = 0x0014;
+    s->ar[4] = 0x0003;
+    s->ar[5] = 0x0014;
     s->t = 0; s->trn = 0;
-    s->sp = 0x5AC8; s->bk = 0;  /* SP init per Calypso boot ROM
-                                 * NOTE: silicon dumps show SP=0x1100 post-handshake.
-                                 * 0x5AC8 is a shortcut anticipating osmocom firmware re-init.
-                                 * See doc/datasheets/README.md §3-4. */
+    s->sp = 0x1100; s->bk = 0xFFF6;  /* SP+BK init aligned with silicon (2026-05-25).
+                                 * 3 ROM dumps (3311/3416/3606) + local : SP=0x1100
+                                 * post-bootloader-handshake. Let firmware repoint
+                                 * to its own stack (0x5AC8 historically observed)
+                                 * via init sequence, comme sur silicon réel.
+                                 * Précédent : SP=0x5AC8 = shortcut anticipant
+                                 * la re-init firmware. Suspect d'être la racine
+                                 * du clobber AR5↔SP overlap à mem[0x3fbe].
+                                 * Voir doc/datasheets/README.md §3-4. */
     s->brc = 0; s->rsa = 0; s->rea = 0;
     /* MMR reset values aligned with Calypso silicon (3 FreeCalypso ROM dumps + local).
      * Empirically validated 2026-04-28. See doc/datasheets/README.md §3.
@@ -8003,7 +8549,15 @@ void c54x_reset(C54xState *s)
     s->st0  = 0x181F;                              /* DP=0x01F per silicon */
     s->st1  = ST1_INTM | ST1_SXM | ST1_XF;         /* 0x2900: INTM=1, SXM=1, XF=1 */
     s->pmst = 0xFFA8;                              /* IPTR=0x1FF, MP_MC=1, OVLY=1, DROM=1 */
-    s->imr = 0;
+    s->imr = 0x52FD;                               /* IMR aligned avec local osmocom dump
+                                                    * (doc/datasheets/README.md §3, post-
+                                                    * bootloader-handshake). 0 était un autre
+                                                    * shortcut comme SP. IRQ #2..#10 vus
+                                                    * INTM=1 IMR=0x0000 IFR=0x28 → IRQs
+                                                    * masquées toutes → handlers jamais run
+                                                    * → flags dispatcher pas écrits → DSP
+                                                    * boucle indéfiniment en df9x (= bloqueur
+                                                    * #2 chain FBSB). Fix 2026-05-25. */
     s->ifr = 0;
     s->xpc = 0;
     s->timer_psc = 0;

@@ -596,14 +596,16 @@ class Bridge:
         elif verb == "POWEROFF":
             self.powered = False; rsp = "RSP POWEROFF 0"
         elif verb == "SETFORMAT":
-            # CRITICAL: bridge always emits TRXDv0 (8-byte header + 148 soft
-            # bits = 156 bytes). If BTS asks for v1 and we echo "agreed v1",
-            # BTS parses our v0 packets with v1 layout → silent drop before
-            # RACH detector. Force v0 in the response regardless of request.
-            requested = args[0] if args else "0"
-            rsp = "RSP SETFORMAT 0 0 0"  # status=0 (ok), accepted=0, available=0 (v0)
-            print(f"TRXC SETFORMAT requested=v{requested} → forced reply v0 "
-                  f"(bridge sends TRXDv0 only)", flush=True)
+            # Bridge envoie TRXDv1 (= byte 0 high nibble = 1, low = TN).
+            # osmo-bts-trx récent attend strictement v1 et drop nos UL si on
+            # répond "v0". Le payload reste identique (148 soft bits ±127),
+            # seul byte 0 change. Voir _handle_ul ci-dessous.
+            # 2026-05-25 : fix passage v0→v1 pour stopper les
+            # "Rx TRXD PDU with unexpected version 0 (expected 1)".
+            requested = args[0] if args else "1"
+            rsp = "RSP SETFORMAT 0 1 1"  # status=0 (ok), accepted=1 (v1), max=1
+            print(f"TRXC SETFORMAT requested=v{requested} → reply v1 "
+                  f"(bridge sends TRXDv1)", flush=True)
         elif verb == "NOMTXPOWER":
             rsp = "RSP NOMTXPOWER 0 50"
         elif verb == "MEASURE":
@@ -672,11 +674,28 @@ class Bridge:
             sent_fn = self.wall_fn()
         else:  # "slot" — default
             sent_fn = next_rach_slot_fn(self.wall_fn())
-        out = bytearray(data)
-        out[1] = (sent_fn >> 24) & 0xFF
-        out[2] = (sent_fn >> 16) & 0xFF
-        out[3] = (sent_fn >>  8) & 0xFF
-        out[4] =  sent_fn        & 0xFF
+        # TRXDv1 UL = 11 B header + 148 soft bits = 159 B (vs v0 = 8+148=156).
+        # Layout v1 :
+        #   [0]    version<<4 | TN     (high nibble=1, low nibble=TN)
+        #   [1:5]  FN BE
+        #   [5]    RSSI uint8
+        #   [6:8]  ToA256 BE int16
+        #   [8]    MTS = 0x00 (GMSK + TSC 0, per trx_data_mod_val GMSK=0x00)
+        #   [9:11] C/I BE int16 = 0 (no info)
+        #   [11:]  148 soft bits ±127
+        # cf osmo-bts/src/osmo-bts-trx/trx_if.c : TRX_UL_V1HDR_LEN = 11
+        # 2026-05-25 fix : insertion MTS + C/I, stoppe l'erreur
+        # "Rx TRXD PDU with unknown or not supported modulation (MTS=0x7f)".
+        v0_hdr = bytearray(data[:8])
+        v0_hdr[0] = (1 << 4) | (data[0] & 0x07)
+        v0_hdr[1] = (sent_fn >> 24) & 0xFF
+        v0_hdr[2] = (sent_fn >> 16) & 0xFF
+        v0_hdr[3] = (sent_fn >>  8) & 0xFF
+        v0_hdr[4] =  sent_fn        & 0xFF
+        # MTS=0x00 GMSK normal burst TSC=0 ; C/I=0 (BE int16, 2 bytes)
+        v1_extra = bytes([0x00, 0x00, 0x00])
+        soft_bits = bytes(data[8:])
+        out = bytes(v0_hdr) + v1_extra + soft_bits
         if sent_fn != qemu_fn:
             self.stats["ul_fn_rewrite"] += 1
 

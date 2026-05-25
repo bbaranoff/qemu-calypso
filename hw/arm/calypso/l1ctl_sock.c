@@ -1,8 +1,20 @@
 /*
- * l1ctl_sock.c — L1CTL unix socket server for Calypso QEMU
+ * l1ctl_sock.c — L1CTL unix socket server (legacy QEMU-internal path)
  *
- * Replaces the Python bridge: provides a unix socket at /tmp/osmocom_l2
- * that speaks L1CTL (length-prefixed messages) to OsmocomBB mobile.
+ * État runtime actuel (2026-05-25) : ce socket est INACTIF dans le run
+ * orchestré par scripts/run.sh. run.sh:458 override l'env L1CTL_SOCK vers
+ * /tmp/qemu_l1ctl_disabled pour le child QEMU, donc ce module crée son
+ * socket à une adresse-poubelle et personne ne s'y connecte. Le VRAI
+ * socket /tmp/osmocom_l2 que le mobile osmocom-bb utilise est créé par
+ * osmocon (-m romload -s /tmp/osmocom_l2), pas par QEMU.
+ *
+ * Le path historique « Replaces the Python bridge » reste possible si on
+ * lance QEMU sans override env — utile pour des tests sans osmocon, mais
+ * pas le mode de fonctionnement principal. Voir doc/L1CTL_SOCK_FLOW.md
+ * et le commentaire à run.sh:458.
+ *
+ * Quand actif : provides a unix socket at /tmp/osmocom_l2 that speaks
+ * L1CTL (length-prefixed messages) to OsmocomBB mobile.
  *
  * Internally translates between:
  *   - sercomm framing (FLAG/ESCAPE/DLCI) on the firmware UART side

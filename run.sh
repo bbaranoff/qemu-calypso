@@ -239,14 +239,27 @@ if [ -z "${CALYPSO_RXDONE_ADDR:-}" ]; then
 fi
 export CALYPSO_RXDONE_ADDR
 
-CALYPSO_FBSB_SYNTH="${CALYPSO_FBSB_SYNTH:-0}"
+# === Defaults no-hack (2026-05-25) ===
+# Politique : aucun bypass de chemin firmware par défaut. Les hacks
+# dev-assist (PM_INJECT, FBSB_SYNTH, DSP_FBDET_SKIP) sont à 0 par défaut.
+# Override explicite dans la cmdline si tu veux un dev-assist temporaire.
+# Conforme à CLAUDE.md règle #1 : "PAS DE HACK". Voir aussi audit run env
+# 2026-05-25 (l'absence de CALYPSO_PM_INJECT activait le hack=800 par défaut).
+CALYPSO_FBSB_SYNTH="${CALYPSO_FBSB_SYNTH:-0}"        # no-hack : synth FB/SB désactivé
+CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}" # no-hack : FB-det handler exécuté
+CALYPSO_PM_INJECT="${CALYPSO_PM_INJECT:-0}"          # no-hack : PM scan réel (code default 800 = HACK actif si absent)
+CALYPSO_DSP_FORCE_DARAM62="${CALYPSO_DSP_FORCE_DARAM62:-0}" # no-hack : pas de force daram[0x62]=1
+CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}" # no-hack : pas de probe-injection bootstub
+
+# === Stability / non-hack mais nécessaire ===
+CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-1}"   # load-bearing pour osmocon firmware download (mémoire [[project_force_rx_done_load_bearing]])
+CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"       # perf : fast-forward DSP idle dispatcher (pas un hack)
+CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
+
+# === Diag / debug (no-hack) ===
 CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
-CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"
-CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
-CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-1}"
-CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
 # CALYPSO_IQ : master switch pour le chemin IQ passthrough.
 #   on/1   = bridge GMSK-module les soft-bits (scipy BT=0.3) et envoie 296 B IQ
@@ -306,7 +319,6 @@ BRIDGE_DL_FN_LOOKAHEAD="${BRIDGE_DL_FN_LOOKAHEAD:-51}"
 # mobile to complete a Location Update cycle.
 # Set to 102 explicitly when QEMU runs near wall-clock (or in production).
 BRIDGE_CLK_PERIOD="${BRIDGE_CLK_PERIOD:-51}"
-CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}"
 CALYPSO_DSP_BUDGET="${CALYPSO_DSP_BUDGET:-256000}"
 export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
        CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
@@ -314,6 +326,7 @@ export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
        CALYPSO_FORCE_RX_DONE \
        CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE CALYPSO_TIMER \
        CALYPSO_PROBE_BOOTSTUB CALYPSO_DSP_BUDGET \
+       CALYPSO_PM_INJECT CALYPSO_DSP_FORCE_DARAM62 \
        BRIDGE_CLK_FROM_QEMU BRIDGE_CLK_PERIOD \
        BRIDGE_UL_FN_REWRITE BRIDGE_DL_FN_REWRITE BRIDGE_DL_FN_LOOKAHEAD
 
@@ -325,7 +338,7 @@ export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
 #   auto              shift dynamic, wall-clock aligned (recommended)
 #   shift=N,sleep=on  fixed shift (1<<N instr ≈ 1ns), explicit sleep
 #   off               disable (legacy default-clock mode)
-CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"  # default auto = stability (CLAUDE.md Stability config)
 export CALYPSO_ICOUNT
 
 # ---- MTTCG mode (Phase C : multi-thread TCG, ARM en thread distinct
@@ -455,6 +468,12 @@ else
     QEMU_GDB_FLAG=""
 fi
 
+# Override délibéré : pour le child QEMU seulement, L1CTL_SOCK pointe vers
+# le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c crée son socket à
+# cette adresse-poubelle (= L1CTL QEMU désactivé). Le VRAI socket L1CTL
+# /tmp/osmocom_l2 est créé plus tard par osmocon (L541 : -s $L1CTL_SOCK,
+# où L1CTL_SOCK garde sa valeur d'origine = /tmp/osmocom_l2). Hors de
+# cette ligne, $L1CTL_SOCK reste = /tmp/osmocom_l2 partout dans run.sh.
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M calypso -cpu arm946 \
     $QEMU_ICOUNT_FLAG \
@@ -581,7 +600,25 @@ fi
 # Sync barrier inline dans la cmd tmux : attendre que la socket l1ctl existe
 # (créée par osmocon après son handshake romload avec le firmware) avant de
 # lancer mobile. Évite le `sleep 3` arbitraire et le 51s spread observé.
-L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done'
+#
+# Crée aussi le symlink ${L1CTL_SOCK}_1 → ${L1CTL_SOCK} : le mobile
+# (instance 1, "ms 1" dans mobile_group1.cfg → layer2-socket
+# /tmp/osmocom_l2_1) cherche le path avec suffixe _1, alors qu'osmocon
+# crée /tmp/osmocom_l2 (sans suffixe). Sans ce symlink, layer2_open()
+# crash → parse cfg fatal → mobile sort, et osmocon stagne dans poll()
+# en émettant des LOST N! sans pipeline L1CTL.
+# La cleanup ligne 428 fait `rm -f /tmp/osmocom_l2_*` donc safe ici.
+#
+# Limitation : couvre uniquement "ms 1". Pour multi-instance (ms 2, etc.)
+# il faudrait N symlinks. Pas d'enjeu actuel (cfg utilise ms 1 only).
+#
+# Trou connu — SAP socket non câblé : mobile_group1.cfg:36 a aussi
+# `sap-socket /tmp/osmocom_sap_1`. Aucun producteur ne crée
+# /tmp/osmocom_sap dans cette stack. Si SAP s'active un jour (SIM
+# emulation via SAP au lieu de natif), il faut d'abord ajouter un
+# producteur (mocksapd ou QEMU module), PUIS un symlink _1. Ajouter
+# juste un `ln -sf` sans producteur = faux positif de couverture.
+L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; [ -S '"$L1CTL_SOCK"' ] && ln -sf '"$L1CTL_SOCK"' '"$L1CTL_SOCK"'_1'
 tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
 case "$CALYPSO_L2_CLIENT" in
     mobile)
@@ -692,7 +729,11 @@ echo "ENV summary:"
 echo "  CALYPSO_DSP_ROM             = $CALYPSO_DSP_ROM"
 echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
-echo "  CALYPSO_FBSB_SYNTH          = $CALYPSO_FBSB_SYNTH"
+echo "  CALYPSO_FBSB_SYNTH          = $CALYPSO_FBSB_SYNTH        (0=real DSP path, 1=HACK synth FB/SB)"
+echo "  CALYPSO_PM_INJECT           = $CALYPSO_PM_INJECT        (0=real PM scan, !=0=HACK inject value)"
+echo "  CALYPSO_DSP_FBDET_SKIP      = $CALYPSO_DSP_FBDET_SKIP        (0=run FB-det handler, 1=HACK skip)"
+echo "  CALYPSO_DSP_FORCE_DARAM62   = $CALYPSO_DSP_FORCE_DARAM62        (0=normal, 1=HACK force daram[0x62]=1)"
+echo "  CALYPSO_PROBE_BOOTSTUB      = $CALYPSO_PROBE_BOOTSTUB        (0=normal, 1=HACK probe-inject bootstub)"
 echo "  CALYPSO_W1C_LATCH           = $CALYPSO_W1C_LATCH"
 echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x023a — pinned 2026-05-07)}"
 echo "  CALYPSO_RACH_FORCE_BSIC     = ${CALYPSO_RACH_FORCE_BSIC:-(unset = use d_rach byte)}"
