@@ -234,12 +234,24 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * Fix : lire depuis dsp->data[] qui est la source de vérité (DSP writes
      * via opcode + ARM writes mirrorés par calypso_dsp_write).
      * Fallback sur dsp_ram[] si s->dsp pas encore alloué (pre-realize). */
-    uint16_t *src = (s->dsp && s->dsp->data)
-                    ? &s->dsp->data[offset/2 + 0x0800]
-                    : &s->dsp_ram[offset/2];
-    uint64_t val = (size == 2) ? src[0] :
-                   (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
-                   ((uint8_t *)src)[offset & 1];
+    /* Sous lock daram_lock pour la lecture cohérente vs DSP-thread writes.
+     * src est un pointeur DANS dsp->data[] ; on copie la valeur sous lock
+     * puis on relâche avant le reste de la logique pour minimiser la
+     * section critique. */
+    uint64_t val;
+    if (s->dsp && s->dsp->data) {
+        calypso_pcb_daram_lock_acquire();
+        uint16_t *src = &s->dsp->data[offset/2 + 0x0800];
+        val = (size == 2) ? src[0] :
+              (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
+              ((uint8_t *)src)[offset & 1];
+        calypso_pcb_daram_lock_release();
+    } else {
+        uint16_t *src = &s->dsp_ram[offset/2];
+        val = (size == 2) ? src[0] :
+              (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
+              ((uint8_t *)src)[offset & 1];
+    }
     /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
@@ -350,12 +362,14 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * MVPD-copied) value via prog_fetch. */
     if (s->dsp) {
         uint16_t dsp_word = offset/2 + 0x0800;
+        calypso_pcb_daram_lock_acquire();
         if (size == 2) {
             s->dsp->data[dsp_word] = (uint16_t)value;
         } else if (size == 4) {
             s->dsp->data[dsp_word]     = (uint16_t)value;
             s->dsp->data[dsp_word + 1] = (uint16_t)(value >> 16);
         }
+        calypso_pcb_daram_lock_release();
         /* size==1 byte: skip — sub-word writes to DSP data are unusual
          * and would need careful endianness handling; falls back to the
          * dsp_ram-only path which is fine for the sub-word case. */
@@ -540,6 +554,12 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 /* MTTCG race fix : lock api_ram pendant écriture pour éviter
                  * que ARM vCPU thread lise un état intermédiaire. Sans lock,
                  * observé 2/46 fires vus par firmware (4% hit rate). */
+                /* Lock ordre canonique : daram_lock < api_ram_lock (cf
+                 * pcb.h L46-48). On écrit à la fois dans dsp->data[] (DSP
+                 * DARAM, guarded by daram_lock) ET dans api_ram[] (alias
+                 * ARM-side dsp_ram, guarded by api_ram_lock). Section
+                 * critique unique. */
+                calypso_pcb_daram_lock_acquire();
                 qemu_mutex_lock(&calypso_pcb_api_ram_lock);
                 /* Write a_pm[0..2] aux DEUX layouts (DSP<33 ET DSP≥33)
                  * sur les DEUX read pages (firmware swap page chaque frame).
@@ -579,6 +599,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                         s->dsp->data[i] = pm_val;
                 }
                 qemu_mutex_unlock(&calypso_pcb_api_ram_lock);
+                calypso_pcb_daram_lock_release();
                 if (pm_log++ < 20 || (pm_log % 200) == 0) {
                     TRX_LOG("PM emul : a_pm[0..2] = %u (~%d dBm) task=%u fn=%u #%u",
                             pm_val, -138 + pm_val/8, (unsigned)value,
@@ -649,12 +670,18 @@ static void calypso_dsp_done(void *opaque) {
                         task_d, task_u, task_md, page, s->fn);
         }
 
+        /* Ordre canonique daram < api_ram. Section critique unique pour
+         * la mirror DMA write page → DSP DARAM. */
+        calypso_pcb_daram_lock_acquire();
+        qemu_mutex_lock(&calypso_pcb_api_ram_lock);
         s->dsp->data[0x0584] = s->dsp_ram[0x01A8/2];
         s->dsp->data[0x0585] = s->fn & 0xFFFF;
         for (int i = 0; i < 20; i++)
             s->dsp->data[0x0586 + i] = wp[i];
         if (s->dsp->api_ram)
             s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
+        qemu_mutex_unlock(&calypso_pcb_api_ram_lock);
+        calypso_pcb_daram_lock_release();
     }
 
     /* Execute TPU RAM micro-instructions (TSP bus commands).

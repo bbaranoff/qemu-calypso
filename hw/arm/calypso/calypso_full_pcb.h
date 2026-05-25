@@ -113,4 +113,38 @@ void *calypso_pcb_tpu_thread(void *arg);
 void *calypso_pcb_sim_thread(void *arg);
 void *calypso_pcb_iota_thread(void *arg);
 
+/* === DARAM access helpers (cross-thread safety) =========================
+ *
+ * Wrappers pour les sites hors c54x.c qui lisent/écrivent dsp->data[] —
+ * BSP IQ burst writes, TRX/FBSB API RAM mailbox mirror, etc.
+ *
+ * Avant 2026-05-25 : ces sites accédaient dsp->data[] direct sans lock.
+ * En single-thread (no PCB DSP thread) c'est OK — pas de racer. Mais dès
+ * qu'on active calypso_pcb_dsp_thread (qui boucle c54x_run en pthread
+ * indépendant), DSP-side reads/writes (déjà locked par data_read/write
+ * dans calypso_c54x.c) racent avec les writes externes non-protégés →
+ * DARAM corruption non-déterministe.
+ *
+ * Usage :
+ *   - Single-access : calypso_dsp_daram_read(dsp, addr) / _write(dsp,a,v)
+ *     → encapsulent lock+access+unlock (impl dans pcb.c)
+ *   - Burst (boucle 100+ iters) : lock externe via les pcb_daram_lock_*
+ *     fonctions, accès direct dsp->data[] entre lock/unlock.
+ *
+ * Performance : qemu_mutex non-contended ~20-30ns. Pour ~300k ops/sec
+ * overall (estimation), overhead < 1% wall. */
+
+/* Burst lock helpers — pour les sections où on accède dsp->data[] en
+ * boucle. Acquire une fois, accès directs entre, release une fois.
+ *
+ * IMPORTANT : pas de return/break dans la section sans release préalable. */
+void calypso_pcb_daram_lock_acquire(void);
+void calypso_pcb_daram_lock_release(void);
+
+/* Single-access helpers — encapsulent lock+access+unlock.
+ * dsp_void = C54xState* (typé void* pour éviter de tirer calypso_c54x.h
+ * dans tous les .c qui includent pcb.h). */
+uint16_t calypso_dsp_daram_read(void *dsp_void, uint16_t addr);
+void     calypso_dsp_daram_write(void *dsp_void, uint16_t addr, uint16_t val);
+
 #endif /* HW_ARM_CALYPSO_FULL_PCB_H */

@@ -13,6 +13,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "calypso_fbsb.h"
+#include "calypso_full_pcb.h"   /* DARAM lock helpers — cf gap #3 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,12 @@
  * Internal: NDB cell access. ndb is the ARM-side dsp_ram[] view
  * (uint16_t *), word-addressed from API base (0x0800 DSP).
  * Address 0x08D4 maps to ndb[(0x08D4 - 0x0800)] = ndb[0x00D4].
+ *
+ * Locking : ndb pointe dans dsp->data[] (cf calypso_fbsb_init appelé
+ * depuis calypso_trx.c). Toute read/write doit prendre daram_lock pour
+ * cohérence cross-thread avec DSP-thread + BSP-thread Phase 2 PCB.
+ * cell_rd/cell_wr encapsulent le lock. Pour les bursts (5 writes a_sch
+ * dans publish_sb_found L295), un lock plus large évite 5 op mutex.
  * ---------------------------------------------------------------- */
 static inline uint16_t *cell(CalypsoFbsb *s, uint16_t dsp_addr)
 {
@@ -32,13 +39,20 @@ static inline uint16_t *cell(CalypsoFbsb *s, uint16_t dsp_addr)
 static inline uint16_t cell_rd(CalypsoFbsb *s, uint16_t dsp_addr)
 {
     uint16_t *p = cell(s, dsp_addr);
-    return p ? *p : 0;
+    if (!p) return 0;
+    calypso_pcb_daram_lock_acquire();
+    uint16_t v = *p;
+    calypso_pcb_daram_lock_release();
+    return v;
 }
 
 static inline void cell_wr(CalypsoFbsb *s, uint16_t dsp_addr, uint16_t v)
 {
     uint16_t *p = cell(s, dsp_addr);
-    if (p) *p = v;
+    if (!p) return;
+    calypso_pcb_daram_lock_acquire();
+    *p = v;
+    calypso_pcb_daram_lock_release();
 }
 
 /* ---------------------------------------------------------------- */
@@ -291,6 +305,7 @@ void calypso_fbsb_publish_sb_found(CalypsoFbsb *s, uint8_t bsic)
     static const uint16_t db_r_word_base[2] = { 0x0028, 0x003C };
     uint32_t sb = ((uint32_t)(bsic & 0x3f)) << 2;
 
+    calypso_pcb_daram_lock_acquire();
     for (int p = 0; p < 2; p++) {
         uint16_t *rp = &s->ndb[db_r_word_base[p]];
         rp[15] = 0;                       /* a_sch[0] — CRC OK (bit 8 cleared) */
@@ -299,6 +314,7 @@ void calypso_fbsb_publish_sb_found(CalypsoFbsb *s, uint8_t bsic)
         rp[18] = (uint16_t)(sb & 0xFFFF); /* a_sch[3] = sb low  */
         rp[19] = (uint16_t)(sb >> 16);    /* a_sch[4] = sb high */
     }
+    calypso_pcb_daram_lock_release();
 
 }
 

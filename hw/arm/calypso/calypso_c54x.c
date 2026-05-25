@@ -638,10 +638,18 @@ static void mvpd_trace_dump_if_due(unsigned insn)
  * exercée avec real data — l'A/B précédent mesurait WR-SITE pré-BSP).
  * Env-gated CALYPSO_CORRELATOR_TRACE=1, zéro coût si OFF.
  *
- * Correlator range : [0x8d00..0x8f80] (FB-det handler PROM0).
+ * Correlator range : [0x8d00..0x9000] (FB-det handler PROM0).
+ *
+ * 2026-05-25 night : range étendu de 0x8F80 → 0x9000. Évidence runtime
+ * (d_fb_det WATCH-READ) montrait des reads à PC=0x8FAC et 0x8FB5 qui
+ * étaient HORS l'ancien filtre → CORR-ENTRY=0 alors que firmware FAIT
+ * des accès dans la zone FB-det. Range élargi pour capturer ces hits.
+ *
  * À l'entrée from-outside : log AR0..7, SP, ST0/1.
  * Pendant exec : log les data_read addr (top N uniques, capped pour
  * éviter explosion log sur runs longs). */
+#define CORR_PC_LO 0x8d00
+#define CORR_PC_HI 0x9000   /* exclusif */
 #define CORR_READ_HIST_MAX 128
 typedef struct { uint16_t addr; uint32_t count; } CorrReadEntry;
 static CorrReadEntry g_corr_read_hist[CORR_READ_HIST_MAX];
@@ -650,6 +658,7 @@ static int         g_corr_trace_enabled = -1; /* -1 uninit, 0 off, 1 on */
 static unsigned    g_corr_entry_count  = 0;
 static unsigned    g_corr_entry_log_cap = 20;
 static uint64_t    g_corr_read_total   = 0;
+static uint16_t    g_corr_last_pc      = 0xFFFF; /* track PC transitions */
 
 static void corr_trace_init_lazy(void)
 {
@@ -657,9 +666,39 @@ static void corr_trace_init_lazy(void)
     const char *e = getenv("CALYPSO_CORRELATOR_TRACE");
     g_corr_trace_enabled = (e && *e == '1') ? 1 : 0;
     if (g_corr_trace_enabled) {
-        fprintf(stderr, "[c54x] CORRELATOR-TRACE enabled, range=[0x8d00..0x8f80] "
+        fprintf(stderr, "[c54x] CORRELATOR-TRACE enabled, range=[0x%04x..0x%04x) "
                         "hist_max=%u entry_log_cap=%u\n",
+                CORR_PC_LO, CORR_PC_HI,
                 CORR_READ_HIST_MAX, g_corr_entry_log_cap);
+    }
+}
+
+/* CORR-ENTRY tracker : appelé au top-of-loop pour chaque insn dispatch.
+ * Détecte transition PC out→in du range FB-det. Log les premières N
+ * entrées avec contexte AR/SP/ST. */
+static void corr_entry_track(uint16_t pc, void *s_void)
+{
+    if (g_corr_trace_enabled <= 0) return;
+    bool was_in  = (g_corr_last_pc >= CORR_PC_LO && g_corr_last_pc < CORR_PC_HI);
+    bool is_in   = (pc >= CORR_PC_LO && pc < CORR_PC_HI);
+    g_corr_last_pc = pc;
+    if (!was_in && is_in) {
+        g_corr_entry_count++;
+        if (g_corr_entry_count <= g_corr_entry_log_cap
+            || (g_corr_entry_count % 100) == 0) {
+            C54xState *s = (C54xState *)s_void;
+            fprintf(stderr,
+                "[c54x] CORR-ENTRY #%u @PC=0x%04x from=0x%04x SP=0x%04x "
+                "ST0=0x%04x ST1=0x%04x AR=[%04x %04x %04x %04x %04x %04x %04x %04x] "
+                "A=%010llx B=%010llx T=%04x\n",
+                g_corr_entry_count, pc, g_corr_last_pc, s->sp,
+                s->st0, s->st1,
+                s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                s->t);
+        }
     }
 }
 
@@ -814,10 +853,11 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr);
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     /* Correlator read tracer (env-gated CALYPSO_CORRELATOR_TRACE=1).
-     * Record addr seulement quand PC ∈ [0x8d00..0x8f80] (FB-det range).
+     * Record addr seulement quand PC ∈ [CORR_PC_LO..CORR_PC_HI) (FB-det range).
+     * Range étendu 2026-05-25 night à 0x8d00..0x9000 (cf comment block au L639).
      * Lazy-init ici plutôt qu'au top-of-loop pour rester centralisé.
      * Coût quand OFF : 1 compare + 1 branch (g_corr_trace_enabled). */
-    if (g_corr_trace_enabled > 0 && s->pc >= 0x8d00 && s->pc < 0x8f80) {
+    if (g_corr_trace_enabled > 0 && s->pc >= CORR_PC_LO && s->pc < CORR_PC_HI) {
         corr_read_record(addr);
     }
     /* MTTCG : protège DARAM access (DSP + ARM-OVLY peuvent racer).
@@ -3786,6 +3826,130 @@ static int c54x_exec_one(C54xState *s)
             s->pc = ra;
             return 0;
         }
+        /* === F2xx dispatch (audit F-class 2026-05-25) =====================
+         *
+         * Per binutils tic54x-opc.c, les ALU masks FCF0/FCFF/FCE0 couvrent
+         * F0xx/F1xx/F2xx/F3xx avec bit 9=SRC bit 8=DST (= convention
+         * binutils stricte). F2xx était le seul gap :
+         *   - F0/F1 → handler legacy L3565 (convention REVERSED bit 8=src,
+         *     gardée pour back-compat ; firmware s'y est calé)
+         *   - F3 → handler dispatch L3966 (binutils convention OK)
+         *   - F2 → fallthrough vers unimpl → 0xf210 tight loop at PC=0xfbd9
+         *
+         * Bug runtime résolu : op=0xf210 op2=0x0008 → `SUB #8,B,A` (next BC
+         * fbe2, ALEQ → wait loop pre-correlator). Confirmed across 3 silicon
+         * ROM dumps (3416, 3606, our local) — cf doc/datasheets/.
+         *
+         * Coverage (binutils strict) :
+         *   - F260-F267 mask FCFF : ALU #lk,16 + MAC
+         *   - F200/F210/F220/F230/F240/F250 mask FCF0 : ADD/SUB/LD/AND/OR/XOR #lk,shift
+         *   - F280-F2FF mask FCE0 : 1-word AND/OR/XOR/SFTL src,shift,dst
+         *
+         * F272/F273/F274 (exact-match RPTBD/BD/CALLD) restent gérés AVANT
+         * (handlers ci-dessus), inchangés. */
+        if (hi8 == 0xF2) {
+            /* F260-F267 : 2-word ALU #lk,16 + MAC #lk (mask FCFF) */
+            if ((op & 0xFCFF) == 0xF060 ||  /* ADD */
+                (op & 0xFCFF) == 0xF061 ||  /* SUB */
+                (op & 0xFCFF) == 0xF062 ||  /* LD  */
+                (op & 0xFCFF) == 0xF063 ||  /* AND */
+                (op & 0xFCFF) == 0xF064 ||  /* OR  */
+                (op & 0xFCFF) == 0xF065 ||  /* XOR */
+                (op & 0xFCFF) == 0xF067) {  /* MAC */
+                op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+                consumed = 2;
+                int sub = op & 0x7;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = src;
+                switch (sub) {
+                case 0x0: result = src + ((int64_t)(int16_t)op2 << 16); break;
+                case 0x1: result = src - ((int64_t)(int16_t)op2 << 16); break;
+                case 0x2: result = ((int64_t)(int16_t)op2 << 16); break;
+                case 0x3: result = src & (((int64_t)op2) << 16); break;
+                case 0x4: result = src | (((int64_t)op2) << 16); break;
+                case 0x5: result = src ^ (((int64_t)op2) << 16); break;
+                case 0x7: {
+                    int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)op2;
+                    if (s->st1 & ST1_FRCT) prod <<= 1;
+                    result = src + prod; break;
+                }
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+            /* F200/F210/F220/F230/F240/F250 : 2-word ALU #lk,shift (mask FCF0) */
+            if ((op & 0xFCF0) == 0xF000 ||  /* ADD */
+                (op & 0xFCF0) == 0xF010 ||  /* SUB  ← 0xF210 hit ici */
+                (op & 0xFCF0) == 0xF020 ||  /* LD   */
+                (op & 0xFCF0) == 0xF030 ||  /* AND  */
+                (op & 0xFCF0) == 0xF040 ||  /* OR   */
+                (op & 0xFCF0) == 0xF050) {  /* XOR  */
+                op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
+                consumed = 2;
+                int subop = (op >> 4) & 0xF;
+                int shift_raw = op & 0xF;
+                int shift = (shift_raw & 0x8) ? (shift_raw - 16) : shift_raw;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t lk_signed = (subop <= 2) ? (int64_t)(int16_t)op2
+                                                 : (int64_t)(uint16_t)op2;
+                int64_t lk_val = (shift >= 0) ? (lk_signed << shift)
+                                              : (lk_signed >> (-shift));
+                int64_t result = src;
+                switch (subop) {
+                case 0x0: result = src + lk_val; break;
+                case 0x1: result = src - lk_val; break;
+                case 0x2: result = lk_val; break;
+                case 0x3: result = src & lk_val; break;
+                case 0x4: result = src | lk_val; break;
+                case 0x5: result = src ^ lk_val; break;
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+            /* F280-F2FF : 1-word shift class (AND/OR/XOR/SFTL src,shift,dst) FCE0 */
+            if ((op & 0xFCE0) == 0xF080 ||  /* AND */
+                (op & 0xFCE0) == 0xF0A0 ||  /* OR  */
+                (op & 0xFCE0) == 0xF0C0 ||  /* XOR */
+                (op & 0xFCE0) == 0xF0E0) {  /* SFTL */
+                int sub = (op >> 5) & 0x7;
+                int src_b = (op >> 9) & 1;
+                int dst_b = (op >> 8) & 1;
+                int shift_raw = op & 0x1F;
+                int shift = (shift_raw & 0x10) ? (shift_raw - 32) : shift_raw;
+                int64_t src = src_b ? s->b : s->a;
+                int64_t result = src;
+                switch (sub) {
+                case 0x4: { int64_t dst_in = dst_b ? s->b : s->a;
+                            int64_t sh = (shift >= 0) ? (dst_in << shift)
+                                                      : (dst_in >> (-shift));
+                            result = src & sh; break; }
+                case 0x5: { int64_t dst_in = dst_b ? s->b : s->a;
+                            int64_t sh = (shift >= 0) ? (dst_in << shift)
+                                                      : (dst_in >> (-shift));
+                            result = src | sh; break; }
+                case 0x6: { int64_t dst_in = dst_b ? s->b : s->a;
+                            int64_t sh = (shift >= 0) ? (dst_in << shift)
+                                                      : (dst_in >> (-shift));
+                            result = src ^ sh; break; }
+                case 0x7: { uint64_t usrc = (uint64_t)src & 0xFFFFFFFFFFULL;
+                            result = (int64_t)((shift >= 0) ? (usrc << shift)
+                                                            : (usrc >> (-shift)));
+                            break; }
+                }
+                if (dst_b) s->b = sext40(result); else s->a = sext40(result);
+                return consumed + s->lk_used;
+            }
+            /* F2xx unmapped — log-once + NOP fallback. Si tu vois ce log,
+             * c'est qu'un bit pattern F2xx n'est pas couvert (audit incomplete). */
+            { static int f2_unm = 0;
+              if (f2_unm++ < 20)
+                  C54_LOG("F2xx unmapped op=0x%04x PC=0x%04x (NOP)", op, s->pc); }
+            return consumed + s->lk_used;
+        }
         /* LMS Xmem, Ymem — Least Mean Square step (1-word dual-operand)
          * Encoding: 1111 001D XXXX YYYY
          * Per SPRU172C: dst += T * Xmem; Ymem += rnd(AH * T); T = Xmem
@@ -3964,16 +4128,27 @@ static int c54x_exec_one(C54xState *s)
          * (0xF3E1 SFTL B,1,B) was directly tied to this bug.
          * See doc/opcodes/0xF3.md for full spec. */
         if (hi8 == 0xF3) {
-            /* F300-F31F: INTR k (preserve existing behavior) */
-            if ((op & 0xFFE0) == 0xF300) {
-                int vec = op & 0x1F;
-                s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 1));
-                s->st1 |= ST1_INTM;
-                uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
-                s->pc = (iptr * 0x80) + vec * 4;
-                return 0;
-            }
+            /* === F300-F31F INTR k REMOVED (2026-05-25 night, audit F-class)
+             *
+             * AUDIT-FINDING : the "INTR k" handler placed at 0xF300-0xF31F
+             * was WRONG. Per binutils tic54x-opc.c L311 :
+             *   { "intr", 1,1,1, 0xF7C0, 0xFFE0, ... }  ← REAL INTR k
+             * INTR k base is 0xF7C0, NOT 0xF300. The F3xx range belongs to
+             * ALU #lk class (per mask 0xFCF0).
+             *
+             * Symptom captured runtime (CALYPSO_AR_TRACE=0x08) :
+             *   PC=0xe9a2 op=0x8913 STLM B,AR3 fires 10243× with B=0 → AR3=0
+             *   The preceding PC=0xe9a0 op=0xf310 was MEANT to be `SUB #5,B,B`
+             *   (= B -= 5) but our wrong INTR handler pushed PC+1 and jumped
+             *   to vec table → SUB never executed → B stayed 0 → AR3=0 →
+             *   BANZ fc54,*AR3- loop infinite at fc50-fc6d → INT3 ISR never
+             *   RETE → INTM=1 forever → IRQ subséquentes pending only.
+             *
+             * Fix : retirer ce handler ; F310 etc. tombent dans la FCF0
+             * dispatch ci-dessous (ADD/SUB/LD/AND/OR/XOR pour F3xx).
+             *
+             * A real INTR k handler should be added at F7Cx if firmware
+             * uses it — TODO. Pas urgent (zero F7Cx hits observed in run). */
 
             /* F360-F367: 2-word with mask FCFF (#lk<<16 variants).
              * Most-specific mask, check first. */
@@ -4007,11 +4182,17 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            /* F330-F35F: 2-word with mask FCF0 (#lk + 4-bit shift).
-             * AND (sub=3), OR (sub=4), XOR (sub=5).
-             * Note: ADD (sub=0) and SUB (sub=1) at F30x/F31x are caught
-             * by INTR handler above (those ranges are INTR semantically). */
-            if ((op & 0xFCF0) == 0xF030 ||  /* AND #lk, SHIFT, src, [dst] */
+            /* F300-F35F: 2-word with mask FCF0 (ALU #lk + 4-bit shift).
+             * ADD (sub=0), SUB (sub=1), LD (sub=2), AND (sub=3), OR (sub=4),
+             * XOR (sub=5).
+             *
+             * 2026-05-25 night : ADD/SUB/LD ADDED here (étaient mis-décodés
+             * par le faux INTR k F300 retiré ci-dessus). Fix smoking-gun
+             * 0xf310 = SUB #lk,B,B au PC=0xe9a0 → B=0 → AR3=0 → loop fc50. */
+            if ((op & 0xFCF0) == 0xF000 ||  /* ADD #lk, SHIFT, src, [dst] */
+                (op & 0xFCF0) == 0xF010 ||  /* SUB ← FIX 0xf310 */
+                (op & 0xFCF0) == 0xF020 ||  /* LD  (binutils mask FEF0, no src) */
+                (op & 0xFCF0) == 0xF030 ||  /* AND */
                 (op & 0xFCF0) == 0xF040 ||  /* OR */
                 (op & 0xFCF0) == 0xF050) {  /* XOR */
                 op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
@@ -4022,14 +4203,25 @@ static int c54x_exec_one(C54xState *s)
                 int src_b = (op >> 9) & 1;
                 int dst_b = (op >> 8) & 1;
                 int64_t src = src_b ? s->b : s->a;
-                int64_t lk_signed = (int16_t)op2;
-                int64_t shifted = (shift >= 0) ? (lk_signed << shift)
-                                               : (lk_signed >> (-shift));
+                /* ADD/SUB/LD : lk signed-extended ; AND/OR/XOR : lk unsigned. */
+                int64_t lk_val;
+                if (subop <= 2) {
+                    int64_t lk_signed = (int64_t)(int16_t)op2;
+                    lk_val = (shift >= 0) ? (lk_signed << shift)
+                                          : (lk_signed >> (-shift));
+                } else {
+                    int64_t lk_unsigned = (int64_t)(uint16_t)op2;
+                    lk_val = (shift >= 0) ? (lk_unsigned << shift)
+                                          : (lk_unsigned >> (-shift));
+                }
                 int64_t result = src;
                 switch (subop) {
-                case 0x3: result = src & shifted; break;  /* AND */
-                case 0x4: result = src | shifted; break;  /* OR  */
-                case 0x5: result = src ^ shifted; break;  /* XOR */
+                case 0x0: result = src + lk_val; break;   /* ADD */
+                case 0x1: result = src - lk_val; break;   /* SUB */
+                case 0x2: result = lk_val; break;         /* LD (src ignored) */
+                case 0x3: result = src & lk_val; break;   /* AND */
+                case 0x4: result = src | lk_val; break;   /* OR  */
+                case 0x5: result = src ^ lk_val; break;   /* XOR */
                 }
                 if (dst_b) s->b = sext40(result); else s->a = sext40(result);
                 return consumed + s->lk_used;
@@ -8419,6 +8611,10 @@ int c54x_run(C54xState *s, int n_insns)
         int consumed;
         uint16_t exec_pc = s->pc;
         uint16_t exec_op = prog_fetch(s, s->pc);
+        /* CORR-ENTRY tracker (env CALYPSO_CORRELATOR_TRACE=1) : capture
+         * transition out→in du range FB-det [0x8d00..0x9000). Cf top of
+         * file pour la lazy-init + l'évidence runtime 2026-05-25 night. */
+        corr_entry_track(s->pc, s);
         consumed = c54x_exec_one(s);
 
         /* Detect SP changes — only log after init (insn > 490M) */
@@ -8891,6 +9087,8 @@ void c54x_reset(C54xState *s)
      * de quel binaire produit le run. */
     C54_LOG("BUILD-IDENT decoder-fixes: F1xx-FIRS-catch=REMOVED "
             "L3609-src-dst=FIXED F-AUDIT-v5=max-min-cmpl-rnd-roltc-fixed "
+            "F2xx-ALU-block=ADDED-2026-05-25-night "
+            "F3xx-INTR-mis-REMOVED-ADD-SUB-LD-ADDED "
             "2026-05-25");
 
 }

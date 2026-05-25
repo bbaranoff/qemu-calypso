@@ -194,21 +194,47 @@ RACH_SLOTS_COMBINED = (
     set(range(24, 31)) | set(range(34, 41)) | set(range(44, 51))
 )
 
-# CLK IND source mode. Two clock domains live on the wire:
-#   - wall-clock (BTS scheduler expects ~235ms intervals at default period)
-#   - qfn (QEMU TDMA tick, ~2× slower than wall in this build)
+# CLK IND mode. Three modes available (BRIDGE_CLK_MODE) :
 #
-#   "0" / unset → CLK IND fn = wall_fn rounded to CLK_IND_PERIOD (default).
-#                 BTS scheduler advances wall-paced. UL bursts must be
-#                 wall-paced too or they land outside the BTS RACH window.
-#   "1"          → CLK IND fn = qfn rounded to CLK_IND_PERIOD. BTS scheduler
-#                 advances qemu-paced (slow). Pair with passthrough UL
-#                 (BRIDGE_UL_FN_REWRITE=0) so UL bursts in qfn match BTS
-#                 scheduler window. Risk: BTS may shutdown on "PC clock
-#                 skew too high" if elapsed_fn between consecutive CLK INDs
-#                 deviates too much from CLK_IND_PERIOD; mitigate by lowering
-#                 BRIDGE_CLK_PERIOD (e.g., 51 → 26).
-CLK_FROM_QEMU = os.environ.get("BRIDGE_CLK_FROM_QEMU", "0") == "1"
+#   "wall"     → CLK IND fn = wall_fn rounded to CLK_IND_PERIOD. Bridge emits
+#                every CLK_IND_WALL_S wall. BTS sees ~217 Hz wall. UL must be
+#                wall-paced.
+#   "hybrid"   → wall-paced EMISSION (~235ms cadence) BUT fn = anchor_qfn +
+#                wall_elapsed × 217 Hz (= fiction silicon-rate). BTS happy
+#                cosmetically. RISK : virtual fn drifts from qfn (~21× ahead
+#                with icount=auto), DSP receives bursts at rate it can't
+#                process. Cause root du blocker FB-det 2026-05-25.
+#   "qfn-pure" → CLK IND emitted ONLY when self.fn (qfn QEMU virtual) has
+#                advanced by CLK_IND_PERIOD frames since last send. No wall
+#                throttle. fn sent = (self.fn // CLK_IND_PERIOD) * PERIOD.
+#                Strict back-pressure : BTS production rate = QEMU consumption
+#                rate. The whole ecosystem (BTS / bridge / DSP) runs at the
+#                QEMU virtual rate (= 10-20 fn/s wall with icount=auto).
+#                CONFIRMED FAIL : BTS shutdown sur "No clock since TRX was
+#                started" / "PC clock skew too high" car wall elapsed entre
+#                CLK INDs est 21× silicon spec. Test : period=1 a aussi fail.
+#   "wall-qfn"  → (NEW 2026-05-25 night2): Replaces fake_trx CLCKGen role
+#                inside bridge. Wall-paced emission (= every CLK_IND_WALL_S
+#                wall, BTS-friendly cadence) BUT fn sent = current qfn
+#                rounded to CLK_IND_PERIOD (NOT a fiction). If qfn lags,
+#                fn stays the same (re-emit with elapsed_fn=0, BTS logs
+#                jitter notice). If qfn caught up, fn jumps. Monotonic ↑
+#                so BTS never rejects backward fn. Compromise : BTS happy
+#                on cadence, fn reflects QEMU virtual reality.
+#
+# Backwards compat :
+#   BRIDGE_CLK_MODE unset + BRIDGE_CLK_FROM_QEMU=0 → "wall"
+#   BRIDGE_CLK_MODE unset + BRIDGE_CLK_FROM_QEMU=1 → "hybrid"
+_clk_mode_env = os.environ.get("BRIDGE_CLK_MODE", "").strip().lower()
+if not _clk_mode_env:
+    _clk_mode_env = "hybrid" if os.environ.get("BRIDGE_CLK_FROM_QEMU", "0") == "1" else "wall"
+if _clk_mode_env not in ("wall", "hybrid", "qfn-pure", "wall-qfn"):
+    print(f"bridge: WARN unknown BRIDGE_CLK_MODE='{_clk_mode_env}', falling back to 'wall'",
+          flush=True)
+    _clk_mode_env = "wall"
+CLK_MODE = _clk_mode_env
+# Legacy boolean (true iff non-wall mode) — preserved for downstream checks
+CLK_FROM_QEMU = (CLK_MODE != "wall")
 
 # UL FN rewrite mode. Three modes:
 #
@@ -360,10 +386,13 @@ class Bridge:
         self._last_clk_fn_sent = None
 
         print(f"bridge: CLK={bts_base} TRXC={bts_base+1} TRXD={bts_base+2} ↔ BSP@6702", flush=True)
-        clk_desc = ('hybrid (wall-paced emit, virtual_fn anchored to qfn)'
-                    if CLK_FROM_QEMU else
-                    'wall_fn (wall-paced 217 Hz)')
-        print(f"bridge: CLK IND source={clk_desc}, "
+        clk_desc = {
+            "wall":     "wall_fn (wall-paced 217 Hz)",
+            "hybrid":   "hybrid (wall-paced emit, virtual_fn anchored to qfn at 217 Hz wall)",
+            "qfn-pure": "qfn-pure (back-pressure : emit only when qfn advances PERIOD frames)",
+            "wall-qfn": "wall-qfn (wall-paced emit + fn=current qfn rounded, monotonic ↑)",
+        }[CLK_MODE]
+        print(f"bridge: CLK IND mode={CLK_MODE} ({clk_desc}), "
               f"period={CLK_IND_PERIOD} frames", flush=True)
         ul_desc = {
             "slot": "slot-aware (next RACH slot ≥ wall_fn — combined CCCH+SDCCH8)",
@@ -503,42 +532,87 @@ class Bridge:
             self.stats["clk"] += 1
             self._last_clk_fn_sent = clk_fn
             if self.stats["clk"] <= 5 or (self.stats["clk"] % 200) == 0:
-                src = "hybrid" if CLK_FROM_QEMU else "wall_fn"
-                print(f"bridge: CLK IND #{self.stats['clk']} fn={clk_fn} ({src})",
+                print(f"bridge: CLK IND #{self.stats['clk']} fn={clk_fn} (mode={CLK_MODE})",
                       flush=True)
         except OSError:
             pass
 
     def maybe_send_clk(self):
-        """CLK IND scheduler. Three modes:
+        """CLK IND scheduler. Three modes (selected via BRIDGE_CLK_MODE) :
 
-        wall-paced (default, CLK_FROM_QEMU=False)
+        wall (default, BRIDGE_CLK_FROM_QEMU=0 backward-compat)
           Send every CLK_IND_WALL_S seconds with clk_fn = wall_fn rounded
           to CLK_IND_PERIOD. BTS sees consistent ~235ms intervals.
 
-        qfn-paced (CLK_FROM_QEMU=True, legacy "1")
-          [deprecated when QEMU slow] Send each time qfn has advanced by
-          CLK_IND_PERIOD since last send. clk_fn = qfn rounded down. BTS
-          dies via clock-skew shutdown when QEMU rate << 217 Hz wall.
-          Kept only as discriminant / for fast emulator builds.
-
-        hybrid (CLK_FROM_QEMU=True, default since 2026-05-23)
+        hybrid (BRIDGE_CLK_FROM_QEMU=1 backward-compat, default since 2026-05-23)
           Wall-paced emission (BTS-friendly cadence) BUT clk_fn = virtual
           fn that ticks at 217 Hz wall rate, anchored to actual qfn at
           startup. BTS sees consistent ~235ms intervals AND fn rate
           matching its scheduler expectation. The slot-aware UL/DL FN
           rewrite still uses self.fn (qfn) for slot alignment, so DSP-side
           path is unaffected. Trade-off: virtual fn drifts from qfn as run
-          progresses (QEMU lag accumulates), but bursts are slot-rewritten
-          to match the virtual fn domain via existing logic.
+          progresses (QEMU lag accumulates), DSP receives bursts at rate
+          it can't process. Cause root du blocker FB-det 2026-05-25.
+
+        qfn-pure (NEW 2026-05-25 night)
+          Strict back-pressure. Send each time qfn (= self.fn) has advanced
+          by CLK_IND_PERIOD frames since last send. clk_fn = qfn rounded
+          down. The whole ecosystem (BTS / bridge / DSP) runs at the QEMU
+          virtual rate — no fiction, no drift by construction. BTS may
+          shutdown on "clock skew too high" because wall elapsed between
+          CLK INDs is ~21× the silicon spec (with icount=auto). Mitigate
+          via smaller CLK_IND_PERIOD (5..26) to send more frequent INDs.
         """
         if not self.powered:
             return
 
         now = time.monotonic()
 
-        if CLK_FROM_QEMU:
-            # Hybrid mode : wall-paced emit + qfn-anchored virtual fn
+        if CLK_MODE == "qfn-pure":
+            # Back-pressure : emit only when qfn has crossed a new PERIOD
+            # boundary. No wall throttle — emission rate = qfn advance rate.
+            target = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+            if self._last_clk_fn_sent is not None and target == self._last_clk_fn_sent:
+                return
+            # Skip the initial "send last_clk_fn_sent=None" branch : self.fn
+            # may be 0 at startup, send fn=0 to bootstrap BTS state.
+            self._send_clk_ind(target)
+            return
+
+        if CLK_MODE == "wall-qfn":
+            # Replaces fake_trx CLCKGen inside bridge. Wall-paced emission
+            # (BTS-friendly cadence) BUT fn = current qfn (real virtual fn,
+            # NOT a fiction). Monotonic ↑ : never go backward.
+            if not hasattr(self, '_last_clk_wall'):
+                self._last_clk_wall = now - CLK_IND_WALL_S
+            if now - self._last_clk_wall < CLK_IND_WALL_S:
+                return
+            self._last_clk_wall += CLK_IND_WALL_S
+            if now - self._last_clk_wall > CLK_IND_WALL_S * 4:
+                self._last_clk_wall = now
+            # fn = qfn rounded to PERIOD. If qfn hasn't advanced past last
+            # sent value, re-emit same fn (BTS sees elapsed_fn=0, logs
+            # jitter notice but doesn't shutdown unless skew too high).
+            target = (self.fn // CLK_IND_PERIOD) * CLK_IND_PERIOD
+            if self._last_clk_fn_sent is not None:
+                # Handle GSM_HYPERFRAME wrap : if delta to last is negative
+                # but huge (≈ HYPERFRAME), it's a legit wrap → accept.
+                # Else, never go backward.
+                hf = 2715648  # GSM_HYPERFRAME
+                delta = (target - self._last_clk_fn_sent) % hf
+                if delta == 0:
+                    # qfn hasn't advanced PERIOD frames since last emit.
+                    # Re-emit same fn — BTS logs jitter but stays up.
+                    target = self._last_clk_fn_sent
+                elif delta > hf // 2:
+                    # target is "behind" last (= qfn went backward, unusual).
+                    # Keep last to avoid BTS rejecting backward fn.
+                    target = self._last_clk_fn_sent
+            self._send_clk_ind(target)
+            return
+
+        if CLK_MODE == "hybrid":
+            # wall-paced emit + qfn-anchored virtual fn (fiction silicon-rate)
             if not hasattr(self, '_hybrid_anchor_qfn'):
                 self._hybrid_anchor_qfn = self.fn
                 self._hybrid_anchor_wall = now
@@ -563,6 +637,7 @@ class Bridge:
             self._send_clk_ind(target)
             return
 
+        # CLK_MODE == "wall"
         if not hasattr(self, '_last_clk_wall'):
             self._last_clk_wall = now - CLK_IND_WALL_S  # force first send
         if now - self._last_clk_wall < CLK_IND_WALL_S:

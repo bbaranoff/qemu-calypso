@@ -38,6 +38,7 @@
 #include "calypso_full_pcb.h"
 
 #include "qemu/main-loop.h"  /* bql_lock / bql_unlock */
+#include "qemu/timer.h"      /* QEMUTimer + QEMU_CLOCK_VIRTUAL */
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
 
@@ -272,6 +273,42 @@ void calypso_pcb_stop_threads(CalypsoPcb *pcb)
     PCB_LOG("all threads joined");
 }
 
+/* === DARAM cross-thread helpers ==========================================
+ *
+ * Voir pcb.h pour la motivation. Ces fonctions encapsulent le mutex
+ * daram_lock pour les sites hors calypso_c54x.c (qui a son propre wrapper
+ * via data_read/data_write). */
+
+/* Accès direct via le vrai type C54xState (data[] indexable). */
+#include "calypso_c54x.h"
+
+uint16_t calypso_dsp_daram_read(void *dsp_void, uint16_t addr)
+{
+    C54xState *dsp = (C54xState *)dsp_void;
+    qemu_mutex_lock(&calypso_pcb_daram_lock);
+    uint16_t v = dsp->data[addr];
+    qemu_mutex_unlock(&calypso_pcb_daram_lock);
+    return v;
+}
+
+void calypso_dsp_daram_write(void *dsp_void, uint16_t addr, uint16_t val)
+{
+    C54xState *dsp = (C54xState *)dsp_void;
+    qemu_mutex_lock(&calypso_pcb_daram_lock);
+    dsp->data[addr] = val;
+    qemu_mutex_unlock(&calypso_pcb_daram_lock);
+}
+
+void calypso_pcb_daram_lock_acquire(void)
+{
+    qemu_mutex_lock(&calypso_pcb_daram_lock);
+}
+
+void calypso_pcb_daram_lock_release(void)
+{
+    qemu_mutex_unlock(&calypso_pcb_daram_lock);
+}
+
 /* === IRQ helpers ========================================================= */
 void calypso_pcb_raise_irq(CalypsoPcb *pcb, int irq_nr)
 {
@@ -339,40 +376,90 @@ void *calypso_pcb_tpu_thread(void *arg)  { return thread_stub(arg, "cal-tpu");  
 #define PCB_TICK_KICK_US    5000    /* 5 ms wall = rxDoneFlag refresh */
 #define PCB_TICK_FRAME_IRQ_US 1000  /* 1 ms = frame_irq lower re-arm */
 
-static void *pcb_tick_loop(CalypsoPcb *pcb, const char *name,
-                           unsigned period_us, void (*invoke)(void))
+/* Tick threads v2 (2026-05-25) — DÉTERMINISTES virtual-clock paced.
+ *
+ * Problème du v1 (g_usleep wall) : ticks fire en wall-clock, l'ordre vs
+ * TCG slices dépendait du host scheduler → trajectoires firmware
+ * différentes selon le run → IMR-W *ZERO* divergent (380k events run A,
+ * 0 events run B avec même build/firmware).
+ *
+ * Fix v2 : un QEMUTimer (QEMU_CLOCK_VIRTUAL) côté TCG main thread arme
+ * le tick à un instant virtual-clock. Son callback (sous BQL) signale
+ * la condvar du pthread tick. Le pthread fait l'invoke() sous BQL.
+ *
+ * Limite assumée : sous TCG single-thread + BQL, le pthread ne gagne pas
+ * en parallélisme (BQL serialize). Le gain est uniquement la
+ * **déterminisme** d'ordre vs ARM TCG. Vrai speedup viendra Phase 2
+ * (DSP thread + barrière TDMA). */
+
+typedef struct {
+    CalypsoPcb *pcb;
+    const char *name;
+    void      (*invoke)(void);
+    unsigned    period_us;
+    QEMUTimer  *timer;        /* virtual-clock timer; armed in TCG main */
+    QemuMutex   mu;
+    QemuCond    cond;
+    bool        pending;      /* set by timer cb, cleared by pthread */
+} PcbTickCtx;
+
+static PcbTickCtx pcb_tick_ctx[4];
+
+static void pcb_tick_timer_cb(void *opaque)
 {
-    PCB_LOG("tick thread %s : start (period=%uµs)", name, period_us);
-    while (!qatomic_read(&pcb->stop)) {
-        g_usleep(period_us);
-        bql_lock();
-        invoke();
-        bql_unlock();
-    }
-    PCB_LOG("tick thread %s : exit", name);
-    return NULL;
+    PcbTickCtx *t = opaque;
+    qemu_mutex_lock(&t->mu);
+    t->pending = true;
+    qemu_cond_signal(&t->cond);
+    qemu_mutex_unlock(&t->mu);
+    /* Re-arm at next virtual-clock instant. Period en ns. */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod(t->timer, now + (int64_t)t->period_us * 1000);
 }
 
-static void *pcb_tick_tdma_fn(void *arg) {
-    return pcb_tick_loop(arg, "cal-tdma", PCB_TICK_TDMA_US,
-                        calypso_trx_tdma_tick_invoke);
-}
-static void *pcb_tick_tint0_fn(void *arg) {
-    return pcb_tick_loop(arg, "cal-tint0", PCB_TICK_TINT0_US,
-                        calypso_tint0_tick_invoke);
-}
-static void *pcb_tick_kick_fn(void *arg) {
-    return pcb_tick_loop(arg, "cal-kick", PCB_TICK_KICK_US,
-                        calypso_trx_kick_invoke);
-}
-static void *pcb_tick_frame_irq_fn(void *arg) {
-    return pcb_tick_loop(arg, "cal-firq", PCB_TICK_FRAME_IRQ_US,
-                        calypso_trx_frame_irq_lower_invoke);
+static void *pcb_tick_loop_v2(void *arg)
+{
+    PcbTickCtx *t = arg;
+    PCB_LOG("tick thread %s : start (period=%uµs, virtual-clock paced)",
+            t->name, t->period_us);
+    while (!qatomic_read(&t->pcb->stop)) {
+        qemu_mutex_lock(&t->mu);
+        while (!t->pending && !qatomic_read(&t->pcb->stop)) {
+            qemu_cond_wait(&t->cond, &t->mu);
+        }
+        t->pending = false;
+        qemu_mutex_unlock(&t->mu);
+        if (qatomic_read(&t->pcb->stop)) break;
+        bql_lock();
+        t->invoke();
+        bql_unlock();
+    }
+    PCB_LOG("tick thread %s : exit", t->name);
+    return NULL;
 }
 
 /* Spawn handles (statiques car le orchestrateur s'en charge). */
 static QemuThread pcb_tick_threads[4];
 static bool       pcb_tick_threads_running = false;
+
+static void pcb_tick_init_one(int idx, const char *name, unsigned period_us,
+                              void (*invoke)(void), CalypsoPcb *pcb)
+{
+    PcbTickCtx *t = &pcb_tick_ctx[idx];
+    t->pcb       = pcb;
+    t->name      = name;
+    t->invoke    = invoke;
+    t->period_us = period_us;
+    t->pending   = false;
+    qemu_mutex_init(&t->mu);
+    qemu_cond_init(&t->cond);
+    /* Timer must be created in TCG main thread context — calypso_pcb_start_
+     * tick_threads runs from realize/init which IS the main thread. */
+    t->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pcb_tick_timer_cb, t);
+    /* Arm initial fire */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod(t->timer, now + (int64_t)period_us * 1000);
+}
 
 void calypso_pcb_start_tick_threads(CalypsoPcb *pcb)
 {
@@ -382,17 +469,27 @@ void calypso_pcb_start_tick_threads(CalypsoPcb *pcb)
         PCB_LOG("tick threads disabled (CALYPSO_PCB_TICK_THREADS!=1)");
         return;
     }
+    /* Init ctx + arm virtual-clock timers BEFORE spawning pthreads, so the
+     * first signal can't race with thread startup. */
+    pcb_tick_init_one(0, "cal-tdma",  PCB_TICK_TDMA_US,
+                      calypso_trx_tdma_tick_invoke,        pcb);
+    pcb_tick_init_one(1, "cal-tint0", PCB_TICK_TINT0_US,
+                      calypso_tint0_tick_invoke,           pcb);
+    pcb_tick_init_one(2, "cal-kick",  PCB_TICK_KICK_US,
+                      calypso_trx_kick_invoke,             pcb);
+    pcb_tick_init_one(3, "cal-firq",  PCB_TICK_FRAME_IRQ_US,
+                      calypso_trx_frame_irq_lower_invoke,  pcb);
     qemu_thread_create(&pcb_tick_threads[0], "cal-tdma",
-                       pcb_tick_tdma_fn, pcb, QEMU_THREAD_JOINABLE);
+                       pcb_tick_loop_v2, &pcb_tick_ctx[0], QEMU_THREAD_JOINABLE);
     qemu_thread_create(&pcb_tick_threads[1], "cal-tint0",
-                       pcb_tick_tint0_fn, pcb, QEMU_THREAD_JOINABLE);
+                       pcb_tick_loop_v2, &pcb_tick_ctx[1], QEMU_THREAD_JOINABLE);
     qemu_thread_create(&pcb_tick_threads[2], "cal-kick",
-                       pcb_tick_kick_fn, pcb, QEMU_THREAD_JOINABLE);
+                       pcb_tick_loop_v2, &pcb_tick_ctx[2], QEMU_THREAD_JOINABLE);
     qemu_thread_create(&pcb_tick_threads[3], "cal-firq",
-                       pcb_tick_frame_irq_fn, pcb, QEMU_THREAD_JOINABLE);
+                       pcb_tick_loop_v2, &pcb_tick_ctx[3], QEMU_THREAD_JOINABLE);
     pcb_tick_threads_running = true;
-    PCB_LOG("tick threads spawned (tdma + tint0 + kick + frame_irq) — "
-            "ARM TCG main thread liberated from periodic ticks");
+    PCB_LOG("tick threads spawned v2 (virtual-clock paced via QEMUTimer + "
+            "condvar) — déterministe, BQL-serialized");
 }
 
 /* === Plan de split (documentation inline) ================================

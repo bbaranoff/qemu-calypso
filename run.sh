@@ -861,17 +861,45 @@ if command -v git >/dev/null 2>&1 && [ -d "$(dirname "$QEMU_C54X_PATH")/../../..
 fi
 echo "  qemu binary mtime: $(stat -c %y "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | cut -d. -f1)"
 echo "  c54x source mtime: $(stat -c %y "$QEMU_C54X_PATH" 2>/dev/null | cut -d. -f1)"
-# Marqueurs decoder fixes — si la string disparait du binaire, le fix est retiré
-if [ -x "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" ]; then
-    if strings "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | grep -q 'FIRS catch RETIRÉ'; then
-        echo "  decoder-fix F1xx FIRS catch:      ✓ REMOVED (2026-05-25)"
+# Marqueurs decoder fixes — grep des strings réellement dans le binaire
+# (= dans le format string BUILD-IDENT compilé en .rodata, pas dans les
+# commentaires C qui sont strippés). Si la string disparait = fix retiré.
+QEMU_BIN="${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}"
+if [ -x "$QEMU_BIN" ]; then
+    BUILD_IDENT_LINE=$(strings "$QEMU_BIN" 2>/dev/null | grep 'BUILD-IDENT decoder-fixes:' | head -1)
+    if [ -n "$BUILD_IDENT_LINE" ]; then
+        case "$BUILD_IDENT_LINE" in
+            *F1xx-FIRS-catch=REMOVED*)
+                echo "  decoder-fix F1xx FIRS catch:      ✓ REMOVED" ;;
+            *)
+                echo "  decoder-fix F1xx FIRS catch:      ⚠ NOT FOUND in binary" ;;
+        esac
+        case "$BUILD_IDENT_LINE" in
+            *L3609-src-dst=FIXED*)
+                echo "  decoder-fix L3609 src/dst swap:   ✓ APPLIED" ;;
+            *)
+                echo "  decoder-fix L3609 src/dst swap:   ⚠ NOT FOUND in binary" ;;
+        esac
+        case "$BUILD_IDENT_LINE" in
+            *F-AUDIT-v5=max-min-cmpl-rnd-roltc-fixed*)
+                echo "  decoder-fix F-AUDIT v5:           ✓ APPLIED (max/min/cmpl/rnd/roltc)" ;;
+            *)
+                echo "  decoder-fix F-AUDIT v5:           ⚠ NOT FOUND in binary" ;;
+        esac
+        case "$BUILD_IDENT_LINE" in
+            *F2xx-ALU-block=ADDED*)
+                echo "  decoder-fix F2xx ALU block:       ✓ ADDED (binutils-strict bit9=src bit8=dst)" ;;
+            *)
+                echo "  decoder-fix F2xx ALU block:       ⚠ NOT FOUND in binary" ;;
+        esac
+        case "$BUILD_IDENT_LINE" in
+            *F3xx-INTR-mis-REMOVED*)
+                echo "  decoder-fix F3xx INTR mis-decode: ✓ REMOVED (was F300/wrong, real INTR=F7C0)" ;;
+            *)
+                echo "  decoder-fix F3xx INTR mis-decode: ⚠ NOT FOUND in binary" ;;
+        esac
     else
-        echo "  decoder-fix F1xx FIRS catch:      ⚠ NOT FOUND in binary"
-    fi
-    if strings "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | grep -q 'Fix 2026-05-25 v4 : src/dst'; then
-        echo "  decoder-fix L3609 src/dst swap:   ✓ APPLIED (2026-05-25 v4)"
-    else
-        echo "  decoder-fix L3609 src/dst swap:   ⚠ NOT FOUND in binary"
+        echo "  decoder-fix markers:              ⚠ BUILD-IDENT not in binary (= old build)"
     fi
 fi
 echo "=========================="

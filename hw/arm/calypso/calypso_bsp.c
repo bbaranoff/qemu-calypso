@@ -31,6 +31,7 @@
 #include "hw/arm/calypso/calypso_iota.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
+#include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 
 /* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
 
@@ -589,8 +590,13 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         samples[i] = (uint16_t)iq[i];
     c54x_bsp_load(bsp.dsp, samples, n > 148 ? 148 : n);
 
-    /* Also write to DARAM for code that reads samples directly. */
+    /* Also write to DARAM for code that reads samples directly.
+     * Wrap the whole burst write + post-write log in a single DARAM lock
+     * section — sans ça, DSP thread (Phase 2 PCB) racerait avec ce write
+     * et lirait des samples partiellement écrits. Cost = 1 mutex op pour
+     * ~157 itérations ≈ négligeable. */
     static unsigned woff = 0;
+    calypso_pcb_daram_lock_acquire();
     for (int i = 0; i < n; i++) {
         uint16_t a = (uint16_t)(bsp.daram_addr + woff);
         bsp.dsp->data[a] = (uint16_t)iq[i];
@@ -600,21 +606,21 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     }
     bsp.bursts_written++;
 
-    /* Log DARAM content after write for FB bursts */
-    {
-        if (bsp.bursts_written <= 3) {
-            BSP_LOG("DARAM after write [0x%04x]: %d %d %d %d %d %d %d %d",
-                    bsp.daram_addr,
-                    n>0?(int16_t)bsp.dsp->data[bsp.daram_addr]:0,
-                    n>1?(int16_t)bsp.dsp->data[bsp.daram_addr+1]:0,
-                    n>2?(int16_t)bsp.dsp->data[bsp.daram_addr+2]:0,
-                    n>3?(int16_t)bsp.dsp->data[bsp.daram_addr+3]:0,
-                    n>4?(int16_t)bsp.dsp->data[bsp.daram_addr+4]:0,
-                    n>5?(int16_t)bsp.dsp->data[bsp.daram_addr+5]:0,
-                    n>6?(int16_t)bsp.dsp->data[bsp.daram_addr+6]:0,
-                    n>7?(int16_t)bsp.dsp->data[bsp.daram_addr+7]:0);
-        }
+    /* Log DARAM content after write for FB bursts (inside lock so values
+     * read are consistent with what we just wrote). */
+    if (bsp.bursts_written <= 3) {
+        BSP_LOG("DARAM after write [0x%04x]: %d %d %d %d %d %d %d %d",
+                bsp.daram_addr,
+                n>0?(int16_t)bsp.dsp->data[bsp.daram_addr]:0,
+                n>1?(int16_t)bsp.dsp->data[bsp.daram_addr+1]:0,
+                n>2?(int16_t)bsp.dsp->data[bsp.daram_addr+2]:0,
+                n>3?(int16_t)bsp.dsp->data[bsp.daram_addr+3]:0,
+                n>4?(int16_t)bsp.dsp->data[bsp.daram_addr+4]:0,
+                n>5?(int16_t)bsp.dsp->data[bsp.daram_addr+5]:0,
+                n>6?(int16_t)bsp.dsp->data[bsp.daram_addr+6]:0,
+                n>7?(int16_t)bsp.dsp->data[bsp.daram_addr+7]:0);
     }
+    calypso_pcb_daram_lock_release();
     if (bsp.bursts_written <= 5 || (bsp.bursts_written % 1000) == 0) {
         BSP_LOG("DMA fn=%u tn=%u n=%d → DARAM[0x%04x..0x%04x] total=%llu "
                 "iq[0..3]=%d,%d,%d,%d",
@@ -658,6 +664,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
 
         static unsigned woff = 0;
+        calypso_pcb_daram_lock_acquire();
         for (int i = 0; i < n; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);
             bsp.dsp->data[a] = (uint16_t)sl->iq[i];
@@ -665,6 +672,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             woff++;
             if (woff >= bsp.daram_len) woff = 0;
         }
+        calypso_pcb_daram_lock_release();
         bsp.bursts_written++;
         sl->valid = false;  /* consumed */
 
@@ -678,6 +686,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             /* Dump first 8 words written so we can verify the I/Q
              * constellation actually landed in the DSP data memory at
              * daram_addr — independent of any ARM-side mapping. */
+            calypso_pcb_daram_lock_acquire();
             BSP_LOG("DMA @0x%04x: %04x %04x %04x %04x %04x %04x %04x %04x",
                     bsp.daram_addr,
                     bsp.dsp->data[bsp.daram_addr + 0],
@@ -688,6 +697,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                     bsp.dsp->data[bsp.daram_addr + 5],
                     bsp.dsp->data[bsp.daram_addr + 6],
                     bsp.dsp->data[bsp.daram_addr + 7]);
+            calypso_pcb_daram_lock_release();
         }
 
         /* Fire BRINT0 */
@@ -764,11 +774,13 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148])
      * candidate location; if it's all-zero, the DSP encoder did not run
      * for this frame (timing miss or wrong addr) and we drop the burst. */
     bool any = false;
+    calypso_pcb_daram_lock_acquire();
     for (int i = 0; i < 148; i++) {
         uint16_t w = bsp.dsp->data[0x0900 + i];
         bits[i] = (uint8_t)(w & 1);
         if (bits[i]) any = true;
     }
+    calypso_pcb_daram_lock_release();
 
     return any;
 }
@@ -843,7 +855,7 @@ bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
      * API RAM at DSP word 0x0800.. is shared with the ARM-visible page
      * at 0xFFD00000. We address via dsp->data[0x0800 + offset]. */
     uint32_t off = d_rach_word_offset();
-    uint16_t d_rach = bsp.dsp->data[0x0800 + off];
+    uint16_t d_rach = calypso_dsp_daram_read(bsp.dsp, 0x0800 + off);
     if (d_rach == 0) {
         /* Pre-LU : firmware hasn't written d_rach yet. Normal during cell
          * selection / SI decode phase. Don't alarm — just skip silently
