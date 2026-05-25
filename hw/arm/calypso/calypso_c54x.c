@@ -3071,19 +3071,42 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            /* F492/F592: MAX src (mask FEFF, 1 word) — keep max of A,B */
-            if ((op & 0xFEFF) == 0xF492) {
+            /* F486/F586: MAX src (mask FEFF, 1 word) — keep max of A,B
+             * F-AUDIT 2026-05-25 v5 : était à 0xF492 (= roltc per binutils).
+             * binutils tic54x-opc.c : "max" 1,1,1, 0xF486, 0xFEFF
+             * → constant moved from 0xF492 to 0xF486 (impl est correct). */
+            if ((op & 0xFEFF) == 0xF486) {
                 int64_t sa = sext40(s->a), sb = sext40(s->b);
                 if (sa < sb) { s->a = s->b; s->st0 |= ST0_C; }
                 else { s->st0 &= ~ST0_C; }
                 return consumed + s->lk_used;
             }
 
-            /* F493/F593: MIN src (mask FEFF, 1 word) — keep min of A,B */
-            if ((op & 0xFEFF) == 0xF493) {
+            /* F487/F587: MIN src (mask FEFF, 1 word) — keep min of A,B
+             * F-AUDIT 2026-05-25 v5 : était à 0xF493 (= cmpl per binutils).
+             * binutils : "min" 1,1,1, 0xF487, 0xFEFF
+             * → constant moved from 0xF493 to 0xF487. */
+            if ((op & 0xFEFF) == 0xF487) {
                 int64_t sa = sext40(s->a), sb = sext40(s->b);
                 if (sa > sb) { s->a = s->b; s->st0 |= ST0_C; }
                 else { s->st0 &= ~ST0_C; }
+                return consumed + s->lk_used;
+            }
+
+            /* F492/F592: ROLTC src (rotate left through TC, mask FEFF, 1 word)
+             * F-AUDIT 2026-05-25 v5 : NOUVEAU handler. binutils :
+             * "roltc" 1,1,1, 0xF492, 0xFEFF — était mis-décodé en MAX.
+             * Semantic SPRU172C : src bit 31 → TC, src << 1, src bit 0 ← TC_old.
+             * Bug observé pré-fix : A_low devenait 0 systématiquement via le
+             * faux MAX (A=B if A<B) à PC=0x9abf, causant cascade STL→IMR=0. */
+            if ((op & 0xFEFF) == 0xF492) {
+                int src = (op >> 8) & 1;
+                int64_t *acc = src ? &s->b : &s->a;
+                int64_t v = *acc & 0xFFFFFFFFFFLL;
+                int new_tc = (int)((v >> 31) & 1);
+                int old_tc = (s->st0 & ST0_TC) ? 1 : 0;
+                *acc = sext40(((v << 1) | (int64_t)old_tc) & 0xFFFFFFFFFFULL);
+                if (new_tc) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
                 return consumed + s->lk_used;
             }
 
@@ -3153,16 +3176,22 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            /* F486/F586: CMPL src (complement, mask FEFF, 1 word) */
-            if ((op & 0xFEFF) == 0xF486) {
+            /* F493/F593: CMPL src (complement, mask FCFF, 1 word)
+             * F-AUDIT 2026-05-25 v5 : était à 0xF486. binutils :
+             * "cmpl" 1,1,2, 0xF493, 0xFCFF, {OP_SRC,OPT|OP_DST}
+             * → constant moved from 0xF486 to 0xF493. Mask FEFF→FCFF
+             * (= permet variant SRC=B via bit 9). */
+            if ((op & 0xFCFF) == 0xF493) {
                 int src = (op >> 8) & 1;
                 int64_t *acc = src ? &s->b : &s->a;
                 *acc = sext40(~(*acc) & 0xFFFFFFFFFFULL);
                 return consumed + s->lk_used;
             }
 
-            /* F487/F587: RND src (round, mask FEFF, 1 word) */
-            if ((op & 0xFEFF) == 0xF487) {
+            /* F49F/F59F: RND src (round, mask FCFF, 1 word)
+             * F-AUDIT 2026-05-25 v5 : était à 0xF487. binutils :
+             * "rnd" 1,1,2, 0xF49F, 0xFCFF, {OP_SRC,OPT|OP_DST} */
+            if ((op & 0xFCFF) == 0xF49F) {
                 int src = (op >> 8) & 1;
                 int64_t *acc = src ? &s->b : &s->a;
                 *acc = sext40(*acc + 0x8000);
@@ -8844,6 +8873,25 @@ void c54x_reset(C54xState *s)
 
     C54_LOG("Reset: PC=0x%04x PMST=0x%04x SP=0x%04x prog[PC]=0x%04x",
             s->pc, s->pmst, s->sp, s->prog[s->pc]);
+
+    /* Build identity dump (2026-05-25) — permet attribution causale dans
+     * les rapports/bundles. Cf review Claude web : "Le rapport ne peut pas
+     * s'attribuer à un état de code". On dump ici les valeurs reset
+     * silicon-aligned utilisées par CE binaire — si elles changent, le
+     * comportement firmware change. Lecture de qemu.log = identité du build. */
+    C54_LOG("BUILD-IDENT silicon-reset: SP=0x%04x BK=0x%04x IMR=0x%04x "
+            "ST0=0x%04x ST1=0x%04x PMST=0x%04x",
+            s->sp, s->bk, s->imr, s->st0, s->st1, s->pmst);
+    C54_LOG("BUILD-IDENT silicon-AR: AR0=0x%04x AR1=0x%04x AR2=0x%04x AR3=0x%04x "
+            "AR4=0x%04x AR5=0x%04x AR6=0x%04x AR7=0x%04x",
+            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+            s->ar[4], s->ar[5], s->ar[6], s->ar[7]);
+    /* Decoder fix flags : si ces fixes sont retirés du source, ce log
+     * n'apparaîtra plus ou aura un format différent — preuve immédiate
+     * de quel binaire produit le run. */
+    C54_LOG("BUILD-IDENT decoder-fixes: F1xx-FIRS-catch=REMOVED "
+            "L3609-src-dst=FIXED F-AUDIT-v5=max-min-cmpl-rnd-roltc-fixed "
+            "2026-05-25");
 
 }
 

@@ -100,6 +100,11 @@ if [ "$MENU_MODE" = "1" ]; then
             export CALYPSO_PM_INJECT=0
             export CALYPSO_DSP_FORCE_DARAM62=0
             export CALYPSO_PROBE_BOOTSTUB=0
+            # Force icount=auto, MTTCG off pour déterminisme (cf
+            # session 2026-05-25 : data MTTCG non-citable pour claims
+            # d'état firmware. Run.sh:462 force ICOUNT=off si MTTCG=1).
+            export CALYPSO_MTTCG=0
+            export CALYPSO_ICOUNT=auto
             ;;
         2)
             echo "[menu] Profil = hack-free + diag FULL"
@@ -108,6 +113,10 @@ if [ "$MENU_MODE" = "1" ]; then
             export CALYPSO_PM_INJECT=0
             export CALYPSO_DSP_FORCE_DARAM62=0
             export CALYPSO_PROBE_BOOTSTUB=0
+            # Force déterminisme : icount=auto, MTTCG off (cf session
+            # 2026-05-25 : data MTTCG non-citable pour state claims).
+            export CALYPSO_MTTCG=0
+            export CALYPSO_ICOUNT=auto
             export CALYPSO_SP_RING=1
             export CALYPSO_SP_RING_TRIG=bootstub
             export CALYPSO_SP_RING_INSN_MIN=1000000
@@ -838,6 +847,36 @@ tmux new-window -t "$SESSION" -n shell
 
 echo
 echo "Pipeline launched. Attach with: tmux attach -t $SESSION"
+
+# Build identity dump (2026-05-25) — attribution causale dans report.
+# Logged au stdout du wrapper + capture-able dans qemu.log via c54x_reset.
+echo "===== BUILD IDENTITY ====="
+QEMU_C54X_PATH="${QEMU_C54X_PATH:-/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c}"
+if command -v git >/dev/null 2>&1 && [ -d "$(dirname "$QEMU_C54X_PATH")/../../../.git" ]; then
+    cd "$(dirname "$QEMU_C54X_PATH")/../../.." 2>/dev/null && {
+        echo "  git rev:         $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        echo "  git status:      $(git diff --stat 2>/dev/null | tail -1 || echo unknown)"
+        cd - >/dev/null
+    }
+fi
+echo "  qemu binary mtime: $(stat -c %y "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | cut -d. -f1)"
+echo "  c54x source mtime: $(stat -c %y "$QEMU_C54X_PATH" 2>/dev/null | cut -d. -f1)"
+# Marqueurs decoder fixes — si la string disparait du binaire, le fix est retiré
+if [ -x "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" ]; then
+    if strings "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | grep -q 'FIRS catch RETIRÉ'; then
+        echo "  decoder-fix F1xx FIRS catch:      ✓ REMOVED (2026-05-25)"
+    else
+        echo "  decoder-fix F1xx FIRS catch:      ⚠ NOT FOUND in binary"
+    fi
+    if strings "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | grep -q 'Fix 2026-05-25 v4 : src/dst'; then
+        echo "  decoder-fix L3609 src/dst swap:   ✓ APPLIED (2026-05-25 v4)"
+    else
+        echo "  decoder-fix L3609 src/dst swap:   ⚠ NOT FOUND in binary"
+    fi
+fi
+echo "=========================="
+echo
+
 echo "ENV summary:"
 echo "  CALYPSO_DSP_ROM             = $CALYPSO_DSP_ROM"
 echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
@@ -855,6 +894,7 @@ echo "  BRIDGE_UL_FN_REWRITE        = $BRIDGE_UL_FN_REWRITE  (slot=next RACH slo
 echo "  BRIDGE_DL_FN_REWRITE        = $BRIDGE_DL_FN_REWRITE  (slot=qfn matching bts_fn%51, naive=current qfn, off=passthrough — BSP rejects all)"
 echo "  BRIDGE_DL_FN_LOOKAHEAD      = $BRIDGE_DL_FN_LOOKAHEAD  (max qfn-future frames before drop, BSP window=64)"
 echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
+echo "  CALYPSO_MTTCG               = ${CALYPSO_MTTCG:-0}  $([ "${CALYPSO_MTTCG:-0}" = "1" ] && echo '⚠️ NON-DÉTERMINISTE — données non-citables pour state claims (cf session 2026-05-25)' || echo '(icount-deterministic ✓)')"
 echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick → qemu.log, 0=silent)"
 echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
