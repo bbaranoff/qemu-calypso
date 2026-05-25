@@ -236,6 +236,39 @@ CLK_MODE = _clk_mode_env
 # Legacy boolean (true iff non-wall mode) — preserved for downstream checks
 CLK_FROM_QEMU = (CLK_MODE != "wall")
 
+# === BURST SOURCE — 2026-05-25 night (c web reframe) ====================
+#
+# "bts" (default) : DL bursts come from osmo-bts-trx via TRXD socket. Pipeline
+#                   complet mais BTS watchdog peut shutdown si CPU starved.
+# "internal"      : Bridge inject TRXDv0 packets via _handle_dl() (= EXACT
+#                   même path de conversion soft-bits→GMSK IQ que BTS).
+#                   Bypass complet osmo-bts → 0 watchdog BTS → run stable.
+#                   Cadence = qfn-gated. Scheduler 51-multiframe per-frame
+#                   ready pour FCCH/SCH/BCCH (BRIDGE_BURST_PATTERN choice).
+#                   Permet de prouver le milestone DSP-lock en isolation :
+#                   FB arrive au bon qfn → DSP corrèle → rxDoneFlag set →
+#                   CONF émis. Si ça marche, B est prouvé sans dépendre du
+#                   pacing BTS. Rebrancher BTS = plumbing optionnel après.
+BURST_SOURCE = os.environ.get("BRIDGE_BURST_SOURCE", "bts").strip().lower()
+if BURST_SOURCE not in ("bts", "internal"):
+    print(f"bridge: WARN unknown BRIDGE_BURST_SOURCE='{BURST_SOURCE}', falling back to 'bts'",
+          flush=True)
+    BURST_SOURCE = "bts"
+
+# BRIDGE_BURST_PATTERN (only when BURST_SOURCE=internal) :
+#   "fcch" (default) : 148 bits all-zero → après GMSK = tone pur +π/2/symbole
+#                      = signature FCCH spec (= +fs/4 = +67.7 kHz à fs=270.83 kHz).
+#                      C'est ce que le DSP correlator cherche pour lock.
+#   "empty"          : 148 bits identical to a no-signal pattern. Sanity check :
+#                      avec ce pattern, DSP doit PAS lock. Si lock, c'est un
+#                      faux positif d'un autre path → bridge feeder pas le
+#                      vrai déclencheur (= c web reframe control).
+BURST_PATTERN = os.environ.get("BRIDGE_BURST_PATTERN", "fcch").strip().lower()
+if BURST_PATTERN not in ("fcch", "empty"):
+    print(f"bridge: WARN unknown BRIDGE_BURST_PATTERN='{BURST_PATTERN}', falling back to 'fcch'",
+          flush=True)
+    BURST_PATTERN = "fcch"
+
 # UL FN rewrite mode. Three modes:
 #
 #   "1" / "slot" / unset (default)
@@ -524,6 +557,116 @@ class Bridge:
                   f"dl_rewrite={dl_rw} dl_drop={dl_dr} "
                   f"wall_fn={wfn} qfn={self.fn}",
                   flush=True)
+
+    def _burst_gen_loop(self):
+        """FIX B 2026-05-25 night (c web reframe v2) : internal burst feeder.
+
+        REFAC c web :
+          - Ne synthétise PAS l'IQ ici (risque offset/sample-rate/format faux).
+          - Construit un TRXDv0 packet AS IF from BTS, l'inject via _handle_dl()
+            → réutilise EXACTEMENT la conversion soft-bits→GMSK IQ du path BTS.
+          - Bit-exact identique au pipeline qui faisait fire FBSB_CONF (FAIL).
+          - Structure per-frame scheduler : prête pour FCCH+SCH+BCCH étapes
+            suivantes. Pour l'instant FCCH seul.
+
+        Multiframe-51 schedule (per TS 45.002, TN=0 CCCH/SDCCH8 combined) :
+          FN%51 ∈ {0, 10, 20, 30, 40}      → FCCH (148 bits all-zero)
+          FN%51 ∈ {1, 11, 21, 31, 41}      → SCH  (TODO future étape)
+          FN%51 ∈ {50}                     → idle frame (skip — pas FCCH)
+          FN%51 autres                     → BCCH/CCCH (TODO future étape)
+
+        Cadence qfn-gated : 1 burst émis par avance qfn (= back-pressure
+        native = DSP processe à son rythme, bridge feed au même rythme).
+        """
+        # FCCH = tone pur (= 148 bits zéro après GMSK = rotation +π/2/symbole)
+        FCCH_SLOTS = frozenset((0, 10, 20, 30, 40))
+        if BURST_PATTERN == "empty":
+            # Sanity check c web : pattern qui doit PAS faire lock le DSP.
+            # 0xFF = soft value max = bit 1 → 148 bits all-one → rotation
+            # constante NÉGATIVE (= -π/2/symbole = -fs/4 = -67.7 kHz).
+            # Si le DSP lock là-dessus, le burst feeder n'est pas le vrai
+            # déclencheur → faux positif (= autre path déclenche).
+            FCCH_BITS = bytes([0xFF] * 148)
+        else:  # "fcch"
+            FCCH_BITS = bytes(148)  # all 0x00 → bit 0 → FCCH spec
+
+        last_emitted_fn = -1
+        emitted_count = 0
+        # Use sentinel internal addr (= not from BTS) to avoid pollution
+        # of self.trxd_remote in _handle_dl (which caches caller addr).
+        internal_addr = ("internal-feeder", 0)
+
+        while not self._stop:
+            time.sleep(0.001)  # poll qfn at 1ms wall
+            if self._stop:
+                return
+            qfn = self.fn
+            if qfn == last_emitted_fn or qfn == 0:
+                continue
+            slot = qfn % 51
+            # Per-frame scheduler : décide content selon slot.
+            if slot in FCCH_SLOTS:
+                content_bits = FCCH_BITS
+                content_tag = "FCCH"
+            else:
+                # SCH / BCCH / idle — pas encore implémenté. Skip ce frame.
+                last_emitted_fn = qfn
+                continue
+
+            # Construct TRXDv0 DL packet AS IF from BTS (8 B header + 148 soft bits).
+            #   [0]    TN
+            #   [1:5]  FN (big-endian)
+            #   [5]    RSSI / format (0 = no extra info)
+            #   [6:8]  reserved
+            #   [8:156] 148 soft bits (1 byte per bit)
+            tn = 0
+            hdr = bytes([tn]) + qfn.to_bytes(4, 'big') + bytes(3)
+            trxd_packet = hdr + content_bits
+
+            # Inject via the EXACT same path BTS would use. _handle_dl reads
+            # the TRXDv0 packet, applies slot-rewrite (no-op here since bts_fn
+            # already = qfn), converts soft-bits→GMSK IQ, sends to BSP UDP.
+            try:
+                self._handle_dl(trxd_packet, internal_addr)
+                emitted_count += 1
+                if emitted_count <= 10 or (emitted_count % 50) == 0:
+                    print(f"bridge: INTERNAL {content_tag} #{emitted_count} "
+                          f"TN={tn} qfn={qfn} (slot={slot}/51) pattern={BURST_PATTERN}",
+                          flush=True)
+            except Exception as e:
+                print(f"bridge: internal feeder error: {e}", flush=True)
+            last_emitted_fn = qfn
+
+    def _clk_loop(self):
+        """FIX A 2026-05-25 night : thread dédié pour CLK_IND emission.
+        Sortir de la main loop (qui bloquait quand handle_trxd() traitait
+        un burst-burst) garantit cadence wall stricte → BTS internal timer
+        toujours nourri → pas de shutdown sur skew.
+
+        Deadline-absolu (= next += period) pour ne pas dériver cumulativement.
+        Tick rate = 1ms wall (= poll fréquent), maybe_send_clk() applique son
+        propre throttle interne (wall_paced ou qfn-pure selon CLK_MODE)."""
+        # Poll period 1ms wall → maybe_send_clk vérifie son gating interne
+        # (wall throttle pour modes wall/hybrid/wall-qfn ; qfn-advance check
+        # pour mode qfn-pure). On NE veut PAS dormir 235ms entre appels
+        # parce que (a) qfn-pure pourrait avoir besoin d'émettre plus tôt
+        # si qfn saute par bonds, (b) la latence d'émission après deadline
+        # doit rester < 1ms pour low jitter BTS.
+        poll_period_s = 0.001
+        next_t = time.monotonic()
+        while not self._stop:
+            now = time.monotonic()
+            if next_t > now:
+                time.sleep(min(next_t - now, 0.01))
+            else:
+                next_t = now  # don't burst-catchup
+            next_t += poll_period_s
+            if self._stop:
+                return
+            try:
+                self.maybe_send_clk()
+            except Exception as e:
+                print(f"bridge: clk thread error: {e}", flush=True)
 
     def _send_clk_ind(self, clk_fn):
         try:
@@ -917,8 +1060,17 @@ class Bridge:
         #   _tick_thread   : qemu_clk_sock (CLK ticks QEMU → telemetry)
         #   _trxc_thread   : trxc_sock (BTS POWERON/RXTUNE control plane)
         #   _stats_thread  : print stats périodiques (5s)
-        # Main loop = SEULEMENT trxd_sock (burst DL/UL = critical path)
-        #             + maybe_send_clk (CLK IND vers BTS, low jitter requis).
+        #
+        # FIX A 2026-05-25 night : 4ème thread dédié _clk_thread.
+        # Avant : maybe_send_clk() était appelé depuis le main loop
+        # (= burst handler). Si handle_trxd() bloque (burst-bunching DL,
+        # GMSK conversion lente, BSP_IQ_MODE), maybe_send_clk() attend.
+        # Observed : gap 4s entre CLK_IND #5 et #6 → BTS internal timer
+        # drift → shutdown sur "PC clock skew too high" L450.
+        # Fix : sortir l'émission CLK_IND dans un thread dédié qui tape
+        # à cadence wall stricte (sleep absolu deadline), indépendant de
+        # tout autre work bridge. BTS internal timer reste nourri quoi
+        # que fasse le main loop.
         self._tick_thread = threading.Thread(
             target=self._tick_loop, daemon=True, name="bridge-tick")
         self._tick_thread.start()
@@ -928,6 +1080,24 @@ class Bridge:
         self._stats_thread = threading.Thread(
             target=self._stats_loop, daemon=True, name="bridge-stats")
         self._stats_thread.start()
+        self._clk_thread = threading.Thread(
+            target=self._clk_loop, daemon=True, name="bridge-clk")
+        self._clk_thread.start()
+
+        # FIX B 2026-05-25 night : internal FB burst feeder thread.
+        # Only spawned if BRIDGE_BURST_SOURCE=internal (bypass osmo-bts).
+        # When active, BTS TRXD socket is still bound (for safety) but
+        # bridge doesn't depend on its bursts.
+        if BURST_SOURCE == "internal":
+            self._burst_gen_thread = threading.Thread(
+                target=self._burst_gen_loop, daemon=True, name="bridge-burst-gen")
+            self._burst_gen_thread.start()
+            print(f"bridge: BURST_SOURCE=internal pattern={BURST_PATTERN} "
+                  f"— FB feeder qfn-gated via _handle_dl(), BTS bypassed",
+                  flush=True)
+        else:
+            print(f"bridge: BURST_SOURCE={BURST_SOURCE} — DL bursts from BTS via TRXD",
+                  flush=True)
 
         # Burst-only main loop : pas de jitter d'autres sockets.
         while running:
@@ -940,8 +1110,9 @@ class Bridge:
 
             if self.trxd_sock in readable: self.handle_trxd()
 
-            # CLK IND emit (wall-paced, BTS-friendly cadence)
-            self.maybe_send_clk()
+            # CLK IND emit MOVED to _clk_thread (FIX A 2026-05-25 night).
+            # Anciennement appelé ici, mais main loop pouvait bloquer sur
+            # handle_trxd() pendant >235ms → BTS shutdown sur skew.
 
         self._stop = True
         print(f"bridge: tick={self.stats['tick']} clk={self.stats['clk']} "

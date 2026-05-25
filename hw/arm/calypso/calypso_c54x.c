@@ -702,6 +702,464 @@ static void corr_entry_track(uint16_t pc, void *s_void)
     }
 }
 
+/* === FBDB/FBF3 + 0x3DC0 probes (c web reframe 2026-05-25 night2) ========
+ *
+ * Sondes diagnostiques POST-désassemblage fc50-fc6f, sans aucun fix.
+ * Trois questions à trancher :
+ *   A) B @ PC=0xfbd9 vaut-il une valeur cohérente avant `SUB #8, B, A` ?
+ *      (= si B faux upstream, F2xx fix donne A faux downstream)
+ *   B) A @ PC=0xfbdb juste après SUB → AR4 setup à PC=0xfbf3 → corruption ?
+ *   C) Le bit 4 du flag 0x3DC0 (= testé par BITF à fc63) est-il jamais set ?
+ *      Si jamais set par aucune routine DSP → BCD NTC à fc66 toujours branche →
+ *      fc50-fc6f loop forever sans toucher au body.
+ *
+ * Env-gated : CALYPSO_FBDB_PROBE=1 active toutes les sondes.
+ * Coût off : 1 compare + 1 branch par opcode (négligeable). */
+static int g_fbdb_probe_enabled = -1;
+static unsigned g_fbdb_probe_log_cap = 100;
+static unsigned g_fbdb_probe_count_b = 0;
+static unsigned g_fbdb_probe_count_a = 0;
+static unsigned g_fbdb_probe_count_fbf3 = 0;
+static unsigned g_addr3dc0_wr_count = 0;
+static unsigned g_addr3dc0_rd_count = 0;
+
+static void fbdb_probe_init_lazy(void)
+{
+    if (g_fbdb_probe_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_FBDB_PROBE");
+    g_fbdb_probe_enabled = (e && *e == '1') ? 1 : 0;
+    if (g_fbdb_probe_enabled) {
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE enabled : track B@0xfbd9 + A@0xfbdb + A@0xfbf3 "
+            "+ ALL r/w to 0x3DC0 (= SARAM flag polled by fc63 BITF)\n");
+    }
+}
+
+/* Hook called from c54x_run top-of-loop, before c54x_exec_one. */
+static void fbdb_probe_check_pc(uint16_t pc, void *s_void)
+{
+    if (g_fbdb_probe_enabled < 0) fbdb_probe_init_lazy();
+    if (g_fbdb_probe_enabled <= 0) return;
+    C54xState *s = (C54xState *)s_void;
+    if (pc == 0xfbd9 && g_fbdb_probe_count_b < g_fbdb_probe_log_cap) {
+        g_fbdb_probe_count_b++;
+        int64_t b = s->b & 0xFFFFFFFFFFLL;
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE B@fbd9 #%u: B=0x%010llx (low=0x%04x sign=%d) "
+            "A=0x%010llx AR2=0x%04x AR3=0x%04x AR4=0x%04x insn=%u\n",
+            g_fbdb_probe_count_b,
+            (unsigned long long)b, (unsigned)(b & 0xFFFF),
+            (b & 0x8000000000LL) ? -1 : 1,
+            (unsigned long long)(s->a & 0xFFFFFFFFFFLL),
+            s->ar[2], s->ar[3], s->ar[4], s->insn_count);
+    }
+    else if (pc == 0xfbdb && g_fbdb_probe_count_a < g_fbdb_probe_log_cap) {
+        g_fbdb_probe_count_a++;
+        int64_t a = s->a & 0xFFFFFFFFFFLL;
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE A@fbdb #%u (= after SUB #8,B,A): A=0x%010llx "
+            "(low=0x%04x), TC=%d insn=%u\n",
+            g_fbdb_probe_count_a, (unsigned long long)a,
+            (unsigned)(a & 0xFFFF),
+            !!(s->st0 & (1 << 13)), s->insn_count);  /* TC = ST0 bit 13 per SPRU131G */
+    }
+    else if (pc == 0xfbf3 && g_fbdb_probe_count_fbf3 < g_fbdb_probe_log_cap) {
+        g_fbdb_probe_count_fbf3++;
+        int64_t a = s->a & 0xFFFFFFFFFFLL;
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE A@fbf3 #%u (= just before STLM A,AR4): "
+            "A=0x%010llx (low=0x%04x) — if low=0 → AR4=0 → AR5=1=MMR_IFR corruption "
+            "insn=%u\n",
+            g_fbdb_probe_count_fbf3, (unsigned long long)a,
+            (unsigned)(a & 0xFFFF), s->insn_count);
+    }
+}
+
+/* === STUCK-STATE PC+XPC histogram (c web reframe 2026-05-25 night3) =====
+ *
+ * Sonde diagnostique : quand le DSP est en "stuck state" (= INTM=1 ET
+ * BRINT0 pending dans IFR), on enregistre PC+XPC. Permet d'identifier
+ * la VRAIE boucle de blocage XPC-qualifiée — sans présumer que c'est
+ * fc50 ou autre PC particulier.
+ *
+ * Le PC HIST classique ne distingue pas les pages XPC (= ambiguous "fc50"
+ * peut être page 0x1F mirror ou 0x28/0x38 etc.).
+ *
+ * Entry/exit du stuck state logué (= delimit la fenêtre).
+ * Top-20 PC+XPC dump périodique (= quand stuck dure).
+ *
+ * Env-gated CALYPSO_STUCK_PROBE=1. Coût off : 1 bit-check + 1 branch. */
+#define STUCK_HIST_SIZE 64
+typedef struct {
+    uint16_t pc;
+    uint8_t  xpc;
+    uint32_t count;
+} StuckHistEntry;
+static StuckHistEntry g_stuck_hist[STUCK_HIST_SIZE];
+static unsigned g_stuck_hist_used = 0;
+static int g_stuck_probe_enabled = -1;
+static int g_stuck_active = 0;
+static uint32_t g_stuck_duration = 0;
+static uint64_t g_stuck_start_insn = 0;
+static unsigned g_stuck_dump_count = 0;
+
+static void stuck_probe_init_lazy(void)
+{
+    if (g_stuck_probe_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_STUCK_PROBE");
+    g_stuck_probe_enabled = (e && *e == '1') ? 1 : 0;
+    if (g_stuck_probe_enabled) {
+        fprintf(stderr,
+            "[c54x] STUCK-PROBE enabled : capture PC+XPC histogramme quand "
+            "INTM=1 + IFR bit5 (BRINT0) pending\n");
+    }
+}
+
+static void stuck_probe_record(uint16_t pc, uint8_t xpc)
+{
+    /* Linear scan small hist (cap 64). Insert or increment. */
+    for (unsigned i = 0; i < g_stuck_hist_used; i++) {
+        if (g_stuck_hist[i].pc == pc && g_stuck_hist[i].xpc == xpc) {
+            g_stuck_hist[i].count++;
+            return;
+        }
+    }
+    if (g_stuck_hist_used < STUCK_HIST_SIZE) {
+        g_stuck_hist[g_stuck_hist_used].pc = pc;
+        g_stuck_hist[g_stuck_hist_used].xpc = xpc;
+        g_stuck_hist[g_stuck_hist_used].count = 1;
+        g_stuck_hist_used++;
+    }
+    /* If hist full, silently drop new PCs — top hot ones already captured. */
+}
+
+static void stuck_probe_dump(uint64_t cur_insn, const char *trig)
+{
+    /* Bubble sort by count desc (n<=64). */
+    for (unsigned k = 0; k < g_stuck_hist_used; k++) {
+        unsigned best = k;
+        for (unsigned i = k + 1; i < g_stuck_hist_used; i++) {
+            if (g_stuck_hist[i].count > g_stuck_hist[best].count) best = i;
+        }
+        if (best != k) {
+            StuckHistEntry tmp = g_stuck_hist[k];
+            g_stuck_hist[k] = g_stuck_hist[best];
+            g_stuck_hist[best] = tmp;
+        }
+    }
+    fprintf(stderr,
+        "[c54x] STUCK-HIST [%s] duration=%u insn since insn=%llu (now=%llu) top:\n",
+        trig, g_stuck_duration,
+        (unsigned long long)g_stuck_start_insn,
+        (unsigned long long)cur_insn);
+    unsigned n_show = g_stuck_hist_used > 20 ? 20 : g_stuck_hist_used;
+    for (unsigned i = 0; i < n_show; i++) {
+        fprintf(stderr,
+            "[c54x]   #%2u PC=0x%04x XPC=%u  count=%u\n",
+            i + 1, g_stuck_hist[i].pc, g_stuck_hist[i].xpc,
+            g_stuck_hist[i].count);
+    }
+}
+
+/* === FORCE-INTM-ONESHOT (c web reframe 2026-05-25 night4) ===============
+ *
+ * Sonde d'arbitrage : quand INTM=1 ET BRINT0 (IFR bit 5) pending,
+ * forcer UNE SEULE FOIS INTM=0 pour permettre dispatch. Observer ce
+ * qui se passe ensuite via les tracers existants (CORR-ENTRY, a_sync_demod
+ * writes, RETE log, INTM-TRANS).
+ *
+ * Partitionne l'arbre :
+ *   - snr/toa réels après dispatch → INTM est le SEUL blocker
+ *   - garbage / rien → aval cassé aussi (≥2 bugs) OU corruption ISR state
+ *
+ * IMPORTANT : c'est une SONDE diagnostique, PAS un fix. Le one-shot
+ * permet d'observer sans masquer un comportement régulier. Si on confirme
+ * "INTM est le seul blocker", le vrai fix sera côté ISR (= pourquoi pas
+ * de RETE), pas un INTM-clear systématique.
+ *
+ * Env-gated CALYPSO_FORCE_INTM_ONESHOT=1. */
+static int g_force_intm_oneshot_enabled = -1;
+static int g_force_intm_oneshot_done = 0;
+static uint64_t g_force_intm_oneshot_insn = 0;
+/* CALYPSO_FORCE_INTM_AT_PC=0xfc6f : restreindre le force au PC donné (=
+ * point sûr = RET du compute kernel fc50 par exemple). 0xFFFF sentinel
+ * = pas de restriction PC (= comportement v1 = première opportunité). */
+static uint16_t g_force_intm_at_pc = 0xFFFF;
+
+static void force_intm_oneshot_check(C54xState *s)
+{
+    if (g_force_intm_oneshot_enabled < 0) {
+        const char *e = getenv("CALYPSO_FORCE_INTM_ONESHOT");
+        g_force_intm_oneshot_enabled = (e && *e == '1') ? 1 : 0;
+        /* Optional PC gate : si CALYPSO_FORCE_INTM_AT_PC=0xXXXX présent,
+         * fire seulement quand PC matche. Permet de départager state-
+         * corruption vs aval-cassé per c web : force à un PC sûr (= RET
+         * fc6f, idle dispatcher, etc.) au lieu de mid-compute fc57. */
+        const char *pc_e = getenv("CALYPSO_FORCE_INTM_AT_PC");
+        if (pc_e && *pc_e) {
+            unsigned long pc_val = strtoul(pc_e, NULL, 0);
+            if (pc_val <= 0xFFFF) {
+                g_force_intm_at_pc = (uint16_t)pc_val;
+            }
+        }
+        if (g_force_intm_oneshot_enabled) {
+            if (g_force_intm_at_pc != 0xFFFF) {
+                fprintf(stderr,
+                    "[c54x] FORCE-INTM-ONESHOT enabled : will clear INTM ONCE "
+                    "when INTM=1 + BRINT0 pending + PC=0x%04x (= safe-PC gate, "
+                    "départage state-corruption vs aval-cassé)\n",
+                    g_force_intm_at_pc);
+            } else {
+                fprintf(stderr,
+                    "[c54x] FORCE-INTM-ONESHOT enabled : will clear INTM ONCE "
+                    "when INTM=1 + BRINT0 pending (= sonde aval-sain, no PC gate)\n");
+            }
+        }
+    }
+    if (g_force_intm_oneshot_enabled <= 0) return;
+    if (g_force_intm_oneshot_done) return;
+    int intm_set = !!(s->st1 & ST1_INTM);
+    int brint0_pending = !!(s->ifr & (1 << 5));
+    if (!(intm_set && brint0_pending)) return;
+    /* Skip very early boot — wait for stable stuck state. */
+    if (s->insn_count < 1000000) return;
+    /* Optional PC gate : if set, only fire at the specified PC (= safe point). */
+    if (g_force_intm_at_pc != 0xFFFF && s->pc != g_force_intm_at_pc) return;
+    /* FIRE one-shot : clear INTM, log context. */
+    g_force_intm_oneshot_done = 1;
+    g_force_intm_oneshot_insn = s->insn_count;
+    fprintf(stderr,
+        "[c54x] FORCE-INTM-ONESHOT FIRED @insn=%llu PC=0x%04x XPC=%u SP=0x%04x "
+        "ST1=0x%04x IMR=0x%04x IFR=0x%04x%s — clearing INTM to allow dispatch\n",
+        (unsigned long long)s->insn_count, s->pc, s->xpc & 0xFF, s->sp,
+        s->st1, s->imr, s->ifr,
+        (g_force_intm_at_pc != 0xFFFF) ? " (safe-PC gate)" : "");
+    s->st1 &= ~ST1_INTM;  /* clear INTM bit 11 */
+    fprintf(stderr,
+        "[c54x] FORCE-INTM-ONESHOT post-clear : ST1=0x%04x — watch next IRQ "
+        "dispatch + CORR-ENTRY + a_sync_demod writes\n", s->st1);
+}
+
+/* === INT3 cycle tracer + control-flow signature (c web reframe 2026-05-25 night5)
+ *
+ * Sonde décisive pour départager F1 (= pourquoi ISR INT3 ne RETE pas).
+ *
+ * Per cycle INT3 :
+ *   - START : INT3 dispatched (vec=19) → reset trace, log cycle_id + entry PC
+ *   - DURING : chaque branch conditionnelle exécutée → (PC, op, target, taken)
+ *   - END (good) : RETE fire → dump trace tagged GOOD + insn count
+ *   - END (orphan) : nouveau INT3 dispatch avant RETE → dump previous tagged
+ *                   ORPHAN-NEXT-INT3 + reason
+ *
+ * Diff offline good_cycle vs orphan_cycle → 1ère branche qui diverge
+ * = trigger du bug. À cette branche, lire l'état testé = la vraie cause.
+ *
+ * Cappé 256 branches/cycle (= overflow tagué pour borne).
+ * Env-gated CALYPSO_INT3_CYCLE_TRACE=1. */
+#define INT3_BRANCH_TRACE_MAX 256
+typedef struct {
+    uint16_t pc;        /* PC of branch insn */
+    uint16_t op;        /* opcode word 0 */
+    uint16_t next_pc;   /* PC after exec (= branch taken target OR fall-through) */
+    uint32_t insn_offset; /* delta from cycle start */
+} Int3BranchEvent;
+static Int3BranchEvent g_int3_trace[INT3_BRANCH_TRACE_MAX];
+static unsigned g_int3_trace_count = 0;
+static int g_int3_trace_overflow = 0;
+static int g_int3_cycle_active = 0;
+static uint64_t g_int3_cycle_id = 0;
+static uint16_t g_int3_cycle_entry_pc = 0;
+static uint64_t g_int3_cycle_entry_insn = 0;
+static int g_int3_trace_enabled = -1;
+
+static void int3_trace_init_lazy(void)
+{
+    if (g_int3_trace_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_INT3_CYCLE_TRACE");
+    g_int3_trace_enabled = (e && *e == '1') ? 1 : 0;
+    if (g_int3_trace_enabled) {
+        fprintf(stderr,
+            "[c54x] INT3-CYCLE-TRACE enabled : par cycle vec=19, log toutes "
+            "branches conditionnelles + RETE/orphan tag. Cap=%u branches/cycle.\n",
+            INT3_BRANCH_TRACE_MAX);
+    }
+}
+
+/* Detect conditional branch / call / return family. Returns 1 if op
+ * is in a tracked branch family, else 0. */
+static int is_int3_traced_branch(uint16_t op)
+{
+    uint16_t hi = op & 0xFF00;
+    if (hi == 0x6C00) return 1;  /* BANZ pmad,Sind */
+    if (hi == 0x6E00) return 1;  /* BANZD pmad,Sind */
+    if (hi == 0xF800) return 1;  /* BC pmad,cond */
+    if (hi == 0xF900) return 1;  /* CC pmad,cond */
+    if (hi == 0xFA00) return 1;  /* BCD pmad,cond */
+    if (hi == 0xFB00) return 1;  /* CCD pmad,cond */
+    if (hi == 0xFC00) {
+        /* FC00 unconditional = RET ; FCxx where xx is cond = RC */
+        if (op != 0xFC00) return 1;
+        return 0;
+    }
+    if (hi == 0xFE00) {
+        if (op != 0xFE00) return 1; /* RCD cond */
+        return 0;
+    }
+    return 0;
+}
+
+/* Called from c54x_interrupt_ex when vec=19 (INT3 FRAME) dispatched. */
+static void int3_cycle_start(C54xState *s, uint16_t target_pc)
+{
+    if (g_int3_trace_enabled < 0) int3_trace_init_lazy();
+    if (g_int3_trace_enabled <= 0) return;
+    /* If previous cycle still active = orphan (= didn't RETE before re-entry) */
+    if (g_int3_cycle_active) {
+        fprintf(stderr,
+            "[c54x] INT3-CYCLE #%llu ORPHAN-NEXT-INT3 — previous cycle didn't "
+            "RETE, new entry @insn=%llu PC=0x%04x. Trace below (%u branches%s) :\n",
+            (unsigned long long)g_int3_cycle_id,
+            (unsigned long long)s->insn_count, target_pc,
+            g_int3_trace_count,
+            g_int3_trace_overflow ? "+ OVERFLOW" : "");
+        for (unsigned i = 0; i < g_int3_trace_count; i++) {
+            Int3BranchEvent *e = &g_int3_trace[i];
+            uint16_t fallthrough = (e->op & 0xFF00) >= 0xF800 && (e->op & 0xFF00) <= 0xFB00
+                                   ? e->pc + 2 : e->pc + 1;
+            fprintf(stderr,
+                "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s\n",
+                i + 1, e->insn_offset, e->pc, e->op, e->next_pc,
+                (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)");
+        }
+    }
+    g_int3_cycle_id++;
+    g_int3_cycle_active = 1;
+    g_int3_cycle_entry_pc = target_pc;
+    g_int3_cycle_entry_insn = s->insn_count;
+    g_int3_trace_count = 0;
+    g_int3_trace_overflow = 0;
+    fprintf(stderr,
+        "[c54x] INT3-CYCLE #%llu START @insn=%llu PC→0x%04x SP=0x%04x "
+        "PMST=0x%04x IFR=0x%04x\n",
+        (unsigned long long)g_int3_cycle_id,
+        (unsigned long long)s->insn_count, target_pc, s->sp,
+        s->pmst, s->ifr);
+}
+
+/* Called from c54x_run after c54x_exec_one. exec_pc/exec_op are the
+ * instruction that just executed; s->pc is the resulting PC. */
+static void int3_cycle_track_branch(C54xState *s, uint16_t exec_pc,
+                                    uint16_t exec_op)
+{
+    if (g_int3_trace_enabled <= 0) return;
+    if (!g_int3_cycle_active) return;
+    if (!is_int3_traced_branch(exec_op)) return;
+    if (g_int3_trace_count >= INT3_BRANCH_TRACE_MAX) {
+        g_int3_trace_overflow = 1;
+        return;
+    }
+    Int3BranchEvent *e = &g_int3_trace[g_int3_trace_count++];
+    e->pc = exec_pc;
+    e->op = exec_op;
+    e->next_pc = s->pc;
+    e->insn_offset = (uint32_t)(s->insn_count - g_int3_cycle_entry_insn);
+}
+
+/* Called from RETE handler (L3300 area) BEFORE INTM is cleared. */
+static void int3_cycle_end_good(C54xState *s, uint16_t return_addr)
+{
+    if (g_int3_trace_enabled <= 0) return;
+    if (!g_int3_cycle_active) return;
+    uint64_t duration = s->insn_count - g_int3_cycle_entry_insn;
+    fprintf(stderr,
+        "[c54x] INT3-CYCLE #%llu RETE-GOOD @insn=%llu duration=%llu PC→0x%04x "
+        "branches=%u%s\n",
+        (unsigned long long)g_int3_cycle_id,
+        (unsigned long long)s->insn_count, (unsigned long long)duration,
+        return_addr, g_int3_trace_count,
+        g_int3_trace_overflow ? "+ OVERFLOW" : "");
+    for (unsigned i = 0; i < g_int3_trace_count; i++) {
+        Int3BranchEvent *e = &g_int3_trace[i];
+        uint16_t fallthrough = (e->op & 0xFF00) >= 0xF800 && (e->op & 0xFF00) <= 0xFB00
+                               ? e->pc + 2 : e->pc + 1;
+        fprintf(stderr,
+            "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s\n",
+            i + 1, e->insn_offset, e->pc, e->op, e->next_pc,
+            (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)");
+    }
+    g_int3_cycle_active = 0;
+}
+
+/* Called from c54x_run top-of-loop. */
+static void stuck_probe_check(C54xState *s)
+{
+    if (g_stuck_probe_enabled < 0) stuck_probe_init_lazy();
+    if (g_stuck_probe_enabled <= 0) return;
+    int intm_set = !!(s->st1 & ST1_INTM);
+    int brint0_pending = !!(s->ifr & (1 << 5));
+    int now_stuck = (intm_set && brint0_pending);
+    if (now_stuck && !g_stuck_active) {
+        g_stuck_active = 1;
+        g_stuck_start_insn = s->insn_count;
+        g_stuck_duration = 0;
+        g_stuck_hist_used = 0;  /* fresh hist per stuck window */
+        fprintf(stderr,
+            "[c54x] STUCK-ENTER insn=%llu PC=0x%04x XPC=%u IFR=0x%04x IMR=0x%04x\n",
+            (unsigned long long)s->insn_count, s->pc, s->xpc & 0xFF,
+            s->ifr, s->imr);
+    }
+    if (now_stuck) {
+        g_stuck_duration++;
+        /* Sample every 100 insns to bound hist diversity */
+        if ((g_stuck_duration % 100) == 0) {
+            stuck_probe_record(s->pc, s->xpc & 0xFF);
+        }
+        /* Dump periodically while stuck */
+        if ((g_stuck_duration % 5000000) == 0 && g_stuck_dump_count < 5) {
+            g_stuck_dump_count++;
+            stuck_probe_dump(s->insn_count, "periodic-5M");
+        }
+    } else if (g_stuck_active) {
+        g_stuck_active = 0;
+        fprintf(stderr,
+            "[c54x] STUCK-EXIT insn=%llu duration=%u PC=0x%04x XPC=%u IFR=0x%04x\n",
+            (unsigned long long)s->insn_count, g_stuck_duration,
+            s->pc, s->xpc & 0xFF, s->ifr);
+        if (g_stuck_duration >= 10000) {  /* only dump if long-ish stuck */
+            stuck_probe_dump(s->insn_count, "on-exit");
+        }
+    }
+}
+
+/* Hook called from data_write_locked when an absolute write hits 0x3DC0. */
+static void fbdb_probe_write_3dc0(uint16_t addr, uint16_t old_val,
+                                  uint16_t new_val, uint16_t pc, unsigned insn)
+{
+    if (g_fbdb_probe_enabled <= 0) return;
+    g_addr3dc0_wr_count++;
+    if (g_addr3dc0_wr_count <= 50) {
+        uint16_t set_mask = new_val & ~old_val;  /* bits set by this write */
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE WR 0x%04x : 0x%04x → 0x%04x (set=0x%04x) "
+            "PC=0x%04x insn=%u %s\n",
+            addr, old_val, new_val, set_mask, pc, insn,
+            (set_mask & 0x0010) ? "*** BIT 4 SET ***" : "");
+    }
+}
+
+static void fbdb_probe_read_3dc0(uint16_t addr, uint16_t val,
+                                 uint16_t pc, unsigned insn)
+{
+    if (g_fbdb_probe_enabled <= 0) return;
+    g_addr3dc0_rd_count++;
+    if (g_addr3dc0_rd_count <= 30
+        || (g_addr3dc0_rd_count % 10000) == 0) {
+        fprintf(stderr,
+            "[c54x] FBDB-PROBE RD 0x%04x = 0x%04x (bit4=%d) PC=0x%04x insn=%u\n",
+            addr, val, !!(val & 0x0010), pc, insn);
+    }
+}
+
 static void corr_read_record(uint16_t addr)
 {
     if (g_corr_trace_enabled <= 0) return;
@@ -871,6 +1329,11 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
+    /* FBDB-PROBE read 0x3DC0 (= SARAM flag polled by fc63 BITF).
+     * Env CALYPSO_FBDB_PROBE=1. Logs first 30 reads + each 10000th. */
+    if (addr == 0x3DC0 && g_fbdb_probe_enabled > 0) {
+        fbdb_probe_read_3dc0(addr, s->data[addr], s->pc, s->insn_count);
+    }
     /* D_BURST_D_W probe : DSP lit db_w->d_burst_d ?
      * 0x0801 (W_PAGE_0 + offset 1), 0x0815 (W_PAGE_1 + offset 1).
      * Si DSP read voit 0,1,2,3 séquentiel → ARM écrit correctement db_w.
@@ -1276,6 +1739,12 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* FBDB-PROBE write to 0x3DC0 (= SARAM flag polled by fc63 BITF).
+     * Env CALYPSO_FBDB_PROBE=1. Logs old→new + which bits set, with focus
+     * on bit 4 (= 0x0010) since that's the bit fc63 tests via BITF. */
+    if (addr == 0x3DC0 && g_fbdb_probe_enabled > 0) {
+        fbdb_probe_write_3dc0(addr, s->data[addr], val, s->pc, s->insn_count);
+    }
     /* COEFFS-WR probe : watch-write sur la zone [0x2bc0..0x2bff] (64 mots).
      * 2026-05-14 evening — COEFFS-DUMP a montré une séquence init→clear→use :
      *   insn=2M  PC=0x9b05  vraies coeffs (f320, a660, ...)
@@ -2986,6 +3455,8 @@ static int c54x_exec_one(C54xState *s)
                 if (s->xpc > 3) s->xpc &= 3;
             }
             s->st1 &= ~ST1_INTM;
+            /* INT3-CYCLE-TRACE : signal cycle end-good before INTM cleared in log */
+            int3_cycle_end_good(s, ra);
             {
                 static uint64_t rete_count;
                 rete_count++;
@@ -8615,7 +9086,20 @@ int c54x_run(C54xState *s, int n_insns)
          * transition out→in du range FB-det [0x8d00..0x9000). Cf top of
          * file pour la lazy-init + l'évidence runtime 2026-05-25 night. */
         corr_entry_track(s->pc, s);
+        /* FBDB-PROBE (env CALYPSO_FBDB_PROBE=1, c web reframe 2026-05-25 night2) :
+         * trace B@fbd9, A@fbdb (= post F2xx SUB), A@fbf3 (= before STLM A,AR4). */
+        fbdb_probe_check_pc(s->pc, s);
+        /* FORCE-INTM-ONESHOT (env CALYPSO_FORCE_INTM_ONESHOT=1, c web reframe
+         * 2026-05-25 night4) : sonde arbitrage — clear INTM UNE FOIS quand
+         * INTM=1 + BRINT0 pending. Observe via tracers existants si aval sain. */
+        force_intm_oneshot_check(s);
+        /* STUCK-PROBE (env CALYPSO_STUCK_PROBE=1, c web reframe 2026-05-25 night3) :
+         * capture PC+XPC histogramme quand INTM=1 + BRINT0 pending. */
+        stuck_probe_check(s);
         consumed = c54x_exec_one(s);
+        /* INT3-CYCLE-TRACE (env CALYPSO_INT3_CYCLE_TRACE=1, c web reframe night5) :
+         * record branch decisions during INT3 ISR cycle. */
+        int3_cycle_track_branch(s, exec_pc, exec_op);
 
         /* Detect SP changes — only log after init (insn > 490M) */
         if (s->sp != sp_before && s->insn_count > 490000000) {
@@ -9141,6 +9625,10 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->st1 |= ST1_INTM;
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;
+        /* INT3-CYCLE-TRACE : hook cycle start for vec=19 (INT3 FRAME) */
+        if (vec == 19) {
+            int3_cycle_start(s, s->pc);
+        }
     }
 
     /* Log interrupts: first 20 + every 100th, so we can count them.
