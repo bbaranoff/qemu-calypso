@@ -22,6 +22,7 @@
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* calypso_async_log : tick log off main thread */
 #include "hw/arm/calypso/sercomm_gate.h"
 
 /* Register offsets */
@@ -669,7 +670,10 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             s->ier = value & 0x0F;
 
             if (old != s->ier && s->label && strcmp(s->label, "modem") != 0) {
-                fprintf(stderr, "[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
+                /* Off-main-thread : ARM TCG ne bloque pas sur stdio.
+                 * Avant : fprintf inline → IER toggle 1.25 Hz × ~50µs
+                 * stdio lock = jitter cumulé sur ARM. */
+                calypso_async_log("[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
                         s->label ? s->label : "?",
                         s->ier,
                         !!(s->ier & IER_RX_DATA),

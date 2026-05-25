@@ -35,11 +35,145 @@ TRXD socket (5702) is bidirectional:
   UL: QEMU:6702 → bridge:5702 → BTS   (forward uplink to BTS, FN rewritten)
 
 Usage: bridge.py
+
+SERCOMM + IQ PATH (re-merged 2026-05-24)
+----------------------------------------
+Historiquement le wire BTS↔QEMU passait par PTY/sercomm DLCI 4 avec
+samples I/Q GMSK-modulés (cf sercomm_udp.py). Ce wire a été remplacé
+par un UDP direct vers la BSP avec soft-bits bruts pour simplifier,
+mais le DSP correlator (FB-det Q15) attend des I/Q baseband, pas des
+soft bits — d'où d_fb_det=0 chronique.
+
+Cette version re-merge sercomm_udp.py dans bridge.py :
+  - sercomm_wrap / SercommParser / soft_bits_to_gmsk_iq : inline
+  - env BRIDGE_BSP_IQ=1   : convertit soft-bits → IQ int16 avant UDP send
+                            vers BSP (calypso_bsp.c lit IQ samples)
+  - env BRIDGE_PTY=/dev/pts/X : optionnel, wire en plus du UDP, envoie
+                            DL bursts en sercomm DLCI 4 + IQ samples sur
+                            cette PTY (DLCI 5 L1CTL reste géré par
+                            osmocon comme avant)
+
+WIRE MAP COURANT
+----------------
+  BTS osmo-bts-trx ─── UDP 5700-5702 ─── bridge.py ─── UDP 6702 ─── QEMU BSP
+                                               │
+                                               └─ (optionnel) PTY sercomm DLCI 4
+                                                  → QEMU UART → calypso_trx.c
 """
-import errno, os, select, signal, socket, struct, sys, time
+import errno, os, select, signal, socket, struct, sys, threading, time
+import fcntl, termios
 
 GSM_HYPERFRAME = 2715648
 GSM_TDMA_S = 4615 / 1_000_000  # 4.615 ms per TDMA frame, wall-clock
+
+# === sercomm framing + IQ modulation (merged from sercomm_udp.py) ============
+SERCOMM_FLAG = 0x7E
+SERCOMM_ESCAPE = 0x7D
+SERCOMM_XOR = 0x20
+DLCI_L1CTL = 5
+DLCI_BURST = 4
+
+
+def sercomm_wrap(dlci, payload):
+    """Encode payload as a sercomm HDLC frame (0x7E flag + 0x7D escape)."""
+    out = bytearray([SERCOMM_FLAG])
+    for b in bytes([dlci, 0x03]) + payload:
+        if b in (SERCOMM_FLAG, SERCOMM_ESCAPE):
+            out.append(SERCOMM_ESCAPE)
+            out.append(b ^ SERCOMM_XOR)
+        else:
+            out.append(b)
+    out.append(SERCOMM_FLAG)
+    return bytes(out)
+
+
+class SercommParser:
+    """Streaming sercomm de-framer. feed(bytes) → [(dlci, payload), ...]."""
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf.extend(data)
+        frames = []
+        while True:
+            try:
+                s = self.buf.index(SERCOMM_FLAG)
+            except ValueError:
+                self.buf.clear()
+                break
+            if s > 0:
+                del self.buf[:s]
+            try:
+                e = self.buf.index(SERCOMM_FLAG, 1)
+            except ValueError:
+                break
+            raw = bytes(self.buf[1:e])
+            del self.buf[:e + 1]
+            if not raw:
+                continue
+            out = bytearray()
+            i = 0
+            while i < len(raw):
+                if raw[i] == SERCOMM_ESCAPE and i + 1 < len(raw):
+                    i += 1
+                    out.append(raw[i] ^ SERCOMM_XOR)
+                else:
+                    out.append(raw[i])
+                i += 1
+            if len(out) >= 2:
+                frames.append((out[0], bytes(out[2:])))
+        return frames
+
+
+def soft_to_int16(soft_bit):
+    """Convert osmocom soft bit (0=strong 1, 255=strong 0) to int16."""
+    return max(-32768, min(32767, int((127 - soft_bit) * 32767 / 127)))
+
+
+def soft_bits_to_gmsk_iq(soft_bits_raw, scale=4096):
+    """Convert TRXD soft bits → GMSK I/Q int16 baseband pairs for DSP BSP.
+    Calypso ABB delivers I/Q complex pairs from antenna ; ici on reconstruit
+    l'équivalent en GMSK-modulant les hard-bits (BT=0.3, h=0.5,
+    1 sample/symbol). Sortie : N soft-bits → 2N int16 = 4N octets, ordre
+    interleaved I,Q,I,Q,... (= ce que le BSP C attend pour memcpy direct).
+    Lazy import numpy/scipy : si absents (env minimal) on génère le pattern
+    hard ±π/2 équivalent au modulateur interne BSP (fallback identique)."""
+    n = len(soft_bits_raw)
+    try:
+        import numpy as np
+        from scipy.ndimage import gaussian_filter1d
+    except ImportError:
+        # Fallback : reproduit le pattern interne ±π/2 du BSP (cos_tab/sin_tab)
+        cos_tab = (0x7FFE, 0, -0x7FFE, 0)
+        sin_tab = (0, 0x7FFE, 0, -0x7FFE)
+        phase_idx = 0
+        out = bytearray()
+        for sb in soft_bits_raw:
+            out += int(cos_tab[phase_idx]).to_bytes(2, 'little', signed=True)
+            out += int(sin_tab[phase_idx]).to_bytes(2, 'little', signed=True)
+            phase_idx = (phase_idx + (3 if sb >= 128 else 1)) & 3
+        return bytes(out)
+    hard = np.array([0.0 if b < 128 else 1.0 for b in soft_bits_raw])
+    nrz = 1.0 - 2.0 * hard
+    bt = 0.3
+    filtered = gaussian_filter1d(nrz, 1.0 / (2.0 * 3.141592653589793 * bt))
+    phase = np.cumsum(filtered) * 3.141592653589793 * 0.5
+    i_samp = np.clip(np.cos(phase) * scale, -32768, 32767).astype(np.int16)
+    q_samp = np.clip(np.sin(phase) * scale, -32768, 32767).astype(np.int16)
+    # Interleave I,Q,I,Q,... : 2N int16 = 4N bytes
+    iq = np.empty(2 * n, dtype=np.int16)
+    iq[0::2] = i_samp
+    iq[1::2] = q_samp
+    return iq.tobytes()
+
+
+# Env gate : convert DL soft-bits → IQ samples before UDP send to BSP.
+# OFF par défaut pour ne rien casser ; ON pour exercer le DSP correlator.
+BSP_IQ_MODE = os.environ.get("BRIDGE_BSP_IQ", "0") == "1"
+# Env gate : optional PTY wire (sercomm DLCI 4 bursts). Empty = disabled.
+# Quand non vide, bridge ouvre cette PTY et envoie DL bursts en parallèle
+# du UDP (DLCI 5 / L1CTL reste géré par osmocon comme avant).
+PTY_PATH = os.environ.get("BRIDGE_PTY", "")
 
 # CLK IND period in frames (default 102 = stock GSM TDMA spec).
 # In debug runs where QEMU is slower than wall-clock, the bridge sends
@@ -204,6 +338,22 @@ class Bridge:
         # QEMU CLK tick receiver
         self.qemu_clk_sock = udp_bind(6700)
 
+        # Optional PTY wire (sercomm DLCI 4 burst path, parallel to UDP).
+        # Ouvert seulement si BRIDGE_PTY non vide. L1CTL DLCI 5 reste géré
+        # par osmocon sur sa propre PTY ; ici on ouvre une PTY séparée pour
+        # injecter les bursts au DSP via l'UART du Calypso quand on veut
+        # exercer le path sercomm complet (init / debug DSP correlator).
+        self.pty_fd = -1
+        self.pty_parser = SercommParser()
+        if PTY_PATH:
+            self._open_pty(PTY_PATH)
+        if BSP_IQ_MODE:
+            print("bridge: BSP_IQ_MODE=on — DL soft-bits → GMSK IQ samples "
+                  "before UDP send", flush=True)
+        if PTY_PATH:
+            print(f"bridge: PTY wire = {PTY_PATH} (sercomm DLCI 4 burst path)",
+                  flush=True)
+
         # Wall-clock-paced FN counter — independent of QEMU. Anchored to
         # POWERON so BTS sees fn=0 right when it asks to power up.
         self._wall_t0 = None       # set at POWERON
@@ -230,6 +380,37 @@ class Bridge:
         print(f"bridge: DL FN rewrite mode={DL_FN_REWRITE_MODE} — {dl_desc}",
               flush=True)
 
+    def _open_pty(self, path):
+        """Open PTY in raw 8N1 115200 non-blocking for sercomm burst injection."""
+        try:
+            self.pty_fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+            attrs = termios.tcgetattr(self.pty_fd)
+            attrs[0] = attrs[1] = attrs[3] = 0
+            attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
+            attrs[4] = attrs[5] = termios.B115200
+            attrs[6][termios.VMIN] = 1
+            attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(self.pty_fd, termios.TCSANOW, attrs)
+            fcntl.fcntl(self.pty_fd, fcntl.F_SETFL,
+                        fcntl.fcntl(self.pty_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        except OSError as e:
+            print(f"bridge: PTY open {path} FAILED: {e} — PTY wire disabled",
+                  flush=True)
+            self.pty_fd = -1
+
+    def _pty_send_burst(self, hdr, iq_payload):
+        """Send a DL burst via sercomm DLCI 4 on the optional PTY."""
+        if self.pty_fd < 0:
+            return
+        frame = sercomm_wrap(DLCI_BURST, bytes(hdr) + iq_payload)
+        try:
+            os.write(self.pty_fd, frame)
+            self.stats.setdefault("pty_burst_tx", 0)
+            self.stats["pty_burst_tx"] += 1
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                print(f"bridge: PTY write error: {e}", flush=True)
+
     def wall_fn(self):
         """Compute current bridge wall-paced FN. Anchored at POWERON."""
         if self._wall_t0 is None:
@@ -239,7 +420,9 @@ class Bridge:
 
     def handle_qemu_tick(self):
         """Receive TDMA tick from QEMU — 4 bytes big-endian FN.
-        Used as telemetry only ; CLK IND is wall_fn-paced now."""
+        Used as telemetry only ; CLK IND is wall_fn-paced now.
+        REFAC 2026-05-24 : appelé depuis _tick_thread (pas le main loop)
+        pour ne pas introduire de jitter dans le burst path."""
         try:
             data, addr = self.qemu_clk_sock.recvfrom(64)
         except OSError:
@@ -256,6 +439,62 @@ class Bridge:
             lag = (wfn - self.fn) % GSM_HYPERFRAME
             print(f"bridge: QEMU tick #{self.stats['tick']} qfn={self.fn} "
                   f"wall_fn={wfn} lag={lag}", flush=True)
+
+    def _tick_loop(self):
+        """Background thread : pump QEMU CLK ticks decoupled from main
+        burst path. Évite que le handle_qemu_tick (217 Hz wall) injecte
+        du jitter dans le pipeline UL/DL en occupant le select main."""
+        while not self._stop:
+            try:
+                rd, _, _ = select.select([self.qemu_clk_sock], [], [], 0.05)
+                if rd:
+                    self.handle_qemu_tick()
+            except Exception:
+                if self._stop:
+                    return
+                time.sleep(0.01)
+
+    def _trxc_loop(self):
+        """Background thread : TRXC control plane (BTS POWERON/RXTUNE/TXTUNE,
+        responses async). Pas dans le burst path critique — isolé pour ne
+        pas bloquer trxd. Modèle similaire au split DSP/BSP côté QEMU :
+        chaque domaine son thread, sync minimale par socket state."""
+        while not self._stop:
+            try:
+                rd, _, _ = select.select([self.trxc_sock], [], [], 0.05)
+                if rd:
+                    self.handle_trxc()
+            except Exception:
+                if self._stop:
+                    return
+                time.sleep(0.01)
+
+    def _stats_loop(self):
+        """Background thread : print stats périodiques (5s) sans bloquer
+        le main loop. Le log de stats reste utile pour drift bts↔qfn et
+        compteurs dl/ul/drop, mais n'a pas besoin d'être inline."""
+        last_dl_ul = 0
+        while not self._stop:
+            time.sleep(5.0)
+            if self._stop:
+                return
+            total = self.stats["dl"] + self.stats["ul"]
+            if total == 0 or total == last_dl_ul:
+                continue
+            last_dl_ul = total
+            wfn = self.wall_fn()
+            in_s  = self.stats.get("ul_in_slot", 0)
+            off_s = self.stats.get("ul_off_slot", 0)
+            dl_rw = self.stats.get("dl_rewrite", 0)
+            dl_dr = self.stats.get("dl_drop_no_slot", 0)
+            print(f"bridge: tick={self.stats['tick']} "
+                  f"clk={self.stats['clk']} "
+                  f"dl={self.stats['dl']} ul={self.stats['ul']} "
+                  f"ul_rewrite={self.stats['ul_fn_rewrite']} "
+                  f"ul_slot_in/off={in_s}/{off_s} "
+                  f"dl_rewrite={dl_rw} dl_drop={dl_dr} "
+                  f"wall_fn={wfn} qfn={self.fn}",
+                  flush=True)
 
     def _send_clk_ind(self, clk_fn):
         try:
@@ -546,10 +785,30 @@ class Bridge:
                   f"bits[0:8]={list(payload[:8])} "
                   f"{'*** FB ***' if is_fb else ''}", flush=True)
 
+        # Optional IQ conversion : soft-bits → GMSK I/Q int16. Le BSP
+        # côté QEMU doit savoir interpréter IQ (le code C lit toujours
+        # soft-bits par défaut ; activer BRIDGE_BSP_IQ après avoir
+        # adapté calypso_bsp.c side, sinon les bursts deviennent garbage).
+        if BSP_IQ_MODE and payload:
+            iq_bytes = soft_bits_to_gmsk_iq(payload)
+            # Pour N soft bits : 2N int16 = 4N bytes IQ payload (interleaved
+            # I,Q,I,Q,...). Total UDP = 8 hdr + 4N. Pour 148 bits = 600 B,
+            # pour 146 bits (BTS truncate) = 592 B. BSP attend iq_bytes >= 4*nbits.
+            udp_out = bytes(out[:8]) + iq_bytes
+        else:
+            udp_out = bytes(out)
+
         try:
-            self.trxd_sock.sendto(bytes(out), QEMU_BSP_ADDR)
+            self.trxd_sock.sendto(udp_out, QEMU_BSP_ADDR)
         except OSError as e:
             print(f"bridge: DL send error: {e}", flush=True)
+
+        # Optional PTY wire (sercomm DLCI 4 burst, parallel to UDP).
+        # Toujours IQ-modulé sur PTY car le path UART est le wire
+        # historique du Calypso réel.
+        if self.pty_fd >= 0 and payload:
+            iq_for_pty = soft_bits_to_gmsk_iq(payload) if not BSP_IQ_MODE else iq_bytes
+            self._pty_send_burst(out[:8], iq_for_pty)
 
     def run(self):
         running = True
@@ -558,41 +817,37 @@ class Bridge:
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
 
+        # REFAC 2026-05-24 : 3 threads isolés du burst path pour timing
+        # propre. Avant : tout dans 1 select → tick handler 217 Hz wall
+        # + stats print + trxc control = jitter sur trxd (burst data).
+        #   _tick_thread   : qemu_clk_sock (CLK ticks QEMU → telemetry)
+        #   _trxc_thread   : trxc_sock (BTS POWERON/RXTUNE control plane)
+        #   _stats_thread  : print stats périodiques (5s)
+        # Main loop = SEULEMENT trxd_sock (burst DL/UL = critical path)
+        #             + maybe_send_clk (CLK IND vers BTS, low jitter requis).
+        self._tick_thread = threading.Thread(
+            target=self._tick_loop, daemon=True, name="bridge-tick")
+        self._tick_thread.start()
+        self._trxc_thread = threading.Thread(
+            target=self._trxc_loop, daemon=True, name="bridge-trxc")
+        self._trxc_thread.start()
+        self._stats_thread = threading.Thread(
+            target=self._stats_loop, daemon=True, name="bridge-stats")
+        self._stats_thread.start()
+
+        # Burst-only main loop : pas de jitter d'autres sockets.
         while running:
-            fds = [self.trxc_sock, self.trxd_sock, self.qemu_clk_sock]
             try:
-                # Timeout 1ms (vs 50ms historique) — réduit le jitter de
-                # CLK IND vu par osmo-bts. Avec 50ms, l'émission CLK IND
-                # pouvait être retardée de ±50ms (~±10 frames GSM), causant
-                # les "We were 1 FN faster/slower than TRX" dans bts.log.
-                # 1ms = ±0.2 frame max, sous le seuil de compensation osmo-bts.
-                readable, _, _ = select.select(fds, [], [], 0.001)
+                # Timeout 1ms — réduit jitter CLK IND vu par osmo-bts.
+                readable, _, _ = select.select([self.trxd_sock], [], [], 0.001)
             except (OSError, ValueError) as e:
                 print(f"bridge: select error: {e}", flush=True)
                 break
 
-            if self.qemu_clk_sock in readable: self.handle_qemu_tick()
-            if self.trxc_sock in readable: self.handle_trxc()
             if self.trxd_sock in readable: self.handle_trxd()
 
-            # Send CLK IND at wall-clock rate using bridge's wall_fn
+            # CLK IND emit (wall-paced, BTS-friendly cadence)
             self.maybe_send_clk()
-
-            if (self.stats["dl"] + self.stats["ul"]) > 0 and \
-               ((self.stats["dl"] + self.stats["ul"]) % 5000) == 0:
-                wfn = self.wall_fn()
-                in_s  = self.stats.get("ul_in_slot", 0)
-                off_s = self.stats.get("ul_off_slot", 0)
-                dl_rw = self.stats.get("dl_rewrite", 0)
-                dl_dr = self.stats.get("dl_drop_no_slot", 0)
-                print(f"bridge: tick={self.stats['tick']} "
-                      f"clk={self.stats['clk']} "
-                      f"dl={self.stats['dl']} ul={self.stats['ul']} "
-                      f"ul_rewrite={self.stats['ul_fn_rewrite']} "
-                      f"ul_slot_in/off={in_s}/{off_s} "
-                      f"dl_rewrite={dl_rw} dl_drop={dl_dr} "
-                      f"wall_fn={wfn} qfn={self.fn}",
-                      flush=True)
 
         self._stop = True
         print(f"bridge: tick={self.stats['tick']} clk={self.stats['clk']} "

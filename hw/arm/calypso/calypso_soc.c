@@ -15,6 +15,7 @@
 #include "hw/misc/unimp.h"
 #include "sysemu/sysemu.h"
 #include "hw/arm/calypso/calypso_soc.h"
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* PCB orchestrator init */
 #include "hw/arm/calypso/calypso_trx.h"
 
 /* Global references for TDMA tick to kick UART RX (both channels).
@@ -295,6 +296,18 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
         memory_region_init_io(mr, NULL, &calypso_mmio8_ops, NULL,
                               "calypso.catchall", 0x100000);
         memory_region_add_subregion_overlap(sysmem, 0xFFF00000, mr, -1);
+    }
+
+    /* === PCB orchestrator init (threading PCB) ====================
+     * Spawn les threads optionnels par puce/unité quand CALYPSO_PCB_THREADS=1
+     * ou granulaire CALYPSO_PCB_THREAD_X=1 / CALYPSO_PCB_TICK_THREADS=1.
+     * Sans wire ici, les gates dans calypso_trx.c / calypso_tint0.c
+     * skip leur re-arm sans qu'aucun thread ne les remplace → ticks meurent. */
+    {
+        CalypsoPcb *pcb = calypso_pcb_init(NULL);
+        if (pcb) {
+            calypso_pcb_start_threads(pcb);
+        }
     }
 
     fprintf(stderr, "[SOC] === calypso_soc_realize DONE ===\n");

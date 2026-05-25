@@ -8,6 +8,7 @@
  */
 
 #include "calypso_c54x.h"
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -287,7 +288,19 @@ static void read_stats_trigger_check(C54xState *s)
             (unsigned long long)delta[RR_OTHER]);
 }
 
+static uint16_t data_read_locked(C54xState *s, uint16_t addr);
+
 static uint16_t data_read(C54xState *s, uint16_t addr)
+{
+    /* MTTCG : protège DARAM access (DSP + ARM-OVLY peuvent racer).
+     * Sans MTTCG : mutex non contesté (overhead minimal). */
+    qemu_mutex_lock(&calypso_pcb_daram_lock);
+    uint16_t v = data_read_locked(s, addr);
+    qemu_mutex_unlock(&calypso_pcb_daram_lock);
+    return v;
+}
+
+static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
     /* D_BURST_D_W probe : DSP lit db_w->d_burst_d ?
@@ -678,7 +691,17 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     return s->data[addr];
 }
 
+static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val);
+
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
+{
+    /* MTTCG lock : voir data_read ci-dessus. */
+    qemu_mutex_lock(&calypso_pcb_daram_lock);
+    data_write_locked(s, addr, val);
+    qemu_mutex_unlock(&calypso_pcb_daram_lock);
+}
+
+static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
     /* COEFFS-WR probe : watch-write sur la zone [0x2bc0..0x2bff] (64 mots).
      * 2026-05-14 evening — COEFFS-DUMP a montré une séquence init→clear→use :
@@ -6032,6 +6055,278 @@ static uint16_t g_sp_low_pc = 0xFFFF;
 static unsigned g_sp_low_hits_at_pc = 0;
 static unsigned g_sp_low_distinct_pcs = 0;
 
+/* SP-decrement histogram per-PC (fix 2026-05-24 v3 — Claude web correction).
+ *
+ * Gating par VALEUR SP (pas insn_count) — robuste à :
+ *   - DSP idle fast-forward (dsp_idle_fast_forward L5937 inflate insn_count
+ *     sans exécuter d'opcodes)
+ *   - jitter externe wall-clock (bridge/osmocon/BTS sur UDP+PTY → instant
+ *     guest où arrive un burst varie run-à-run, insn_count des events
+ *     déclenchés par bursts pas stable)
+ *
+ * Logique : armé quand SP descend SOUS le plateau (default < 0x2000, sous
+ * 0x3fb0 où SP stationne 632k→3.5M insns du run jackpot). Reste armé
+ * jusqu'au dump quand SP < 0x0100 (proche underflow). Pendant cette fenêtre,
+ * compte chaque SP-décrement par PC.
+ *
+ * 3 bénéfices :
+ *   1. Auto-aligne sur la descente quels que soient FF et jitter externe
+ *   2. Rend la question FF caduque (descente = real insns, pas idle-poll)
+ *   3. Exclut churn équilibré du plateau (PSHM/POP matched à PCs distincts
+ *      pollue insn-window mais pas SP-window — leaker domine mécaniquement)
+ *
+ * Override env :
+ *   CALYPSO_SP_HIST_ARM   (default 0x2000) — threshold pour armer
+ *   CALYPSO_SP_HIST_DUMP  (default 0x0100) — threshold pour dumper
+ *
+ * Capture toutes voies SP-write : direct s->sp--, MMR_SP via data_write
+ * callback, IRQ push (audit couverture 2026-05-24 : tous paths passent
+ * par s->sp variable). */
+typedef struct {
+    uint16_t pc;
+    uint16_t op_last;
+    uint32_t dec_count;
+    int32_t  delta_sum;   /* négatif = drain net */
+} SpDecEntry;
+#define SP_HIST_MAX 512
+static SpDecEntry g_sp_dec_hist[SP_HIST_MAX];
+static unsigned   g_sp_dec_used = 0;
+static unsigned   g_sp_dec_total_events = 0;
+static uint16_t   g_sp_dec_arm_threshold = 0;
+static uint16_t   g_sp_dec_dump_threshold = 0;
+static int        g_sp_dec_enabled = -1;
+static int        g_sp_dec_armed = 0;
+static int        g_sp_dec_dumped = 0;
+static unsigned   g_sp_dec_arm_insn = 0;   /* insn at which we armed */
+static uint16_t   g_sp_dec_arm_sp = 0;     /* SP value at arm */
+
+/* === Raw SP ring buffer (Patch 3 — 2026-05-25) ===
+ * Per-iteration record of (insn, PC, SP, op) at top-of-loop, no filter,
+ * no sign classification. Dumped edge-triggered when SP crosses below
+ * the dump threshold (réutilise le trigger du histo, sans freeze).
+ * Évite définitivement les bugs de wrap signé qui ont mordu l'histo
+ * (underflow v3/v4, overflow v5/maintenant). Brut, donc honnête.
+ * Env gates :
+ *   CALYPSO_SP_RING=1     active (default OFF, zéro coût sinon)
+ *   CALYPSO_SP_RING_MAX=N cap nombre de dumps par run (default 4) */
+#define SP_RING_SZ 512  /* must be power of 2 */
+typedef struct {
+    unsigned insn;
+    uint16_t pc;
+    uint16_t sp;
+    uint16_t op;
+    uint16_t _pad;
+} SpRingEntry;
+static SpRingEntry g_sp_ring[SP_RING_SZ];
+static unsigned    g_sp_ring_head = 0;
+static uint64_t    g_sp_ring_total = 0;
+static int         g_sp_ring_enabled = -1;
+static unsigned    g_sp_ring_dump_count = 0;
+static unsigned    g_sp_ring_dump_max = 0;
+
+static void sp_ring_record(unsigned insn, uint16_t pc, uint16_t sp, uint16_t op)
+{
+    if (g_sp_ring_enabled <= 0) return;
+    SpRingEntry *e = &g_sp_ring[g_sp_ring_head];
+    e->insn = insn; e->pc = pc; e->sp = sp; e->op = op;
+    g_sp_ring_head = (g_sp_ring_head + 1) & (SP_RING_SZ - 1);
+    g_sp_ring_total++;
+}
+
+static void sp_ring_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
+{
+    if (g_sp_ring_enabled <= 0) return;
+    if (g_sp_ring_dump_max && g_sp_ring_dump_count >= g_sp_ring_dump_max) return;
+    g_sp_ring_dump_count++;
+    fprintf(stderr,
+        "[c54x] SP-RING DUMP[%s] @insn=%u sp_now=0x%04x total_recorded=%llu "
+        "dump#%u\n",
+        trig, insn_now, sp_now,
+        (unsigned long long)g_sp_ring_total, g_sp_ring_dump_count);
+    unsigned n = (g_sp_ring_total < SP_RING_SZ)
+                 ? (unsigned)g_sp_ring_total : SP_RING_SZ;
+    unsigned start = (g_sp_ring_total < SP_RING_SZ) ? 0 : g_sp_ring_head;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned idx = (start + k) & (SP_RING_SZ - 1);
+        SpRingEntry *e = &g_sp_ring[idx];
+        fprintf(stderr,
+            "[c54x] SP-RING[%u] insn=%u PC=0x%04x SP=0x%04x op=0x%04x\n",
+            k, e->insn, e->pc, e->sp, e->op);
+    }
+}
+
+static void sp_ring_init_lazy(void)
+{
+    if (g_sp_ring_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_SP_RING");
+    g_sp_ring_enabled = (e && *e == '1') ? 1 : 0;
+    const char *m = getenv("CALYPSO_SP_RING_MAX");
+    g_sp_ring_dump_max = (m && *m) ? (unsigned)strtoul(m, NULL, 0) : 4u;
+    if (g_sp_ring_enabled) {
+        fprintf(stderr,
+            "[c54x] SP-RING enabled, sz=%u, max_dumps=%u\n",
+            SP_RING_SZ, g_sp_ring_dump_max);
+    }
+}
+
+static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
+{
+    fprintf(stderr,
+        "[c54x] SP-HIST DUMP[%s] arm@(insn=%u,sp=0x%04x) now@(insn=%u,sp=0x%04x) "
+        "events=%u distinct_pcs=%u\n",
+        trig, g_sp_dec_arm_insn, g_sp_dec_arm_sp, insn_now, sp_now,
+        g_sp_dec_total_events, g_sp_dec_used);
+
+    /* Top-K par dec_count (trickle leak). */
+    fprintf(stderr, "[c54x] SP-HIST TOP BY COUNT (corrupteur trickle):\n");
+    for (unsigned k = 0; k < 20 && k < g_sp_dec_used; k++) {
+        unsigned best = k;
+        for (unsigned i = k + 1; i < g_sp_dec_used; i++) {
+            if (g_sp_dec_hist[i].dec_count > g_sp_dec_hist[best].dec_count)
+                best = i;
+        }
+        if (best != k) {
+            SpDecEntry tmp = g_sp_dec_hist[k];
+            g_sp_dec_hist[k] = g_sp_dec_hist[best];
+            g_sp_dec_hist[best] = tmp;
+        }
+        fprintf(stderr,
+            "[c54x] SP-HIST #%u pc=0x%04x op_last=0x%04x dec_count=%u "
+            "delta_sum=%d\n",
+            k + 1, g_sp_dec_hist[k].pc, g_sp_dec_hist[k].op_last,
+            g_sp_dec_hist[k].dec_count, g_sp_dec_hist[k].delta_sum);
+    }
+
+    /* Top-K par |delta_sum| (single-event jump corrupteur — 1 event huge). */
+    fprintf(stderr, "[c54x] SP-HIST TOP BY |delta_sum| (corrupteur single-jump):\n");
+    for (unsigned k = 0; k < 10 && k < g_sp_dec_used; k++) {
+        unsigned best = k;
+        int32_t best_abs = g_sp_dec_hist[k].delta_sum < 0
+                           ? -g_sp_dec_hist[k].delta_sum
+                           :  g_sp_dec_hist[k].delta_sum;
+        for (unsigned i = k + 1; i < g_sp_dec_used; i++) {
+            int32_t a = g_sp_dec_hist[i].delta_sum < 0
+                        ? -g_sp_dec_hist[i].delta_sum
+                        :  g_sp_dec_hist[i].delta_sum;
+            if (a > best_abs) { best = i; best_abs = a; }
+        }
+        if (best != k) {
+            SpDecEntry tmp = g_sp_dec_hist[k];
+            g_sp_dec_hist[k] = g_sp_dec_hist[best];
+            g_sp_dec_hist[best] = tmp;
+        }
+        fprintf(stderr,
+            "[c54x] SP-HIST D#%u pc=0x%04x op_last=0x%04x dec_count=%u "
+            "delta_sum=%d\n",
+            k + 1, g_sp_dec_hist[k].pc, g_sp_dec_hist[k].op_last,
+            g_sp_dec_hist[k].dec_count, g_sp_dec_hist[k].delta_sum);
+    }
+    g_sp_dec_dumped = 1;
+}
+
+static void sp_hist_account(uint16_t exec_pc, uint16_t exec_op,
+                            uint16_t sp_before, uint16_t sp_now,
+                            unsigned insn)
+{
+    if (g_sp_dec_enabled < 0) {
+        const char *e_arm = getenv("CALYPSO_SP_HIST_ARM");
+        const char *e_dump = getenv("CALYPSO_SP_HIST_DUMP");
+        unsigned arm  = (e_arm  && *e_arm)  ? (unsigned)strtoul(e_arm,  NULL, 0) : 0x2000u;
+        unsigned dump = (e_dump && *e_dump) ? (unsigned)strtoul(e_dump, NULL, 0) : 0x0100u;
+        if (arm > 0xFFFF) arm = 0xFFFF;
+        if (dump > 0xFFFF) dump = 0xFFFF;
+        if (dump >= arm) dump = (arm > 0x100) ? (arm - 0x100) : 0;
+        g_sp_dec_arm_threshold  = (uint16_t)arm;
+        g_sp_dec_dump_threshold = (uint16_t)dump;
+        g_sp_dec_enabled = 1;
+        fprintf(stderr,
+            "[c54x] SP-HIST gating SP-value : ARM<0x%04x DUMP<0x%04x\n",
+            g_sp_dec_arm_threshold, g_sp_dec_dump_threshold);
+    }
+    if (!g_sp_dec_enabled) return;
+    /* Patch 1 (2026-05-25) : freeze RETIRÉ. L'ancien `if (g_sp_dec_dumped)
+     * return;` faisait du one-shot, donc tous les events post-1er-dump
+     * étaient perdus. Sans freeze, plusieurs dumps consécutifs si SP
+     * reste sous threshold — c'est borné en pratique par le rate-limit
+     * du sp_ring_dump_max et par le edge-detect dans le top-of-loop. */
+
+    /* Patch 2 (2026-05-25) : drop le cast (int16_t). Le wrap signé
+     * mis-classifiait les chutes high→low en pop. Pure int32 sub :
+     *   0x9006→0x0000 : delta = -36870 (correct, descent capturé)
+     *   0xC000→0x0000 : delta = -49152 (correct, descent capturé)
+     * Note : casse l'underflow wrap (0x2bc0→0xfff8 = +52280, vu comme
+     * pop), mais l'histo n'est plus la source de vérité pour le kill
+     * — c'est le ring buffer qui tranche. Histo = drift trickle uniquement. */
+    if (!g_sp_dec_armed) {
+        int32_t first_check = (int32_t)sp_now - (int32_t)sp_before;
+        if (first_check < 0) {
+            g_sp_dec_armed = 1;
+            g_sp_dec_arm_insn = insn;
+            g_sp_dec_arm_sp = sp_now;
+            fprintf(stderr,
+                "[c54x] SP-HIST ARMED @insn=%u SP=0x%04x (sp_before=0x%04x delta=%d) "
+                "pc=0x%04x op=0x%04x\n",
+                insn, sp_now, sp_before, first_check, exec_pc, exec_op);
+        } else {
+            return;  /* no negative delta yet — wait */
+        }
+    }
+
+    /* Record event AVANT le dump check (fix 2026-05-24 v4 — sinon un
+     * single-event jump qui franchit DUMP en une instruction est perdu). */
+    int32_t delta = (int32_t)sp_now - (int32_t)sp_before;
+    if (delta < 0) {
+        g_sp_dec_total_events++;
+        unsigned i;
+        for (i = 0; i < g_sp_dec_used; i++) {
+            if (g_sp_dec_hist[i].pc == exec_pc) break;
+        }
+        if (i == g_sp_dec_used) {
+            if (g_sp_dec_used >= SP_HIST_MAX) {
+                static int sat_log = 0;
+                if (!sat_log) {
+                    fprintf(stderr,
+                        "[c54x] SP-HIST saturated (>%u distinct PCs) — "
+                        "broaden if needed\n", SP_HIST_MAX);
+                    sat_log = 1;
+                }
+            } else {
+                g_sp_dec_hist[i].pc = exec_pc;
+                g_sp_dec_hist[i].op_last = exec_op;
+                g_sp_dec_hist[i].dec_count = 0;
+                g_sp_dec_hist[i].delta_sum = 0;
+                g_sp_dec_used++;
+            }
+        }
+        if (i < g_sp_dec_used) {
+            g_sp_dec_hist[i].op_last = exec_op;
+            g_sp_dec_hist[i].dec_count++;
+            g_sp_dec_hist[i].delta_sum += delta;
+        }
+        /* Log first 10 events verbatim — for single-event jumps the corrupteur
+         * est dans les premiers events (souvent un seul mot dans le histo). */
+        if (g_sp_dec_total_events <= 10) {
+            fprintf(stderr,
+                "[c54x] SP-HIST EVENT #%u pc=0x%04x op=0x%04x "
+                "sp_before=0x%04x sp_now=0x%04x delta=%d insn=%u\n",
+                g_sp_dec_total_events, exec_pc, exec_op,
+                sp_before, sp_now, delta, insn);
+        }
+    }
+
+    /* DUMP : APRÈS l'accounting, vérifier seuil dump.
+     * Patch 1 (2026-05-25) : edge-trigger only — dump quand SP croise
+     * sous le floor (sp_before >= threshold && sp_now < threshold).
+     * Sans cet edge, sans le freeze, on dumperait à chaque iter une
+     * fois SP bas. Avec edge, on dump le plongeon mais pas les iters
+     * suivantes où SP reste bas. Si SP remonte puis re-plonge, on
+     * re-dump (utile pour observer recovery + re-descente). */
+    if (sp_before >= g_sp_dec_dump_threshold && sp_now < g_sp_dec_dump_threshold) {
+        sp_ring_dump("sp-floor-cross", insn, sp_now);
+        sp_hist_dump("sp-floor-cross", insn, sp_now);
+    }
+}
+
 static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
                           uint16_t sp_before, const char *trig)
 {
@@ -6045,6 +6340,9 @@ static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
         fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - i) & 255]);
     fprintf(stderr, "\n[c54x] TRAP sp_low=0x%04x at last_pc=0x%04x hits_at_pc=%u distinct_pcs=%u\n",
             g_sp_low, g_sp_low_pc, g_sp_low_hits_at_pc, g_sp_low_distinct_pcs);
+    /* SP-HIST dump (fix v3 2026-05-24 — SP-windowed, no-insn-dep). */
+    if (g_sp_dec_used > 0 && !g_sp_dec_dumped)
+        sp_hist_dump("trap", s->insn_count, s->sp);
     fprintf(stderr, "[c54x] TRAP sp_trail[-256..-1] (|Δ|>32 only; insn old->new @pc op A_low):\n");
     for (int i = 256; i >= 1; i--) {
         unsigned k = (g_sp_trail_idx - i) & 255;
@@ -6552,6 +6850,49 @@ int c54x_run(C54xState *s, int n_insns)
     }
 
     while (executed < n_insns && s->running && !s->idle) {
+        /* === TOP-OF-LOOP SP CHOKEPOINT (fix 2026-05-24 v6 Claude web) ===
+         * Le hook SP existant est en BAS de boucle (L7471). Toute
+         * instruction qui sort tôt (goto unimpl, return, continue, handler
+         * qui sort de la dispatch chain) bypasse le hook → l'écriture SP
+         * a lieu mais n'est pas comptabilisée. Hier l'audit "tout passe
+         * par s->sp" était correct sur les SITES d'écriture mais ne
+         * vérifiait pas si le hook tourne pour ces instructions.
+         *
+         * Symptôme : 61 events captés vs descente attendue de 11k+ mots
+         * → la descente passe par bypass(es). Fix : observer s->sp à un
+         * CHOKEPOINT obligé (top de boucle), comparer avec la valeur de
+         * l'itération précédente. Bypass-proof par construction : on
+         * regarde la VALEUR à un point de passage, pas le SITE.
+         *
+         * Implementation : statics (persistent inter-c54x_run-calls). */
+        {
+            static uint16_t topgate_last_sp = 0;
+            static uint16_t topgate_last_pc = 0;
+            static uint16_t topgate_last_op = 0;
+            static int      topgate_valid   = 0;
+
+            if (topgate_valid && s->sp != topgate_last_sp) {
+                /* Compte l'instruction PRÉCÉDENTE qui a changé SP, quelle
+                 * que soit sa voie de sortie (early-exit, return, etc.) */
+                sp_hist_account(topgate_last_pc, topgate_last_op,
+                                topgate_last_sp, s->sp, s->insn_count);
+            }
+            topgate_last_sp = s->sp;
+            topgate_last_pc = s->pc;
+            topgate_last_op = prog_fetch(s, s->pc);
+            topgate_valid   = 1;
+
+            /* Patch 3 (2026-05-25) : raw ring buffer record.
+             * Inconditionnel per-iter (pas de filtre Δ, pas de classification
+             * signée). Env-gated CALYPSO_SP_RING=1, zéro coût si OFF.
+             * Le ring est dumpé edge-triggered par sp_hist_account quand
+             * SP croise sous le floor — fournit les ~512 dernières
+             * (insn,PC,SP,op) AVANT le plongeon, donc la trajectoire
+             * d'approche et l'instruction exacte qui plonge. */
+            sp_ring_init_lazy();
+            sp_ring_record(s->insn_count, s->pc, s->sp, topgate_last_op);
+        }
+
         /* DSP idle fast-forward — see dsp_idle_fast_forward() comment.
          * Skips MAC simulation when DSP is in its empty-task-slot
          * polling loop, returning host CPU to the rest of QEMU. */
@@ -7326,6 +7667,10 @@ int c54x_run(C54xState *s, int n_insns)
             if (trap_armed && s->sp != sp_before && s->insn_count > 33754) {
                 int16_t delta = (int16_t)(s->sp - sp_before);
                 uint16_t a_low = (uint16_t)(s->a & 0xFFFF);
+
+                /* SP-HIST per-PC accounting déplacé en TOP-of-loop chokepoint
+                 * (fix v6 2026-05-24) — bypass-proof. Voir L6773.
+                 * Pas d'appel ici sinon double-count. */
 
                 /* (a) trail — only big jumps (skip push/pop ±1..32 noise) */
                 if (delta > 32 || delta < -32) {

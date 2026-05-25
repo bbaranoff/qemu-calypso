@@ -248,6 +248,30 @@ CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
 CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-1}"
 CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
+# CALYPSO_IQ : master switch pour le chemin IQ passthrough.
+#   on/1   = bridge GMSK-module les soft-bits (scipy BT=0.3) et envoie 296 B IQ
+#            par burst ; QEMU BSP fait memcpy direct au DSP correlator au lieu
+#            de la modulation ±π/2 hard interne. Cible : améliorer TOA/Angle
+#            FB-det (vu DSP error 51536 + TOA=0xFFFFC9C0 en mode hard-mod).
+#   off/0  = mode hard-mod historique (bridge soft-bits + BSP modulate ±π/2).
+# Default : on (le hard-mod est connu pour casser le DSP correlator FCCH).
+CALYPSO_IQ="${CALYPSO_IQ:-on}"
+case "$CALYPSO_IQ" in
+    on|1|true|yes)
+        CALYPSO_BSP_IQ_PASSTHROUGH=1
+        BRIDGE_BSP_IQ=1
+        ;;
+    off|0|false|no)
+        CALYPSO_BSP_IQ_PASSTHROUGH=0
+        BRIDGE_BSP_IQ=0
+        ;;
+    *)
+        echo "[run.sh] CALYPSO_IQ='$CALYPSO_IQ' inconnu (attendu on/off) → fallback on" >&2
+        CALYPSO_BSP_IQ_PASSTHROUGH=1
+        BRIDGE_BSP_IQ=1
+        ;;
+esac
+export CALYPSO_IQ CALYPSO_BSP_IQ_PASSTHROUGH BRIDGE_BSP_IQ
 # CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) côté
 # calypso_trx.c. =0 (default) = runs silencieux, zéro stderr-pipe backpressure.
 # =1 = mêmes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
@@ -268,7 +292,11 @@ BRIDGE_DL_FN_REWRITE="${BRIDGE_DL_FN_REWRITE:-slot}"
 # Max qfn-future frames a DL burst may be tagged. Bounded by
 # BSP_FN_MATCH_WINDOW (=64 default in calypso_bsp.c). Default 32 leaves
 # half-window safety margin. Set 51 to never drop (always find a slot).
-BRIDGE_DL_FN_LOOKAHEAD="${BRIDGE_DL_FN_LOOKAHEAD:-32}"
+# Default 51 (was 32) : couvre un cycle complet mod 51 → tout bts_fn trouve
+# un qfn slot matchant dans la fenêtre. Sous icount=auto, drift bts↔qfn
+# ~34k frames → avec 32 on dropait ~37% des DL bursts ("delta_to_match=33
+# > lookahead=32"). 51 = burst latency max ~230ms, acceptable cell selection.
+BRIDGE_DL_FN_LOOKAHEAD="${BRIDGE_DL_FN_LOOKAHEAD:-51}"
 # CLK IND period — default 51 (half of stock 102) to keep osmo-bts-trx
 # scheduler happy when QEMU runs slower than wall-clock real-time. With
 # a 102-frame period, the BTS accumulates skew between consecutive
@@ -299,6 +327,28 @@ export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
 #   off               disable (legacy default-clock mode)
 CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"
 export CALYPSO_ICOUNT
+
+# ---- MTTCG mode (Phase C : multi-thread TCG, ARM en thread distinct
+#                  des periph callbacks). Incompatible avec icount=auto.
+#                  Voir MTTCG_AUDIT.md pour les locks fins requis. ----
+CALYPSO_MTTCG="${CALYPSO_MTTCG:-0}"
+export CALYPSO_MTTCG
+if [ "$CALYPSO_MTTCG" = "1" ]; then
+    if [ "$CALYPSO_ICOUNT" != "off" ]; then
+        echo "[run.sh] CALYPSO_MTTCG=1 forces CALYPSO_ICOUNT=off (incompatible)" >&2
+        CALYPSO_ICOUNT="off"
+        export CALYPSO_ICOUNT
+    fi
+    if [ "${CALYPSO_PCB_TICK_THREADS:-0}" = "1" ]; then
+        echo "[run.sh] CALYPSO_MTTCG=1 forces CALYPSO_PCB_TICK_THREADS=0 (redondant)" >&2
+        CALYPSO_PCB_TICK_THREADS="0"
+        export CALYPSO_PCB_TICK_THREADS
+    fi
+    QEMU_ACCEL_FLAG="-accel tcg,thread=multi"
+else
+    QEMU_ACCEL_FLAG=""
+fi
+
 if [ "$CALYPSO_ICOUNT" = "off" ]; then
     QEMU_ICOUNT_FLAG=""
 else
@@ -365,6 +415,7 @@ if [ -z "$CALYPSO_L2_CLIENT" ]; then
     esac
 fi
 echo "L2 client = $CALYPSO_L2_CLIENT"
+echo "CALYPSO_IQ = $CALYPSO_IQ (CALYPSO_BSP_IQ_PASSTHROUGH=$CALYPSO_BSP_IQ_PASSTHROUGH, BRIDGE_BSP_IQ=$BRIDGE_BSP_IQ)"
 
 # ---------- cleanup ----------
 rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
@@ -407,6 +458,7 @@ fi
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M calypso -cpu arm946 \
     $QEMU_ICOUNT_FLAG \
+    $QEMU_ACCEL_FLAG \
     $QEMU_GDB_FLAG \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \
@@ -486,7 +538,7 @@ fi
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
 tmux send-keys -t "$SESSION:osmocon" \
-    "$OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
+    ": > $OSMOCON_LOG && $OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
 
 echo -n "Waiting for osmocon to expose $L1CTL_SOCK..."
 for i in $(seq 1 30); do
@@ -498,7 +550,7 @@ if [ -S "$L1CTL_SOCK" ]; then echo " OK"; else echo " WARN — socket missing"; 
 # ---------- 3. bridge.py ----------
 tmux new-window -t "$SESSION" -n bridge
 tmux send-keys -t "$SESSION:bridge" \
-    "python3 $BRIDGE 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
+    ": > $BRIDGE_LOG && BRIDGE_BSP_IQ=$BRIDGE_BSP_IQ python3 $BRIDGE 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
 
 # Pas de wait `QEMU tick` ici : avec le hack CALYPSO_FORCE_RX_DONE, le
 # firmware peut prendre du temps à libérer le polling SIM (plusieurs ops
@@ -510,7 +562,7 @@ tmux send-keys -t "$SESSION:bridge" \
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" \
-    "osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
+    ": > $BTS_LOG && osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
 # Sync barrier : attendre que osmo-bts-trx ait commencé à pousser des DL
 # bursts au bridge — proxy fiable : `bridge: DL #` dans bridge.log
 # (le bridge.py imprime ça à chaque burst TRXDv0 reçu de bts-trx).
@@ -534,7 +586,7 @@ tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
 case "$CALYPSO_L2_CLIENT" in
     mobile)
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "$L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+            ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
         ;;
     ccch_scan)
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
@@ -547,7 +599,7 @@ case "$CALYPSO_L2_CLIENT" in
     *)
         echo "WARN — CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
         tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "$L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+            ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
         ;;
 esac
 

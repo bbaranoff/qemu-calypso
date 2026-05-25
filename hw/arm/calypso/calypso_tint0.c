@@ -16,6 +16,7 @@
 #include "calypso_tint0.h"
 #include "calypso_c54x.h"
 #include "hw/core/cpu.h"
+#include <stdlib.h>  /* getenv */
 
 #define TINT0_LOG(fmt, ...) \
     fprintf(stderr, "[tint0] " fmt "\n", ##__VA_ARGS__)
@@ -50,14 +51,31 @@ static void tint0_tick_cb(void *opaque)
     /* Delegate frame work to calypso_trx */
     calypso_tint0_do_tick(tint0.fn);
 
-    /* Re-arm timer */
-    if (tint0.running) {
-        timer_mod_ns(tint0.timer,
-                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TINT0_PERIOD_NS);
+    /* Re-arm timer — gated par CALYPSO_PCB_TICK_THREADS. Si threading
+     * actif (= pcb spawn tint0 thread qui self-paces), on N'arme PAS le
+     * QEMUTimer pour éviter double-tick. */
+    {
+        static int pcb_threaded = -1;
+        if (pcb_threaded < 0) {
+            const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
+            pcb_threaded = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (!pcb_threaded && tint0.running) {
+            timer_mod_ns(tint0.timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + TINT0_PERIOD_NS);
+        }
     }
 
     /* Kick ARM CPU to process pending IRQs */
 qemu_notify_event();
+}
+
+/* Public invoker pour pcb tick thread — call la même body que le QEMUTimer
+ * callback. À appeler avec BQL held. */
+void calypso_tint0_tick_invoke(void);
+void calypso_tint0_tick_invoke(void)
+{
+    tint0_tick_cb(NULL);
 }
 
 /* ---- Public API ---- */

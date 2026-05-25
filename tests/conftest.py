@@ -908,21 +908,39 @@ def _audit_blocker(r: dict) -> str:
     err = (r.get("err_short") or "").strip()
     if not err:
         return ""
-    # Keywords : tokens alphanum >= 4 chars. On exclut les très communs.
-    STOP = {"assert", "True", "False", "None", "self", "test", "tests",
-            "AssertionError", "ValueError", "TypeError", "Error"}
-    kws = []
+    # FIX 2026-05-24 : prioriser les VALEURS du message (key=value, hex
+    # addresses, decimal nums) sur les tokens génériques (qui pèchent les
+    # noms de tests / fichiers .py / classes Error). L'ancien algo greppait
+    # `test_qemu_insn_rate_p1_above_1m` partout et retournait 0 — bruit.
+    # Strip d'abord la 1ère ligne avec le node_id pytest.
+    err_clean = "\n".join(
+        l for l in err.splitlines()
+        if not _re_a.match(r"^\s*[\w/]+\.py[:\d]*\s*(in\s+test_)?", l)
+    )
     seen = set()
-    for tok in _re_a.findall(r'[A-Za-z_][A-Za-z0-9_]{3,}', err):
+    kws = []
+    # 1. key=value (le plus discriminant : task=24, rate=12345, fn=N)
+    for k, v in _re_a.findall(r'\b([a-z_][a-z_0-9]*)=(\w+)', err_clean):
+        kv = f"{k}={v}"
+        if kv not in seen and len(kws) < 4:
+            seen.add(kv); kws.append(kv)
+    # 2. hex addresses (0x...)
+    for h in _re_a.findall(r'\b(0x[0-9a-fA-F]{3,})\b', err_clean):
+        if h not in seen and len(kws) < 6:
+            seen.add(h); kws.append(h)
+    # 3. tokens 4+ chars (filet de sécurité) — EXCLURE test names + modules
+    STOP = {"assert", "True", "False", "None", "self", "test", "tests",
+            "AssertionError", "ValueError", "TypeError", "Error",
+            "Exception", "RuntimeError", "KeyError", "IndexError",
+            "py", "pytest", "Traceback", "File", "line", "module"}
+    for tok in _re_a.findall(r'\b([A-Za-z_][A-Za-z0-9_]{3,})\b', err_clean):
         if tok in STOP or tok in seen:
             continue
+        if tok.startswith("test_") or tok.endswith("_test") or "." in tok:
+            continue
         seen.add(tok); kws.append(tok)
-        if len(kws) >= 5:
+        if len(kws) >= 8:
             break
-    # Aussi : tokens numériques notables (task=24, fn=N, etc.) — extrait paires
-    nums = _re_a.findall(r'\b([a-z_]+)=(\d+)', err)
-    if nums:
-        kws.extend([f"{k}={v}" for k, v in nums[:3] if f"{k}={v}" not in seen])
     if not kws:
         return ""
     LOGS = [("qemu", "/root/qemu.log"),
