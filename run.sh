@@ -19,15 +19,21 @@ SESSION="calypso"
 # test_results.md/qmd complets). Crée une fenêtre tmux `gen-doc` dans la session
 # `calypso` existante et y bascule pour montrer le run pytest en direct.
 GEN_DOC_MODE=0
+MENU_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --gen-doc-local) GEN_DOC_MODE=1 ;;
+        --menu) MENU_MODE=1 ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [--gen-doc-local]
+Usage: $0 [--gen-doc-local] [--menu]
 
 Default : launch the full Calypso pipeline (QEMU + osmocon + bridge + bts +
 mobile + gsmtap + irda capture) in a tmux session and attach to it.
+
+--menu      : interactive profile selection before launch (hack-free /
+              dev-assist / full-diag / custom). Sets CALYPSO_* env vars
+              and re-execs.
 
 --gen-doc-local : skip pipeline launch, run pytest in the container "trying"
             (no requirement that qemu-system-arm be running — tests can
@@ -52,6 +58,113 @@ done
 if [ "$GEN_DOC_MODE" = "1" ]; then
     CALYPSO_AUTO_GEN_DOC=1
     export CALYPSO_AUTO_GEN_DOC
+fi
+
+# ---- --menu : interactive profile selection -----------------------------
+# Set les CALYPSO_* vars selon profil choisi avant les defaults plus bas.
+# Profils :
+#   1) hack-free + diag minimal     (run nettoyé, peu de logs)
+#   2) hack-free + diag complet     (= sondes hunt actuelles : SP/AR/IMR/RSBX/WATCH)
+#   3) dev-assist PM_INJECT=800     (= mobile passe PM scan via hack)
+#   4) dev-assist FBSB_SYNTH=1      (= DSP FB-det shunted, mobile gsm322)
+#   5) custom (réponse var-par-var)
+#   0) cancel
+if [ "$MENU_MODE" = "1" ]; then
+    echo
+    echo "========================================="
+    echo " Calypso run.sh — Profile selection"
+    echo "========================================="
+    echo
+    echo "  1) hack-free + diag MINIMAL"
+    echo "     (production-like, peu de logs)"
+    echo
+    echo "  2) hack-free + diag FULL"
+    echo "     (sondes hunt actives : SP_RING + AR_TRACE + RSBX + WATCH_3FBE)"
+    echo
+    echo "  3) dev-assist PM_INJECT=800"
+    echo "     (mobile passe PM scan via hack, atteint FBSB_REQ)"
+    echo
+    echo "  4) dev-assist FBSB_SYNTH=1"
+    echo "     (DSP FB-det shunted via synth NDB write, mobile→gsm322)"
+    echo
+    echo "  5) custom (saisie var-par-var)"
+    echo
+    echo "  0) cancel"
+    echo
+    read -p "Choix [1-5, 0] : " CHOICE
+    case "$CHOICE" in
+        1)
+            echo "[menu] Profil = hack-free + diag MINIMAL"
+            export CALYPSO_FBSB_SYNTH=0
+            export CALYPSO_DSP_FBDET_SKIP=0
+            export CALYPSO_PM_INJECT=0
+            export CALYPSO_DSP_FORCE_DARAM62=0
+            export CALYPSO_PROBE_BOOTSTUB=0
+            ;;
+        2)
+            echo "[menu] Profil = hack-free + diag FULL"
+            export CALYPSO_FBSB_SYNTH=0
+            export CALYPSO_DSP_FBDET_SKIP=0
+            export CALYPSO_PM_INJECT=0
+            export CALYPSO_DSP_FORCE_DARAM62=0
+            export CALYPSO_PROBE_BOOTSTUB=0
+            export CALYPSO_SP_RING=1
+            export CALYPSO_SP_RING_TRIG=bootstub
+            export CALYPSO_SP_RING_INSN_MIN=1000000
+            export CALYPSO_SP_ABS_TRACE=1
+            export CALYPSO_AR_TRACE=0xFF
+            export CALYPSO_WATCH_3FBE=1
+            export CALYPSO_CORRELATOR_TRACE=1
+            export CALYPSO_MVPD_TRACE=1
+            export CALYPSO_MVPD_BOOT_LIMIT=500000
+            export CALYPSO_RSBX_INTM_TRACE=1
+            ;;
+        3)
+            echo "[menu] Profil = dev-assist PM_INJECT=800"
+            export CALYPSO_FBSB_SYNTH=0
+            export CALYPSO_DSP_FBDET_SKIP=0
+            export CALYPSO_PM_INJECT=800
+            ;;
+        4)
+            echo "[menu] Profil = dev-assist FBSB_SYNTH=1"
+            export CALYPSO_FBSB_SYNTH=1
+            export CALYPSO_DSP_FBDET_SKIP=0
+            export CALYPSO_PM_INJECT=800
+            ;;
+        5)
+            echo "[menu] Profil = custom"
+            _ask() {
+                local var="$1" def="$2" prompt="$3"
+                read -p "  $var [$def] ($prompt) : " val
+                val="${val:-$def}"
+                export "$var=$val"
+            }
+            echo "--- Hacks (0 = désactivé, no-hack) ---"
+            _ask CALYPSO_PM_INJECT       0 "PM scan hack (800 = inject value)"
+            _ask CALYPSO_FBSB_SYNTH      0 "synth FB/SB NDB hack"
+            _ask CALYPSO_DSP_FBDET_SKIP  0 "skip DSP FB-det handler"
+            echo "--- Diagnostic ---"
+            _ask CALYPSO_SP_RING         0 "SP ring buffer"
+            _ask CALYPSO_SP_ABS_TRACE    0 "SP absolute writes"
+            _ask CALYPSO_AR_TRACE        0 "AR0..AR7 mask (0xFF = all)"
+            _ask CALYPSO_WATCH_3FBE      0 "watch 0x3fb0..0x3fbf writes"
+            _ask CALYPSO_CORRELATOR_TRACE 0 "FB-det reads + AR3/AR4 entry"
+            _ask CALYPSO_MVPD_TRACE      0 "MVPD overlay occupancy"
+            _ask CALYPSO_RSBX_INTM_TRACE 0 "RSBX INTM hits counter"
+            echo "--- Misc ---"
+            _ask CALYPSO_BSP_DARAM_ADDR  0x3fb0 "BSP DMA target addr"
+            _ask CALYPSO_IQ              on    "IQ passthrough (on/off)"
+            _ask CALYPSO_ICOUNT          auto  "icount mode"
+            ;;
+        0|*)
+            echo "[menu] cancelled"
+            exit 0
+            ;;
+    esac
+    echo
+    echo "[menu] Lancement avec :"
+    env | grep -E '^CALYPSO_' | sort | sed 's/^/  /'
+    echo
 fi
 
 # Détection pytest réutilisée par la fenêtre gen-doc auto plus bas.

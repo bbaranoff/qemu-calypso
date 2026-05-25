@@ -100,6 +100,8 @@ def pytest_configure(config):
         "drift:                drift temporel inter-couches via timestamps logs",
         # test_timer_invariants.py
         "timer_invariant:      compteurs timers QEMU ([tdma]/[frame_irq]/[kick]) + CSV log_timeline",
+        # test_ar_imr_inth_invariants.py (2026-05-25)
+        "ar_imr_invariant:     invariants DSP init silicon (SP/AR/IMR) + IRQ servicing + bootstub regression",
         # test_gdb_stub.py (Phase 2)
         "runtime_gdb:          GDB stub :1234 — handshake, regs, mem, PC, NDB",
         # extension monitor (Phase 2)

@@ -183,6 +183,286 @@ static struct {
     uint64_t sweep_nonzero_count;
 } g_fb_det_timing;
 
+/* === Generic ARn write tracer with provenance (2026-05-25 v3 unified) ===
+ * Tracer paramétré pour AR0..AR7. Remplace les ad-hoc ar2/ar4. Env mask
+ * `CALYPSO_AR_TRACE` (hex, default 0) :
+ *   =0xFF  → trace tous les AR0..AR7
+ *   =0x14  → trace AR2 + AR4 seulement (bits 2 et 4 set)
+ *   =0x04  → AR2 only
+ *   =0     → désactivé (zéro coût)
+ *
+ * Hook : `case MMR_AR0..AR7` dans data_write_locked. Skip auto-modify
+ * noise (Δ ∈ [-3, 3]). Classification opcode via decode + flag ZERO
+ * automatique (= suspect clobber MMR via STL A,*AR-).
+ *
+ * Question résolue par cette sonde : qui pose ARn = mauvaise valeur ?
+ *   STM-#lk    → immediate hardcoded ROM (silicon-intentional, le fix
+ *                est ailleurs : étape ultérieure qui ré-set manque)
+ *   MVDM-mem   → load depuis mem (slot uninit divergence QEMU vs silicon)
+ *   MVMM       → copie d'un autre AR (remonter le tracer sur source)
+ *   STM Smem   → load mem indirect (idem MVDM)
+ *   STLM-A     → from accumulator A (vérifier d'où A vient) */
+#define AR_HIST_MAX 64
+typedef struct {
+    uint16_t pc;
+    uint16_t op_last;
+    uint16_t val_last;
+    uint32_t count;
+} ArEntry;
+static ArEntry  g_ar_hist[8][AR_HIST_MAX];
+static unsigned g_ar_used[8]    = {0};
+static unsigned g_ar_total[8]   = {0};
+static unsigned g_ar_mask       = 0;
+static int      g_ar_enabled    = -1;
+static unsigned g_ar_log_cap    = 50;
+
+static void ar_write_track(C54xState *s, unsigned idx, uint16_t new_val)
+{
+    if (g_ar_enabled < 0) {
+        const char *e = getenv("CALYPSO_AR_TRACE");
+        g_ar_mask = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0;
+        g_ar_enabled = (g_ar_mask != 0) ? 1 : 0;
+        if (g_ar_enabled) {
+            fprintf(stderr,
+                "[c54x] AR-TRACE enabled, mask=0x%02x (AR0..AR7), "
+                "log_cap=%u hist_max=%u\n",
+                g_ar_mask, g_ar_log_cap, AR_HIST_MAX);
+        }
+    }
+    if (g_ar_enabled <= 0) return;
+    if (idx >= 8) return;
+    if (!(g_ar_mask & (1u << idx))) return;
+
+    uint16_t old_val = s->ar[idx];
+    int32_t delta = (int32_t)new_val - (int32_t)old_val;
+    if (delta >= -3 && delta <= 3) return;  /* skip auto-modify noise */
+    g_ar_total[idx]++;
+
+    uint16_t op = prog_fetch(s, s->pc);
+    const char *kind = "MISC";
+    if ((op & 0xFF80) == 0x7700) kind = "STM-#lk";
+    else if ((op & 0xFF00) == 0x8400) kind = "STLM-A";
+    else if ((op & 0xFF00) == 0x8600) kind = "MVDM-mem";
+    else if ((op & 0xFF00) == 0x8800) kind = "MVMM";
+    else if ((op & 0xF800) == 0x8000) kind = "STL-A";
+
+    unsigned i;
+    for (i = 0; i < g_ar_used[idx]; i++) {
+        if (g_ar_hist[idx][i].pc == s->pc) {
+            g_ar_hist[idx][i].count++;
+            g_ar_hist[idx][i].val_last = new_val;
+            g_ar_hist[idx][i].op_last = op;
+            break;
+        }
+    }
+    if (i == g_ar_used[idx] && g_ar_used[idx] < AR_HIST_MAX) {
+        g_ar_hist[idx][i].pc = s->pc;
+        g_ar_hist[idx][i].op_last = op;
+        g_ar_hist[idx][i].val_last = new_val;
+        g_ar_hist[idx][i].count = 1;
+        g_ar_used[idx]++;
+    }
+    if (g_ar_total[idx] <= g_ar_log_cap) {
+        fprintf(stderr,
+            "[c54x] AR%u-W #%u %s @insn=%u PC=0x%04x op=0x%04x  "
+            "AR%u %04x → %04x (Δ=%+d)  A=%010llx SP=%04x\n",
+            idx, g_ar_total[idx], kind, s->insn_count, s->pc, op,
+            idx, old_val, new_val, delta,
+            (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->sp);
+    }
+    /* Distinction sémantique critique (cf review Claude web 2026-05-25 v2) :
+     * - STM-#lk    = deliberate AR update via immediate hardcoded ROM
+     *                (silicon-intentional, l'AR change par design firmware)
+     * - LD-#k      = idem (small immediate)
+     * - STL-A / autres = side-effect d'un MMR write where AR happens to
+     *                    self-alias (= AR pointing at its own MMR slot).
+     *                    NOT an explicit AR update — coincidence pointer.
+     * Label clairement pour ne pas confondre les 2 dans le hunt. */
+    if (new_val == 0) {
+        int deliberate = ((op & 0xFF80) == 0x7700);  /* STM-#lk only */
+        fprintf(stderr,
+            "[c54x] AR%u-W ZERO %s @insn=%u PC=0x%04x op=0x%04x AR%u←0 "
+            "(kind=%s)\n",
+            idx,
+            deliberate ? "DELIBERATE" : "SIDE-EFFECT",
+            s->insn_count, s->pc, op, idx, kind);
+    }
+}
+
+/* === A accumulator provenance tracer (2026-05-25 v3) ===
+ * Capture le LAST WRITER de A via chokepoint top-of-loop : compare A
+ * iter-à-iter, si change → mémorise PC + op du writer. Quand un trigger
+ * PC fire (default = 0x9ac0 = STL A,*AR2- clobber IMR), dump A + last
+ * writer. Réponse à la question Claude web : A=0 délibéré (= mask-all
+ * design firmware) ou A=0 divergence (= A devait porter mask valide) ?
+ *
+ * Env : CALYPSO_A_TRACE_PC=0x9ac0 (hex PC trigger, default 0xFFFF=off)
+ * Zéro coût si env non set. */
+static int64_t  g_a_last_value      = 0;
+static uint16_t g_a_last_writer_pc  = 0;
+static uint16_t g_a_last_writer_op  = 0;
+static unsigned g_a_last_writer_insn = 0;
+static int      g_a_trace_enabled   = -1;
+static uint16_t g_a_trace_pc        = 0xFFFF;
+static unsigned g_a_trace_hits      = 0;
+static unsigned g_a_trace_log_cap   = 50;
+
+static void a_track_init_lazy(void)
+{
+    if (g_a_trace_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_A_TRACE_PC");
+    if (e && *e) {
+        g_a_trace_pc = (uint16_t)strtoul(e, NULL, 0);
+        g_a_trace_enabled = 1;
+        fprintf(stderr,
+            "[c54x] A-TRACE enabled, trigger PC=0x%04x log_cap=%u\n",
+            g_a_trace_pc, g_a_trace_log_cap);
+    } else {
+        g_a_trace_enabled = 0;
+    }
+}
+
+static void a_track_iter(C54xState *s, uint16_t prev_pc, uint16_t prev_op)
+{
+    if (g_a_trace_enabled <= 0) return;
+    /* Detect A change → mémorise dernier writer */
+    if (s->a != g_a_last_value) {
+        g_a_last_writer_pc   = prev_pc;
+        g_a_last_writer_op   = prev_op;
+        g_a_last_writer_insn = s->insn_count;
+        g_a_last_value       = s->a;
+    }
+    /* Trigger : PC about to execute matches target */
+    if (s->pc == g_a_trace_pc) {
+        g_a_trace_hits++;
+        int a_zero = ((s->a & 0xFFFF) == 0);
+        /* Log if (a) parmi les N premiers (contexte) OR (b) A_low=0 (= cas
+         * suspect STL clobber zone). Évite cap log silencieux qui masque
+         * les events critiques tardifs (cf cas insn=253328 IMR clobber). */
+        if (g_a_trace_hits <= g_a_trace_log_cap || a_zero) {
+            fprintf(stderr,
+                "[c54x] A-AT-PC #%u @insn=%u PC=0x%04x  A=%010llx (low=0x%04x, %s) "
+                "last_writer: PC=0x%04x op=0x%04x @insn=%u\n",
+                g_a_trace_hits, s->insn_count, s->pc,
+                (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                (unsigned)(s->a & 0xFFFF),
+                a_zero ? "A_low=0 → STL clobber zone" : "A_low≠0",
+                g_a_last_writer_pc, g_a_last_writer_op,
+                g_a_last_writer_insn);
+        }
+    }
+}
+
+/* === AR6 windowed snapshot at trigger PC (2026-05-25 v4) ===
+ * Capture AR6 + B + source provenance à chaque fire d'un PC trigger,
+ * fenêtré sur [insn_lo, insn_hi] pour éviter explosion log (le PC 0x821a
+ * fire 10M+ fois). Réponse à la question Claude web : aux fires qui
+ * clobber IMR à PC=0x821a, AR6 vaut 0 (= base divergence) ou 0x16
+ * (= self-alias feedback) ?
+ *
+ * Tracking AR6's last writer (= what set AR6 to its current value)
+ * via top-of-loop comparison (même pattern que A tracer).
+ *
+ * Env :
+ *   CALYPSO_AR6_AT_PC=0x821a    PC trigger
+ *   CALYPSO_AR6_WIN_LO=3619500  insn window start
+ *   CALYPSO_AR6_WIN_HI=3619810  insn window end (one outer-loop iter)
+ *   CALYPSO_AR6_AT_LOG_CAP=200  max log lines (default 200)
+ */
+static uint16_t g_ar6_last_value     = 0;
+static uint16_t g_ar6_last_writer_pc = 0;
+static uint16_t g_ar6_last_writer_op = 0;
+static unsigned g_ar6_last_writer_insn = 0;
+static int      g_ar6_at_enabled     = -1;
+static uint16_t g_ar6_at_pc          = 0xFFFF;
+static unsigned g_ar6_at_win_lo      = 0;
+static unsigned g_ar6_at_win_hi      = 0;
+static unsigned g_ar6_at_hits        = 0;
+static unsigned g_ar6_at_log_cap     = 200;
+
+static void ar6_at_init_lazy(void)
+{
+    if (g_ar6_at_enabled >= 0) return;
+    const char *e = getenv("CALYPSO_AR6_AT_PC");
+    if (e && *e) {
+        g_ar6_at_pc = (uint16_t)strtoul(e, NULL, 0);
+        g_ar6_at_enabled = 1;
+        const char *lo = getenv("CALYPSO_AR6_WIN_LO");
+        const char *hi = getenv("CALYPSO_AR6_WIN_HI");
+        const char *cap = getenv("CALYPSO_AR6_AT_LOG_CAP");
+        g_ar6_at_win_lo = (lo && *lo) ? (unsigned)strtoul(lo, NULL, 0) : 0;
+        g_ar6_at_win_hi = (hi && *hi) ? (unsigned)strtoul(hi, NULL, 0) : 0xFFFFFFFFu;
+        g_ar6_at_log_cap = (cap && *cap) ? (unsigned)strtoul(cap, NULL, 0) : 200;
+        fprintf(stderr,
+            "[c54x] AR6-AT-PC enabled, trigger PC=0x%04x window=[%u..%u] cap=%u\n",
+            g_ar6_at_pc, g_ar6_at_win_lo, g_ar6_at_win_hi, g_ar6_at_log_cap);
+    } else {
+        g_ar6_at_enabled = 0;
+    }
+}
+
+static void ar6_at_iter(C54xState *s, uint16_t prev_pc, uint16_t prev_op)
+{
+    if (g_ar6_at_enabled <= 0) return;
+    /* Track AR6 last writer */
+    if (s->ar[6] != g_ar6_last_value) {
+        g_ar6_last_writer_pc   = prev_pc;
+        g_ar6_last_writer_op   = prev_op;
+        g_ar6_last_writer_insn = s->insn_count;
+        g_ar6_last_value       = s->ar[6];
+    }
+    /* Trigger : PC about to execute matches AND within window */
+    if (s->pc == g_ar6_at_pc &&
+        s->insn_count >= g_ar6_at_win_lo &&
+        s->insn_count <= g_ar6_at_win_hi) {
+        g_ar6_at_hits++;
+        if (g_ar6_at_hits <= g_ar6_at_log_cap) {
+            uint16_t ar6 = s->ar[6];
+            const char *regime;
+            if (ar6 == 0)              regime = "AR6=0 → addr=IMR (BUFFER BASE DIVERGENCE)";
+            else if (ar6 == 0x16)      regime = "AR6=0x16 → addr=MMR_AR6 (SELF-ALIAS)";
+            else if (ar6 < 0x20)       regime = "AR6 in MMR zone";
+            else                        regime = "AR6 normal";
+            fprintf(stderr,
+                "[c54x] AR6-AT-PC #%u @insn=%u PC=0x%04x  AR6=0x%04x (%s) "
+                "B=%010llx (high=0x%04x)  last_writer: PC=0x%04x op=0x%04x @insn=%u\n",
+                g_ar6_at_hits, s->insn_count, s->pc,
+                ar6, regime,
+                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                (unsigned)((s->b >> 16) & 0xFFFF),
+                g_ar6_last_writer_pc, g_ar6_last_writer_op,
+                g_ar6_last_writer_insn);
+        }
+    }
+}
+
+
+/* RSBX INTM hits counter (cheap probe, candidat 1 du doc §7). */
+static uint64_t g_rsbx_intm_hits = 0;
+static int      g_rsbx_intm_enabled = -1;
+
+static void rsbx_intm_check(C54xState *s, uint16_t op)
+{
+    if (g_rsbx_intm_enabled < 0) {
+        const char *e = getenv("CALYPSO_RSBX_INTM_TRACE");
+        g_rsbx_intm_enabled = (e && *e == '1') ? 1 : 0;
+        if (g_rsbx_intm_enabled) {
+            fprintf(stderr, "[c54x] RSBX-INTM-TRACE enabled (op=0xF6BB)\n");
+        }
+    }
+    if (g_rsbx_intm_enabled <= 0) return;
+    if (op == 0xF6BB) {
+        g_rsbx_intm_hits++;
+        if (g_rsbx_intm_hits <= 20 || (g_rsbx_intm_hits % 1000) == 0) {
+            fprintf(stderr,
+                "[c54x] RSBX-INTM #%llu @insn=%u PC=0x%04x  ST1 INTM 0x%04x → "
+                "(cleared) — IRQ enable path atteint !\n",
+                (unsigned long long)g_rsbx_intm_hits, s->insn_count, s->pc,
+                s->st1);
+        }
+    }
+}
+
 /* === AR4 write tracer with provenance (2026-05-25) ===
  * Hooke chaque write vers MMR_AR4 (= 0x14) via data_write_locked.
  * Logge (insn, PC, opcode courant, val écrite, ancien AR4) + tente une
@@ -198,94 +478,6 @@ static struct {
  * Si AR4 vient d'un mem load (LDM/MVDM), le corrupter remonte au TCB
  * en mémoire — pas l'instruction qui charge AR4, mais le TCB lui-même
  * (potentiellement uninitialized faute de re-init firmware sautée). */
-#define AR4_HIST_MAX 64
-typedef struct {
-    uint16_t pc;
-    uint16_t op_last;
-    uint16_t val_last;
-    uint32_t count;
-} Ar4Entry;
-static Ar4Entry g_ar4_hist[AR4_HIST_MAX];
-static unsigned g_ar4_used    = 0;
-static unsigned g_ar4_total   = 0;
-static int      g_ar4_enabled = -1;
-static unsigned g_ar4_log_cap = 50;
-
-static void ar4_write_track(C54xState *s, uint16_t new_val)
-{
-    if (g_ar4_enabled < 0) {
-        const char *e = getenv("CALYPSO_AR4_TRACE");
-        g_ar4_enabled = (e && *e == '1') ? 1 : 0;
-        if (g_ar4_enabled) {
-            fprintf(stderr, "[c54x] AR4-TRACE enabled, log_cap=%u hist_max=%u\n",
-                    g_ar4_log_cap, AR4_HIST_MAX);
-        }
-    }
-    if (g_ar4_enabled <= 0) return;
-    uint16_t old_val = s->ar[4];
-    /* Skip noise : pas de changement, ou changement uniquement par ±1/2
-     * (auto-modify type, irrelevant pour la chasse au saut). On garde
-     * seulement les |Δ|>3 pour signal/bruit. */
-    int32_t delta = (int32_t)new_val - (int32_t)old_val;
-    if (delta >= -3 && delta <= 3) return;
-
-    g_ar4_total++;
-
-    /* Tentative classification provenance depuis opcode courant */
-    uint16_t op = prog_fetch(s, s->pc);
-    const char *kind = "MISC";
-    if ((op & 0xFF80) == 0x7700) {
-        /* 0x77yx : STM #lk, Smem (Smem=AR4 here) → immediate from next word */
-        kind = "STM-#lk";
-    } else if ((op & 0xFF00) == 0x8400) {
-        kind = "STLM-A";   /* STLM A, AR4 = store A low into AR4 */
-    } else if ((op & 0xFF00) == 0x8600) {
-        kind = "MVDM-mem"; /* MVDM dmad, AR4 = mem absolute → AR4 */
-    } else if ((op & 0xFF00) == 0x8800) {
-        kind = "MVMM";     /* MVMM ARi, AR4 = register copy */
-    } else if ((op & 0xF800) == 0x8000) {
-        kind = "STL-A";    /* STL A,Smem with Smem=0x14 */
-    }
-
-    /* Per-PC histo */
-    unsigned i;
-    for (i = 0; i < g_ar4_used; i++) {
-        if (g_ar4_hist[i].pc == s->pc) {
-            g_ar4_hist[i].count++;
-            g_ar4_hist[i].val_last = new_val;
-            g_ar4_hist[i].op_last = op;
-            break;
-        }
-    }
-    if (i == g_ar4_used && g_ar4_used < AR4_HIST_MAX) {
-        g_ar4_hist[i].pc = s->pc;
-        g_ar4_hist[i].op_last = op;
-        g_ar4_hist[i].val_last = new_val;
-        g_ar4_hist[i].count = 1;
-        g_ar4_used++;
-    }
-
-    /* Verbatim log first N */
-    if (g_ar4_total <= g_ar4_log_cap) {
-        fprintf(stderr,
-            "[c54x] AR4-W #%u %s @insn=%u PC=0x%04x op=0x%04x  "
-            "AR4 %04x → %04x (Δ=%+d)  A=%010llx AR3=%04x AR5=%04x SP=%04x\n",
-            g_ar4_total, kind, s->insn_count, s->pc, op,
-            old_val, new_val, delta,
-            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
-            s->ar[3], s->ar[5], s->sp);
-    }
-
-    /* Suspect flag : valeur dans zones bug observées */
-    if ((new_val >= 0x2b80 && new_val <= 0x2c00) ||
-        (new_val >= 0x3fb0 && new_val <= 0x3fbf)) {
-        fprintf(stderr,
-            "[c54x] AR4-W SUSPECT! @insn=%u PC=0x%04x op=0x%04x "
-            "AR4←0x%04x (zone bug, corrupter ?)\n",
-            s->insn_count, s->pc, op, new_val);
-    }
-}
-
 /* === SP absolute-write tracer (2026-05-25 — nohack hunt) ===
  * Logge chaque write SP via STL/STM/STLM absolute, FRAME #imm, MVMM
  * register transfer — c'est-à-dire les sites où SP est *téléporté* à une
@@ -1418,7 +1610,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         case MMR_TRN:  s->trn = val; return;
         case MMR_AR0: case MMR_AR1: case MMR_AR2: case MMR_AR3:
         case MMR_AR4: case MMR_AR5: case MMR_AR6: case MMR_AR7:
-            if (addr == MMR_AR4) ar4_write_track(s, val);  /* probe avant write */
+            ar_write_track(s, addr - MMR_AR0, val);  /* unified probe AR0..AR7 */
             s->ar[addr - MMR_AR0] = val; return;
         case MMR_SP:
             if (val >= 0x0800 && val < 0x0900) {
@@ -3342,26 +3534,29 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0xF0 || hi8 == 0xF1) {
-            /* FIRS -- catch before other F1xx handlers */
-            if (hi8 == 0xF1) {
-                op2 = prog_fetch(s, s->pc + 1);
-                consumed = 2;
-                int xar = (op >> 4) & 0x07;
-                int yar = op & 0x07;
-                uint16_t xval = data_read(s, s->ar[xar]);
-                uint16_t yval = data_read(s, s->ar[yar]);
-                uint8_t xmod = (op >> 4) & 0xF;
-                if ((xmod & 0x1) == 0) s->ar[xar]++; else s->ar[xar]--;
-                if ((op & 0x08) == 0) s->ar[yar]++; else s->ar[yar]--;
-                int16_t coeff = (int16_t)prog_read(s, op2);
-                int16_t ah = (int16_t)((s->a >> 16) & 0xFFFF);
-                int64_t product = (int64_t)ah * (int64_t)coeff;
-                if (s->st1 & ST1_FRCT) product <<= 1;
-                s->b = sext40(s->b + product);
-                int32_t sum = (int32_t)(int16_t)xval + (int32_t)(int16_t)yval;
-                s->a = sext40((int64_t)sum << 16);
-                return consumed + s->lk_used;
-            }
+            /* FIRS catch RETIRÉ (2026-05-25 v3, Claude web review).
+             *
+             * Le bloc `if (hi8 == 0xF1) { FIRS treatment }` qui était ici
+             * était FAUX : per binutils tic54x-opc.c, vrai FIRS = 0xE000
+             * mask 0xFF00 (handled separately at the 0xE0 case), JAMAIS
+             * 0xF1xx. Le catch-all capture-tout 0xF1xx faisait :
+             *   s->a = sext40((int64_t)sum << 16);
+             * → A_low = 0 inconditionnellement → STL A,*AR2- à PC=0x9ac0
+             * écrivait 0 à mem[AR2] qui se trouvait être MMR_IMR (0x12 via
+             * self-aliasing) → IMR cleared → DSP bloqué (bloqueur #2).
+             *
+             * Diagnostic via A provenance tracer (CALYPSO_A_TRACE_PC=0x9ac0)
+             * a montré last_writer = PC=0x9abd op=0xf1fe = `SFTL A,-2,B`
+             * (binutils mask 0xFCE0 base 0xF0E0). SFTL handler EXISTE à
+             * L3915, capture correctement 0xF1FE & 0xFCE0 = 0xF0E0.
+             *
+             * Après retrait du catch, les 0xF1xx tombent dans :
+             *   - SFTL/AND/OR/XOR 1-word (mask FCE0)  : L3915
+             *   - AND/OR/XOR/MAC #lk<<16 (mask FCFF) : L3852
+             *   - AND/OR/XOR #lk+shift  (mask FCF0)  : L3886
+             * Si une opcode 0xF1xx n'a pas de handler (par ex. add/sub lk
+             * variants avec DST=B), tombe à F4xx unhandled NOP log à la fin
+             * du bloc → diagnostic visible. */
             /* F073: B pmad — unconditional branch (2-word).
              * Per tic54x-opc.c: 0xF073 mask 0xFFFF. */
             if (op == 0xF073) {
@@ -3497,9 +3692,19 @@ static int c54x_exec_one(C54xState *s)
                 if (alu_op >= 8) {
                     /* F08x-F0Fx: accumulator-to-accumulator ops (1-word).
                      * bits 7:5 = op (100=AND,101=OR,110=XOR,111=SFTL)
-                     * bits 4:0 = shift (signed 5-bit), bits 9:8 = src,dst */
-                    int src_sel = (op >> 8) & 1;
-                    int dst_sel = (op >> 9) & 1;
+                     * bits 4:0 = shift (signed 5-bit), bits 9:8 = src,dst
+                     *
+                     * Fix 2026-05-25 v4 : src/dst inversés. Per binutils
+                     * tic54x convention (et confirmé par L3915 même opcode
+                     * famille mais handler shadowed) : bit 9 = SRC,
+                     * bit 8 = DST. L'inversion mettait dst=A pour 0xf1fe
+                     * (= SFTL A,-2,B), qui calculait A = B>>2 au lieu de
+                     * B = A>>2. Si B=0 → A=0 → STL A,*AR2- pose 0 à IMR
+                     * (bloqueur #2 racine, cf [[blocker-2-dsp-dispatcher]]).
+                     * Diagnostic via A-AT-PC tracer : 8454 fires A_low=0
+                     * last_writer=0xf1fe @PC=0x9abd. */
+                    int src_sel = (op >> 9) & 1;   /* bit 9 = SRC (was bit 8) */
+                    int dst_sel = (op >> 8) & 1;   /* bit 8 = DST (was bit 9) */
                     int64_t sv = src_sel ? s->b : s->a;
                     int64_t *dst = dst_sel ? &s->b : &s->a;
                     int shift = op & 0x1F;
@@ -3872,6 +4077,7 @@ static int c54x_exec_one(C54xState *s)
                 /* F6Bx: RSBX -- reset bit in ST1 (bit 9=1, bit 8=0).
                  * Per tic54x-opc.c: RSBX 0xF4B0 mask 0xFDF0 covers F6Bx. */
                 int bit = op & 0x0F;
+                rsbx_intm_check(s, op);  /* probe candidat 1 doc §7 */
                 s->st1 &= ~(1 << bit);
                 return consumed + s->lk_used;
             }
@@ -7370,6 +7576,22 @@ int c54x_run(C54xState *s, int n_insns)
                 sp_ring_check_bootstub_entry(s,
                     topgate_last_pc, topgate_last_op, topgate_last_sp,
                     s->pc, s->sp, s->insn_count);
+            }
+
+            /* A provenance tracer (2026-05-25 v3, Claude web review).
+             * Track A's last writer + dump at trigger PC. Resout fork
+             * NMI-vs-A-divergence avant impl invasive. */
+            a_track_init_lazy();
+            if (topgate_valid) {
+                a_track_iter(s, topgate_last_pc, topgate_last_op);
+            }
+
+            /* AR6 windowed snapshot (2026-05-25 v4) — disambigue AR6=0
+             * (base divergence) vs AR6=0x16 (self-alias feedback) au PC
+             * trigger. Env CALYPSO_AR6_AT_PC=0x821a + window. */
+            ar6_at_init_lazy();
+            if (topgate_valid) {
+                ar6_at_iter(s, topgate_last_pc, topgate_last_op);
             }
 
             topgate_last_sp = s->sp;
