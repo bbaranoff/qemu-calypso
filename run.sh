@@ -1,18 +1,18 @@
 #!/bin/bash
-# run.sh — Calypso QEMU pipeline.
+# run.sh -- Calypso QEMU pipeline.
 #
-# Data path : osmo-bts-trx → osmo-trx-ipc → calypso-ipc-device → QEMU BSP
-# DMA → DSP CCCH demod → a_cd[] in NDB → ARM L1 → L1CTL_DATA_IND.
-# Modem GMSK intégré dans osmo-trx (chaîne radio software-defined complète).
+# Data path : osmo-bts-trx : osmo-trx-ipc : calypso-ipc-device : QEMU BSP
+# DMA : DSP CCCH demod : a_cd[] in NDB : ARM L1 : L1CTL_DATA_IND.
+# Modem GMSK integre dans osmo-trx (chaine radio software-defined complete).
 
 set -euo pipefail
 
 SESSION="calypso"
 
 # ---- args : --gen-doc / --help -----------------------------------------------
-# --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne déjà dans le
-# container et lance pytest pour produire la doc (report.md condensé +
-# test_results.md/qmd complets). Crée une fenêtre tmux `gen-doc` dans la session
+# --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne deja dans le
+# container et lance pytest pour produire la doc (report.md condense +
+# test_results.md/qmd complets). Cree une fenetre tmux `gen-doc` dans la session
 # `calypso` existante et y bascule pour montrer le run pytest en direct.
 GEN_DOC_MODE=0
 MENU_MODE=0
@@ -20,6 +20,18 @@ for arg in "$@"; do
     case "$arg" in
         --gen-doc-local) GEN_DOC_MODE=1 ;;
         --menu) MENU_MODE=1 ;;
+        --run-all)
+            echo "[run.sh] --run-all : delegating to run-all.sh"
+            exec "$(dirname "$0")/run-all.sh" "${@:2}"
+            ;;
+        --run-all-debug)
+            echo "[run.sh] --run-all-debug : delegating to run-all-debug.sh"
+            exec "$(dirname "$0")/run-all-debug.sh" "${@:2}"
+            ;;
+        --select-verdict)
+            echo "[run.sh] --select-verdict : delegating to select-verdict.sh"
+            exec "$(dirname "$0")/select-verdict.sh" "${@:2}"
+            ;;
         -h|--help)
             cat <<EOF
 Usage: $0 [--gen-doc-local] [--menu]
@@ -32,7 +44,7 @@ Default : launch the full Calypso pipeline (QEMU + osmocon + calypso-ipc-device
               and re-execs.
 
 --gen-doc-local : skip pipeline launch, run pytest in the container "trying"
-            (no requirement that qemu-system-arm be running — tests can
+            (no requirement that qemu-system-arm be running -- tests can
             still fail/skip if dependencies missing). Output lands in a new
             tmux window 'gen-doc' of the calypso session (if it exists);
             otherwise streamed to the current terminal.
@@ -48,114 +60,528 @@ EOF
 done
 
 # `--gen-doc-local` = synonyme de "lance le pipeline normal ET force la
-# génération de doc auto" (qui se déclenche T+30s après QEMU launch dans une
-# fenêtre tmux dédiée). Pas de mode "skip pipeline" : si tu veux régénérer la
+# generation de doc auto" (qui se declenche T+30s apres QEMU launch dans une
+# fenetre tmux dediee). Pas de mode "skip pipeline" : si tu veux regenerer la
 # doc sans relancer, lance directement pytest dans le container.
 if [ "$GEN_DOC_MODE" = "1" ]; then
     CALYPSO_AUTO_GEN_DOC=1
     export CALYPSO_AUTO_GEN_DOC
 fi
 
-# ---- --menu : interactive profile selection -----------------------------
-# Set les CALYPSO_* vars selon profil choisi avant les defaults plus bas.
-# Profils :
-#   1) hack-free + diag minimal     (run nettoyé, peu de logs)
-#   2) hack-free + diag complet     (= sondes hunt actuelles : SP/AR/IMR/RSBX/WATCH)
-#   3) dev-assist PM_INJECT=800     (= mobile passe PM scan via hack)
-#   4) dev-assist FBSB_SYNTH=1      (= DSP FB-det shunted, mobile gsm322)
-#   5) custom (réponse var-par-var)
-#   0) cancel
+# ---- --menu : kernel-menuconfig style (whiptail) -----------------------
+# Hierarchie 3 niveaux avec heritage et conditions :
+#
+#   Niveau 1 : Mode general (5 presets + free)
+#   Niveau 2 : Components -- pre-coches selon le mode, modifiables
+#              (mode "free" = tout decoche par defaut)
+#   Niveau 3 : Sub-options conditionnelles a ce qu'on a coche
+#              (L2 client variant si L2 ON, icount config si MTTCG off, etc)
+#   Niveau 4 : Resume + confirm
+#
+# Si whiptail absent : fallback text simple.
 if [ "$MENU_MODE" = "1" ]; then
-    echo
-    echo "========================================="
-    echo " Calypso run.sh — Profile selection"
-    echo "========================================="
-    echo
-    echo "  1) hack-free + diag MINIMAL"
-    echo "     (production-like, peu de logs)"
-    echo
-    echo "  2) hack-free + diag FULL"
-    echo "     (sondes hunt actives : SP_RING + AR_TRACE + RSBX + WATCH_3FBE)"
-    echo
-    echo "  3) dev-assist PM_INJECT=800"
-    echo "     (mobile passe PM scan via hack, atteint FBSB_REQ)"
-    echo
-    echo "  4) dev-assist FBSB_SYNTH=1"
-    echo "     (DSP FB-det shunted via synth NDB write, mobile→gsm322)"
-    echo
-    echo "  5) custom (saisie var-par-var)"
-    echo
-    echo "  0) cancel"
-    echo
-    read -p "Choix [1-5, 0] : " CHOICE
-    case "$CHOICE" in
-        1)
-            echo "[menu] Profil = hack-free + diag MINIMAL"
-            export CALYPSO_PROBE_BOOTSTUB=0
-            # Force icount=auto, MTTCG off pour déterminisme (cf
-            # session 2026-05-25 : data MTTCG non-citable pour claims
-            # d'état firmware. Run.sh:462 force ICOUNT=off si MTTCG=1).
-            export CALYPSO_MTTCG=0
-            export CALYPSO_ICOUNT=auto
-            ;;
-        2)
-            echo "[menu] Profil = hack-free + diag FULL"
-            export CALYPSO_PROBE_BOOTSTUB=0
-            # Force déterminisme : icount=auto, MTTCG off (cf session
-            # 2026-05-25 : data MTTCG non-citable pour state claims).
-            export CALYPSO_MTTCG=0
-            export CALYPSO_ICOUNT=auto
-            export CALYPSO_SP_RING=1
-            export CALYPSO_SP_RING_TRIG=bootstub
-            export CALYPSO_SP_RING_INSN_MIN=1000000
-            export CALYPSO_SP_ABS_TRACE=1
-            export CALYPSO_AR_TRACE=0xFF
-            export CALYPSO_WATCH_3FBE=1
-            export CALYPSO_CORRELATOR_TRACE=1
-            export CALYPSO_MVPD_TRACE=1
-            export CALYPSO_MVPD_BOOT_LIMIT=500000
-            export CALYPSO_RSBX_INTM_TRACE=1
-            ;;
-        3)
-            echo "[menu] Profil = dev-assist PM_INJECT=800"
-            ;;
-        4)
-            echo "[menu] Profil = dev-assist FBSB_SYNTH=1"
-            ;;
-        5)
-            echo "[menu] Profil = custom"
-            _ask() {
-                local var="$1" def="$2" prompt="$3"
-                read -p "  $var [$def] ($prompt) : " val
-                val="${val:-$def}"
-                export "$var=$val"
-            }
-            echo "--- Hacks (0 = désactivé, no-hack) ---"
-            echo "--- Diagnostic ---"
-            _ask CALYPSO_SP_RING         0 "SP ring buffer"
-            _ask CALYPSO_SP_ABS_TRACE    0 "SP absolute writes"
-            _ask CALYPSO_AR_TRACE        0 "AR0..AR7 mask (0xFF = all)"
-            _ask CALYPSO_WATCH_3FBE      0 "watch 0x3fb0..0x3fbf writes"
-            _ask CALYPSO_CORRELATOR_TRACE 0 "FB-det reads + AR3/AR4 entry"
-            _ask CALYPSO_MVPD_TRACE      0 "MVPD overlay occupancy"
-            _ask CALYPSO_RSBX_INTM_TRACE 0 "RSBX INTM hits counter"
-            echo "--- Misc ---"
-            _ask CALYPSO_BSP_DARAM_ADDR  0x3fb0 "BSP DMA target addr"
-            _ask CALYPSO_IQ              on    "IQ passthrough (on/off)"
-            _ask CALYPSO_ICOUNT          auto  "icount mode"
-            ;;
-        0|*)
-            echo "[menu] cancelled"
-            exit 0
-            ;;
+
+  if ! command -v whiptail >/dev/null 2>&1; then
+    echo "[menu] whiptail absent -- fallback text minimal"
+    echo "  Modes disponibles : full | shunt | shunt-ipc | bridge | bare | free"
+    read -p "  CALYPSO_MODE = " CALYPSO_MODE
+    : "${CALYPSO_MODE:=full}"
+    export CALYPSO_MODE
+  else
+
+    # ---- Theme palettes ----
+    # Chaque theme = palette NEWT_COLORS. Choisi par l'user au 1er ecran.
+    # Override via env CALYPSO_MENU_THEME=red|green|magenta|cyan|mono|amber.
+    _theme_red() {
+      # Red list focus + YELLOW button focus -> deux highlights distincts.
+      export NEWT_COLORS='
+        root=white,blue
+        roottext=brightwhite,blue
+        window=,lightgray
+        border=blue,lightgray
+        title=yellow,blue
+        button=brightwhite,blue
+        compactbutton=brightwhite,blue
+        actbutton=black,brightyellow
+        checkbox=black,lightgray
+        actcheckbox=brightwhite,red
+        entry=black,lightgray
+        actentry=brightwhite,red
+        listbox=black,lightgray
+        actlistbox=brightwhite,red
+        textbox=black,lightgray
+        acttextbox=brightwhite,red
+        helpline=brightwhite,blue
+        sellistbox=brightwhite,red
+        actsellistbox=brightwhite,red
+      '
+    }
+    _theme_green() {
+      export NEWT_COLORS='
+        root=brightgreen,black
+        roottext=brightgreen,black
+        window=,black
+        border=brightgreen,black
+        title=brightyellow,black
+        button=brightgreen,black
+        compactbutton=green,black
+        actbutton=black,brightyellow
+        checkbox=brightgreen,black
+        actcheckbox=black,brightgreen
+        entry=brightgreen,black
+        actentry=black,brightgreen
+        listbox=brightgreen,black
+        actlistbox=black,brightgreen
+        textbox=brightgreen,black
+        acttextbox=black,brightgreen
+        helpline=brightgreen,black
+        sellistbox=black,brightgreen
+        actsellistbox=black,brightgreen
+      '
+    }
+    _theme_magenta() {
+      export NEWT_COLORS='
+        root=white,magenta
+        roottext=brightwhite,magenta
+        window=,lightgray
+        border=magenta,lightgray
+        title=brightyellow,magenta
+        button=black,lightgray
+        compactbutton=black,lightgray
+        actbutton=black,brightyellow
+        checkbox=black,lightgray
+        actcheckbox=brightwhite,magenta
+        entry=black,lightgray
+        actentry=brightwhite,magenta
+        listbox=black,lightgray
+        actlistbox=brightwhite,magenta
+        textbox=black,lightgray
+        acttextbox=brightwhite,magenta
+        helpline=brightwhite,magenta
+        sellistbox=brightwhite,magenta
+        actsellistbox=brightwhite,magenta
+      '
+    }
+    _theme_cyan() {
+      export NEWT_COLORS='
+        root=brightwhite,blue
+        roottext=brightwhite,blue
+        window=,lightgray
+        border=cyan,lightgray
+        title=brightyellow,cyan
+        button=black,lightgray
+        compactbutton=black,lightgray
+        actbutton=black,brightyellow
+        checkbox=black,lightgray
+        actcheckbox=black,brightcyan
+        entry=black,lightgray
+        actentry=black,brightcyan
+        listbox=black,lightgray
+        actlistbox=black,brightcyan
+        textbox=black,lightgray
+        acttextbox=black,brightcyan
+        helpline=brightwhite,blue
+        sellistbox=black,brightcyan
+        actsellistbox=black,brightcyan
+      '
+    }
+    _theme_mono() {
+      export NEWT_COLORS='
+        root=white,black
+        roottext=white,black
+        window=,white
+        border=black,white
+        title=black,white
+        button=black,white
+        compactbutton=black,white
+        actbutton=white,black
+        checkbox=black,white
+        actcheckbox=white,black
+        entry=black,white
+        actentry=white,black
+        listbox=black,white
+        actlistbox=white,black
+        textbox=black,white
+        acttextbox=white,black
+        helpline=white,black
+        sellistbox=white,black
+        actsellistbox=white,black
+      '
+    }
+    _theme_cool() {
+      # Default cool theme : navy + cyan listbox accents, JAUNE pour focus
+      # buttons -> distinct de actlistbox (qui reste cyan).
+      export NEWT_COLORS='
+        root=brightcyan,blue
+        roottext=brightwhite,blue
+        window=,black
+        border=brightcyan,black
+        title=brightyellow,blue
+        button=brightwhite,blue
+        compactbutton=brightwhite,blue
+        actbutton=black,brightyellow
+        checkbox=brightcyan,black
+        actcheckbox=black,brightcyan
+        entry=brightwhite,black
+        actentry=black,brightcyan
+        listbox=brightwhite,black
+        actlistbox=black,brightcyan
+        textbox=brightwhite,black
+        acttextbox=black,brightcyan
+        helpline=brightyellow,blue
+        sellistbox=black,brightcyan
+        actsellistbox=black,brightcyan
+      '
+    }
+    _theme_amber() {
+      export NEWT_COLORS='
+        root=brightyellow,black
+        roottext=brightyellow,black
+        window=,black
+        border=brightyellow,black
+        title=brightwhite,brightyellow
+        button=brightyellow,black
+        compactbutton=yellow,black
+        actbutton=black,brightyellow
+        checkbox=brightyellow,black
+        actcheckbox=black,brightyellow
+        entry=brightyellow,black
+        actentry=black,brightyellow
+        listbox=brightyellow,black
+        actlistbox=black,brightyellow
+        textbox=brightyellow,black
+        acttextbox=black,brightyellow
+        helpline=brightyellow,black
+        sellistbox=black,brightyellow
+        actsellistbox=black,brightyellow
+      '
+    }
+    # Default theme = green (matrix vibes). Override via env CALYPSO_MENU_THEME.
+    case "${CALYPSO_MENU_THEME:-green}" in
+      cool)    _theme_cool ;;
+      red)     _theme_red ;;
+      green)   _theme_green ;;
+      magenta) _theme_magenta ;;
+      cyan)    _theme_cyan ;;
+      mono)    _theme_mono ;;
+      amber)   _theme_amber ;;
     esac
-    echo
-    echo "[menu] Lancement avec :"
-    env | grep -E '^CALYPSO_' | sort | sed 's/^/  /'
-    echo
+    BACKTITLE="Calypso QEMU -- DSP shunt / IPC / Bridge -- menuconfig style"
+
+    _cancel() { echo "[menu] cancelled by user" >&2; exit 0; }
+
+    # ---- 0) THEME picker (skip si CALYPSO_MENU_THEME deja set par env) ----
+    if [ -z "${CALYPSO_MENU_THEME:-}" ]; then
+      CHOSEN_THEME=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[0/4] Theme" \
+        --notags --menu \
+        "\n Choisir le theme du menu (ENTER pour selectionner).\n" \
+        17 72 7 \
+        "green"   "Green     -- matrix-style, fond noir (default)" \
+        "cool"    "Cool      -- navy + cyan accents, sleek" \
+        "red"     "Red       -- focus blanc sur rouge (high contrast)" \
+        "magenta" "Magenta   -- focus blanc sur magenta" \
+        "cyan"    "Cyan      -- focus noir sur cyan brillant" \
+        "amber"   "Amber     -- terminal vintage jaune/noir" \
+        "mono"    "Mono      -- noir et blanc seulement" \
+        3>&1 1>&2 2>&3) || _cancel
+      export CALYPSO_MENU_THEME="$CHOSEN_THEME"
+      # Re-apply le theme choisi (la palette par defaut etait deja set
+      # plus haut mais le user vient d'en choisir une autre).
+      case "$CALYPSO_MENU_THEME" in
+        cool)    _theme_cool ;;
+        red)     _theme_red ;;
+        green)   _theme_green ;;
+        magenta) _theme_magenta ;;
+        cyan)    _theme_cyan ;;
+        mono)    _theme_mono ;;
+        amber)   _theme_amber ;;
+      esac
+    fi
+
+    # ---- 1) MODE general (--menu : ENTER directly selects) ----
+    CALYPSO_MODE=$(whiptail --backtitle "$BACKTITLE" \
+      --title "[1/4] General mode" \
+      --notags --menu \
+      "\n Pick a preset (ENTER on item to select). Level 2 inherits it.\n\n \
+ Fine override: env vars CALYPSO_SKIP_*, CALYPSO_DSP_SHUNT, ...\
+" \
+      20 84 7 \
+      "full"      "Full radio pipeline (default legacy)" \
+      "shunt"     "DSP shunt canned -- bissection FBSB" \
+      "shunt-ipc" "DSP shunt + radio chain" \
+      "bridge"    "Legacy bridge.py Python" \
+      "bare"      "QEMU + osmocon only" \
+      "free"      "Free mode -- pick everything yourself" \
+      3>&1 1>&2 2>&3) || _cancel
+    export CALYPSO_MODE
+
+    # ---- Pre-cochage des composants selon le mode (heritage visible) ----
+    # _PRE_X = "ON"/"OFF" selon le mode, sert de defaut au niveau 2.
+    case "$CALYPSO_MODE" in
+      full)
+        _PRE_SHUNT=OFF; _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
+        _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=ON; _PRE_IRDA=ON
+        _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      shunt)
+        _PRE_SHUNT=ON;  _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=OFF
+        _PRE_BTS=OFF;   _PRE_L2=ON;   _PRE_GSMTAP=OFF; _PRE_IRDA=ON
+        _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      shunt-ipc)
+        _PRE_SHUNT=ON;  _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
+        _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=ON; _PRE_IRDA=ON
+        _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      bridge)
+        _PRE_SHUNT=OFF; _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=ON
+        _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=ON; _PRE_IRDA=ON
+        _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      bare)
+        _PRE_SHUNT=OFF; _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=OFF
+        _PRE_BTS=OFF;   _PRE_L2=OFF;  _PRE_GSMTAP=OFF; _PRE_IRDA=ON
+        _PRE_DOC=OFF;   _PRE_MTTCG=OFF
+        ;;
+      free)
+        _PRE_SHUNT=OFF; _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=OFF
+        _PRE_BTS=OFF;   _PRE_L2=OFF;  _PRE_GSMTAP=OFF; _PRE_IRDA=OFF
+        _PRE_DOC=OFF;   _PRE_MTTCG=OFF
+        ;;
+    esac
+
+    # ---- 2) COMPONENTS -- checklist heritee du mode ----
+    # Une boucle de validation : si conflits mutex detectes, msg + retry.
+    _comp_dialog() {
+      whiptail --backtitle "$BACKTITLE" \
+        --title "[2/4] Components (mode herite: $CALYPSO_MODE)" \
+        --notags --checklist \
+        "\n ESPACE = toggle, TAB = OK/Cancel\n\n \
+ Coche par defaut selon le mode choisi.\n \
+ Mutex auto-resolus a la sortie :\n  * IPC_DEVICE+TRX_IPC  XOR  BRIDGE_PY (pipeline radio)\n  * MTTCG  XOR  icount auto\n" \
+        24 82 11 \
+        "DSP_SHUNT"  "DSP mock -- skip c54x, ARM-only (canned FB+SB)" $_PRE_SHUNT \
+        "IPC_DEVICE" "calypso-ipc-device -- UDP 6702 <-> shm bridge" $_PRE_IPC \
+        "TRX_IPC"    "osmo-trx-ipc -- GMSK modem + TRXD vers BTS" $_PRE_TRX \
+        "BRIDGE_PY"  "bridge.py -- pont Python legacy (mutex IPC)" $_PRE_BRIDGE \
+        "BTS"        "osmo-bts-trx -- BTS radio + RSL vers BSC" $_PRE_BTS \
+        "L2"         "L2 client -- mobile/ccch_scan/cell_log" $_PRE_L2 \
+        "GSMTAP"     "tcpdump GSMTAP capture vers pcap" $_PRE_GSMTAP \
+        "IRDA"       "IrDA serial1 capture (fw printf debug)" $_PRE_IRDA \
+        "DOC"        "Auto-gen doc T+60s (pytest in-container)" $_PRE_DOC \
+        "MTTCG"      "MTTCG multi-thread TCG (non-deterministe)" $_PRE_MTTCG \
+        3>&1 1>&2 2>&3
+    }
+
+    # Pattern-match plus robuste que grep (gere bien le case " *" avec quotes)
+    _has() { case " $COMPS " in *"\"$1\""*) return 0 ;; *) return 1 ;; esac; }
+
+    while true; do
+      COMPS=$(_comp_dialog) || _cancel
+
+      # Mutex check : bridge.py XOR (ipc-device | trx-ipc)
+      if _has BRIDGE_PY && { _has IPC_DEVICE || _has TRX_IPC; }; then
+        whiptail --backtitle "$BACKTITLE" --title "Conflit mutex" --msgbox \
+          "\n BRIDGE_PY est mutuellement exclusif avec IPC_DEVICE et TRX_IPC.\n\n \
+ C'est l'ancien chemin Python (bridge.py) vs le moderne (osmo-trx-ipc).\n \
+ Un seul peut tourner a la fois -- decoche l'un OU l'autre.\n" \
+          14 76 3>&1 1>&2 2>&3 || _cancel
+        # On reload avec les pre-cochages mis a jour pour montrer l'etat actuel
+        _has DSP_SHUNT  && _PRE_SHUNT=ON  || _PRE_SHUNT=OFF
+        _has IPC_DEVICE && _PRE_IPC=ON    || _PRE_IPC=OFF
+        _has TRX_IPC    && _PRE_TRX=ON    || _PRE_TRX=OFF
+        _has BRIDGE_PY  && _PRE_BRIDGE=ON || _PRE_BRIDGE=OFF
+        _has BTS        && _PRE_BTS=ON    || _PRE_BTS=OFF
+        _has L2         && _PRE_L2=ON     || _PRE_L2=OFF
+        _has GSMTAP     && _PRE_GSMTAP=ON || _PRE_GSMTAP=OFF
+        _has IRDA       && _PRE_IRDA=ON   || _PRE_IRDA=OFF
+        _has DOC        && _PRE_DOC=ON    || _PRE_DOC=OFF
+        _has MTTCG      && _PRE_MTTCG=ON  || _PRE_MTTCG=OFF
+        continue
+      fi
+
+      # Implication : TRX_IPC sans IPC_DEVICE : osmo-trx-ipc va greeting-fail.
+      if _has TRX_IPC && ! _has IPC_DEVICE; then
+        whiptail --backtitle "$BACKTITLE" --title "Dependance manquante" --msgbox \
+          "\n osmo-trx-ipc requiert calypso-ipc-device (master socket).\n\n \
+ Sans le device, le greeting handshake fail et osmo-trx-ipc exit.\n \
+ Active IPC_DEVICE ou desactive TRX_IPC.\n" \
+          12 76 3>&1 1>&2 2>&3 || _cancel
+        continue
+      fi
+
+      break
+    done
+
+    # Parse final : SKIP_* vars
+    _has DSP_SHUNT  && CALYPSO_DSP_SHUNT=1        || CALYPSO_DSP_SHUNT=0
+    _has IPC_DEVICE && CALYPSO_SKIP_IPC_DEVICE=0  || CALYPSO_SKIP_IPC_DEVICE=1
+    _has TRX_IPC    && CALYPSO_SKIP_TRX_IPC=0     || CALYPSO_SKIP_TRX_IPC=1
+    _has BRIDGE_PY  && CALYPSO_SKIP_BRIDGE_PY=0   || CALYPSO_SKIP_BRIDGE_PY=1
+    _has BTS        && CALYPSO_SKIP_BTS=0         || CALYPSO_SKIP_BTS=1
+    _has L2         && CALYPSO_SKIP_L2=0          || CALYPSO_SKIP_L2=1
+    _has GSMTAP     && CALYPSO_SKIP_GSMTAP=0      || CALYPSO_SKIP_GSMTAP=1
+    _has IRDA       && CALYPSO_IRDA_CAPTURE=1     || CALYPSO_IRDA_CAPTURE=0
+    _has DOC        && CALYPSO_AUTO_GEN_DOC=1     || CALYPSO_AUTO_GEN_DOC=0
+    _has MTTCG      && CALYPSO_MTTCG=1            || CALYPSO_MTTCG=0
+
+    # ---- 3) SUB-OPTIONS conditionnelles (--menu : ENTER directly selects) ----
+    # 3a) L2 variant (si L2 ON)
+    if [ "$CALYPSO_SKIP_L2" = "0" ]; then
+      CALYPSO_L2_CLIENT=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] L2 client variant" \
+        --notags --menu \
+        "\n Application qui consomme L1CTL via /tmp/osmocom_l2.\n" \
+        14 76 3 \
+        "mobile"    "mobile -- osmocom-bb stack L23 + VTY (default)" \
+        "ccch_scan" "ccch_scan -- scan CCCH ARFCN, dump SI/IA" \
+        "cell_log"  "cell_log -- scan cells + power measures" \
+        3>&1 1>&2 2>&3) || _cancel
+      export CALYPSO_L2_CLIENT
+    fi
+
+    # 3b) icount (toujours, sauf si MTTCG ON : forced off)
+    if [ "$CALYPSO_MTTCG" = "1" ]; then
+      export CALYPSO_ICOUNT=off
+      whiptail --backtitle "$BACKTITLE" --title "MTTCG actif" --msgbox \
+        "\n MTTCG ON : CALYPSO_ICOUNT force a 'off' (mutex).\n\n \
+ Rappel CLAUDE.md session 2026-05-25 :\n MTTCG est NON-DETERMINISTE -- ses donnees ne sont pas\n citables pour des claims d'etat firmware.\n" \
+        14 76 3>&1 1>&2 2>&3
+    else
+      ICOUNT=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] QEMU icount mode" \
+        --notags --menu \
+        "\n Pacing horloge virtuelle QEMU.\n" \
+        14 76 3 \
+        "off"   "off -- wall-clock (default, auto bloque actuellement)" \
+        "auto"  "auto -- deterministe (broken under load, debug en cours)" \
+        "shift" "shift=N -- pacing fixe (N saisi ensuite)" \
+        3>&1 1>&2 2>&3) || _cancel
+      case "$ICOUNT" in
+        auto) export CALYPSO_ICOUNT=auto ;;
+        off)  export CALYPSO_ICOUNT=off ;;
+        shift)
+          while true; do
+            SHIFT_N=$(whiptail --backtitle "$BACKTITLE" --title "icount shift" \
+              --inputbox "\n Valeur N : entier 1-16 (1<<N instr ~= 1ns)\n" \
+              11 60 "8" 3>&1 1>&2 2>&3) || _cancel
+            # Validate : entier dans [1, 16]
+            if echo "$SHIFT_N" | grep -qE '^[0-9]+$' && [ "$SHIFT_N" -ge 1 ] && [ "$SHIFT_N" -le 16 ]; then
+              break
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Invalid" --msgbox \
+              "\n Valeur invalide : '$SHIFT_N'.\n Attendu : entier entre 1 et 16.\n" \
+              10 60 3>&1 1>&2 2>&3
+          done
+          export CALYPSO_ICOUNT="shift=${SHIFT_N},sleep=on"
+          ;;
+      esac
+    fi
+
+    # 3c) Diag profile
+    DIAG=$(whiptail --backtitle "$BACKTITLE" \
+      --title "[3/4] Diagnostic profile" \
+      --notags --menu \
+      "\n Sondes c54x / instrumentation.\n" \
+      14 76 3 \
+      "none"    "none -- production-like (recommended)" \
+      "minimal" "minimal -- hack-free + diag minimal" \
+      "full"    "full -- SP_RING + AR + WATCH + CORR + MVPD" \
+      3>&1 1>&2 2>&3) || _cancel
+
+    # 3d) Pytest config (si DOC ON)
+    if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
+      PYTEST_VERBOSITY=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] Pytest verbosity" \
+        --notags --menu \
+        "\n Verbosity du pytest auto-gen-doc (T+60s).\n" \
+        14 76 4 \
+        "v"   "verbose -- un test par ligne (default)" \
+        "q"   "quiet -- resume minimal" \
+        "vv"  "very verbose -- details complets" \
+        "vvv" "ultra -- debug pytest" \
+        3>&1 1>&2 2>&3) || _cancel
+      export CALYPSO_PYTEST_VERBOSITY="$PYTEST_VERBOSITY"
+
+      PYTEST_SCOPE=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] Pytest scope" \
+        --notags --menu \
+        "\n Quels tests executer dans la fenetre gen-doc.\n" \
+        14 76 4 \
+        "default"   "Default -- exclusion functional/qemu-iotests/etc" \
+        "smoke"     "Smoke -- juste test_run_all_modes.py (si JSON present)" \
+        "all"       "All -- pas d'exclusion (lent)" \
+        "calypso"   "Calypso only -- tests/calypso/ si present" \
+        3>&1 1>&2 2>&3) || _cancel
+      export CALYPSO_PYTEST_SCOPE="$PYTEST_SCOPE"
+    fi
+    case "$DIAG" in
+      minimal)
+        export CALYPSO_PROBE_BOOTSTUB=0
+        ;;
+      full)
+        export CALYPSO_PROBE_BOOTSTUB=0
+        export CALYPSO_SP_RING=1
+        export CALYPSO_SP_RING_TRIG=bootstub
+        export CALYPSO_SP_RING_INSN_MIN=1000000
+        export CALYPSO_SP_ABS_TRACE=1
+        export CALYPSO_AR_TRACE=0xFF
+        export CALYPSO_WATCH_3FBE=1
+        export CALYPSO_CORRELATOR_TRACE=1
+        export CALYPSO_MVPD_TRACE=1
+        export CALYPSO_MVPD_BOOT_LIMIT=500000
+        export CALYPSO_RSBX_INTM_TRACE=1
+        ;;
+    esac
+
+    export CALYPSO_DSP_SHUNT CALYPSO_MODE CALYPSO_MTTCG \
+           CALYPSO_IRDA_CAPTURE CALYPSO_AUTO_GEN_DOC
+    export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
+           CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
+
+    # ---- 4) RESUME + confirm ----
+    _ind() { [ "$1" = "0" ] && echo "[ ]" || echo "[X]"; }
+    _dsp_label() { [ "$CALYPSO_DSP_SHUNT" = "1" ] && echo "(canned FB+SB)" || echo "(c54x emule)"; }
+    DSP_ON="$CALYPSO_DSP_SHUNT"
+    IPC_ON=$((1 - CALYPSO_SKIP_IPC_DEVICE))
+    TRX_ON=$((1 - CALYPSO_SKIP_TRX_IPC))
+    BRG_ON=$((1 - CALYPSO_SKIP_BRIDGE_PY))
+    BTS_ON=$((1 - CALYPSO_SKIP_BTS))
+    L2_ON=$((1 - CALYPSO_SKIP_L2))
+    GSM_ON=$((1 - CALYPSO_SKIP_GSMTAP))
+
+    SUMMARY=" Mode             : $CALYPSO_MODE"
+    SUMMARY+=$'\n'" Diag profile     : $DIAG"
+    SUMMARY+=$'\n'" L2 variant       : ${CALYPSO_L2_CLIENT:-(skipped)}"
+    SUMMARY+=$'\n'" Pytest           : verb=${CALYPSO_PYTEST_VERBOSITY:-(off)} scope=${CALYPSO_PYTEST_SCOPE:-(off)}"
+    SUMMARY+=$'\n'
+    SUMMARY+=$'\n'"  Components"
+    SUMMARY+=$'\n'"   $(_ind $DSP_ON) DSP shunt        $(_dsp_label)"
+    SUMMARY+=$'\n'"   $(_ind $IPC_ON) ipc-device       (UDP<->shm bridge)"
+    SUMMARY+=$'\n'"   $(_ind $TRX_ON) osmo-trx-ipc     (GMSK modem)"
+    SUMMARY+=$'\n'"   $(_ind $BRG_ON) bridge.py        (Python legacy)"
+    SUMMARY+=$'\n'"   $(_ind $BTS_ON) osmo-bts-trx     (BTS radio)"
+    SUMMARY+=$'\n'"   $(_ind $L2_ON) L2 client        (${CALYPSO_L2_CLIENT:---})"
+    SUMMARY+=$'\n'"   $(_ind $GSM_ON) GSMTAP capture"
+    SUMMARY+=$'\n'"   $(_ind $CALYPSO_IRDA_CAPTURE) IrDA capture"
+    SUMMARY+=$'\n'"   $(_ind $CALYPSO_AUTO_GEN_DOC) gen-doc T+60s"
+    SUMMARY+=$'\n'
+    SUMMARY+=$'\n'"  QEMU accel"
+    SUMMARY+=$'\n'"   icount           = $CALYPSO_ICOUNT"
+    SUMMARY+=$'\n'"   MTTCG            = $CALYPSO_MTTCG"
+
+    whiptail --backtitle "$BACKTITLE" --title "[4/4] Confirm launch" --yesno \
+      "$SUMMARY" 26 80 3>&1 1>&2 2>&3 || _cancel
+
+  fi  # fin whiptail branch
+  echo
+  echo "[menu] Lancement avec :"
+  env | grep -E '^CALYPSO_' | sort | sed 's/^/  /'
+  echo
 fi
 
-# Détection pytest réutilisée par la fenêtre gen-doc auto plus bas.
+# Detection pytest reutilisee par la fenetre gen-doc auto plus bas.
 detect_pytest() {
     local override="${CALYPSO_PYTEST:-}"
     if [ -n "$override" ]; then echo "$override"; return; fi
@@ -176,10 +602,10 @@ detect_pytest() {
     echo ""
 }
 
-if false; then  # ancien bloc gen-doc-local, conservé désactivé pour référence
+if false; then  # ancien bloc gen-doc-local, conserve desactive pour reference
 
-    # In-container mode : `/.dockerenv` présent → on est DANS le container,
-    # lance pytest direct sans préfixe docker.
+    # In-container mode : `/.dockerenv` present : on est DANS le container,
+    # lance pytest direct sans prefixe docker.
     if [ -f /.dockerenv ]; then
         echo "=== --gen-doc-local : in-container mode (no docker prefix) ==="
 
@@ -196,23 +622,23 @@ if false; then  # ancien bloc gen-doc-local, conservé désactivé pour référe
         }
         PYTEST_BIN=$(detect_pytest)
         if [ -z "$PYTEST_BIN" ]; then
-            echo "pytest absent — tentative d'installation..."
+            echo "pytest absent -- tentative d'installation..."
             pip_install_one pytest
             PYTEST_BIN=$(detect_pytest)
         fi
         if [ -z "$PYTEST_BIN" ]; then
-            echo "ERR: pytest introuvable et install pip échouée." >&2
+            echo "ERR: pytest introuvable et install pip echouee." >&2
             echo "     Installer manuellement : pip install pytest" >&2
-            echo "     Ou définir CALYPSO_PYTEST=/path/to/pytest" >&2
+            echo "     Ou definir CALYPSO_PYTEST=/path/to/pytest" >&2
             exit 1
         fi
         # pycotap : requis par functional/qemu_test/testcase.py
         python3 -c "import pycotap" 2>/dev/null \
             || { echo "Installing pycotap..."; pip_install_one pycotap; }
         # gdb : module Python qui vient avec GDB system (pas via pip).
-        # On vérifie que `gdb` (le binaire) est dispo, sinon apt install.
+        # On verifie que `gdb` (le binaire) est dispo, sinon apt install.
         if ! command -v gdb >/dev/null 2>&1; then
-            echo "gdb absent — tentative d'installation via apt..."
+            echo "gdb absent -- tentative d'installation via apt..."
             (apt-get update -qq 2>&1 && apt-get install -y -qq gdb 2>&1) | tail -3 || true
         fi
         echo "Using pytest: $PYTEST_BIN"
@@ -232,9 +658,9 @@ echo ; echo '=== Dernier per-run folder ===' ; \
 ls -dt /tmp/test_results_*/ 2>/dev/null | head -1 ; \
 echo ; echo '[gen-doc done] Press <Enter> to keep this window open.' ; read -r _"
 
-        # Si tmux est dispo et qu'on a une session 'calypso' existante : fenêtre dédiée.
-        # Si tmux dispo mais pas de session : on en crée une 'gen-doc-session'.
-        # Si pas de tmux du tout : on exécute en foreground.
+        # Si tmux est dispo et qu'on a une session 'calypso' existante : fenetre dediee.
+        # Si tmux dispo mais pas de session : on en cree une 'gen-doc-session'.
+        # Si pas de tmux du tout : on execute en foreground.
         if command -v tmux >/dev/null 2>&1; then
             if tmux has-session -t "$SESSION" 2>/dev/null; then
                 TARGET="$SESSION"
@@ -246,17 +672,17 @@ echo ; echo '[gen-doc done] Press <Enter> to keep this window open.' ; read -r _
             tmux new-window -t "$TARGET" -n gen-doc
             tmux send-keys -t "$TARGET:gen-doc" "$PYTEST_CMD" C-m
             tmux select-window -t "$TARGET:gen-doc"
-            echo "=== --gen-doc-local lancé dans tmux '$TARGET:gen-doc' ==="
+            echo "=== --gen-doc-local lance dans tmux '$TARGET:gen-doc' ==="
             if [ "$TARGET" = "gen-doc-session" ]; then
                 echo "Attach : tmux attach -t $TARGET"
                 # Si terminal interactif, attach directement
                 [ -t 0 ] && exec tmux attach -t "$TARGET"
             else
-                echo "Attach (si pas déjà dedans) : tmux attach -t $TARGET"
+                echo "Attach (si pas deja dedans) : tmux attach -t $TARGET"
             fi
             exit 0
         else
-            echo "=== tmux absent — exécution foreground ==="
+            echo "=== tmux absent -- execution foreground ==="
             eval "$PYTEST_CMD"
             exit $?
         fi
@@ -295,18 +721,18 @@ EOF
         tmux new-window -t "$SESSION" -n gen-doc
         tmux send-keys -t "$SESSION:gen-doc" "$GEN_DOC_CMD; read -r _" C-m
         tmux select-window -t "$SESSION:gen-doc"
-        echo "=== --gen-doc-local lancé dans tmux '$SESSION:gen-doc' ==="
-        echo "Attach (si pas déjà dedans) : tmux attach -t $SESSION"
+        echo "=== --gen-doc-local lance dans tmux '$SESSION:gen-doc' ==="
+        echo "Attach (si pas deja dedans) : tmux attach -t $SESSION"
         exit 0
     else
-        echo "=== tmux session '$SESSION' absente — exécution directe ==="
+        echo "=== tmux session '$SESSION' absente -- execution directe ==="
         eval "$GEN_DOC_CMD"
         exit $?
     fi
-fi  # ancien bloc gen-doc-local — désactivé par `if false; then` plus haut
+fi  # ancien bloc gen-doc-local -- desactive par `if false; then` plus haut
 
 # Firmware paths configurable via env (FW_ELF/FW_BIN). Defaults to layer1
-# pour compal_e88. run_rssi.sh override these to lancer rssi.highram à la place.
+# pour compal_e88. run_rssi.sh override these to lancer rssi.highram a la place.
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
 FW_BIN="${FW_BIN:-/opt/GSM/firmware/board/compal_e88/layer1.highram.bin}"
 QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
@@ -314,13 +740,180 @@ OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
 MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
 OSMO_TRX_IPC="${OSMO_TRX_IPC:-osmo-trx-ipc}"
-OSMO_TRX_IPC_CFG="${OSMO_TRX_IPC_CFG:-/etc/osmocom/osmo-trx-ipc.cfg}"
-# calypso-ipc-device = pont QEMU UDP 6702 ↔ osmo-trx-ipc shm. Default :
-# le binaire compilé dans tools/calypso-ipc-device/. Override via env si
+# Default cfg = versioned 1-chan cfg dans qemu-src/cfgs/. Le /etc/osmocom/
+# legacy declarait chan 0 + chan 1 : osmo-trx-ipc demande 2 chans, calypso
+# en a 1 : DDEV ERROR chan num mismatch. Le fichier versionne a juste chan 0.
+OSMO_TRX_IPC_CFG_DEFAULT="/opt/GSM/qemu-src/cfgs/osmo-trx-ipc.cfg"
+[ -f "$OSMO_TRX_IPC_CFG_DEFAULT" ] || OSMO_TRX_IPC_CFG_DEFAULT="/etc/osmocom/osmo-trx-ipc.cfg"
+OSMO_TRX_IPC_CFG="${OSMO_TRX_IPC_CFG:-$OSMO_TRX_IPC_CFG_DEFAULT}"
+# calypso-ipc-device = pont QEMU UDP 6702 <-> osmo-trx-ipc shm. Default :
+# le binaire compile dans tools/calypso-ipc-device/. Override via env si
 # tu veux pointer un autre path, ou vide pour skip (mode legacy debug).
 CALYPSO_IPC_DEVICE_DEFAULT="/opt/GSM/qemu-src/tools/calypso-ipc-device/calypso-ipc-device"
 CALYPSO_IPC_DEVICE="${CALYPSO_IPC_DEVICE-$CALYPSO_IPC_DEVICE_DEFAULT}"
 IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
+
+# ---- CALYPSO_MODE preset (cf. doc en tete du fichier) ----
+# Selectionne un preset de composants a lancer. Override fin via les
+# CALYPSO_SKIP_* individuels (cf bloc plus bas).
+#
+#   full       (default) -- Full radio pipeline.
+#                          QEMU + osmocon + ipc-device + osmo-trx-ipc
+#                          + osmo-bts-trx + L2 client + gsmtap.
+#                          C'est le mode legacy, rien ne change pour les
+#                          runs qui ne set pas CALYPSO_MODE.
+#
+#   shunt      -- Bissection FBSB_CONF (Phase 1 canned, no real radio).
+#                QEMU(+DSP_SHUNT) + osmocon + L2 client.
+#                Skip ipc-device, osmo-trx-ipc, osmo-bts-trx, gsmtap.
+#                Le mock cote QEMU (calypso_dsp_shunt.c) repond aux
+#                taches DSP avec des valeurs canned. Objectif unique :
+#                determiner si FBSB_CONF tire (= ARM path OK) ou non
+#                (= bug cote ARM, pas DSP). Cf CLAUDE.md.
+#
+#   shunt-ipc  -- Phase 2 (futur). Comme `full` mais avec DSP_SHUNT actif
+#                pour que les vrais I/Q d'osmo-trx-ipc soient demod-es
+#                cote bridge plutot que par le c54x emule.
+#
+#   bridge     -- Legacy. Pipeline d'avant le passage a osmo-trx-ipc :
+#                QEMU + osmocon + bridge.py (Python, 5700-5702/6700/6702)
+#                + osmo-bts-trx + L2 client + gsmtap.
+#                bridge.py est restaure depuis git (commit 30933d1^).
+#                Skip ipc-device + osmo-trx-ipc, le bridge Python remplit
+#                le role de pont BTS<->QEMU avec son propre wall-paced FN
+#                + GMSK soft:IQ inline (cf BRIDGE_BSP_IQ).
+#
+#   bare       -- QEMU + osmocon seulement. Pour debug fw isole, gdb,
+#                tests qui n'ont pas besoin du L2/L3.
+CALYPSO_MODE="${CALYPSO_MODE:-full}"
+case "$CALYPSO_MODE" in
+    full|shunt|shunt-ipc|bridge|bare|free) ;;
+    *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
+esac
+
+# Defaults derives du preset. Chaque var peut etre overridee explicitement
+# par l'env avant l'invocation (l'override gagne sur le preset).
+case "$CALYPSO_MODE" in
+    full)
+        : "${CALYPSO_DSP_SHUNT:=0}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
+        : "${CALYPSO_SKIP_TRX_IPC:=0}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    shunt)
+        : "${CALYPSO_DSP_SHUNT:=1}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=1}"
+        : "${CALYPSO_SKIP_TRX_IPC:=1}"
+        : "${CALYPSO_SKIP_BTS:=1}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=1}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    shunt-ipc)
+        : "${CALYPSO_DSP_SHUNT:=1}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
+        : "${CALYPSO_SKIP_TRX_IPC:=0}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    bridge)
+        : "${CALYPSO_DSP_SHUNT:=0}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=1}"
+        : "${CALYPSO_SKIP_TRX_IPC:=1}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=0}"
+        ;;
+    bare)
+        : "${CALYPSO_DSP_SHUNT:=0}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=1}"
+        : "${CALYPSO_SKIP_TRX_IPC:=1}"
+        : "${CALYPSO_SKIP_BTS:=1}"
+        : "${CALYPSO_SKIP_L2:=1}"
+        : "${CALYPSO_SKIP_GSMTAP:=1}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    free)
+        # Mode free : aucun preset. Le menu (niveau 2) ou l'env user
+        # doivent setter les CALYPSO_SKIP_* explicitement. Defaults safe
+        # = pipeline complet (comme full) pour eviter l'echec silencieux
+        # si l'user lance `CALYPSO_MODE=free ./run.sh` sans menu.
+        : "${CALYPSO_DSP_SHUNT:=0}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
+        : "${CALYPSO_SKIP_TRX_IPC:=0}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+esac
+export CALYPSO_DSP_SHUNT CALYPSO_MODE
+export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
+       CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
+
+# ---- Auto-resolution implications / exclusions ----
+# Apres les presets + override env, on applique les regles de coherence.
+# Chaque regle log explicitement ce qu'elle force pour pas surprendre.
+
+# Regle 1 : DSP_SHUNT=1 : BTS chain inutile (canned ne touche pas la radio).
+# N'override pas si user a explicitement set SKIP_BTS=0 (= "je veux la
+# radio quand meme meme en shunt", cas shunt-ipc).
+if [ "$CALYPSO_DSP_SHUNT" = "1" ] && [ "$CALYPSO_MODE" != "shunt-ipc" ]; then
+    if [ -z "${_USER_SET_SKIP_IPC_DEVICE:-}" ]; then
+        [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" = "0" ] && echo "[run.sh] DSP_SHUNT=1 : SKIP_IPC_DEVICE=1 (canned, pas besoin)"
+        CALYPSO_SKIP_IPC_DEVICE=1
+    fi
+    if [ -z "${_USER_SET_SKIP_TRX_IPC:-}" ]; then
+        [ "${CALYPSO_SKIP_TRX_IPC:-0}" = "0" ] && echo "[run.sh] DSP_SHUNT=1 : SKIP_TRX_IPC=1 (canned, pas besoin)"
+        CALYPSO_SKIP_TRX_IPC=1
+    fi
+    if [ -z "${_USER_SET_SKIP_BTS:-}" ]; then
+        [ "${CALYPSO_SKIP_BTS:-0}" = "0" ] && echo "[run.sh] DSP_SHUNT=1 : SKIP_BTS=1 (canned, pas besoin)"
+        CALYPSO_SKIP_BTS=1
+    fi
+fi
+
+# Regle 2 : bridge.py XOR (ipc-device | osmo-trx-ipc). Si conflit, bridge.py
+# gagne (parce que c'est ce que l'user a choisi explicitement en mode bridge,
+# ou exporte en env).
+if [ "$CALYPSO_SKIP_BRIDGE_PY" = "0" ]; then
+    if [ "${CALYPSO_SKIP_IPC_DEVICE:-1}" = "0" ] || [ "${CALYPSO_SKIP_TRX_IPC:-1}" = "0" ]; then
+        echo "[run.sh] MUTEX bridge.py <-> ipc/trx-ipc -- desactivation ipc/trx-ipc"
+        CALYPSO_SKIP_IPC_DEVICE=1
+        CALYPSO_SKIP_TRX_IPC=1
+    fi
+fi
+
+# Regle 3 : osmo-trx-ipc requiert calypso-ipc-device (sinon il echoue
+# greeting). Si on a trx-ipc actif et ipc-device skipped, warn + desactive.
+if [ "${CALYPSO_SKIP_TRX_IPC:-1}" = "0" ] && [ "${CALYPSO_SKIP_IPC_DEVICE:-1}" = "1" ]; then
+    echo "[run.sh] WARN osmo-trx-ipc requires calypso-ipc-device -- desactivation trx-ipc"
+    CALYPSO_SKIP_TRX_IPC=1
+fi
+
+# Regle 4 : osmo-bts-trx requiert un pont radio (ipc/trx-ipc OU bridge.py).
+# Sinon il a personne a qui parler en TRXD. Ne touche pas si DSP_SHUNT
+# (ou BTS est aussi skipped par regle 1).
+if [ "${CALYPSO_SKIP_BTS:-1}" = "0" ] \
+   && [ "${CALYPSO_SKIP_TRX_IPC:-1}" = "1" ] \
+   && [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" = "1" ]; then
+    echo "[run.sh] WARN osmo-bts-trx sans pont radio (ni trx-ipc ni bridge.py) -- il restera en idle"
+fi
+
+# Regle 5 : MTTCG XOR icount auto. Deja gere ailleurs (CALYPSO_MTTCG=1
+# force ICOUNT=off plus bas), mais logger ici pour tracabilite.
+if [ "${CALYPSO_MTTCG:-0}" = "1" ] && [ "${CALYPSO_ICOUNT:-off}" != "off" ]; then
+    echo "[run.sh] MUTEX MTTCG <-> icount -- sera force ICOUNT=off (cf bloc MTTCG)"
+fi
+
+export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
+       CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
 
 # ---- DSP / DIAG instruments (override at command line if needed) ----
 CALYPSO_DSP_ROM="${CALYPSO_DSP_ROM:-/opt/GSM/calypso_dsp.txt}"
@@ -331,11 +924,11 @@ export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG
 # === Defaults no-hack ===
 # Politique : aucun bypass de chemin firmware. Tous les hacks env-gated
 # (PM_INJECT, FBSB_SYNTH, DSP_FBDET_SKIP, FORCE_RX_DONE, BYPASS_BDLENA,
-# FORCE_DARAM62) ont été retirés du code source 2026-05-26.
-# Conforme à CLAUDE.md règle #1 : "PAS DE HACK".
+# FORCE_DARAM62) ont ete retires du code source 2026-05-26.
+# Conforme a CLAUDE.md regle #1 : "PAS DE HACK".
 CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}" # diag-only probe (no hack)
 
-# === Stability / non-hack mais nécessaire ===
+# === Stability / non-hack mais necessaire ===
 CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"       # perf : fast-forward DSP idle dispatcher (pas un hack)
 CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
 
@@ -344,16 +937,16 @@ CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
-# CALYPSO_BSP_IQ_PASSTHROUGH : QEMU BSP accepte du cs16 I,Q entrelacé en
-# DMA direct vers le corrélateur DSP (au lieu de moduler les 148 hard-bits
-# lui-même en ±π/2). Default ON : c'est ce que produit notre device IPC
-# (osmo-trx natif modem GMSK). Si =0, le BSP reverte à sa modulation hard
-# interne — mode legacy non-utilisé maintenant.
+# CALYPSO_BSP_IQ_PASSTHROUGH : QEMU BSP accepte du cs16 I,Q entrelace en
+# DMA direct vers le correlateur DSP (au lieu de moduler les 148 hard-bits
+# lui-meme en +/-pi/2). Default ON : c'est ce que produit notre device IPC
+# (osmo-trx natif modem GMSK). Si =0, le BSP reverte a sa modulation hard
+# interne -- mode legacy non-utilise maintenant.
 CALYPSO_BSP_IQ_PASSTHROUGH="${CALYPSO_BSP_IQ_PASSTHROUGH:-1}"
 export CALYPSO_BSP_IQ_PASSTHROUGH
-# CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) côté
-# calypso_trx.c. =0 (default) = runs silencieux, zéro stderr-pipe backpressure.
-# =1 = mêmes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
+# CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) cote
+# calypso_trx.c. =0 (default) = runs silencieux, zero stderr-pipe backpressure.
+# =1 = memes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
 CALYPSO_TIMER="${CALYPSO_TIMER:-0}"
 CALYPSO_DSP_BUDGET="${CALYPSO_DSP_BUDGET:-256000}"
 export CALYPSO_W1C_LATCH \
@@ -368,9 +961,9 @@ export CALYPSO_W1C_LATCH \
 # QEMU_CLOCK_VIRTUAL so it no longer races with icount.
 # Other accepted values:
 #   auto              shift dynamic, wall-clock aligned (recommended)
-#   shift=N,sleep=on  fixed shift (1<<N instr ≈ 1ns), explicit sleep
+#   shift=N,sleep=on  fixed shift (1<<N instr ~= 1ns), explicit sleep
 #   off               disable (legacy default-clock mode)
-CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"  # default auto = stability (CLAUDE.md Stability config)
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"  # default off = wall-clock (auto bloque actuellement, debug en cours)
 export CALYPSO_ICOUNT
 
 # ---- MTTCG mode (Phase C : multi-thread TCG, ARM en thread distinct
@@ -414,17 +1007,17 @@ QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
 
 # ---- Log timestamping ----
 # Chaque ligne des logs (qemu.log, osmocon.log, mobile.log) est
-# préfixée par `<epoch_sec> +<rel_sec>s ` (epoch_sec = horloge mur depuis 1970,
-# rel_sec = secondes depuis le démarrage du wrapper). Permet de détecter les
+# prefixee par `<epoch_sec> +<rel_sec>s ` (epoch_sec = horloge mur depuis 1970,
+# rel_sec = secondes depuis le demarrage du wrapper). Permet de detecter les
 # drifts temporels entre logs en comparant les timestamps colonne 1+2.
-# Désactiver via CALYPSO_LOG_TS=0.
-# Note : grep -E des tests n'est pas perturbé (le prefix est en début de
+# Desactiver via CALYPSO_LOG_TS=0.
+# Note : grep -E des tests n'est pas perturbe (le prefix est en debut de
 # ligne, les patterns sont en milieu).
 CALYPSO_LOG_TS="${CALYPSO_LOG_TS:-1}"
 TSLOG_SCRIPT=/tmp/calypso_tslog.py
 cat > "$TSLOG_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
-"""Préfixe stdin avec `<epoch_sec> +<rel_sec>s ` et flush ligne par ligne."""
+"""Prefixe stdin avec `<epoch_sec> +<rel_sec>s ` et flush ligne par ligne."""
 import sys, time
 t0 = time.time()
 for line in sys.stdin:
@@ -441,7 +1034,7 @@ fi
 
 # ---------- L2 client selection (menu) ----------
 # Choix de l'application L23/L2 qui consomme L1CTL via /tmp/osmocom_l2 :
-#   1. mobile    : osmocom-bb mobile complet (stack L23 + VTY) — default
+#   1. mobile    : osmocom-bb mobile complet (stack L23 + VTY) -- default
 #   2. ccch_scan : ccch_scan -a 1 (scan CCCH ARFCN 1, dump SI/IA)
 #   3. cell_log  : cell_log (scan toutes les cells, mesures de power)
 # Set CALYPSO_L2_CLIENT=mobile|ccch_scan|cell_log to override the prompt.
@@ -475,7 +1068,7 @@ pkill -9 -f calypso-ipc-device 2>/dev/null || true
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
 rm -f /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
-# Drop the legacy mmap from previous runs — no longer used, but lying
+# Drop the legacy mmap from previous runs -- no longer used, but lying
 # around in /dev/shm could confuse forensic forensics on old runs.
 rm -f /dev/shm/calypso_si.bin
 sleep 1
@@ -490,12 +1083,12 @@ tmux new-session -d -s "$SESSION" -n qemu
 # timer in calypso_trx.c was moved to QEMU_CLOCK_VIRTUAL so icount no
 # longer freezes the TDMA tick. If you observe device/osmo-trx-ipc
 # timeouts, fall back with CALYPSO_ICOUNT=off.
-# gdb-stub : activé d'office sur 0.0.0.0:1234 pour que les tests/scripts
+# gdb-stub : active d'office sur 0.0.0.0:1234 pour que les tests/scripts
 # d'injection (inject.py / validating.py / tests/test_inject_frames.py)
-# puissent s'y connecter sans avoir à passer par le monitor HMP. La syntaxe
-# `tcp::1234` bind sur toutes les interfaces du container — utilisable
-# depuis l'IP container (ex. 172.20.0.11:1234) côté host.
-# Override via CALYPSO_GDB_PORT (set vide pour désactiver).
+# puissent s'y connecter sans avoir a passer par le monitor HMP. La syntaxe
+# `tcp::1234` bind sur toutes les interfaces du container -- utilisable
+# depuis l'IP container (ex. 172.20.0.11:1234) cote host.
+# Override via CALYPSO_GDB_PORT (set vide pour desactiver).
 CALYPSO_GDB_PORT="${CALYPSO_GDB_PORT:-1234}"
 if [ -n "$CALYPSO_GDB_PORT" ]; then
     QEMU_GDB_FLAG="-gdb tcp::$CALYPSO_GDB_PORT"
@@ -503,11 +1096,11 @@ else
     QEMU_GDB_FLAG=""
 fi
 
-# Override délibéré : pour le child QEMU seulement, L1CTL_SOCK pointe vers
-# le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c crée son socket à
-# cette adresse-poubelle (= L1CTL QEMU désactivé). Le VRAI socket L1CTL
-# /tmp/osmocom_l2 est créé plus tard par osmocon (L541 : -s $L1CTL_SOCK,
-# où L1CTL_SOCK garde sa valeur d'origine = /tmp/osmocom_l2). Hors de
+# Override delibere : pour le child QEMU seulement, L1CTL_SOCK pointe vers
+# le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c cree son socket a
+# cette adresse-poubelle (= L1CTL QEMU desactive). Le VRAI socket L1CTL
+# /tmp/osmocom_l2 est cree plus tard par osmocon (L541 : -s $L1CTL_SOCK,
+# ou L1CTL_SOCK garde sa valeur d'origine = /tmp/osmocom_l2). Hors de
 # cette ligne, $L1CTL_SOCK reste = /tmp/osmocom_l2 partout dans run.sh.
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M calypso -cpu arm946 \
@@ -532,19 +1125,19 @@ for i in $(seq 1 30); do
     sleep 1; echo -n "."
 done
 if [ -z "$PTY_MODEM" ]; then
-    echo " TIMEOUT — no PTY in $QEMU_LOG"
+    echo " TIMEOUT -- no PTY in $QEMU_LOG"
     exit 1
 fi
 echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 
 # ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
 # Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
-# le firmware compal_e88 fait déjà `cons_bind_uart(UART_IRDA)` (init.c:105),
-# donc tout `printf()` côté fw passe par UART_IRDA. Ici on consomme le PTY
-# serial1 alloué par QEMU et on l'archive dans /tmp/fw-irda.log avec le même
-# préfixe timestamp que les autres logs.
+# le firmware compal_e88 fait deja `cons_bind_uart(UART_IRDA)` (init.c:105),
+# donc tout `printf()` cote fw passe par UART_IRDA. Ici on consomme le PTY
+# serial1 alloue par QEMU et on l'archive dans /tmp/fw-irda.log avec le meme
+# prefixe timestamp que les autres logs.
 #
-# Désactivable via CALYPSO_IRDA_CAPTURE=0 (rare — utile si saturation diag).
+# Desactivable via CALYPSO_IRDA_CAPTURE=0 (rare -- utile si saturation diag).
 CALYPSO_IRDA_CAPTURE="${CALYPSO_IRDA_CAPTURE:-1}"
 if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
     echo -n "Waiting for QEMU PTY serial1 (UART_IRDA) allocation..."
@@ -562,9 +1155,9 @@ if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
         ln -sf "$PTY_IRDA" /tmp/irda.pty.link
         : > /tmp/fw-irda.log
         tmux new-window -t "$SESSION" -n irda
-        # Lance irda_capture en background (silencieux — il pose ses bytes
+        # Lance irda_capture en background (silencieux -- il pose ses bytes
         # dans /tmp/fw-irda.log directement, pas sur stdout) puis suit le
-        # log en live dans la fenêtre tmux pour debug visuel.
+        # log en live dans la fenetre tmux pour debug visuel.
         tmux send-keys -t "$SESSION:irda" \
             "IRDA_PTY=/tmp/irda.pty.link FW_IRDA_LOG=/tmp/fw-irda.log python3 /opt/GSM/qemu-src/tools/irda_capture.py 2>/tmp/irda_capture.stderr.log & sleep 0.5 && echo '--- live tail /tmp/fw-irda.log ---' && tail -F /tmp/fw-irda.log" C-m
         echo -n "Waiting for irda_capture to register pid..."
@@ -575,19 +1168,19 @@ if [ "$CALYPSO_IRDA_CAPTURE" = "1" ]; then
         if [ -f /tmp/irda_capture.pid ]; then
             echo " OK (pid=$(cat /tmp/irda_capture.pid))"
         else
-            echo " WARN — pidfile absent (capture peut-être pas lancé)"
+            echo " WARN -- pidfile absent (capture peut-etre pas lance)"
         fi
     else
-        echo " WARN — no serial1 PTY detected → IrDA capture skipped"
+        echo " WARN -- no serial1 PTY detected : IrDA capture skipped"
     fi
 fi
 
-# Note : le marker `=== fw-irda boot OK ===` émis par cons_puts() ligne 119
-# de compal_e88/init.c peut être perdu si irda_capture s'attache au slave PTY
-# après que QEMU ait écrit (race window ~0.5–1.5s). Solution durable : passer
-# par Phase 5 du plan IrDA (beacon hot path dans la main loop, qui ré-émet
-# régulièrement et garantit la capture). Ne PAS tenter `-S` + `cont` ici : ça
-# perturbe la séquence osmocon→firmware (le mobile ne camp plus sur la cell).
+# Note : le marker `=== fw-irda boot OK ===` emis par cons_puts() ligne 119
+# de compal_e88/init.c peut etre perdu si irda_capture s'attache au slave PTY
+# apres que QEMU ait ecrit (race window ~0.5-1.5s). Solution durable : passer
+# par Phase 5 du plan IrDA (beacon hot path dans la main loop, qui re-emet
+# regulierement et garantit la capture). Ne PAS tenter `-S` + `cont` ici : ca
+# perturbe la sequence osmocon:firmware (le mobile ne camp plus sur la cell).
 
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
@@ -599,142 +1192,168 @@ for i in $(seq 1 30); do
     [ -S "$L1CTL_SOCK" ] && break
     sleep 1; echo -n "."
 done
-if [ -S "$L1CTL_SOCK" ]; then echo " OK"; else echo " WARN — socket missing"; fi
+if [ -S "$L1CTL_SOCK" ]; then echo " OK"; else echo " WARN -- socket missing"; fi
 
 # ---------- 3. calypso-ipc-device (Phase 1 du chantier osmo-trx-ipc) ----------
-# Pont QEMU UDP 6702 ↔ osmo-trx-ipc shm. Fork d'ipc-driver-test
-# (/opt/GSM/osmo-trx/Transceiver52M/device/ipc/) où le wrapper UHD est
-# remplacé par : DL → cs16 shm → UDP 6702 vers QEMU, UL → recv 6702 →
-# heartbeat zéros vers shm (cf. session 2026-05-26 plan).
-# Le device DOIT démarrer AVANT osmo-trx-ipc — c'est lui qui crée le
+# Pont QEMU UDP 6702 <-> osmo-trx-ipc shm. Fork d'ipc-driver-test
+# (/opt/GSM/osmo-trx/Transceiver52M/device/ipc/) ou le wrapper UHD est
+# remplace par : DL : cs16 shm : UDP 6702 vers QEMU, UL : recv 6702 :
+# heartbeat zeros vers shm (cf. session 2026-05-26 plan).
+# Le device DOIT demarrer AVANT osmo-trx-ipc -- c'est lui qui cree le
 # master socket Unix ($IPC_MSOCK_PATH), osmo-trx-ipc s'y connecte.
-tmux new-window -t "$SESSION" -n ipc-device
-if [ -n "$CALYPSO_IPC_DEVICE" ] && [ -x "$CALYPSO_IPC_DEVICE" ]; then
-    tmux send-keys -t "$SESSION:ipc-device" \
-        ": > $IPC_DEVICE_LOG && $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
-    echo -n "Waiting for calypso-ipc-device master sock ($IPC_MSOCK_PATH)..."
-    for i in $(seq 1 30); do
-        [ -S "$IPC_MSOCK_PATH" ] && break
-        sleep 0.5; echo -n "."
-    done
-    [ -S "$IPC_MSOCK_PATH" ] && echo " OK" || echo " WARN — socket missing"
+if [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ]; then
+    tmux new-window -t "$SESSION" -n ipc-device
+    if [ -n "$CALYPSO_IPC_DEVICE" ] && [ -x "$CALYPSO_IPC_DEVICE" ]; then
+        tmux send-keys -t "$SESSION:ipc-device" \
+            ": > $IPC_DEVICE_LOG && $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
+        echo -n "Waiting for calypso-ipc-device master sock ($IPC_MSOCK_PATH)..."
+        for i in $(seq 1 30); do
+            [ -S "$IPC_MSOCK_PATH" ] && break
+            sleep 0.5; echo -n "."
+        done
+        [ -S "$IPC_MSOCK_PATH" ] && echo " OK" || echo " WARN -- socket missing"
+    else
+        tmux send-keys -t "$SESSION:ipc-device" \
+            "echo '[TODO] calypso-ipc-device pas encore implemente (Phase 1).' && \
+             echo 'Pour activer : CALYPSO_IPC_DEVICE=/path/to/calypso-ipc-device ./run.sh' && \
+             echo 'Voir : /opt/GSM/osmo-trx/Transceiver52M/device/ipc/ipc-driver-test.c' && \
+             echo 'Sans ce device, osmo-trx-ipc sortira en erreur (pas de master sock).'" C-m
+        echo "[run.sh] calypso-ipc-device pas configure (CALYPSO_IPC_DEVICE vide) -- osmo-trx-ipc va echouer"
+    fi
 else
-    tmux send-keys -t "$SESSION:ipc-device" \
-        "echo '[TODO] calypso-ipc-device pas encore implémenté (Phase 1).' && \
-         echo 'Pour activer : CALYPSO_IPC_DEVICE=/path/to/calypso-ipc-device ./run.sh' && \
-         echo 'Voir : /opt/GSM/osmo-trx/Transceiver52M/device/ipc/ipc-driver-test.c' && \
-         echo 'Sans ce device, osmo-trx-ipc sortira en erreur (pas de master sock).'" C-m
-    echo "[run.sh] calypso-ipc-device pas configuré (CALYPSO_IPC_DEVICE vide) — osmo-trx-ipc va échouer"
+    echo "[run.sh] SKIP_IPC_DEVICE=1 -- calypso-ipc-device non lance"
 fi
 
 # ---------- 3bis. osmo-trx-ipc ----------
 # Connect to $IPC_MSOCK_PATH, expose TRXD UDP 5700-5702 vers osmo-bts-trx.
-# Si calypso-ipc-device n'est pas démarré, osmo-trx-ipc exit immédiatement
-# (greeting_req sans réponse → erreur). C'est OK en transition : sa fenêtre
-# tmux reste, on voit le message d'erreur, on relance quand le device est prêt.
-tmux new-window -t "$SESSION" -n osmo-trx-ipc
-tmux send-keys -t "$SESSION:osmo-trx-ipc" \
-    ": > $OSMO_TRX_IPC_LOG && $OSMO_TRX_IPC -C $OSMO_TRX_IPC_CFG 2>&1 | $TSLOG | tee $OSMO_TRX_IPC_LOG" C-m
+# Si calypso-ipc-device n'est pas demarre, osmo-trx-ipc exit immediatement
+# (greeting_req sans reponse : erreur). C'est OK en transition : sa fenetre
+# tmux reste, on voit le message d'erreur, on relance quand le device est pret.
+if [ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ]; then
+    tmux new-window -t "$SESSION" -n osmo-trx-ipc
+    tmux send-keys -t "$SESSION:osmo-trx-ipc" \
+        ": > $OSMO_TRX_IPC_LOG && $OSMO_TRX_IPC -C $OSMO_TRX_IPC_CFG 2>&1 | $TSLOG | tee $OSMO_TRX_IPC_LOG" C-m
+else
+    echo "[run.sh] SKIP_TRX_IPC=1 -- osmo-trx-ipc non lance"
+fi
+
+# ---------- 3ter. bridge.py (legacy) ----------
+# Mode bridge : pont Python pur (UDP 5700-5702 <-> UDP 6702) au lieu d'osmo-trx-ipc.
+# Wall-clock-paced FN counter, sercomm soft:I/Q GMSK inline (BRIDGE_BSP_IQ=1).
+if [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ]; then
+    BRIDGE_PY="${BRIDGE_PY:-/opt/GSM/qemu-src/bridge.py}"
+    BRIDGE_LOG="${BRIDGE_LOG:-/tmp/bridge.py.log}"
+    if [ -x "$BRIDGE_PY" ]; then
+        tmux new-window -t "$SESSION" -n bridge-py
+        tmux send-keys -t "$SESSION:bridge-py" \
+            ": > $BRIDGE_LOG && BRIDGE_BSP_IQ=${BRIDGE_BSP_IQ:-1} python3 -u $BRIDGE_PY 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
+        echo "[run.sh] bridge.py lance (legacy mode)"
+    else
+        echo "[run.sh] WARN bridge.py introuvable ($BRIDGE_PY) -- mode bridge casse"
+    fi
+fi
 
 # ---------- 4. osmo-bts-trx ----------
-tmux new-window -t "$SESSION" -n bts
-tmux send-keys -t "$SESSION:bts" \
-    ": > $BTS_LOG && osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
+if [ "${CALYPSO_SKIP_BTS:-0}" != "1" ]; then
+    tmux new-window -t "$SESSION" -n bts
+    tmux send-keys -t "$SESSION:bts" \
+        ": > $BTS_LOG && osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
+else
+    echo "[run.sh] SKIP_BTS=1 -- osmo-bts-trx non lance"
+fi
 
 # ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------
-# Sync barrier inline dans la cmd tmux : attendre que la socket l1ctl existe
-# (créée par osmocon après son handshake romload avec le firmware) avant de
-# lancer mobile. Évite le `sleep 3` arbitraire et le 51s spread observé.
+# Sync barrier inline dans la cmd tmux : attendre que la socket L1CTL
+# existe (creee par osmocon apres son handshake romload avec le firmware)
+# avant de lancer mobile. Evite le `sleep 3` arbitraire et le 51s spread
+# observe.
 #
-# Crée aussi le symlink ${L1CTL_SOCK}_1 → ${L1CTL_SOCK} : le mobile
-# (instance 1, "ms 1" dans mobile_group1.cfg → layer2-socket
-# /tmp/osmocom_l2_1) cherche le path avec suffixe _1, alors qu'osmocon
-# crée /tmp/osmocom_l2 (sans suffixe). Sans ce symlink, layer2_open()
-# crash → parse cfg fatal → mobile sort, et osmocon stagne dans poll()
-# en émettant des LOST N! sans pipeline L1CTL.
-# La cleanup ligne 428 fait `rm -f /tmp/osmocom_l2_*` donc safe ici.
+# AUDIT 2026-05-26 : TOUS les mobile cfgs (host + container) utilisent
+# `layer2-socket /tmp/osmocom_l2` SANS suffixe `_1`. Le symlink
+# `${L1CTL_SOCK}_1 -> ${L1CTL_SOCK}` est conserve en DUMMY/safety net
+# (au cas ou un cfg externe utiliserait l'ancien format `_1`). Sans
+# producteur de ce path, il n'est pas obligatoire mais inoffensif.
 #
-# Limitation : couvre uniquement "ms 1". Pour multi-instance (ms 2, etc.)
-# il faudrait N symlinks. Pas d'enjeu actuel (cfg utilise ms 1 only).
-#
-# Trou connu — SAP socket non câblé : mobile_group1.cfg:36 a aussi
-# `sap-socket /tmp/osmocom_sap_1`. Aucun producteur ne crée
-# /tmp/osmocom_sap dans cette stack. Si SAP s'active un jour (SIM
-# emulation via SAP au lieu de natif), il faut d'abord ajouter un
-# producteur (mocksapd ou QEMU module), PUIS un symlink _1. Ajouter
-# juste un `ln -sf` sans producteur = faux positif de couverture.
-L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; [ -S '"$L1CTL_SOCK"' ] && ln -sf '"$L1CTL_SOCK"' '"$L1CTL_SOCK"'_1'
-tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
-case "$CALYPSO_L2_CLIENT" in
-    mobile)
-        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
-        ;;
-    ccch_scan)
-        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "$L1CTL_WAIT && ccch_scan -a 1 2>&1 | $TSLOG | tee $L2_LOG" C-m
-        ;;
-    cell_log)
-        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            "$L1CTL_WAIT && cell_log 2>&1 | $TSLOG | tee $L2_LOG" C-m
-        ;;
-    *)
-        echo "WARN — CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
-        tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-            ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
-        ;;
-esac
+# SAP socket : osef (pas de mocksapd, SIM natif via cfg, pas branche).
+L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; [ -S '"$L1CTL_SOCK"' ] && ln -sf '"$L1CTL_SOCK"' '"$L1CTL_SOCK"'_1 2>/dev/null || true'
+if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
+    tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
+    case "$CALYPSO_L2_CLIENT" in
+        mobile)
+            tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+            ;;
+        ccch_scan)
+            tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+                "$L1CTL_WAIT && ccch_scan -a 1 2>&1 | $TSLOG | tee $L2_LOG" C-m
+            ;;
+        cell_log)
+            tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+                "$L1CTL_WAIT && cell_log 2>&1 | $TSLOG | tee $L2_LOG" C-m
+            ;;
+        *)
+            echo "WARN -- CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
+            tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+            ;;
+    esac
+else
+    echo "[run.sh] SKIP_L2=1 -- L2 client non lance"
+fi
 
-# ---------- 6. gsmtap capture (any iface — covers eth0 mobile/BTS + eth1) ----------
-# `--print` affiche en live ET continue d'écrire le pcap ; `-U` flush par paquet
-# pour que le pcap soit utilisable immédiatement (sinon buffer 4KB).
+# ---------- 6. gsmtap capture (any iface -- covers eth0 mobile/BTS + eth1) ----------
+# `--print` affiche en live ET continue d'ecrire le pcap ; `-U` flush par paquet
+# pour que le pcap soit utilisable immediatement (sinon buffer 4KB).
+if [ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ]; then
 tmux new-window -t "$SESSION" -n gsmtap
 tmux send-keys -t "$SESSION:gsmtap" \
     "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap.pcap udp port 4729" C-m
+fi  # CALYPSO_SKIP_GSMTAP
 
-# ---------- 7. window 'all' — agrège les 6 premières en 6 panes ----------
+# ---------- 7. window 'all' -- agrege les 6 premieres en 6 panes ----------
 # Vue unique pour superviser qemu / irda / osmocon / bts / L2 client
-# côte à côte. Chaque pane fait juste `tail -F` du log correspondant. Layout
-# tiled = grille 2×3 par défaut. Les logs n'existent peut-être pas encore au
-# moment de la création des panes — `tail -F` (majuscule) gère ce cas (suit
-# le fichier dès qu'il apparaît) sans crash.
+# cote a cote. Chaque pane fait juste `tail -F` du log correspondant. Layout
+# tiled = grille 2x3 par defaut. Les logs n'existent peut-etre pas encore au
+# moment de la creation des panes -- `tail -F` (majuscule) gere ce cas (suit
+# le fichier des qu'il apparait) sans crash.
 case "$CALYPSO_L2_CLIENT" in
     ccch_scan|cell_log) L2_TAIL_LOG="$L2_LOG" ;;
     *)                  L2_TAIL_LOG="$MOBILE_LOG" ;;
 esac
-# Création séquentielle : `select-layout tiled` après chaque split pour
-# redistribuer l'espace, sinon la 3e/4e pane devient trop étroite et tmux
+# Creation sequentielle : `select-layout tiled` apres chaque split pour
+# redistribuer l'espace, sinon la 3e/4e pane devient trop etroite et tmux
 # rejette le split suivant avec "no space for new pane".
 tmux new-window -t "$SESSION" -n all \
     "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
-for spec in \
-    "tcpdump|__TCPDUMP__" \
-    "osmocon|$OSMOCON_LOG" \
-    "ipc-device|$IPC_DEVICE_LOG" \
-    "osmo-trx-ipc|$OSMO_TRX_IPC_LOG" \
-    "bts|$BTS_LOG" \
-    "$CALYPSO_L2_CLIENT|$L2_TAIL_LOG"
-do
+# Build dynamic spec list selon ce qui tourne reellement.
+_ALL_SPECS=("osmocon|$OSMOCON_LOG")
+[ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("tcpdump|__TCPDUMP__")
+[ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ] && _ALL_SPECS+=("ipc-device|$IPC_DEVICE_LOG")
+[ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ] && _ALL_SPECS+=("osmo-trx-ipc|$OSMO_TRX_IPC_LOG")
+[ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
+[ "${CALYPSO_SKIP_BTS:-0}" != "1" ] && _ALL_SPECS+=("bts|$BTS_LOG")
+[ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
+for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
     if [ "$log" = "__TCPDUMP__" ]; then
         # Live tcpdump hex + ASCII (sans -w pour ne pas dupliquer le pcap
-        # canonique géré par la fenêtre `gsmtap`).
+        # canonique gere par la fenetre `gsmtap`).
         cmd="clear; echo '=== $name ==='; sleep 5 && tcpdump -i any -X udp port 4729"
     else
         cmd="clear; echo '=== $name ==='; tail -F $log"
     fi
-    tmux split-window -t "$SESSION:all" "$cmd"
+    tmux split-window -t "$SESSION:all" "$cmd" 2>/dev/null || true
     tmux select-layout -t "$SESSION:all" tiled
 done
 
-# ---------- 8. gen-doc auto (30s après QEMU launch) ----------
-# Une fenêtre tmux dédiée qui attend 30s que le pipeline se stabilise puis
-# lance pytest in-container pour produire la doc en arrière-plan. Pas de
-# rappel récursif à run.sh — on inline la commande pytest avec ses ignores
-# et env vars. Désactivable via CALYPSO_AUTO_GEN_DOC=0.
+# ---------- 8. gen-doc auto (30s apres QEMU launch) ----------
+# Une fenetre tmux dediee qui attend 30s que le pipeline se stabilise puis
+# lance pytest in-container pour produire la doc en arriere-plan. Pas de
+# rappel recursif a run.sh -- on inline la commande pytest avec ses ignores
+# et env vars. Desactivable via CALYPSO_AUTO_GEN_DOC=0.
 CALYPSO_AUTO_GEN_DOC="${CALYPSO_AUTO_GEN_DOC:-1}"
 if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
-    # Pré-install des deps Python (silencieux, idempotent)
+    # Pre-install des deps Python (silencieux, idempotent)
     pip_install_silent() {
         python3 -c "import $1" 2>/dev/null && return 0
         (pip install "$1" 2>&1 \
@@ -748,21 +1367,50 @@ if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
     GEN_DOC_PYTEST=$(detect_pytest)
     [ -z "$GEN_DOC_PYTEST" ] && GEN_DOC_PYTEST="python3 -m pytest"
 
+    # Pytest verbosity (set par le menu, ou default v).
+    case "${CALYPSO_PYTEST_VERBOSITY:-v}" in
+      q)   PY_VERBOSITY="-q --no-header" ;;
+      v)   PY_VERBOSITY="-v --tb=short --color=yes" ;;
+      vv)  PY_VERBOSITY="-vv --tb=long --color=yes" ;;
+      vvv) PY_VERBOSITY="-vvv --tb=long --color=yes --log-cli-level=DEBUG" ;;
+      *)   PY_VERBOSITY="-v --tb=short --color=yes" ;;
+    esac
+
+    # Pytest scope (set par le menu, ou default).
+    case "${CALYPSO_PYTEST_SCOPE:-default}" in
+      smoke)
+        PY_TARGET="test_run_all_modes.py"
+        PY_IGNORES=""
+        ;;
+      all)
+        PY_TARGET=""
+        PY_IGNORES=""
+        ;;
+      calypso)
+        PY_TARGET="calypso/"
+        PY_IGNORES=""
+        ;;
+      default|*)
+        PY_TARGET=""
+        PY_IGNORES="--ignore=functional --ignore=guest-debug \
+                    --ignore=qemu-iotests --ignore=qtest --ignore=unit \
+                    --ignore=tcg --ignore=migration --ignore=vm \
+                    --ignore=avocado --ignore=fp"
+        ;;
+    esac
+
     tmux new-window -t "$SESSION" -n gen-doc
     tmux send-keys -t "$SESSION:gen-doc" \
-        "echo '[gen-doc] waiting 60s for pipeline to stabilize…'; sleep 60; \
-         echo '[gen-doc] launching pytest in-container'; \
+        "echo '[gen-doc] waiting 60s for pipeline to stabilize...'; sleep 60; \
+         echo '[gen-doc] launching pytest in-container (verbosity=${CALYPSO_PYTEST_VERBOSITY:-v} scope=${CALYPSO_PYTEST_SCOPE:-default})'; \
          cd /opt/GSM/qemu-src/tests && \
          CALYPSO_TEST_OUT=/tmp \
          CALYPSO_REPO=/opt/GSM/qemu-src \
          CALYPSO_HOST_ROOT=/root \
-         $GEN_DOC_PYTEST -v --tb=short --color=yes \
-            --ignore=functional --ignore=guest-debug \
-            --ignore=qemu-iotests --ignore=qtest --ignore=unit \
-            --ignore=tcg --ignore=migration --ignore=vm \
-            --ignore=avocado --ignore=fp; \
+         CALYPSO_MODE_TAG=$CALYPSO_MODE \
+         $GEN_DOC_PYTEST $PY_VERBOSITY $PY_IGNORES $PY_TARGET; \
          echo; echo '=== Artefacts ==='; \
-         ls -la /tmp/report.md /tmp/test_results.md /tmp/test_results.qmd 2>/dev/null; \
+         ls -la /tmp/report.md /tmp/test_results.md /tmp/test_results.qmd /tmp/test_results_latest.zip 2>/dev/null; \
          echo; echo '[gen-doc] done. Press <Enter> to keep window open.'; read -r _" C-m
 fi
 
@@ -772,7 +1420,7 @@ tmux new-window -t "$SESSION" -n shell
 echo
 echo "Pipeline launched. Attach with: tmux attach -t $SESSION"
 
-# Build identity dump (2026-05-25) — attribution causale dans report.
+# Build identity dump (2026-05-25) -- attribution causale dans report.
 # Logged au stdout du wrapper + capture-able dans qemu.log via c54x_reset.
 echo "===== BUILD IDENTITY ====="
 QEMU_C54X_PATH="${QEMU_C54X_PATH:-/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c}"
@@ -785,45 +1433,45 @@ if command -v git >/dev/null 2>&1 && [ -d "$(dirname "$QEMU_C54X_PATH")/../../..
 fi
 echo "  qemu binary mtime: $(stat -c %y "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | cut -d. -f1)"
 echo "  c54x source mtime: $(stat -c %y "$QEMU_C54X_PATH" 2>/dev/null | cut -d. -f1)"
-# Marqueurs decoder fixes — grep des strings réellement dans le binaire
-# (= dans le format string BUILD-IDENT compilé en .rodata, pas dans les
-# commentaires C qui sont strippés). Si la string disparait = fix retiré.
+# Marqueurs decoder fixes -- grep des strings reellement dans le binaire
+# (= dans le format string BUILD-IDENT compile en .rodata, pas dans les
+# commentaires C qui sont strippes). Si la string disparait = fix retire.
 QEMU_BIN="${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}"
 if [ -x "$QEMU_BIN" ]; then
     BUILD_IDENT_LINE=$(strings "$QEMU_BIN" 2>/dev/null | grep 'BUILD-IDENT decoder-fixes:' | head -1)
     if [ -n "$BUILD_IDENT_LINE" ]; then
         case "$BUILD_IDENT_LINE" in
             *F1xx-FIRS-catch=REMOVED*)
-                echo "  decoder-fix F1xx FIRS catch:      ✓ REMOVED" ;;
+                echo "  decoder-fix F1xx FIRS catch:      [X] REMOVED" ;;
             *)
-                echo "  decoder-fix F1xx FIRS catch:      ⚠ NOT FOUND in binary" ;;
+                echo "  decoder-fix F1xx FIRS catch:      ! NOT FOUND in binary" ;;
         esac
         case "$BUILD_IDENT_LINE" in
             *L3609-src-dst=FIXED*)
-                echo "  decoder-fix L3609 src/dst swap:   ✓ APPLIED" ;;
+                echo "  decoder-fix L3609 src/dst swap:   [X] APPLIED" ;;
             *)
-                echo "  decoder-fix L3609 src/dst swap:   ⚠ NOT FOUND in binary" ;;
+                echo "  decoder-fix L3609 src/dst swap:   ! NOT FOUND in binary" ;;
         esac
         case "$BUILD_IDENT_LINE" in
             *F-AUDIT-v5=max-min-cmpl-rnd-roltc-fixed*)
-                echo "  decoder-fix F-AUDIT v5:           ✓ APPLIED (max/min/cmpl/rnd/roltc)" ;;
+                echo "  decoder-fix F-AUDIT v5:           [X] APPLIED (max/min/cmpl/rnd/roltc)" ;;
             *)
-                echo "  decoder-fix F-AUDIT v5:           ⚠ NOT FOUND in binary" ;;
+                echo "  decoder-fix F-AUDIT v5:           ! NOT FOUND in binary" ;;
         esac
         case "$BUILD_IDENT_LINE" in
             *F2xx-ALU-block=ADDED*)
-                echo "  decoder-fix F2xx ALU block:       ✓ ADDED (binutils-strict bit9=src bit8=dst)" ;;
+                echo "  decoder-fix F2xx ALU block:       [X] ADDED (binutils-strict bit9=src bit8=dst)" ;;
             *)
-                echo "  decoder-fix F2xx ALU block:       ⚠ NOT FOUND in binary" ;;
+                echo "  decoder-fix F2xx ALU block:       ! NOT FOUND in binary" ;;
         esac
         case "$BUILD_IDENT_LINE" in
             *F3xx-INTR-mis-REMOVED*)
-                echo "  decoder-fix F3xx INTR mis-decode: ✓ REMOVED (was F300/wrong, real INTR=F7C0)" ;;
+                echo "  decoder-fix F3xx INTR mis-decode: [X] REMOVED (was F300/wrong, real INTR=F7C0)" ;;
             *)
-                echo "  decoder-fix F3xx INTR mis-decode: ⚠ NOT FOUND in binary" ;;
+                echo "  decoder-fix F3xx INTR mis-decode: ! NOT FOUND in binary" ;;
         esac
     else
-        echo "  decoder-fix markers:              ⚠ BUILD-IDENT not in binary (= old build)"
+        echo "  decoder-fix markers:              ! BUILD-IDENT not in binary (= old build)"
     fi
 fi
 echo "=========================="
@@ -835,20 +1483,20 @@ echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
 echo "  CALYPSO_PROBE_BOOTSTUB      = $CALYPSO_PROBE_BOOTSTUB        (0=normal, 1=HACK probe-inject bootstub)"
 echo "  CALYPSO_W1C_LATCH           = $CALYPSO_W1C_LATCH"
-echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x023a — pinned 2026-05-07)}"
+echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x023a -- pinned 2026-05-07)}"
 echo "  CALYPSO_RACH_FORCE_BSIC     = ${CALYPSO_RACH_FORCE_BSIC:-(unset = use d_rach byte)}"
 echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
-echo "  CALYPSO_MTTCG               = ${CALYPSO_MTTCG:-0}  $([ "${CALYPSO_MTTCG:-0}" = "1" ] && echo '⚠️ NON-DÉTERMINISTE — données non-citables pour state claims (cf session 2026-05-25)' || echo '(icount-deterministic ✓)')"
-echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick → qemu.log, 0=silent)"
+echo "  CALYPSO_MTTCG               = ${CALYPSO_MTTCG:-0}  $([ "${CALYPSO_MTTCG:-0}" = "1" ] && echo '! NON-DETERMINISTE -- donnees non-citables pour state claims (cf session 2026-05-25)' || echo '(icount-deterministic [X])')"
+echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick : qemu.log, 0=silent)"
 echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
-echo "  CALYPSO_IRDA_CAPTURE        = $CALYPSO_IRDA_CAPTURE  (1=consume serial1 PTY → /tmp/fw-irda.log)"
+echo "  CALYPSO_IRDA_CAPTURE        = $CALYPSO_IRDA_CAPTURE  (1=consume serial1 PTY : /tmp/fw-irda.log)"
 echo "  OSMO_TRX_IPC                = $OSMO_TRX_IPC"
 echo "  OSMO_TRX_IPC_CFG            = $OSMO_TRX_IPC_CFG"
-echo "  CALYPSO_IPC_DEVICE          = ${CALYPSO_IPC_DEVICE:-(unset — Phase 1 TODO, osmo-trx-ipc échouera)}"
+echo "  CALYPSO_IPC_DEVICE          = ${CALYPSO_IPC_DEVICE:-(unset -- Phase 1 TODO, osmo-trx-ipc echouera)}"
 echo "  IPC_MSOCK_PATH              = $IPC_MSOCK_PATH"
 if [ "$CALYPSO_IRDA_CAPTURE" = "1" ] && [ -n "${PTY_IRDA:-}" ]; then
-    echo "  IrDA channel                = $PTY_IRDA → /tmp/irda.pty.link → /tmp/fw-irda.log"
+    echo "  IrDA channel                = $PTY_IRDA : /tmp/irda.pty.link : /tmp/fw-irda.log"
 fi
 echo
 echo "Manual warm-start (debug, if BSC unavailable) :"
@@ -856,4 +1504,13 @@ echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
 echo
 
 tmux select-window -t "$SESSION:all" 2>/dev/null || tmux select-window -t "$SESSION:qemu"
+
+# CALYPSO_NO_ATTACH=1 : ne pas attacher tmux (mode non-interactif, utile
+# pour run-all.sh ou tests pytest qui orchestrent plusieurs runs).
+if [ "${CALYPSO_NO_ATTACH:-0}" = "1" ]; then
+    echo "[run.sh] CALYPSO_NO_ATTACH=1 -- session tmux '$SESSION' tourne en background"
+    echo "[run.sh] Attach manuel : tmux attach -t $SESSION"
+    echo "[run.sh] Kill : tmux kill-session -t $SESSION"
+    exit 0
+fi
 exec tmux attach -t "$SESSION"

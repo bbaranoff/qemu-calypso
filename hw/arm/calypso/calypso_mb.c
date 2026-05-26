@@ -25,6 +25,7 @@
 #include "sysemu/reset.h"
 
 #include "hw/arm/calypso/calypso_soc.h"
+#include "calypso_dsp_shunt.h"
 
 #define CALYPSO_XRAM_BASE     0x01000000
 #define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
@@ -196,6 +197,13 @@ static void calypso_machine_init(MachineState *machine)
                 (unsigned long)entry, ret);
 
     }
+
+    /* ---- DSP shunt (mock côté ARM, skip c54x) ----
+     * Activé via env CALYPSO_DSP_SHUNT=1. Ne touche au c54x que via le
+     * gate calypso_dsp_shunt_active() utilisé dans calypso_bsp.c et
+     * calypso_trx.c pour stopper les écritures DMA vers DARAM.
+     * Cf hw/arm/calypso/calypso_dsp_shunt.c. */
+    calypso_dsp_shunt_init(sysmem, &address_space_memory);
 
     fprintf(stderr, "[MB] === Machine ready ===\n");
     fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",

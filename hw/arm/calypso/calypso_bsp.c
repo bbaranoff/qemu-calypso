@@ -32,6 +32,7 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 #include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
+#include "calypso_dsp_shunt.h"
 
 /* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
 
@@ -551,6 +552,15 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
 {
     bsp.bursts_seen++;
 
+    /* GATE DSP_SHUNT : si le shunt est actif, le c54x ne tourne pas et
+     * le mock écrit directement NDB/read-page. Toute écriture BSP vers
+     * DARAM écraserait les valeurs canned du mock. */
+    if (calypso_dsp_shunt_active()) {
+        if (bsp.bursts_seen <= 3)
+            BSP_LOG("rx_burst: DSP_SHUNT active, dropping fn=%u tn=%u", fn, tn);
+        return;
+    }
+
     if (!bsp.dsp) {
         if (bsp.bursts_seen <= 3)
             BSP_LOG("rx_burst: no DSP attached, dropping fn=%u tn=%u", fn, tn);
@@ -645,6 +655,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
  * current QEMU virtual FN and a BDLENA pulse is pending, deliver it. */
 void calypso_bsp_deliver_buffered(uint32_t current_fn)
 {
+    /* GATE DSP_SHUNT (cf calypso_bsp_rx_burst). Idem ici : si le shunt
+     * est actif, on ne livre aucun sample bufferisé — le mock owns la
+     * DARAM API region pour ses canned responses. */
+    if (calypso_dsp_shunt_active()) return;
+
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
     for (int tn = 0; tn < BSP_NUM_TN; tn++) {

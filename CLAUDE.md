@@ -1,5 +1,20 @@
 # QEMU Calypso — Claude Code Context
 
+## Working style with user
+
+Quand l'user me donne un nouvel ordre, je **continue les taches precedentes en parallele**. Je n'abandonne PAS le contexte courant. Si un fix etait en cours et l'user demande autre chose, je termine le fix ET je traite la nouvelle demande. La file de taches s'enchaine, elle ne se reset pas.
+
+## Dual-agent setup
+
+L'user travaille en parallèle avec **Claude Code** (ici, accès fichiers/git/build)
+et **Claude.ai web** (chat, dit "c web"). Il précise quand il bascule. **c web
+est le reviewer** : il challenge l'approche/les hypothèses/les hacks avant
+qu'on code. Quand le user paste un diag ou un plan de c web : prendre au
+sérieux mais croiser avec `git diff` et l'état réel du code avant fix. Quand
+c web demande des headers/grep, sortir propre (file:line, struct entière) pour
+que le user puisse copier-coller dans le chat web. Cf. mémoire
+[[feedback_dual_agent_division]].
+
 ## Session pickup (2026-05-08 night → next session)
 
 ```

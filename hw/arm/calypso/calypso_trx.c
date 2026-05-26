@@ -95,6 +95,7 @@ typedef struct CalypsoTRX {
 static CalypsoTRX *g_trx;
 
 #include "qemu/atomic.h"
+#include "calypso_dsp_shunt.h"
 
 /* FBSB host-side orchestration. Reintroduced after preNoCell refactor
  * (28 Apr) accidentally removed the wire. The bridge delivers I/Q from
@@ -510,8 +511,12 @@ static void calypso_dsp_done(void *opaque) {
 
     /* Hardware DMA: copy API write page → DSP DARAM 0x0586.
      * Triggered by firmware writing TPU_CTRL with EN bit (dsp_end_scenario).
-     * This is the ONLY place DMA happens — same as real Calypso. */
-    if (s->dsp && s->dsp_ram[0x01A8/2] != 0) {
+     * This is the ONLY place DMA happens — same as real Calypso.
+     *
+     * GATED par CALYPSO_DSP_SHUNT : si le shunt est actif, on skip
+     * complètement cette DMA — le mock écrit les résultats directement
+     * dans NDB/read-page et le c54x est inactif (pas de consommateur). */
+    if (s->dsp && s->dsp_ram[0x01A8/2] != 0 && !calypso_dsp_shunt_active()) {
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
         uint16_t *wp = page ?
             &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
@@ -696,6 +701,10 @@ static void calypso_frame_irq_lower(void *o){
                 (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
     qemu_irq_lower(((CalypsoTRX*)o)->irqs[CALYPSO_IRQ_TPU_FRAME]);
+
+    /* DSP shunt service hook (no-op si shunt off). Servir APRÈS le lower
+     * pour que le mock écrive ses résultats entre deux ticks ARM. */
+    calypso_dsp_shunt_on_frame_tick();
 }
 
 static void calypso_tdma_tick(void *opaque) {

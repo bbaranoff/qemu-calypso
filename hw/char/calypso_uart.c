@@ -262,9 +262,16 @@ static void calypso_uart_rx_poll(void *opaque)
      * wants `CALYPSO_ICOUNT != off` to work end-to-end. */
     qemu_chr_fe_accept_input(&s->chr);
 
-    /* Re-arm (realtime, 50ms) */
+    /* Re-arm (realtime, 5ms — tightened from 50ms 2026-05-26 night).
+     *
+     * Sous icount=auto, le main_loop QEMU itère moins fréquemment
+     * pendant les TCG bursts ARM, ce qui creuse une latence wall-clock
+     * entre l'arrivée de bytes osmocon sur la PTY et leur livraison à
+     * calypso_uart_receive. À 50ms la romload upload (64 KiB / blocks
+     * 1024) prenait > 60s wall et osmocon timeout. À 5ms ça matche la
+     * cadence émission osmocon (~1KB tous les 5ms). */
     timer_mod(s->rx_poll_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5);
 }
 
 /* ---- Control PTY callbacks ---- */
@@ -477,6 +484,11 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         if (pt_len > 0) {
             sercomm_gate_feed(s, passthrough, pt_len);
         }
+        /* Réamorce le chardev backend pour la batch suivante.
+         * Sous icount=auto le main_loop itère moins souvent → sans cet
+         * appel les bytes osmocon attendent jusqu'au prochain tick du
+         * rx_poll_timer (5ms). osmocon timeout sur ses blocs romload. */
+        qemu_chr_fe_accept_input(&s->chr);
         return;
     }
 

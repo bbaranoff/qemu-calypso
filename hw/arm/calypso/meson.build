@@ -22,6 +22,7 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'fw_console.c',
     'calypso_sim.c',
     'calypso_full_pcb.c',
+    'calypso_dsp_shunt.c',
   ),
   osmocoding,
 ])
