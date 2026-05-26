@@ -62,17 +62,33 @@ Pour implémentation sémantiquement correcte des familles **ST||OP parallèles*
 un handler dédié inspiré du ST||LD existant à `0xC8..0xCB` (ligne 4773).
 **Non urgent** tant que SP est stable et que blocker FB-det persiste.
 
-## Priorité C — Comprendre RETE=0
+## Priorité C — RETE=0 RÉSOLU 2026-05-25 night
 
-Malgré INTM=0 post-fix POPM, `RETE` count reste à 0 sur 4.3B insn.
-Possibilités :
-- (a) `c54x_interrupt_ex` jamais appelé → générateur d'IRQ matérielle
-  côté ARM (BSP, TPU, INTH) ne fire pas de SINT vers DSP
-- (b) IRQ fire mais ISR boucle sans atteindre RETE
-- (c) Pending IRQ replay block (ligne 5148) gardé par condition non remplie
+**Le firmware n'utilise pas RETE (0xF4EB). Il sort d'ISR via POPM ST1 + RCD.**
 
-À investiguer après tracé init AR3/AR4 (le blocker correlator est plus
-direct et probablement plus fondamental).
+Empirique INT3-CYCLE-TRACE run 2026-05-25 night :
+- `INTM-TRANS 1→0` à insn=143 et insn=2627748 (= 2 exits ISR observés)
+- Les deux ont `cause prev_exec PC=0x7706 op=0x8a07`
+- 0x8a07 = POPM ST1 (op 0x8A00 mask 0xFF00, lo=7 = MMR[7] = ST1)
+- POPM ST1 pop la stack dans ST1, INTM se clear comme side-effect (le ST1 sauvé en entry d'IRQ avait INTM=0)
+- L'instruction suivante PC=0x7707 op=0xFE00 = RCD (return conditional delayed, cond=always)
+- → exit pattern = `POPM ST1 ; RCD` (pas RETE)
+
+Confirme hypothèse (b) de la liste : IRQ fire (INTM-TRANS observé), ISR
+exécute, sort par POPM ST1 + RCD au lieu de RETE. Compte RETE=0
+**n'est pas un bug** — c'est le pattern firmware.
+
+**Implication pour instrumentation** : tout hook placé sur le handler
+0xF4EB est dead code. Cf fix `int3_cycle_end_good` déplacé du RETE
+handler (calypso_c54x.c L3459) vers le détecteur générique INTM 1→0
+(L8501) — fire sur toute transition, capte RETE/POPM ST1/RSBX INTM
+indifféremment.
+
+**Front F1 actif maintenant** : ISR #1 sort proprement (POPM ST1
+@insn=2.63M). ISR #2 entre immédiatement (@insn=2.63M) et reste
+bloqué dans la boucle compute fc54-fc6d (153k iter/M-insn) sur 1.25B
+insn sans atteindre sa séquence POPM ST1 de sortie. Diff signature
+branche cycle #1 vs #2 = next probe (INT3_CYCLE_TRACE relance).
 
 ## Run config courante
 

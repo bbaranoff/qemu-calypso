@@ -956,12 +956,13 @@ static void force_intm_oneshot_check(C54xState *s)
  *
  * Cappé 256 branches/cycle (= overflow tagué pour borne).
  * Env-gated CALYPSO_INT3_CYCLE_TRACE=1. */
-#define INT3_BRANCH_TRACE_MAX 256
+#define INT3_BRANCH_TRACE_MAX 1024
 typedef struct {
     uint16_t pc;        /* PC of branch insn */
     uint16_t op;        /* opcode word 0 */
     uint16_t next_pc;   /* PC after exec (= branch taken target OR fall-through) */
-    uint32_t insn_offset; /* delta from cycle start */
+    uint32_t insn_offset; /* delta from cycle start (first occurrence) */
+    uint32_t repeat;    /* consecutive identical (pc,op,next_pc) collapsed count */
 } Int3BranchEvent;
 static Int3BranchEvent g_int3_trace[INT3_BRANCH_TRACE_MAX];
 static unsigned g_int3_trace_count = 0;
@@ -1024,12 +1025,17 @@ static void int3_cycle_start(C54xState *s, uint16_t target_pc)
             g_int3_trace_overflow ? "+ OVERFLOW" : "");
         for (unsigned i = 0; i < g_int3_trace_count; i++) {
             Int3BranchEvent *e = &g_int3_trace[i];
-            uint16_t fallthrough = (e->op & 0xFF00) >= 0xF800 && (e->op & 0xFF00) <= 0xFB00
-                                   ? e->pc + 2 : e->pc + 1;
+            /* 2-word branches (no lk_used here for simplicity) : BC/CC/BCD/CCD
+             * (0xF8-0xFB) and BANZ/BANZD (0x6C/0x6E). 1-word : RET/RC/RCD. */
+            uint16_t hi = e->op & 0xFF00;
+            bool two_word = (hi >= 0xF800 && hi <= 0xFB00)
+                            || hi == 0x6C00 || hi == 0x6E00;
+            uint16_t fallthrough = e->pc + (two_word ? 2 : 1);
             fprintf(stderr,
-                "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s\n",
+                "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s ×%u\n",
                 i + 1, e->insn_offset, e->pc, e->op, e->next_pc,
-                (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)");
+                (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)",
+                e->repeat);
         }
     }
     g_int3_cycle_id++;
@@ -1049,11 +1055,41 @@ static void int3_cycle_start(C54xState *s, uint16_t target_pc)
 /* Called from c54x_run after c54x_exec_one. exec_pc/exec_op are the
  * instruction that just executed; s->pc is the resulting PC. */
 static void int3_cycle_track_branch(C54xState *s, uint16_t exec_pc,
-                                    uint16_t exec_op)
+                                    uint16_t exec_op, int consumed)
 {
     if (g_int3_trace_enabled <= 0) return;
     if (!g_int3_cycle_active) return;
     if (!is_int3_traced_branch(exec_op)) return;
+    /* Compute next_pc correctly across all branch-handler patterns :
+     * 1. Non-delayed branch TAKEN  → handler set s->pc=target, returned consumed=0
+     *    → s->pc already = target.
+     * 2. Delayed branch TAKEN      → handler armed delay_slots=2 + delayed_pc,
+     *    returned consumed>0; main loop hasn't run +=consumed yet
+     *    → eventual target = s->delayed_pc.
+     * 3. Branch FALL-THROUGH (any) → handler returned consumed>0, s->pc unchanged,
+     *    delay_slots not set; main loop will += consumed → next insn
+     *    → next = exec_pc + consumed. */
+    uint16_t actual_next;
+    if (consumed == 0) {
+        actual_next = s->pc;
+    } else if (s->delay_slots == 2) {
+        actual_next = s->delayed_pc;
+    } else {
+        actual_next = (uint16_t)(exec_pc + consumed);
+    }
+
+    /* Dedup-pattern : look up to 4 slots back. Catches consecutive
+     * identical (distance 1, AAA), strict alternation (distance 2,
+     * ABAB), and short cycles up to length 4 (ABCDABCD). Each iteration
+     * of the repeating pattern bumps the matched slot's repeat — total
+     * iterations = max(repeat) across slots forming the cycle. */
+    for (unsigned back = 1; back <= 4 && back <= g_int3_trace_count; back++) {
+        Int3BranchEvent *cand = &g_int3_trace[g_int3_trace_count - back];
+        if (cand->pc == exec_pc && cand->op == exec_op && cand->next_pc == actual_next) {
+            cand->repeat++;
+            return;
+        }
+    }
     if (g_int3_trace_count >= INT3_BRANCH_TRACE_MAX) {
         g_int3_trace_overflow = 1;
         return;
@@ -1061,8 +1097,9 @@ static void int3_cycle_track_branch(C54xState *s, uint16_t exec_pc,
     Int3BranchEvent *e = &g_int3_trace[g_int3_trace_count++];
     e->pc = exec_pc;
     e->op = exec_op;
-    e->next_pc = s->pc;
+    e->next_pc = actual_next;
     e->insn_offset = (uint32_t)(s->insn_count - g_int3_cycle_entry_insn);
+    e->repeat = 1;
 }
 
 /* Called from RETE handler (L3300 area) BEFORE INTM is cleared. */
@@ -1080,12 +1117,15 @@ static void int3_cycle_end_good(C54xState *s, uint16_t return_addr)
         g_int3_trace_overflow ? "+ OVERFLOW" : "");
     for (unsigned i = 0; i < g_int3_trace_count; i++) {
         Int3BranchEvent *e = &g_int3_trace[i];
-        uint16_t fallthrough = (e->op & 0xFF00) >= 0xF800 && (e->op & 0xFF00) <= 0xFB00
-                               ? e->pc + 2 : e->pc + 1;
+        uint16_t hi = e->op & 0xFF00;
+        bool two_word = (hi >= 0xF800 && hi <= 0xFB00)
+                        || hi == 0x6C00 || hi == 0x6E00;
+        uint16_t fallthrough = e->pc + (two_word ? 2 : 1);
         fprintf(stderr,
-            "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s\n",
+            "[c54x]   #%3u Δ%u PC=0x%04x op=0x%04x → next=0x%04x %s ×%u\n",
             i + 1, e->insn_offset, e->pc, e->op, e->next_pc,
-            (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)");
+            (e->next_pc == fallthrough) ? "(NOT_TAKEN)" : "(TAKEN)",
+            e->repeat);
     }
     g_int3_cycle_active = 0;
 }
@@ -3455,8 +3495,9 @@ static int c54x_exec_one(C54xState *s)
                 if (s->xpc > 3) s->xpc &= 3;
             }
             s->st1 &= ~ST1_INTM;
-            /* INT3-CYCLE-TRACE : signal cycle end-good before INTM cleared in log */
-            int3_cycle_end_good(s, ra);
+            /* INT3-CYCLE-TRACE end-good hook NOT here : firmware exits ISR via
+             * POPM ST1 + RCD (not RETE 0xF4EB), so this path is dead. Hook
+             * moved to generic INTM 1→0 detector below — catches all idioms. */
             {
                 static uint64_t rete_count;
                 rete_count++;
@@ -8498,6 +8539,13 @@ int c54x_run(C54xState *s, int n_insns)
                 }
                 intm_log++;
             }
+            /* INT3-CYCLE-TRACE : fire end-good on ANY INTM 1→0 transition,
+             * not just RETE — firmware uses POPM ST1 + RCD pattern. The
+             * function itself is a no-op when probe disabled or no cycle
+             * active, so unconditional call is safe. */
+            if (prev_intm == 1 && cur_intm == 0) {
+                int3_cycle_end_good(s, s->pc);
+            }
             prev_intm = cur_intm;
         }
 
@@ -9099,7 +9147,7 @@ int c54x_run(C54xState *s, int n_insns)
         consumed = c54x_exec_one(s);
         /* INT3-CYCLE-TRACE (env CALYPSO_INT3_CYCLE_TRACE=1, c web reframe night5) :
          * record branch decisions during INT3 ISR cycle. */
-        int3_cycle_track_branch(s, exec_pc, exec_op);
+        int3_cycle_track_branch(s, exec_pc, exec_op, consumed);
 
         /* Detect SP changes — only log after init (insn > 490M) */
         if (s->sp != sp_before && s->insn_count > 490000000) {
