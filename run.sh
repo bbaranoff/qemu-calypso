@@ -91,10 +91,6 @@ if [ "$MENU_MODE" = "1" ]; then
     case "$CHOICE" in
         1)
             echo "[menu] Profil = hack-free + diag MINIMAL"
-            export CALYPSO_FBSB_SYNTH=0
-            export CALYPSO_DSP_FBDET_SKIP=0
-            export CALYPSO_PM_INJECT=0
-            export CALYPSO_DSP_FORCE_DARAM62=0
             export CALYPSO_PROBE_BOOTSTUB=0
             # Force icount=auto, MTTCG off pour déterminisme (cf
             # session 2026-05-25 : data MTTCG non-citable pour claims
@@ -104,10 +100,6 @@ if [ "$MENU_MODE" = "1" ]; then
             ;;
         2)
             echo "[menu] Profil = hack-free + diag FULL"
-            export CALYPSO_FBSB_SYNTH=0
-            export CALYPSO_DSP_FBDET_SKIP=0
-            export CALYPSO_PM_INJECT=0
-            export CALYPSO_DSP_FORCE_DARAM62=0
             export CALYPSO_PROBE_BOOTSTUB=0
             # Force déterminisme : icount=auto, MTTCG off (cf session
             # 2026-05-25 : data MTTCG non-citable pour state claims).
@@ -126,15 +118,9 @@ if [ "$MENU_MODE" = "1" ]; then
             ;;
         3)
             echo "[menu] Profil = dev-assist PM_INJECT=800"
-            export CALYPSO_FBSB_SYNTH=0
-            export CALYPSO_DSP_FBDET_SKIP=0
-            export CALYPSO_PM_INJECT=800
             ;;
         4)
             echo "[menu] Profil = dev-assist FBSB_SYNTH=1"
-            export CALYPSO_FBSB_SYNTH=1
-            export CALYPSO_DSP_FBDET_SKIP=0
-            export CALYPSO_PM_INJECT=800
             ;;
         5)
             echo "[menu] Profil = custom"
@@ -145,9 +131,6 @@ if [ "$MENU_MODE" = "1" ]; then
                 export "$var=$val"
             }
             echo "--- Hacks (0 = désactivé, no-hack) ---"
-            _ask CALYPSO_PM_INJECT       0 "PM scan hack (800 = inject value)"
-            _ask CALYPSO_FBSB_SYNTH      0 "synth FB/SB NDB hack"
-            _ask CALYPSO_DSP_FBDET_SKIP  0 "skip DSP FB-det handler"
             echo "--- Diagnostic ---"
             _ask CALYPSO_SP_RING         0 "SP ring buffer"
             _ask CALYPSO_SP_ABS_TRACE    0 "SP absolute writes"
@@ -345,39 +328,14 @@ CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x3fb0}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
 export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG
 
-# ---- Env-gated dev assists (default OFF = real path) ----
-# Set =1 in the calling environment to enable. Cf. README.md "Env vars".
-# CALYPSO_RXDONE_ADDR : auto-détection via nm sur le firmware elf. Permet de
-# survivre aux rebuilds firmware qui shiftent l'adresse BSS de rxDoneFlag.
-# Override via env si besoin (force une valeur fixe).
-if [ -z "${CALYPSO_RXDONE_ADDR:-}" ]; then
-    NM="/root/gnuarm/install/bin/arm-elf-nm"
-    [ -x "$NM" ] || NM="arm-elf-nm"
-    if command -v "$NM" >/dev/null 2>&1 || [ -x "$NM" ]; then
-        _rxd_addr=$("$NM" -n "$FW_ELF" 2>/dev/null \
-                    | awk '$3 == "rxDoneFlag" { print "0x"$1 ; exit }')
-        if [ -n "$_rxd_addr" ]; then
-            CALYPSO_RXDONE_ADDR="$_rxd_addr"
-            echo "[run.sh] auto-detected CALYPSO_RXDONE_ADDR=$CALYPSO_RXDONE_ADDR (from nm $FW_ELF)"
-        fi
-    fi
-fi
-export CALYPSO_RXDONE_ADDR
-
-# === Defaults no-hack (2026-05-25) ===
-# Politique : aucun bypass de chemin firmware par défaut. Les hacks
-# dev-assist (PM_INJECT, FBSB_SYNTH, DSP_FBDET_SKIP) sont à 0 par défaut.
-# Override explicite dans la cmdline si tu veux un dev-assist temporaire.
-# Conforme à CLAUDE.md règle #1 : "PAS DE HACK". Voir aussi audit run env
-# 2026-05-25 (l'absence de CALYPSO_PM_INJECT activait le hack=800 par défaut).
-CALYPSO_FBSB_SYNTH="${CALYPSO_FBSB_SYNTH:-0}"        # no-hack : synth FB/SB désactivé
-CALYPSO_DSP_FBDET_SKIP="${CALYPSO_DSP_FBDET_SKIP:-0}" # no-hack : FB-det handler exécuté
-CALYPSO_PM_INJECT="${CALYPSO_PM_INJECT:-0}"          # no-hack : PM scan réel (code default 800 = HACK actif si absent)
-CALYPSO_DSP_FORCE_DARAM62="${CALYPSO_DSP_FORCE_DARAM62:-0}" # no-hack : pas de force daram[0x62]=1
-CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}" # no-hack : pas de probe-injection bootstub
+# === Defaults no-hack ===
+# Politique : aucun bypass de chemin firmware. Tous les hacks env-gated
+# (PM_INJECT, FBSB_SYNTH, DSP_FBDET_SKIP, FORCE_RX_DONE, BYPASS_BDLENA,
+# FORCE_DARAM62) ont été retirés du code source 2026-05-26.
+# Conforme à CLAUDE.md règle #1 : "PAS DE HACK".
+CALYPSO_PROBE_BOOTSTUB="${CALYPSO_PROBE_BOOTSTUB:-0}" # diag-only probe (no hack)
 
 # === Stability / non-hack mais nécessaire ===
-CALYPSO_FORCE_RX_DONE="${CALYPSO_FORCE_RX_DONE:-1}"   # load-bearing pour osmocon firmware download (mémoire [[project_force_rx_done_load_bearing]])
 CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"       # perf : fast-forward DSP idle dispatcher (pas un hack)
 CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
 
@@ -398,13 +356,11 @@ export CALYPSO_BSP_IQ_PASSTHROUGH
 # =1 = mêmes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
 CALYPSO_TIMER="${CALYPSO_TIMER:-0}"
 CALYPSO_DSP_BUDGET="${CALYPSO_DSP_BUDGET:-256000}"
-export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
+export CALYPSO_W1C_LATCH \
        CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
        CALYPSO_DSP_IDLE_FF CALYPSO_DSP_IDLE_RANGE \
-       CALYPSO_FORCE_RX_DONE \
-       CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE CALYPSO_TIMER \
-       CALYPSO_PROBE_BOOTSTUB CALYPSO_DSP_BUDGET \
-       CALYPSO_PM_INJECT CALYPSO_DSP_FORCE_DARAM62
+       CALYPSO_UART_TRACE CALYPSO_TIMER \
+       CALYPSO_PROBE_BOOTSTUB CALYPSO_DSP_BUDGET
 
 # ---- icount mode (deterministic virtual clock paced by instruction count) ----
 # Default ON (auto = shift=auto,sleep=on,align=off). Set CALYPSO_ICOUNT=off
@@ -877,10 +833,6 @@ echo "ENV summary:"
 echo "  CALYPSO_DSP_ROM             = $CALYPSO_DSP_ROM"
 echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
-echo "  CALYPSO_FBSB_SYNTH          = $CALYPSO_FBSB_SYNTH        (0=real DSP path, 1=HACK synth FB/SB)"
-echo "  CALYPSO_PM_INJECT           = $CALYPSO_PM_INJECT        (0=real PM scan, !=0=HACK inject value)"
-echo "  CALYPSO_DSP_FBDET_SKIP      = $CALYPSO_DSP_FBDET_SKIP        (0=run FB-det handler, 1=HACK skip)"
-echo "  CALYPSO_DSP_FORCE_DARAM62   = $CALYPSO_DSP_FORCE_DARAM62        (0=normal, 1=HACK force daram[0x62]=1)"
 echo "  CALYPSO_PROBE_BOOTSTUB      = $CALYPSO_PROBE_BOOTSTUB        (0=normal, 1=HACK probe-inject bootstub)"
 echo "  CALYPSO_W1C_LATCH           = $CALYPSO_W1C_LATCH"
 echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x023a — pinned 2026-05-07)}"
@@ -890,7 +842,6 @@ echo "  CALYPSO_MTTCG               = ${CALYPSO_MTTCG:-0}  $([ "${CALYPSO_MTTCG:
 echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick → qemu.log, 0=silent)"
 echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP idle dispatcher)"
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
-echo "  CALYPSO_FORCE_RX_DONE       = ${CALYPSO_FORCE_RX_DONE}"
 echo "  CALYPSO_IRDA_CAPTURE        = $CALYPSO_IRDA_CAPTURE  (1=consume serial1 PTY → /tmp/fw-irda.log)"
 echo "  OSMO_TRX_IPC                = $OSMO_TRX_IPC"
 echo "  OSMO_TRX_IPC_CFG            = $OSMO_TRX_IPC_CFG"

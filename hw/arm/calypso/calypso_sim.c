@@ -604,55 +604,6 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000);
         }
 
-        /* Gestion SIM normative — rxDoneFlag side-effect on IT_WT.
-         *
-         * Sémantique : quand le firmware observe IT_WT (wait time complete
-         * = fin de la séquence RX SIM), il devrait poser rxDoneFlag=1 dans
-         * son sim_irq_handler @ sim_irq_handler+0x14 (STRNE r1,[r3,#0],
-         * encoding 0x15831000, VA=0x008228c4 sur le build courant).
-         *
-         * Ce STR conditionnel ARM ne commit pas de manière fiable sous
-         * `-icount auto` (bug TCG, voir target/arm/tcg/translate.c —
-         * STR cond avec icount peut être interrompu mi-condition). Faute
-         * de fix TCG, le SIM emulator pose lui-même le flag : c'est la
-         * "responsabilité matérielle" — quand le hardware sait que le
-         * RX est terminé, il signale au firmware. Le firmware aurait fait
-         * exactement ce write s'il avait pu, donc on le fait à sa place.
-         *
-         * cpu_exit() force le TB busy-loop du firmware à recompiler →
-         * il relit rxDoneFlag depuis la mémoire fraîchement updated.
-         *
-         * Par défaut ON. Désactiver via CALYPSO_FORCE_RX_DONE=0 pour
-         * tester le path firmware natif (régression test sous icount=off
-         * où le STR cond commit correctement).
-         *
-         * Adresse rxDoneFlag = 0x008302d4 (nm layer1.highram.elf 2026-05-24).
-         * Override via CALYPSO_RXDONE_ADDR si rebuild firmware change.
-         */
-        if (v & CALYPSO_SIM_IT_WT) {
-            static int disabled = -1;
-            if (disabled < 0) {
-                const char *env = getenv("CALYPSO_FORCE_RX_DONE");
-                disabled = (env && env[0] == '0') ? 1 : 0;
-            }
-            if (!disabled) {
-                static unsigned force_n;
-                static uint32_t rxdone_addr;
-                if (!rxdone_addr) {
-                    const char *aenv = getenv("CALYPSO_RXDONE_ADDR");
-                    rxdone_addr = aenv ? (uint32_t)strtoul(aenv, NULL, 0)
-                                       : 0x008302d4;
-                }
-                const uint32_t one = 1;
-                cpu_physical_memory_write(rxdone_addr, &one, sizeof(one));
-                CPUState *cpu = first_cpu;
-                if (cpu) cpu_exit(cpu);
-                if (force_n++ < 30)
-                    SIM_LOG("SIM IT_WT → rxDoneFlag=1 @0x%08x #%u "
-                            "(IT=0x%04x) + cpu_exit",
-                            rxdone_addr, force_n, v);
-            }
-        }
         /* Lighter instrumentation : just IT bits + FIFO state, no PC read.
          * The ARM_PC access via env.regs[15] from inside an MMIO read may
          * itself trigger TB recompile under -icount auto. Now we know all

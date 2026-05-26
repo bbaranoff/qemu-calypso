@@ -82,9 +82,10 @@ static void gate_push_to_fifo(CalypsoUARTState *s,
     { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
     for (int i = 0; i < len; i++) {
         uint8_t c = frame[i];
-        /* Standard sercomm: only escape FLAG and ESCAPE. Escaping
-         * 0x00 was a bug — the firmware sercomm parser doesn't
-         * expect it and would drop the frame. */
+        /* Standard sercomm HDLC byte stuffing : escape FLAG (0x7e) and
+         * ESCAPE (0x7d) so they survive in payload bytes. Mandatory for
+         * the firmware sercomm parser ; removing this corrupts every
+         * frame whose payload contains 0x7e or 0x7d. */
         if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE) {
             { uint8_t _e = SERCOMM_ESCAPE; calypso_uart_inject_raw(s, &_e, 1); }
             { uint8_t _x = c ^ SERCOMM_XOR; calypso_uart_inject_raw(s, &_x, 1); }

@@ -87,24 +87,6 @@ void calypso_fbsb_reset(CalypsoFbsb *s)
  * firmware's prim_fbsb.c expects: when the task is FB_DSP_TASK we
  * enter FB0_SEARCH; when it's SB_DSP_TASK we enter SB_SEARCH.
  * ---------------------------------------------------------------- */
-/* CALYPSO_FBSB_SYNTH=1 → publish synthetic FB/SB results in NDB so the
- * firmware progresses past FBSB without waiting for the DSP correlator
- * to converge. Documented dev-assist for cases where the emulated DSP
- * fb-det doesn't converge on bridge-fed GMSK samples. Default 0 = real
- * DSP path. Read once at first call. */
-static int fbsb_synth_mode(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("CALYPSO_FBSB_SYNTH");
-        cached = (e && *e == '1') ? 1 : 0;
-        fprintf(stderr, "[calypso-fbsb] CALYPSO_FBSB_SYNTH=%d (%s path)\n",
-                cached, cached ? "synth, dev-assist" : "real DSP");
-        fflush(stderr);
-    }
-    return cached;
-}
-
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn)
 {
@@ -112,40 +94,21 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
             d_task_md, (unsigned long)fn, s ? (int)s->state : -1);
     fflush(stderr);
     if (!s) return;
-    int synth = fbsb_synth_mode();
     switch (d_task_md) {
     case DSP_TASK_FB:
-        /* The DSP runs the real fb-det routine on the I/Q stream that
-         * the BSP feeds from osmo-bts-trx (GMSK-modulated). Convergence
-         * depends on the routine running fully each frame — see
-         * doc/FBSB_FLOW.md and the icount/wall-clock notes in run.sh.
-         * If CALYPSO_FBSB_SYNTH=1, publish synthetic results to bypass
-         * the (currently non-converging) emulated correlator. */
+        /* Real DSP path : DSP correlator runs on I/Q stream from BSP. */
         s->state       = FBSB_FB0_SEARCH;
         s->fb0_attempt = 0;
         s->fb1_attempt = 0;
         s->sb_attempt  = 0;
         s->fn_started  = fn;
-        if (synth) {
-            calypso_fbsb_publish_fb_found(s,
-                /* toa */ 0, /* pm */ 80, /* angle */ 0, /* snr */ 100);
-            s->state = FBSB_FB0_FOUND;
-            calypso_fbsb_dump(s, "FB0_FOUND (synth)");
-        } else {
-            calypso_fbsb_dump(s, "FB0_SEARCH (real DSP path)");
-        }
+        calypso_fbsb_dump(s, "FB0_SEARCH (real DSP path)");
         break;
     case DSP_TASK_SB:
         s->state      = FBSB_SB_SEARCH;
         s->sb_attempt = 0;
         s->fn_started = fn;
-        if (synth) {
-            calypso_fbsb_publish_sb_found(s, /* bsic */ 0);
-            s->state = FBSB_SB_FOUND;
-            calypso_fbsb_dump(s, "SB_FOUND (synth)");
-        } else {
-            calypso_fbsb_dump(s, "SB_SEARCH (real DSP path)");
-        }
+        calypso_fbsb_dump(s, "SB_SEARCH (real DSP path)");
         break;
     case DSP_TASK_ALLC: {
         /* CCCH read (task=24, ALLC_DSP_TASK). The DSP demodulates BCCH

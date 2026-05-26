@@ -103,7 +103,6 @@ static struct {
     C54xState *dsp;
     uint16_t   daram_addr;
     uint16_t   daram_len;
-    uint16_t   bypass_bdlena;
     uint64_t   bursts_seen;
     uint64_t   bursts_written;
     uint64_t   bursts_dropped_no_window;
@@ -460,7 +459,6 @@ void calypso_bsp_init(C54xState *dsp)
      * the FB-det wait loop at PROM0 0x7700. */
     bsp.daram_addr     = parse_uint_env("CALYPSO_BSP_DARAM_ADDR", 0x3fb0);
     bsp.daram_len      = parse_uint_env("CALYPSO_BSP_DARAM_LEN",  296);
-    bsp.bypass_bdlena  = parse_uint_env("CALYPSO_BSP_BYPASS_BDLENA", 0);
     bsp.bursts_seen = 0;
     bsp.bursts_written = 0;
     bsp.bursts_dropped_no_window = 0;
@@ -543,7 +541,7 @@ void calypso_bsp_init(C54xState *dsp)
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",
             (void *)dsp, bsp.daram_addr, bsp.daram_len,
             bsp.daram_addr ? "" : "  (DISCOVERY mode — no DMA)",
-            bsp.bypass_bdlena ? "  (BDLENA gate BYPASSED — debug)" : "");
+            "");
 }
 
 /* ---- DL burst → DSP DARAM ---- */
@@ -570,7 +568,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
 
     /* On real hw the BSP serial link only carries samples while IOTA's
      * BDLENA pin is asserted. */
-    if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn)) {
+    if (!calypso_iota_take_bdl_pulse(tn)) {
         bsp.bursts_dropped_no_window++;
         if (bsp.bursts_dropped_no_window <= 5 ||
             (bsp.bursts_dropped_no_window % 100000) == 0) {
@@ -653,7 +651,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         BspBurstSlot *sl = bsp_take_for_fn(tn, current_fn);
         if (!sl) continue;
 
-        if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn))
+        if (!calypso_iota_take_bdl_pulse(tn))
             continue;
 
         int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;

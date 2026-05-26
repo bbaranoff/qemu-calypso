@@ -1539,30 +1539,6 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
      *     (a_cd[] init, NDB cell, ...).
      *   - No change : branch / compare is more subtle than read.
      * This is a force-test, not a fix — remove or env-leave-off after. */
-    if (addr == 0x0062 && s->pc >= 0xCC62 && s->pc <= 0xCC6F) {
-        static int force_cached = -1;
-        if (force_cached < 0) {
-            const char *e = getenv("CALYPSO_DSP_FORCE_DARAM62");
-            force_cached = (e && *e == '1') ? 1 : 0;
-            fprintf(stderr,
-                    "[c54x] CALYPSO_DSP_FORCE_DARAM62=%d (%s)\n",
-                    force_cached,
-                    force_cached ? "FORCING daram[0x62]=1 in idle disp loop"
-                                 : "real value (no force)");
-            fflush(stderr);
-        }
-        if (force_cached) {
-            static unsigned force_log;
-            if (force_log < 5) {
-                fprintf(stderr,
-                        "[c54x] FORCE-DARAM62 #%u PC=0x%04x real=0x%04x → returning 0x0001 insn=%u\n",
-                        force_log, s->pc, s->data[0x62], s->insn_count);
-                force_log++;
-            }
-            return 1;
-        }
-    }
-
     /* === DSP idle dispatcher trace (PC ∈ 0xCC62..0xCC6F) ===
      * The DSP gets stuck in this PROM0 loop polling task slots. Dump the
      * exact (PC, addr, value, AR2..AR5) for the first N reads so we can
@@ -8385,59 +8361,6 @@ int c54x_run(C54xState *s, int n_insns)
                 executed     += ff_cyc;
                 continue;
             }
-        }
-
-        /* CALYPSO_DSP_FBDET_SKIP — completion of the SYNTH strategy.
-         * When the firmware enters the fb-det routine (PC range
-         * 0x8d00..0x8f80) AND we already publish synthetic FB results
-         * via CALYPSO_FBSB_SYNTH=1, executing the routine is pure
-         * waste : the caller will read NDB, find the synth d_fb_det=1,
-         * and ignore whatever the routine would have computed.
-         *
-         * Mechanism : at the FIRST PC entering the range from outside,
-         * pop the return addr from stack (CALL convention) and jump to
-         * it. Subsequent PCs inside the range fall back to normal exec
-         * (we only short-circuit the entry point per call).
-         *
-         * Default OFF. Enable with CALYPSO_DSP_FBDET_SKIP=1 alongside
-         * CALYPSO_FBSB_SYNTH=1 for B2B / demo runs where you accept the
-         * shunt for performance. Silently no-op without FBSB_SYNTH so
-         * the user can leave it set without affecting real-DSP runs.
-         */
-        {
-            static int fbdet_skip_enabled = -1;
-            static int fbsb_synth_active = -1;
-            static uint16_t prev_pc_fbdet = 0;
-            static uint64_t fbdet_skip_count = 0;
-
-            if (fbdet_skip_enabled < 0) {
-                const char *e1 = getenv("CALYPSO_DSP_FBDET_SKIP");
-                fbdet_skip_enabled = (e1 && *e1 == '1') ? 1 : 0;
-                const char *e2 = getenv("CALYPSO_FBSB_SYNTH");
-                fbsb_synth_active = (e2 && *e2 == '1') ? 1 : 0;
-                C54_LOG("DSP FBDET SKIP: %s%s",
-                        fbdet_skip_enabled ? "enabled" : "disabled",
-                        fbdet_skip_enabled && !fbsb_synth_active
-                            ? " (but FBSB_SYNTH=0 — skip is no-op)" : "");
-            }
-            if (fbdet_skip_enabled && fbsb_synth_active &&
-                s->pc >= 0x8d00 && s->pc < 0x8f80 &&
-                (prev_pc_fbdet < 0x8d00 || prev_pc_fbdet >= 0x8f80)) {
-                uint16_t ra = data_read(s, s->sp);
-                s->sp = (uint16_t)(s->sp + 1);
-                fbdet_skip_count++;
-                if (fbdet_skip_count <= 5 || (fbdet_skip_count % 10000) == 0) {
-                    C54_LOG("FBDET-SKIP #%llu entry_pc=0x%04x ra=0x%04x SP=0x%04x",
-                            (unsigned long long)fbdet_skip_count,
-                            s->pc, ra, s->sp);
-                }
-                s->pc = ra;
-                prev_pc_fbdet = ra;
-                s->cycles += 5;
-                executed += 5;
-                continue;
-            }
-            prev_pc_fbdet = s->pc;
         }
 
         /* Replay any interrupt that fired while INTM=1.
