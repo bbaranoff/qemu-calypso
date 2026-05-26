@@ -759,13 +759,20 @@ static void calypso_tdma_tick(void *opaque) {
         TRX_LOG("CALYPSO_DSP_BUDGET = %d insn/c54x_run (default 256000)",
                 dsp_budget);
     }
-    if (s->dsp && s->dsp->running && !s->dsp_init_done) {
+    /* GATE DSP_SHUNT : si le shunt est actif, le mock cote ARM remplace
+     * la DSP. Skip TOUS les c54x_run -> le c54x emule n'execute aucune
+     * instruction, ne touche pas a la DARAM, ne fabrique pas de d_dsp_page
+     * concurrent avec le mock. */
+    if (s->dsp && s->dsp->running && !s->dsp_init_done && !calypso_dsp_shunt_active()) {
         if (!s->dsp->idle)
             dsp_n_exec_2 = c54x_run(s->dsp, dsp_budget);
         if (s->dsp->idle) {
             s->dsp_init_done = true;
             TRX_LOG("DSP init complete (first IDLE reached)");
         }
+    } else if (calypso_dsp_shunt_active() && !s->dsp_init_done) {
+        /* En shunt mode, on saute l'init DSP "boot" — le mock prend le relais. */
+        s->dsp_init_done = true;
     }
     t_dspboot = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
@@ -806,8 +813,10 @@ static void calypso_tdma_tick(void *opaque) {
         /* ── 5. Run DSP (RX path : FBSB demod, BCCH/CCCH decode) ──
          * Budget partagé avec section 2 via static `dsp_budget` (env var
          * CALYPSO_DSP_BUDGET). NE PAS supprimer ce 2e appel — il porte le
-         * compute RX critique (Claude web review 2026-05-16). */
-        if (!s->dsp->idle) {
+         * compute RX critique (Claude web review 2026-05-16).
+         *
+         * GATE DSP_SHUNT : skip si shunt actif (cf section 2 commentaire). */
+        if (!s->dsp->idle && !calypso_dsp_shunt_active()) {
             dsp_n_exec_5 = c54x_run(s->dsp, dsp_budget);
         }
 

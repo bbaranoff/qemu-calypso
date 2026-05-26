@@ -80,6 +80,14 @@
 #define NDB_D_FB_DET        0x48
 #define NDB_D_FB_MODE       0x4A
 #define NDB_A_SYNC_DEMOD    0x4C   /* [4] words */
+#define NDB_A_CD            0x1FC  /* a_cd[15] : CCCH demod result.
+                                       EMPIRIQUE 2026-05-26 night : valide via HMP stop +
+                                       GDB read + analyse DATA_IND mobile.
+                                       fire_crc=0x02 + biterr=0xFF match NDB+0x1FC content
+                                       (= bytes 0x40 0x00 0x8F 0xF4 0xF8 0x82 ...).
+                                       DWARF disait 0x1DC mais c'est une autre struct variant
+                                       (DSP=34/36 unused). CLAUDE.md disait 0x1F8 — proche
+                                       mais off by 4. La firmware ARM lit a_cd[3] a NDB+0x202. */
 #define NDB_A_SCH26         0x54   /* [5] words */
 
 /* ---- l1_environment.h constants ---- */
@@ -154,7 +162,7 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     g_shunt.d_fn      = shunt_read_w(wp + WP_D_FN);
     g_shunt.pending   = true;
 
-    qemu_log_mask(LOG_UNIMP,
+    fprintf(stderr,
         "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_ra=%u fn=%u\n",
         page_idx, g_shunt.d_task_md, g_shunt.d_task_d,
         g_shunt.d_task_ra, g_shunt.d_fn);
@@ -221,7 +229,7 @@ static void shunt_dispatch_fb(uint8_t page_idx)
      * real DSP's task-completion echo. */
     shunt_write_w(rp_base(page_idx) + RP_D_TASK_MD, FB_DSP_TASK);
 
-    qemu_log_mask(LOG_UNIMP,
+    fprintf(stderr,
         "[dsp-shunt] DISPATCH FB page=%u → d_fb_det=1 TOA=%d PM=0x%x "
         "ANGLE=%d SNR=0x%x (NDB only)\n",
         page_idx, SHUNT_CANNED_TOA, SHUNT_CANNED_PM,
@@ -256,24 +264,85 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
 
-    qemu_log_mask(LOG_UNIMP,
+    fprintf(stderr,
         "[dsp-shunt] DISPATCH SB page=%u → sb=0x%08x BSIC=%u TOA=%d (read-page only)\n",
         page_idx, sb, SHUNT_CANNED_BSIC, SHUNT_CANNED_TOA);
 }
 
+/* Canned SI3 bytes — 23 L2-frame bytes (RR PD + SI3 mt + payload).
+ * Format conforme a osmocom-bb prim_rx_nb.c:154 :
+ *   dsp_memcpy_from_api(rxnb.di->data, &dsp_api.ndb->a_cd[3], 23, 0);
+ * Donc a_cd[0..2] = STATUS (CRC, biterr), a_cd[3..14] = 23B L2 frame.
+ *
+ * Layout L2+L3 RR SI3 :
+ *   [0]=0x49 LI=18 EL=1   [1]=0x06 RR PD   [2]=0x1B SI3 mt
+ *   [3..4]=Cell ID
+ *   [5..7]=MCC/MNC encoded (0x00 0xF1 0x10 = MCC 001 MNC 01)
+ *   [8..9]=LAC
+ *   [10..11]=cell options + cell select
+ *   [12..14]=RACH ctrl
+ *   [15..22] = padding 0x2B */
+static const uint8_t SHUNT_CANNED_SI3_L2[23] = {
+    0x49, 0x06, 0x1B,                   /* L2 hdr + RR PD + SI3 mt */
+    0x00, 0x01,                         /* Cell ID = 1 */
+    0x00, 0xF1, 0x10,                   /* MCC=001 MNC=01 */
+    0x00, 0x01,                         /* LAC = 1 */
+    0x01, 0x00,                         /* cell opts + cell select */
+    0x18, 0xFF, 0xFF,                   /* RACH ctrl */
+    0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B
+};
+
 static void shunt_dispatch_allc(uint8_t page_idx)
 {
-    /* TODO Phase 1 canned : a_cd[15] = canned SI3 bytes
-     * NDB+0x1F8 = 0xFFD003A0 (per CLAUDE.md, also DWARF-checkable). */
-    qemu_log_mask(LOG_UNIMP,
-        "[dsp-shunt] DISPATCH ALLC page=%u (TODO canned values)\n", page_idx);
+    /* a_cd layout (cf osmocom-bb prim_rx_nb.c) :
+     *   a_cd[0]   = FIRE status bits (B_FIRE0/B_FIRE1) -> 0x0000 = CRC pass
+     *   a_cd[1]   = (reserved / BLUD bit)              -> 0x0000
+     *   a_cd[2]   = num_biterr                          -> 0x0000
+     *   a_cd[3..14] = 23 bytes L2 frame (SI3 here)
+     */
+    uint32_t addr_a_cd = BASE_API_NDB + NDB_A_CD;
+
+    /* a_cd[0..2] = status words = 0 (CRC pass, no biterr) */
+    shunt_write_w(addr_a_cd + 0, 0x0000);  /* a_cd[0] */
+    shunt_write_w(addr_a_cd + 2, 0x0000);  /* a_cd[1] */
+    shunt_write_w(addr_a_cd + 4, 0x0000);  /* a_cd[2] */
+
+    /* a_cd[3..14] = 23B L2 frame, packed in 12 words LE */
+    for (int i = 0; i < 23; i += 2) {
+        uint8_t lo = SHUNT_CANNED_SI3_L2[i];
+        uint8_t hi = (i + 1 < 23) ? SHUNT_CANNED_SI3_L2[i + 1] : 0x2B;
+        uint16_t w = lo | (hi << 8);
+        shunt_write_w(addr_a_cd + 6 + i, w);   /* +6 = a_cd[3] base */
+    }
+
+    /* IMPORTANT : firmware prim_rx_nb.c:79 fait
+     *   if (db_r->d_burst_d != burst_id) return 0;
+     * et attend la sequence burst 0,1,2,3 pour assembler la frame.
+     * On echo le d_burst_d que l'ARM a poste dans la read page pour que
+     * le check passe. Sinon le firmware bail avant dsp_memcpy_from_api()
+     * et n'envoie JAMAIS L1CTL_DATA_IND. */
+    uint32_t rp = rp_base(page_idx);
+    shunt_write_w(rp + RP_D_TASK_D,  ALLC_DSP_TASK);
+    shunt_write_w(rp + RP_D_BURST_D, g_shunt.d_burst_d);
+
+    /* a_serv_demod[4] = {TOA, PM, ANGLE, SNR} per-burst measurements.
+     * Firmware prim_rx_nb.c:89-94 reads these. Canned : TOA=23, PM=high,
+     * ANGLE=0 (AFC converged), SNR=high (passes AFC_SNR_THRESHOLD). */
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, 23);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, 0x7000);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, 0x7000);
+
+    fprintf(stderr,
+        "[dsp-shunt] DISPATCH ALLC page=%u burst_d=%u -> SI3 in a_cd[3..14] + "
+        "a_serv_demod canned\n", page_idx, g_shunt.d_burst_d);
 }
 
 static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
 {
     /* TODO : NB DL = decoded BCCH/CCCH burst payload into NDB a_cd[].
      * NB UL = consume burst bits from DARAM for TX (forwarded to bridge). */
-    qemu_log_mask(LOG_UNIMP,
+    fprintf(stderr,
         "[dsp-shunt] DISPATCH NB page=%u task_d=%u (TODO)\n",
         page_idx, task_d);
 }

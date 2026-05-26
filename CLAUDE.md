@@ -104,7 +104,7 @@ Dual-core GSM baseband emulator:
 - Read Page 1: 0x0078
 - NDB: 0x01A8 (d_dsp_page, d_error_status, d_spcx_rif, ...)
 - d_fb_det: NDB + 0x48 = 0x01F0
-- a_cd[15]: NDB + 0x1F8 = 0x03A0
+- a_cd[15]: NDB + 0x1DC = 0x0384  (DWARF-validated 2026-05-26 — was 0x1F8/0x03A0 in older doc, WRONG)
 
 ## Interrupt Vectors (IPTR=0x1FF → base 0xFF80)
 

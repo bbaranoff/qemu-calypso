@@ -81,6 +81,19 @@ fi
 # Si whiptail absent : fallback text simple.
 if [ "$MENU_MODE" = "1" ]; then
 
+  # ---- Fix TERM + locale pour whiptail/newt box-drawing ----
+  # Sans ca, le terminal affiche `qqqq` au lieu des bordures (DEC special
+  # graphics non-rendus). Le container/tmux a souvent TERM=dumb ou un TERM
+  # qui ne declare pas acsc.
+  export LANG="${LANG:-C.UTF-8}"
+  export LC_ALL="${LC_ALL:-C.UTF-8}"
+  case "${TERM:-}" in
+    dumb|"" ) export TERM=xterm-256color ;;
+  esac
+  # Disable NewT's UTF-8 box if locale still broken (fallback ASCII).
+  # Decommente si les bordures restent en qqqq apres ce fix :
+  # export NCURSES_NO_UTF8_ACS=1
+
   if ! command -v whiptail >/dev/null 2>&1; then
     echo "[menu] whiptail absent -- fallback text minimal"
     echo "  Modes disponibles : full | shunt | shunt-ipc | bridge | bare | free"
@@ -256,8 +269,8 @@ if [ "$MENU_MODE" = "1" ]; then
         actsellistbox=black,brightyellow
       '
     }
-    # Default theme = green (matrix vibes). Override via env CALYPSO_MENU_THEME.
-    case "${CALYPSO_MENU_THEME:-green}" in
+    # Default theme = red (high contrast). Override via env CALYPSO_MENU_THEME.
+    case "${CALYPSO_MENU_THEME:-red}" in
       cool)    _theme_cool ;;
       red)     _theme_red ;;
       green)   _theme_green ;;
@@ -277,9 +290,9 @@ if [ "$MENU_MODE" = "1" ]; then
         --notags --menu \
         "\n Choisir le theme du menu (ENTER pour selectionner).\n" \
         17 72 7 \
-        "green"   "Green     -- matrix-style, fond noir (default)" \
+        "red"     "Red       -- focus blanc sur rouge (default, high contrast)" \
+        "green"   "Green     -- matrix-style, fond noir" \
         "cool"    "Cool      -- navy + cyan accents, sleek" \
-        "red"     "Red       -- focus blanc sur rouge (high contrast)" \
         "magenta" "Magenta   -- focus blanc sur magenta" \
         "cyan"    "Cyan      -- focus noir sur cyan brillant" \
         "amber"   "Amber     -- terminal vintage jaune/noir" \
@@ -739,6 +752,28 @@ QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
 OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
 MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
+
+# Copie la cfg mobile versionnee dans /root/.osmocom/bb/. Elle contient
+# deja stick 1 + log stderr avec DMM/DRR/DCC/DSMS debug. Force a chaque
+# run pour eviter le drift entre runs.
+MOBILE_CFG_VERSIONED="${MOBILE_CFG_VERSIONED:-/opt/GSM/qemu-src/cfgs/mobile_group1.cfg}"
+[ -f "$MOBILE_CFG_VERSIONED" ] || MOBILE_CFG_VERSIONED="/home/nirvana/qemu-src/cfgs/mobile_group1.cfg"
+if [ -f "$MOBILE_CFG_VERSIONED" ] && [ "${CALYPSO_SYNC_MOBILE_CFG:-1}" = "1" ]; then
+    mkdir -p "$(dirname "$MOBILE_CFG")"
+    cp "$MOBILE_CFG_VERSIONED" "$MOBILE_CFG"
+    echo "[run.sh] mobile_group1.cfg synced from $MOBILE_CFG_VERSIONED"
+fi
+
+# Override stick ARFCN si CALYPSO_STICK_ARFCN set (default = garde cfg versionnee).
+CALYPSO_STICK_ARFCN="${CALYPSO_STICK_ARFCN:-}"
+if [ -n "$CALYPSO_STICK_ARFCN" ] && [ "$CALYPSO_STICK_ARFCN" != "0" ] && [ -f "$MOBILE_CFG" ]; then
+    if grep -qE "^ stick [0-9]+" "$MOBILE_CFG" 2>/dev/null; then
+        sed -i "s/^ stick [0-9]\+$/ stick $CALYPSO_STICK_ARFCN/" "$MOBILE_CFG"
+        echo "[run.sh] mobile_group1.cfg : stick forced to $CALYPSO_STICK_ARFCN"
+    elif grep -qE "^ no stick" "$MOBILE_CFG" 2>/dev/null; then
+        sed -i "s/^ no stick$/ stick $CALYPSO_STICK_ARFCN/" "$MOBILE_CFG"
+    fi
+fi
 OSMO_TRX_IPC="${OSMO_TRX_IPC:-osmo-trx-ipc}"
 # Default cfg = versioned 1-chan cfg dans qemu-src/cfgs/. Le /etc/osmocom/
 # legacy declarait chan 0 + chan 1 : osmo-trx-ipc demande 2 chans, calypso
@@ -1276,12 +1311,40 @@ fi
 #
 # SAP socket : osef (pas de mocksapd, SIM natif via cfg, pas branche).
 L1CTL_WAIT='i=0; while [ ! -S '"$L1CTL_SOCK"' ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; [ -S '"$L1CTL_SOCK"' ] && ln -sf '"$L1CTL_SOCK"' '"$L1CTL_SOCK"'_1 2>/dev/null || true'
+
+# Categories debug mobile : ajout DPLMN/DGS pour voir "no cell found",
+# selection PLMN/cellule, etat MM/RR. Override via CALYPSO_MOBILE_DEBUG.
+# Categories utiles (osmocom-bb common.c) :
+#   DRR     radio resource (FBSB attempts)
+#   DMM     mobility (Mobile_Mngt + no_cell_found events)
+#   DCC     call control
+#   DLAPDM  L2 LAPDm
+#   DCS     cell selection (gsm322)
+#   DSAP    SAP socket
+#   DPAG    paging
+#   DL1C    L1CTL trace (PM_REQ/CONF, FBSB_REQ/CONF, etc)
+#   DSUM    summary
+#   DSI     system info (SI3/4/5/6 reception)
+#   DRSL    Radio Signalling Link
+#   DNM     Network Management
+#   DPLMN   PLMN selection (HPLMN search, no_plmn_found)
+#   DGS     gsm subscriber state
+#   DSMS    SMS
+#   DSS     supplementary services
+#   DGS     general state
+CALYPSO_MOBILE_DEBUG="${CALYPSO_MOBILE_DEBUG:-DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK}"
+# `all` = alias du mask par defaut complet (cf `mobile -h`).
+# Note : separateur = `:` pour osmocom-bb mobile (pas `,`).
+if [ "$CALYPSO_MOBILE_DEBUG" = "all" ]; then
+    CALYPSO_MOBILE_DEBUG="DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK"
+fi
+
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
     tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
     case "$CALYPSO_L2_CLIENT" in
         mobile)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d $CALYPSO_MOBILE_DEBUG 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
             ;;
         ccch_scan)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
@@ -1294,7 +1357,7 @@ if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
         *)
             echo "WARN -- CALYPSO_L2_CLIENT=$CALYPSO_L2_CLIENT inconnu, fallback mobile"
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d DRR,DMM,DCC,DLAPDM,DCS,DSAP,DPAG,DL1C,DSUM,DSI,DRSL,DNM 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d $CALYPSO_MOBILE_DEBUG 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
             ;;
     esac
 else
