@@ -4,10 +4,10 @@
 
 ```
 DONE
-- DL FN rewrite slot-aware implemented in bridge.py
+- DL FN rewrite slot-aware implemented in calypso-ipc-device
   → BSP delta passed from 15000 → 0..32 (within BSP_FN_MATCH_WINDOW=64)
-  → env BRIDGE_DL_FN_REWRITE=slot|naive|off, default slot
-  → env BRIDGE_DL_FN_LOOKAHEAD=32 (half BSP window margin)
+  → env (removed)=slot|naive|off, default slot
+  → env (removed)=32 (half BSP window margin)
 - BCCH_INJECT / FBSB_SYNTH purge clean
   → scripts/rsl_si_tap.py deleted entirely
   → CALYPSO_BCCH_INJECT + CALYPSO_SI_MMAP_PATH env vars deleted
@@ -33,7 +33,7 @@ NEXT
   for PC ∈ 0xDF93..0xDFB1, observe what flag IT polls.
 
 KEY FILES TOUCHED
-- bridge.py                        (DL FN rewrite + slot-aware UL retained)
+- calypso-ipc-device                        (DL FN rewrite + slot-aware UL retained)
 - run_si.sh                        (cleanup + new envs + ENV summary)
 - hw/arm/calypso/calypso_fbsb.c    (mmap consumer + BCCH_INJECT removed)
 - hw/arm/calypso/calypso_c54x.c    (IDLE-DISP RD trace + FORCE-DARAM62)
@@ -42,11 +42,11 @@ DROPPED ENVS (do not re-set)
   CALYPSO_BCCH_INJECT  CALYPSO_SI_MMAP_PATH
 
 DEFAULTS (run_si.sh)
-  BRIDGE_CLK_FROM_QEMU=0           (wall-paced, BTS happy)
-  BRIDGE_CLK_PERIOD=51             (BTS skew tolerance)
-  BRIDGE_UL_FN_REWRITE=slot
-  BRIDGE_DL_FN_REWRITE=slot
-  BRIDGE_DL_FN_LOOKAHEAD=32
+  (removed)=0           (wall-paced, BTS happy)
+  (removed)=51             (BTS skew tolerance)
+  (removed)=slot
+  (removed)=slot
+  (removed)=32
   CALYPSO_FBSB_SYNTH=0             (set =1 to keep mobile past FBSB phase)
 ```
 
@@ -198,7 +198,7 @@ samples (= the new top blocker).
 ### Stability config
 
 `run.sh` launches QEMU with `-icount shift=auto,align=off,sleep=off` for
-deterministic virtual time and bridge.py with `BRIDGE_CLK_FROM_QEMU=1`
+deterministic virtual time and calypso-ipc-device with `(removed)=1`
 for QEMU-driven CLK IND. The pair eliminates host-load jitter that was
 producing 28% LOST timer events.
 
@@ -210,7 +210,7 @@ producing 28% LOST timer events.
 | `CALYPSO_W1C_LATCH=1` | W1C latch on a_sync_demod cells (default OFF) |
 | `CALYPSO_NDB_D_RACH_OFFSET=0xNNN` | Override d_rach word index (default 0x01CB) |
 | `CALYPSO_RACH_FORCE_BSIC=N` | Force BSIC in RACH encoder to N (0..63), overriding d_rach byte. Match `osmo-bsc.cfg base_station_id_code` |
-| `BRIDGE_CLK_FROM_QEMU=1` | CLK IND from QEMU FN (default OFF = wall-clock) |
+| `(removed)=1` | CLK IND from QEMU FN (default OFF = wall-clock) |
 | `CALYPSO_ICOUNT=auto/off/shift=N` | QEMU icount mode (default `auto`). Kick timer is on VIRTUAL clock so icount doesn't freeze TDMA. |
 
 As of 2026-05-08, no env-gated dev-assist can deliver SIs to mobile L3
@@ -267,5 +267,5 @@ docker exec CONTAINER bash -c "cd /opt/GSM/qemu-src/build && ninja qemu-system-a
 - `hw/arm/calypso/sercomm_gate.c` — Sercomm DLCI router (PTY → FIFO)
 - `hw/intc/calypso_inth.c` — INTH interrupt controller
 - `hw/char/calypso_uart.c` — UART with RX FIFO + sercomm
-- `bridge.py` — BTS UDP bridge (clock-slave)
+- `calypso-ipc-device` — BTS UDP bridge (clock-slave)
 - `run.sh` — Orchestrated launch (QEMU → bridge → BTS → mobile)

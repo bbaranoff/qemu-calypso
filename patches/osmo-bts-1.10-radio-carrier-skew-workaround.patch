@@ -1,0 +1,84 @@
+Subject: [osmo-bts] Force setattr_success on Radio Carrier OPSTART for BSC/BTS version skew
+Date: 2026-05-26
+Applies-to: osmo-bts 1.10.0
+Tested-with: osmo-bsc 1.14.0
+Author: Calypso QEMU pipeline (manual workaround)
+
+PROBLEM
+-------
+With osmo-bsc 1.14.0 driving osmo-bts 1.10.0, the BSC issues an OML
+Get-Attributes-Request for the Radio Carrier MO that lists attributes
+the BTS does not support (SW Configuration on RADIO-CARRIER, Manufacturer
+Dependent State on BASEBAND-TRANSCEIVER, SW Configuration on GPRS-CELL).
+The BTS replies with NM_NACK_OBJCLASS_NOTSUPP per attribute, and the BSC
+then never sends a Set-Radio-Attributes message. Consequently
+`trx->mo.setattr_success` stays at its init value `false`, and when the
+BSC subsequently sends OPSTART for the Radio Carrier, the FSM emits
+`oml_mo_opstart_nack(&trx->mo, NM_NACK_CANT_PERFORM)` and the BSC drops
+the OML link. The cycle repeats forever ; the BTS scheduler never enters
+OP_ENABLED for the radio carrier, so TS0 is configured but never radiated
+as FCCH/SCH/BCCH — only DUMMY NB fills the slot.
+
+EVIDENCE
+--------
+- BSC log : `OPSTART NACK CAUSE=Message cannot be performed` on every
+  RADIO-CARRIER OPSTART try, followed by `Got OPSTART NACK going to drop
+  the OML links`.
+- BTS log : `DOML ERROR OC=RADIO-CARRIER : O&M Get Attributes [0], SW
+  Configuration is unsupported`.
+- BTS log : `grep -c NM_EV_ /tmp/bts.log` returns 0 → no
+  NM_EV_RX_SETATTR ever delivered to the radio_carrier FSM.
+- FFT sweep on 51 consecutive DL chunks (tools/fcch_sweep.py) : zero
+  bursts with dphi_std<0.10 ; all 51 chunks have dphi_std≈1.10 and
+  full-scale rms ≈ 32000 — signature of GMSK-modulated DUMMY NB
+  (alternating ±π/2 phase steps), not FCCH (constant +π/2).
+
+WORKAROUND
+----------
+Inside `nm_radio_carrier_fsm.c::st_op_disabled_offline()`, on
+`NM_EV_RX_OPSTART`, force `trx->mo.setattr_success = true` instead of
+checking it. This mirrors the existing `#if 0` block in
+`nm_bb_transc_fsm.c` that upstream already used to handle the same class
+of issue for the BASEBAND-TRANSCEIVER object ("Disabled because osmo-bsc
+doesn't send SetAttr on BB_TRANSC object").
+
+Setting `setattr_success=true` also unblocks the later recalc check
+`rsl_link && phy_state && setattr_success && opstart_success` that
+transitions the FSM to OP_ENABLED.
+
+The BTS 1.10 has nothing to apply from these unsupported attrs anyway,
+so bypassing the gate does not cause a configuration loss — it just
+restores the operational path that the version skew has artificially
+blocked.
+
+LONG-TERM
+---------
+Proper fix is to align versions (osmo-bsc 1.10.x with osmo-bts 1.10, or
+upgrade osmo-bts to a release that reports the attrs the BSC 1.14
+queries). This patch is a localized workaround until then.
+
+---
+ src/common/nm_radio_carrier_fsm.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+--- a/src/common/nm_radio_carrier_fsm.c
++++ b/src/common/nm_radio_carrier_fsm.c
+@@ -122,10 +122,14 @@
+ 		oml_fom_ack_nack_copy_msg(setattr_data->msg, rc);
+ 		break; /* check statechg below */
+ 	case NM_EV_RX_OPSTART:
+-		if (!trx->mo.setattr_success) {
+-			oml_mo_opstart_nack(&trx->mo, NM_NACK_CANT_PERFORM);
+-			return;
+-		}
++		/* Workaround 2026-05-26 : osmo-bsc 1.14 + osmo-bts 1.10 version skew.
++		 * BSC queries OML attrs unsupported by BTS (SW Configuration,
++		 * Manufacturer Dep State on Radio Carrier) → BSC skips SetAttr
++		 * → setattr_success stays false → NACK loop. Mirrors the existing
++		 * #if 0 in nm_bb_transc_fsm.c that disabled the same check for the
++		 * BB_TRANSC object. Force setattr_success=true so the subsequent
++		 * state recalc (rsl && phy && setattr && opstart) can pass too. */
++		trx->mo.setattr_success = true;
+ 		bts_model_opstart(trx->bts, &trx->mo, trx);
+ 		return;
+ 	case NM_EV_OPSTART_ACK:

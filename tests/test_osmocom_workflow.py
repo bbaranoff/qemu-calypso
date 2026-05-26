@@ -1,13 +1,13 @@
 """
 test_osmocom_workflow.py — vérifie l'alignement de notre QEMU Calypso avec
-le workflow attendu par OsmocomBB (firmware layer1 + osmo-bts-trx + bridge.py).
+le workflow attendu par OsmocomBB (firmware layer1 + osmo-bts-trx + calypso-ipc-device).
 
 Markers :
   - `osmocom_compliant`  : point du workflow où on respecte la spec OsmocomBB
   - `osmocom_divergent`  : point où on DIVERGE (xfail ou skip, à corriger)
   - `osmocom_sim`        : sémantique SIM controller
   - `osmocom_clock`      : alignement clock domains
-  - `osmocom_bridge`     : bridge.py timing
+  - `osmocom_bridge`     : calypso-ipc-device timing
   - `osmocom_boot`       : séquence boot ARM/DSP
 
 Couvre les divergences identifiées dans WORKFLOW_OSMOCOM.md :
@@ -40,7 +40,7 @@ SIM_H = f"{QEMU_SRC}/include/hw/arm/calypso/calypso_sim.h"
 TRX_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_trx.c"
 BSP_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_bsp.c"
 TINT0_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_tint0.c"
-BRIDGE_PY = f"{QEMU_SRC}/bridge.py"
+BRIDGE_PY = f"{QEMU_SRC}/calypso-ipc-device"
 RUN_SH = f"{QEMU_SRC}/run.sh"
 QEMU_LOG = "/root/qemu.log"
 BTS_LOG = "/tmp/bts.log"
@@ -236,7 +236,7 @@ def test_tdma_tick_on_virtual_clock():
 @pytest.mark.osmocom_compliant
 @pytest.mark.osmocom_bridge
 def test_bridge_select_timeout_low_jitter():
-    """bridge.py select.select timeout doit être ≤ 5ms pour limiter jitter
+    """calypso-ipc-device select.select timeout doit être ≤ 5ms pour limiter jitter
     sur l'émission CLK IND (sub-frame).
 
     Avant fix 2026-05-24 : 50ms → jitter ±10 frames → BTS log spam
@@ -246,10 +246,10 @@ def test_bridge_select_timeout_low_jitter():
     src = _read(BRIDGE_PY)
     assert src, f"can't read {BRIDGE_PY}"
     m = re.search(r"select\.select\([^,]+,\s*\[\],\s*\[\],\s*([0-9.]+)\)", src)
-    assert m, "select.select call not found in bridge.py"
+    assert m, "select.select call not found in calypso-ipc-device"
     timeout = float(m.group(1))
     assert timeout <= 0.005, (
-        f"bridge.py select timeout = {timeout*1000:.1f}ms, "
+        f"calypso-ipc-device select timeout = {timeout*1000:.1f}ms, "
         f"max accepté = 5ms (idéal 1ms) pour low-jitter CLK IND")
 
 
@@ -325,7 +325,7 @@ def test_tcg_strne_commits_under_icount_auto():
 @pytest.mark.osmocom_divergent
 @pytest.mark.osmocom_bridge
 def test_bridge_clock_from_qemu_default():
-    """BRIDGE_CLK_FROM_QEMU devrait être =1 par défaut sous icount=auto pour
+    """(removed) devrait être =1 par défaut sous icount=auto pour
     aligner la bridge clock sur QEMU FN au lieu de wall.
 
     Actuel default = 0 (wall-paced). Sous icount=auto + default=0, bridge
@@ -334,12 +334,12 @@ def test_bridge_clock_from_qemu_default():
     src = _read(RUN_SH)
     assert src, f"can't read {RUN_SH}"
     m = re.search(
-        r'BRIDGE_CLK_FROM_QEMU\s*=\s*"\$\{\s*BRIDGE_CLK_FROM_QEMU\s*:-\s*([01])\s*\}"',
+        r'(removed)\s*=\s*"\$\{\s*(removed)\s*:-\s*([01])\s*\}"',
         src)
-    assert m, "BRIDGE_CLK_FROM_QEMU default line not found"
+    assert m, "(removed) default line not found"
     default = m.group(1)
     if default == "0":
-        pytest.xfail("BRIDGE_CLK_FROM_QEMU=0 default — pas idéal sous icount=auto, "
+        pytest.xfail("(removed)=0 default — pas idéal sous icount=auto, "
                      "à flipper à =1 quand stable")
     assert default == "1"
 
@@ -380,7 +380,7 @@ def test_runtime_sim_it_wt_rxdone_log_present():
                     reason="bts.log absent")
 def test_runtime_bts_no_fn_skew_messages():
     """bts.log ne doit plus avoir massivement de 'We were 1 FN faster/slower'
-    après fix bridge.py select timeout.
+    après fix calypso-ipc-device select timeout.
     """
     log = _read(BTS_LOG)
     if not log:
@@ -389,4 +389,4 @@ def test_runtime_bts_no_fn_skew_messages():
     # On accepte un peu de skew sur démarrage (warmup)
     assert skew < 20, (
         f"bts.log contient {skew} messages 'FN faster/slower' — "
-        f"jitter bridge.py trop élevé, vérifier select timeout")
+        f"jitter calypso-ipc-device trop élevé, vérifier select timeout")

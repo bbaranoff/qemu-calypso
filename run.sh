@@ -1,13 +1,9 @@
 #!/bin/bash
-# run.sh — Calypso QEMU pipeline (was run_si.sh, renamed 2026-05-08).
+# run.sh — Calypso QEMU pipeline.
 #
-# All SI delivery to mobile L3 goes through the legitimate path now :
-# osmo-bts-trx encodes BCCH bursts → bridge.py UDP relay → QEMU BSP
+# Data path : osmo-bts-trx → osmo-trx-ipc → calypso-ipc-device → QEMU BSP
 # DMA → DSP CCCH demod → a_cd[] in NDB → ARM L1 → L1CTL_DATA_IND.
-#
-# The previous rsl_si_tap.py + /dev/shm/calypso_si.bin mmap shortcut
-# was removed (it was a hack that bypassed DSP demod and made the
-# mobile camp on a stale cache even when BTS was dead).
+# Modem GMSK intégré dans osmo-trx (chaîne radio software-defined complète).
 
 set -euo pipefail
 
@@ -28,8 +24,8 @@ for arg in "$@"; do
             cat <<EOF
 Usage: $0 [--gen-doc-local] [--menu]
 
-Default : launch the full Calypso pipeline (QEMU + osmocon + bridge + bts +
-mobile + gsmtap + irda capture) in a tmux session and attach to it.
+Default : launch the full Calypso pipeline (QEMU + osmocon + calypso-ipc-device
++ osmo-trx-ipc + bts + mobile + gsmtap + irda) in a tmux session and attach.
 
 --menu      : interactive profile selection before launch (hack-free /
               dev-assist / full-diag / custom). Sets CALYPSO_* env vars
@@ -331,10 +327,17 @@ fi  # ancien bloc gen-doc-local — désactivé par `if false; then` plus haut
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
 FW_BIN="${FW_BIN:-/opt/GSM/firmware/board/compal_e88/layer1.highram.bin}"
 QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
-BRIDGE="/opt/GSM/qemu-src/bridge.py"
 OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
 MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
+OSMO_TRX_IPC="${OSMO_TRX_IPC:-osmo-trx-ipc}"
+OSMO_TRX_IPC_CFG="${OSMO_TRX_IPC_CFG:-/etc/osmocom/osmo-trx-ipc.cfg}"
+# calypso-ipc-device = pont QEMU UDP 6702 ↔ osmo-trx-ipc shm. Default :
+# le binaire compilé dans tools/calypso-ipc-device/. Override via env si
+# tu veux pointer un autre path, ou vide pour skip (mode legacy debug).
+CALYPSO_IPC_DEVICE_DEFAULT="/opt/GSM/qemu-src/tools/calypso-ipc-device/calypso-ipc-device"
+CALYPSO_IPC_DEVICE="${CALYPSO_IPC_DEVICE-$CALYPSO_IPC_DEVICE_DEFAULT}"
+IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 
 # ---- DSP / DIAG instruments (override at command line if needed) ----
 CALYPSO_DSP_ROM="${CALYPSO_DSP_ROM:-/opt/GSM/calypso_dsp.txt}"
@@ -383,64 +386,17 @@ CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
-# CALYPSO_IQ : master switch pour le chemin IQ passthrough.
-#   on/1   = bridge GMSK-module les soft-bits (scipy BT=0.3) et envoie 296 B IQ
-#            par burst ; QEMU BSP fait memcpy direct au DSP correlator au lieu
-#            de la modulation ±π/2 hard interne. Cible : améliorer TOA/Angle
-#            FB-det (vu DSP error 51536 + TOA=0xFFFFC9C0 en mode hard-mod).
-#   off/0  = mode hard-mod historique (bridge soft-bits + BSP modulate ±π/2).
-# Default : on (le hard-mod est connu pour casser le DSP correlator FCCH).
-CALYPSO_IQ="${CALYPSO_IQ:-on}"
-case "$CALYPSO_IQ" in
-    on|1|true|yes)
-        CALYPSO_BSP_IQ_PASSTHROUGH=1
-        BRIDGE_BSP_IQ=1
-        ;;
-    off|0|false|no)
-        CALYPSO_BSP_IQ_PASSTHROUGH=0
-        BRIDGE_BSP_IQ=0
-        ;;
-    *)
-        echo "[run.sh] CALYPSO_IQ='$CALYPSO_IQ' inconnu (attendu on/off) → fallback on" >&2
-        CALYPSO_BSP_IQ_PASSTHROUGH=1
-        BRIDGE_BSP_IQ=1
-        ;;
-esac
-export CALYPSO_IQ CALYPSO_BSP_IQ_PASSTHROUGH BRIDGE_BSP_IQ
+# CALYPSO_BSP_IQ_PASSTHROUGH : QEMU BSP accepte du cs16 I,Q entrelacé en
+# DMA direct vers le corrélateur DSP (au lieu de moduler les 148 hard-bits
+# lui-même en ±π/2). Default ON : c'est ce que produit notre device IPC
+# (osmo-trx natif modem GMSK). Si =0, le BSP reverte à sa modulation hard
+# interne — mode legacy non-utilisé maintenant.
+CALYPSO_BSP_IQ_PASSTHROUGH="${CALYPSO_BSP_IQ_PASSTHROUGH:-1}"
+export CALYPSO_BSP_IQ_PASSTHROUGH
 # CALYPSO_TIMER : gate les fprintf timer (frame_irq, tdma_tick, kick) côté
 # calypso_trx.c. =0 (default) = runs silencieux, zéro stderr-pipe backpressure.
 # =1 = mêmes lignes qu'avant. Cf. helper static calypso_timer_log() (cached).
 CALYPSO_TIMER="${CALYPSO_TIMER:-0}"
-# BRIDGE_CLK_FROM_QEMU=0 (default): CLK IND wall-paced. BTS scheduler stays
-# happy (no clock-skew shutdown). Pair with BRIDGE_UL_FN_REWRITE=1/slot for
-# slot-aware UL rewrite that lands bursts in BTS RACH slot windows.
-# =1 mode: CLK IND qfn-paced. Fundamentally incompatible with osmo-bts-trx
-# clock-skew check at PERIOD>=3 (BTS shutdown). Only useful for experiments
-# with PERIOD=1 (~217 CLK INDs/s wall, marginal but match guaranteed).
-BRIDGE_CLK_FROM_QEMU="${BRIDGE_CLK_FROM_QEMU:-0}"
-# UL FN rewrite mode: slot|naive|off. Default slot-aware.
-BRIDGE_UL_FN_REWRITE="${BRIDGE_UL_FN_REWRITE:-slot}"
-# DL FN rewrite mode: slot|naive|off. Default slot-aware (preserves
-# bts_fn%%51 → BCCH/CCCH/SDCCH typing intact). Without it, BSP drops
-# 100%% of DL bursts since bts_fn drifts ~50 frames/s ahead of qfn.
-BRIDGE_DL_FN_REWRITE="${BRIDGE_DL_FN_REWRITE:-slot}"
-# Max qfn-future frames a DL burst may be tagged. Bounded by
-# BSP_FN_MATCH_WINDOW (=64 default in calypso_bsp.c). Default 32 leaves
-# half-window safety margin. Set 51 to never drop (always find a slot).
-# Default 51 (was 32) : couvre un cycle complet mod 51 → tout bts_fn trouve
-# un qfn slot matchant dans la fenêtre. Sous icount=auto, drift bts↔qfn
-# ~34k frames → avec 32 on dropait ~37% des DL bursts ("delta_to_match=33
-# > lookahead=32"). 51 = burst latency max ~230ms, acceptable cell selection.
-BRIDGE_DL_FN_LOOKAHEAD="${BRIDGE_DL_FN_LOOKAHEAD:-51}"
-# CLK IND period — default 51 (half of stock 102) to keep osmo-bts-trx
-# scheduler happy when QEMU runs slower than wall-clock real-time. With
-# a 102-frame period, the BTS accumulates skew between consecutive
-# CLK INDs faster than they arrive → bts_shutdown_fsm "PC clock skew
-# too high" or "No more clock from transceiver" within ~30 s. With 51,
-# the correction rate doubles and BTS survives long enough for the
-# mobile to complete a Location Update cycle.
-# Set to 102 explicitly when QEMU runs near wall-clock (or in production).
-BRIDGE_CLK_PERIOD="${BRIDGE_CLK_PERIOD:-51}"
 CALYPSO_DSP_BUDGET="${CALYPSO_DSP_BUDGET:-256000}"
 export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
        CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
@@ -448,9 +404,7 @@ export CALYPSO_FBSB_SYNTH CALYPSO_W1C_LATCH \
        CALYPSO_FORCE_RX_DONE \
        CALYPSO_DSP_FBDET_SKIP CALYPSO_UART_TRACE CALYPSO_TIMER \
        CALYPSO_PROBE_BOOTSTUB CALYPSO_DSP_BUDGET \
-       CALYPSO_PM_INJECT CALYPSO_DSP_FORCE_DARAM62 \
-       BRIDGE_CLK_FROM_QEMU BRIDGE_CLK_PERIOD \
-       BRIDGE_UL_FN_REWRITE BRIDGE_DL_FN_REWRITE BRIDGE_DL_FN_LOOKAHEAD
+       CALYPSO_PM_INJECT CALYPSO_DSP_FORCE_DARAM62
 
 # ---- icount mode (deterministic virtual clock paced by instruction count) ----
 # Default ON (auto = shift=auto,sleep=on,align=off). Set CALYPSO_ICOUNT=off
@@ -492,17 +446,18 @@ fi
 
 # ---- log paths ----
 QEMU_LOG="/root/qemu.log"
-BRIDGE_LOG="/tmp/bridge.log"
 OSMOCON_LOG="/tmp/osmocon.log"
 MOBILE_LOG="/tmp/mobile.log"
 BTS_LOG="/tmp/bts.log"
 L2_LOG="/tmp/l2_client.log"
+OSMO_TRX_IPC_LOG="/tmp/osmo-trx-ipc.log"
+IPC_DEVICE_LOG="/tmp/calypso-ipc-device.log"
 MON_SOCK="/tmp/qemu-calypso-mon.sock"
 L1CTL_SOCK="/tmp/osmocom_l2"
 QEMU_DUMMY_SOCK="/tmp/qemu_l1ctl_disabled"
 
 # ---- Log timestamping ----
-# Chaque ligne des logs (qemu.log, bridge.log, osmocon.log, mobile.log) est
+# Chaque ligne des logs (qemu.log, osmocon.log, mobile.log) est
 # préfixée par `<epoch_sec> +<rel_sec>s ` (epoch_sec = horloge mur depuis 1970,
 # rel_sec = secondes depuis le démarrage du wrapper). Permet de détecter les
 # drifts temporels entre logs en comparant les timestamps colonne 1+2.
@@ -550,15 +505,17 @@ if [ -z "$CALYPSO_L2_CLIENT" ]; then
     esac
 fi
 echo "L2 client = $CALYPSO_L2_CLIENT"
-echo "CALYPSO_IQ = $CALYPSO_IQ (CALYPSO_BSP_IQ_PASSTHROUGH=$CALYPSO_BSP_IQ_PASSTHROUGH, BRIDGE_BSP_IQ=$BRIDGE_BSP_IQ)"
+echo "CALYPSO_BSP_IQ_PASSTHROUGH = $CALYPSO_BSP_IQ_PASSTHROUGH"
 
 # ---------- cleanup ----------
-rm -f "$QEMU_LOG" "$BRIDGE_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
-      "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK"
+rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
+      "$OSMO_TRX_IPC_LOG" "$IPC_DEVICE_LOG" \
+      "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK" \
+      "$IPC_MSOCK_PATH" "${IPC_MSOCK_PATH}_0"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-killall -9 qemu-system-arm osmo-bts-trx mobile osmocon 2>/dev/null || true
-pkill -9 -f bridge.py 2>/dev/null || true
+killall -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc 2>/dev/null || true
+pkill -9 -f calypso-ipc-device 2>/dev/null || true
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
 rm -f /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
@@ -575,8 +532,8 @@ tmux new-session -d -s "$SESSION" -n qemu
 # ---------- 1. QEMU ----------
 # icount controlled by CALYPSO_ICOUNT env var (default 'auto'). The kick
 # timer in calypso_trx.c was moved to QEMU_CLOCK_VIRTUAL so icount no
-# longer freezes the TDMA tick → bridge UDP path. If you observe the
-# bridge wait timeout again, fall back with CALYPSO_ICOUNT=off.
+# longer freezes the TDMA tick. If you observe device/osmo-trx-ipc
+# timeouts, fall back with CALYPSO_ICOUNT=off.
 # gdb-stub : activé d'office sur 0.0.0.0:1234 pour que les tests/scripts
 # d'injection (inject.py / validating.py / tests/test_inject_frames.py)
 # puissent s'y connecter sans avoir à passer par le monitor HMP. La syntaxe
@@ -688,35 +645,45 @@ for i in $(seq 1 30); do
 done
 if [ -S "$L1CTL_SOCK" ]; then echo " OK"; else echo " WARN — socket missing"; fi
 
-# ---------- 3. bridge.py ----------
-tmux new-window -t "$SESSION" -n bridge
-tmux send-keys -t "$SESSION:bridge" \
-    ": > $BRIDGE_LOG && BRIDGE_BSP_IQ=$BRIDGE_BSP_IQ python3 $BRIDGE 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
+# ---------- 3. calypso-ipc-device (Phase 1 du chantier osmo-trx-ipc) ----------
+# Pont QEMU UDP 6702 ↔ osmo-trx-ipc shm. Fork d'ipc-driver-test
+# (/opt/GSM/osmo-trx/Transceiver52M/device/ipc/) où le wrapper UHD est
+# remplacé par : DL → cs16 shm → UDP 6702 vers QEMU, UL → recv 6702 →
+# heartbeat zéros vers shm (cf. session 2026-05-26 plan).
+# Le device DOIT démarrer AVANT osmo-trx-ipc — c'est lui qui crée le
+# master socket Unix ($IPC_MSOCK_PATH), osmo-trx-ipc s'y connecte.
+tmux new-window -t "$SESSION" -n ipc-device
+if [ -n "$CALYPSO_IPC_DEVICE" ] && [ -x "$CALYPSO_IPC_DEVICE" ]; then
+    tmux send-keys -t "$SESSION:ipc-device" \
+        ": > $IPC_DEVICE_LOG && $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
+    echo -n "Waiting for calypso-ipc-device master sock ($IPC_MSOCK_PATH)..."
+    for i in $(seq 1 30); do
+        [ -S "$IPC_MSOCK_PATH" ] && break
+        sleep 0.5; echo -n "."
+    done
+    [ -S "$IPC_MSOCK_PATH" ] && echo " OK" || echo " WARN — socket missing"
+else
+    tmux send-keys -t "$SESSION:ipc-device" \
+        "echo '[TODO] calypso-ipc-device pas encore implémenté (Phase 1).' && \
+         echo 'Pour activer : CALYPSO_IPC_DEVICE=/path/to/calypso-ipc-device ./run.sh' && \
+         echo 'Voir : /opt/GSM/osmo-trx/Transceiver52M/device/ipc/ipc-driver-test.c' && \
+         echo 'Sans ce device, osmo-trx-ipc sortira en erreur (pas de master sock).'" C-m
+    echo "[run.sh] calypso-ipc-device pas configuré (CALYPSO_IPC_DEVICE vide) — osmo-trx-ipc va échouer"
+fi
 
-# Pas de wait `QEMU tick` ici : avec le hack CALYPSO_FORCE_RX_DONE, le
-# firmware peut prendre du temps à libérer le polling SIM (plusieurs ops
-# SELECT/READ_BINARY successifs), ce qui retarde le premier CLK IND. Le
-# bridge et osmo-bts-trx ci-dessous gèrent l'attente naturellement
-# (bridge n'émet CLK IND qu'après POWERON de bts-trx, et bts-trx
-# patiente que bridge soit prêt).
+# ---------- 3bis. osmo-trx-ipc ----------
+# Connect to $IPC_MSOCK_PATH, expose TRXD UDP 5700-5702 vers osmo-bts-trx.
+# Si calypso-ipc-device n'est pas démarré, osmo-trx-ipc exit immédiatement
+# (greeting_req sans réponse → erreur). C'est OK en transition : sa fenêtre
+# tmux reste, on voit le message d'erreur, on relance quand le device est prêt.
+tmux new-window -t "$SESSION" -n osmo-trx-ipc
+tmux send-keys -t "$SESSION:osmo-trx-ipc" \
+    ": > $OSMO_TRX_IPC_LOG && $OSMO_TRX_IPC -C $OSMO_TRX_IPC_CFG 2>&1 | $TSLOG | tee $OSMO_TRX_IPC_LOG" C-m
 
 # ---------- 4. osmo-bts-trx ----------
 tmux new-window -t "$SESSION" -n bts
 tmux send-keys -t "$SESSION:bts" \
     ": > $BTS_LOG && osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
-# Sync barrier : attendre que osmo-bts-trx ait commencé à pousser des DL
-# bursts au bridge — proxy fiable : `bridge: DL #` dans bridge.log
-# (le bridge.py imprime ça à chaque burst TRXDv0 reçu de bts-trx).
-echo -n "Waiting for osmo-bts-trx to attach to bridge..."
-for i in $(seq 1 30); do
-    grep -qE 'bridge: DL #|bridge: tick' "$BRIDGE_LOG" 2>/dev/null && break
-    sleep 1; echo -n "."
-done
-if grep -qE 'bridge: DL #|bridge: tick' "$BRIDGE_LOG" 2>/dev/null; then
-    echo " OK"
-else
-    echo " TIMEOUT (bts-trx pas attaché en 30s)"
-fi
 
 # ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------
 # Sync barrier inline dans la cmd tmux : attendre que la socket l1ctl existe
@@ -770,7 +737,7 @@ tmux send-keys -t "$SESSION:gsmtap" \
     "sleep 5 && tcpdump -i any -U --print -X -w /root/mobile-gsmtap.pcap udp port 4729" C-m
 
 # ---------- 7. window 'all' — agrège les 6 premières en 6 panes ----------
-# Vue unique pour superviser qemu / irda / osmocon / bridge / bts / L2 client
+# Vue unique pour superviser qemu / irda / osmocon / bts / L2 client
 # côte à côte. Chaque pane fait juste `tail -F` du log correspondant. Layout
 # tiled = grille 2×3 par défaut. Les logs n'existent peut-être pas encore au
 # moment de la création des panes — `tail -F` (majuscule) gère ce cas (suit
@@ -787,7 +754,8 @@ tmux new-window -t "$SESSION" -n all \
 for spec in \
     "tcpdump|__TCPDUMP__" \
     "osmocon|$OSMOCON_LOG" \
-    "bridge|$BRIDGE_LOG" \
+    "ipc-device|$IPC_DEVICE_LOG" \
+    "osmo-trx-ipc|$OSMO_TRX_IPC_LOG" \
     "bts|$BTS_LOG" \
     "$CALYPSO_L2_CLIENT|$L2_TAIL_LOG"
 do
@@ -917,10 +885,6 @@ echo "  CALYPSO_PROBE_BOOTSTUB      = $CALYPSO_PROBE_BOOTSTUB        (0=normal, 
 echo "  CALYPSO_W1C_LATCH           = $CALYPSO_W1C_LATCH"
 echo "  CALYPSO_NDB_D_RACH_OFFSET   = ${CALYPSO_NDB_D_RACH_OFFSET:-(default 0x023a — pinned 2026-05-07)}"
 echo "  CALYPSO_RACH_FORCE_BSIC     = ${CALYPSO_RACH_FORCE_BSIC:-(unset = use d_rach byte)}"
-echo "  BRIDGE_CLK_FROM_QEMU        = $BRIDGE_CLK_FROM_QEMU  (0=wall-paced safe, 1=qfn-paced experimental)"
-echo "  BRIDGE_UL_FN_REWRITE        = $BRIDGE_UL_FN_REWRITE  (slot=next RACH slot ≥ wall_fn, naive=blind wall_fn, off=passthrough)"
-echo "  BRIDGE_DL_FN_REWRITE        = $BRIDGE_DL_FN_REWRITE  (slot=qfn matching bts_fn%51, naive=current qfn, off=passthrough — BSP rejects all)"
-echo "  BRIDGE_DL_FN_LOOKAHEAD      = $BRIDGE_DL_FN_LOOKAHEAD  (max qfn-future frames before drop, BSP window=64)"
 echo "  CALYPSO_ICOUNT              = $CALYPSO_ICOUNT  (flag: ${QEMU_ICOUNT_FLAG:-(none)})"
 echo "  CALYPSO_MTTCG               = ${CALYPSO_MTTCG:-0}  $([ "${CALYPSO_MTTCG:-0}" = "1" ] && echo '⚠️ NON-DÉTERMINISTE — données non-citables pour state claims (cf session 2026-05-25)' || echo '(icount-deterministic ✓)')"
 echo "  CALYPSO_TIMER               = $CALYPSO_TIMER  (1=fprintf tdma_tick/frame_irq/kick → qemu.log, 0=silent)"
@@ -928,6 +892,10 @@ echo "  CALYPSO_DSP_IDLE_FF         = $CALYPSO_DSP_IDLE_FF  (1=fast-forward DSP 
 echo "  CALYPSO_DSP_IDLE_RANGE      = ${CALYPSO_DSP_IDLE_RANGE:-(default 0xe9ac:0xe9b7,0xcc62:0xcc6f)}"
 echo "  CALYPSO_FORCE_RX_DONE       = ${CALYPSO_FORCE_RX_DONE}"
 echo "  CALYPSO_IRDA_CAPTURE        = $CALYPSO_IRDA_CAPTURE  (1=consume serial1 PTY → /tmp/fw-irda.log)"
+echo "  OSMO_TRX_IPC                = $OSMO_TRX_IPC"
+echo "  OSMO_TRX_IPC_CFG            = $OSMO_TRX_IPC_CFG"
+echo "  CALYPSO_IPC_DEVICE          = ${CALYPSO_IPC_DEVICE:-(unset — Phase 1 TODO, osmo-trx-ipc échouera)}"
+echo "  IPC_MSOCK_PATH              = $IPC_MSOCK_PATH"
 if [ "$CALYPSO_IRDA_CAPTURE" = "1" ] && [ -n "${PTY_IRDA:-}" ]; then
     echo "  IrDA channel                = $PTY_IRDA → /tmp/irda.pty.link → /tmp/fw-irda.log"
 fi

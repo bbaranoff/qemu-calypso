@@ -63,11 +63,11 @@ BSP_DARAM_TARGET_DEFAULT = 0x3fb0
 
 # Bridge env
 BRIDGE_DEFAULTS = {
-    "BRIDGE_CLK_FROM_QEMU":   "0",
-    "BRIDGE_CLK_PERIOD":      "51",
-    "BRIDGE_DL_FN_REWRITE":   "slot",
-    "BRIDGE_DL_FN_LOOKAHEAD": "32",
-    "BRIDGE_UL_FN_REWRITE":   "slot",
+    "(removed)":   "0",
+    "(removed)":      "51",
+    "(removed)":   "slot",
+    "(removed)": "32",
+    "(removed)":   "slot",
 }
 
 # Timeouts

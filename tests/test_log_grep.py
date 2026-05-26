@@ -21,7 +21,7 @@ CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
 
 QEMU_LOG    = os.environ.get("CALYPSO_QEMU_LOG",    "/root/qemu.log")
-BRIDGE_LOG  = os.environ.get("CALYPSO_BRIDGE_LOG",  "/tmp/bridge.log")
+(removed)  = os.environ.get("CALYPSO_(removed)",  "/tmp/bridge.log")
 OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/tmp/osmocon.log")
 MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/tmp/mobile.log")
 FW_IRDA_LOG = os.environ.get("CALYPSO_FW_IRDA_LOG", "/tmp/fw-irda.log")
@@ -111,19 +111,19 @@ def test_grep_qemu_no_sp_catastrophe_recent():
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_dl_bursts_received():
     """Bridge reçoit des DL bursts de osmo-bts-trx (≥ 100)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip("bridge.log absent")
-    n = _grep_count(BRIDGE_LOG, "bridge: DL #")
+    n = _grep_count((removed), "bridge: DL #")
     assert n >= 100, f"DL bursts reçus seulement {n} (attendu ≥ 100)"
 
 
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_fb_pattern_dominant():
     """≥ 50% des DL bursts sont des FB bursts (cell BCCH idle pattern)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip("bridge.log absent")
-    total = _grep_count(BRIDGE_LOG, "bridge: DL #")
-    fb    = _grep_count(BRIDGE_LOG, r"\*\*\* FB \*\*\*")
+    total = _grep_count((removed), "bridge: DL #")
+    fb    = _grep_count((removed), r"\*\*\* FB \*\*\*")
     if total < 10:
         pytest.skip(f"DL count trop faible ({total})")
     ratio = fb / total
@@ -133,9 +133,9 @@ def test_grep_bridge_fb_pattern_dominant():
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_no_clock_skew_shutdown():
     """Pas de message 'shutdown' / 'PC clock skew' dans bridge.log (BTS vivant)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "shutdown|clock skew|No more clock")
+    n = _grep_count((removed), "shutdown|clock skew|No more clock")
     assert n == 0, f"signal shutdown BTS détecté ({n}×) — bts-trx a give-up"
 
 
@@ -285,24 +285,24 @@ def test_blocker_osmocon_no_pty_error():
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_bts_shutdown():
     """Bridge ne signale pas de shutdown BTS."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "BTS shutdown|shutdown_fsm|No more clock")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "BTS shutdown|shutdown_fsm|No more clock")
     assert n == 0, f"bridge : {n}× BTS shutdown — bts-trx mort"
 
 
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_rach_parity():
     """Pas d'erreur RACH parity / framing dans bridge.log."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "odd burst length|parity.*error|TRXD.*malformed")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "odd burst length|parity.*error|TRXD.*malformed")
     assert n == 0, f"bridge : {n}× RACH/TRXD framing error"
 
 
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_socket_error():
     """Pas d'erreur socket UDP dans bridge.log."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "Connection refused|recvfrom.*fail|sendto.*fail")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "Connection refused|recvfrom.*fail|sendto.*fail")
     assert n == 0, f"bridge : {n}× socket error"
 
 

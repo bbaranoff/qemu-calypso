@@ -6,7 +6,7 @@
  * DSP DARAM. The DSP code (FB/SB/burst detection in PROM0) reads them
  * from a fixed DARAM buffer and posts results into the NDB.
  *
- * In QEMU, DL bursts arrive via UDP (TRXDv0 from bridge.py on port 5702).
+ * In QEMU, DL bursts arrive via UDP (TRXDv0 from calypso-ipc-device on port 5702).
  * This module owns that socket, decodes the TRXDv0 header, converts hard
  * bits to I/Q samples, and DMA-writes them into DSP DARAM.
  *
@@ -372,7 +372,7 @@ static void bsp_trxd_readable(void *opaque)
      *
      * IQ PASSTHROUGH (2026-05-24) : si le payload UDP fait >= 296 octets
      * et que CALYPSO_BSP_IQ_PASSTHROUGH=1, on interprète buf[8..] comme
-     * int16 IQ pairs LE (bridge.py BRIDGE_BSP_IQ=1 envoie ce format,
+     * int16 IQ pairs LE (calypso-ipc-device CALYPSO_BSP_IQ_PASSTHROUGH=1 envoie ce format,
      * GMSK-modulé scipy BT=0.3 réaliste vs notre ±π/2 hard-modulation).
      * Sinon : modulation interne historique (148 hard-bits → 296 int16). */
     int16_t iq[296];  /* 148 I/Q pairs = 296 values */
@@ -736,7 +736,7 @@ void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148])
     for (int i = 0; i < 148; i++)
         pkt[8 + i] = bits[i] ? 127 : (uint8_t)(-127);
 
-    /* Hex dump of every UL burst as it's sent — symmetric with the bridge.py
+    /* Hex dump of every UL burst as it's sent — symmetric with the calypso-ipc-device
      * UL print, so we can correlate L1 → bridge → BTS at the byte level
      * when chasing TRXD framing or RACH parity issues. Cap at 200 to keep
      * log finite. */

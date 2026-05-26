@@ -28,7 +28,7 @@ CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
 QEMU_SRC = "/opt/GSM/qemu-src"
 QEMU_LOG = "/root/qemu.log"
-BRIDGE_LOG = "/tmp/bridge.log"
+(removed) = "/tmp/bridge.log"
 BTS_LOG = "/tmp/bts.log"
 GRAPHS_OUT = "/tmp/timer_graphs.mmd"
 
@@ -146,7 +146,7 @@ def _periods_ms(timestamps):
 TIMER_RUNTIME_PROBES = [
     ("tdma_tick", QEMU_LOG, r"\[tdma\] tick #", 4.615, "TDMA frame (virtual)"),
     ("kick", QEMU_LOG, r"\[kick\] fire #", 5.0, "Kick (wall, was REALTIME)"),
-    ("bridge_clk_ind", BRIDGE_LOG, r"CLK IND", 235.4, "CLK IND (51 frames)"),
+    ("bridge_clk_ind", (removed), r"CLK IND", 235.4, "CLK IND (51 frames)"),
     ("bts_clk_ind", BTS_LOG, r"Clock indication: fn=", 235.4, "BTS CLK IND reçu"),
     ("bsp_burst", QEMU_LOG, r"\[BSP\] BURST fn=", 4.615, "BSP RX burst"),
 ]

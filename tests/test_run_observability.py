@@ -59,7 +59,7 @@ MOBILE_PCAP        = HOST_ROOT / "mobile-gsmtap.pcap"
 EXPECTED_PROCESSES = {
     "qemu-system-arm": 1,
     "osmocon":         1,
-    "bridge.py":       1,
+    "calypso-ipc-device":       1,
     "osmo-bts-trx":    1,
     "mobile":          1,
     "tcpdump":         1,
@@ -178,10 +178,10 @@ def list_processes() -> dict[str, list[int]]:
             continue
         pid, comm = int(parts[0]), parts[1]
         args = parts[2] if len(parts) == 3 else ""
-        # Normaliser : python3 bridge.py compte comme "bridge.py"
+        # Normaliser : python3 calypso-ipc-device compte comme "calypso-ipc-device"
         key = comm
-        if "bridge.py" in args:
-            key = "bridge.py"
+        if "calypso-ipc-device" in args:
+            key = "calypso-ipc-device"
         if "mobile_group" in args:
             key = "mobile"
         procs.setdefault(key, []).append(pid)
@@ -627,7 +627,7 @@ def test_d_fb_det_data_no_longer_zero(capsys):
 @pytest.mark.runtime_bridge
 def test_bridge_log_shows_traffic():
     r = dexec(["tail", "-n", "200", "/tmp/bridge.log"])
-    assert r.stdout.strip(), "bridge.log vide — bridge.py muet, problème UDP ?"
+    assert r.stdout.strip(), "bridge.log vide — calypso-ipc-device muet, problème UDP ?"
 
 @pytest.mark.runtime_bridge
 def test_bridge_fn_drift_under_threshold():
@@ -643,7 +643,7 @@ def test_bridge_fn_drift_under_threshold():
 
 @pytest.mark.runtime_bridge
 def test_bridge_dl_lookahead_respected():
-    """BRIDGE_DL_FN_LOOKAHEAD=32 par défaut. Aucun drop ne doit avoir delta>32."""
+    """(removed)=32 par défaut. Aucun drop ne doit avoir delta>32."""
     r = dexec(["grep", "-c", "lookahead drop", "/tmp/bridge.log"])
     drops = int(r.stdout.strip() or "0")
     # Tolère quelques drops au warm-up, pas plus.

@@ -30,7 +30,7 @@ INSIDE = os.path.exists("/.dockerenv")
 MON_SOCK = "/tmp/qemu-calypso-mon.sock"
 QEMU_LOG = "/root/qemu.log"
 OSMOCON_LOG = "/tmp/osmocon.log"
-BRIDGE_LOG = "/tmp/bridge.log"
+(removed) = "/tmp/bridge.log"
 
 # Zones de busy-wait connues côté firmware (à étendre quand on en trouve d'autres).
 # Format : (addr_start, addr_end_inclusive) avec "près de calypso_sim_powerup+0x54".
@@ -192,7 +192,7 @@ def test_osmocon_no_recent_lost_spam():
 @pytest.mark.runtime_firmware
 def test_bridge_has_dl_bursts():
     """bridge.log a au moins quelques DL bursts — preuve osmo-bts-trx connecté."""
-    n = _grep_count(BRIDGE_LOG, "bridge: DL #")
+    n = _grep_count((removed), "bridge: DL #")
     assert n >= 10, (
         f"{n} DL bursts dans bridge.log — osmo-bts-trx pas connecté ou "
         f"bridge ne route pas (vérifier BSP UDP 6702 listening)"

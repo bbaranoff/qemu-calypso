@@ -88,7 +88,7 @@ def pytest_configure(config):
         # test_run_observability.py
         "runtime_health:        container alive + processus attendus",
         "runtime_dsp:           sample qemu.log + probes DSP",
-        "runtime_bridge:        bridge.py drift FN + lookahead",
+        "runtime_bridge:        calypso-ipc-device drift FN + lookahead",
         "runtime_l1ctl:         pcap GSMTAP via tshark",
         "runtime_vty:           VTY mobile L23 (état RR/MM)",
         "runtime_irq:           compteurs IRQ via monitor QEMU",
@@ -121,7 +121,7 @@ def pytest_configure(config):
         "osmocom_divergent:    point divergent (workflow non respecté ; xfail attendu)",
         "osmocom_sim:          sémantique SIM controller (IT bits, FIFO, ATR)",
         "osmocom_clock:        alignement clock domains (VIRTUAL vs REALTIME)",
-        "osmocom_bridge:       bridge.py timing et CLK IND jitter",
+        "osmocom_bridge:       calypso-ipc-device timing et CLK IND jitter",
         "osmocom_boot:         séquence boot ARM/DSP + handshake",
     ):
         config.addinivalue_line("markers", marker)

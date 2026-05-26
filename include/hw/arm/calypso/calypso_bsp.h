@@ -2,7 +2,7 @@
  * Calypso BSP/RIF DMA — public interface.
  *
  * Faithful path for downlink I/Q samples between sercomm_gate (the QEMU
- * surrogate of the IOTA RF frontend wired through bridge.py) and the
+ * surrogate of the IOTA RF frontend wired through calypso-ipc-device) and the
  * Calypso DSP DARAM. No NDB result hacking — the DSP code itself is
  * expected to find FB/SB and post results in the NDB.
  *

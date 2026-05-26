@@ -35,7 +35,7 @@ work, that's where the bug lives, not in a convenient stub.
                                              │ UDP 6702
                                              ▼
                                   ┌──────────────────────┐
-                                  │  bridge.py (Python)  │   ← QEMU clock-slave
+                                  │  calypso-ipc-device (Python)  │   ← QEMU clock-slave
                                   └──────────┬───────────┘
                                              │ UDP 5700-5702
                                              ▼
@@ -173,10 +173,10 @@ plus the QEMU build tree at `/opt/GSM/qemu-src/build/`.
 | `CALYPSO_DSP_FBDET_SKIP`       | `0`           | Diagnostic option to skip FB-det inner loop entirely.                                                         |
 | `CALYPSO_NDB_D_RACH_OFFSET`    | `0x01CB`      | Override word index of `d_rach` in NDB (DSP version-dependent).                                               |
 | `CALYPSO_RACH_FORCE_BSIC`      | unset         | Force BSIC in RACH encoder (0-63). Match `osmo-bsc.cfg base_station_id_code`.                                 |
-| `BRIDGE_CLK_FROM_QEMU`         | `0`           | `1` → CLK IND driven by QEMU FN. Pair with `-icount` for fully virtual time.                                  |
-| `BRIDGE_DL_FN_REWRITE`         | `slot`        | DL FN rewrite policy (slot-aware vs naive).                                                                   |
-| `BRIDGE_DL_FN_LOOKAHEAD`       | `32`          | Lookahead margin for DL FN rewrite.                                                                           |
-| `BRIDGE_UL_FN_REWRITE`         | `slot`        | UL FN rewrite policy.                                                                                         |
+| `(removed)`         | `0`           | `1` → CLK IND driven by QEMU FN. Pair with `-icount` for fully virtual time.                                  |
+| `(removed)`         | `slot`        | DL FN rewrite policy (slot-aware vs naive).                                                                   |
+| `(removed)`       | `32`          | Lookahead margin for DL FN rewrite.                                                                           |
+| `(removed)`         | `slot`        | UL FN rewrite policy.                                                                                         |
 | `CALYPSO_DSP_ROM`              | `calypso_dsp.txt` | Path to DSP ROM dump.                                                                                     |
 | `CALYPSO_SIM_CFG`              | `~/.osmocom/bb/sim.cfg` | SIM IMSI/Ki config.                                                                                 |
 | `L1CTL_SOCK`                   | `/tmp/osmocom_l2` | Mobile↔QEMU L1CTL Unix socket.                                                                          |
@@ -230,7 +230,7 @@ qemu-calypso/
 ├── tests/                         ← pytest milestone harness (49 tests)
 │   ├── test_calypso_milestones.py
 │   └── test_run_observability.py
-├── bridge.py                      ← BTS UDP ↔ BSP relay
+├── calypso-ipc-device                      ← BTS UDP ↔ BSP relay
 ├── run.sh                         ← launch orchestration
 ├── calypso_dsp.txt                ← DSP ROM dump (132K words)
 ├── calypso.md                     ← Pipeline + sequence diagrams
