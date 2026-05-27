@@ -18,6 +18,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
+#include "hw/core/cpu.h"          /* current_cpu, mem_io_pc — for RBR-READ-PROBE */
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
@@ -147,6 +148,21 @@ static uint8_t fifo_pop(CalypsoUARTState *s)
     data = s->rx_fifo[s->rx_tail];
     s->rx_tail = (s->rx_tail + 1) % CALYPSO_UART_RX_FIFO_SIZE;
     s->rx_count--;
+
+    /* RBR-POP-PROBE (2026-05-27, c web review) : count fifo_pop calls to
+     * discriminate icount-rerun vs access-size-decomposition vs other
+     * byte-loss mechanisms. One romload run shows the ratio. */
+    {
+        static uint64_t pop_total;
+        pop_total++;
+        if (s->label && !strcmp(s->label, "modem") && pop_total <= 200) {
+            fprintf(stderr,
+                    "[UART-POP-PROBE] #%llu byte=0x%02x rx_count_after=%u\n",
+                    (unsigned long long)pop_total,
+                    (unsigned)data,
+                    (unsigned)s->rx_count);
+        }
+    }
 
     return data;
 }
@@ -514,6 +530,25 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         if (s->lcr & LCR_DLAB) {
             val = s->dll;
         } else {
+            /* RBR-READ-PROBE (2026-05-27) : log access size + offset + ARM
+             * mem_io_pc (host retaddr, but stable within a single insn).
+             * Combine with [UART-POP-PROBE] : if N pops per N reads with same
+             * mem_io_pc → access-size decomposition. If N pops per N reads
+             * with distinct mem_io_pc → real distinct LDRs (no decomposition,
+             * no rerun). Different counts → other byte-loss mechanism. */
+            if (s->label && !strcmp(s->label, "modem")) {
+                static int read_log = 0;
+                if (read_log < 200) {
+                    uintptr_t pc = current_cpu ? current_cpu->mem_io_pc : 0;
+                    fprintf(stderr,
+                            "[UART-RBR-READ] #%d off=0x%02x size=%u "
+                            "mem_io_pc=0x%lx rx_count_before=%u\n",
+                            read_log, (unsigned)offset, size,
+                            (unsigned long)pc, (unsigned)s->rx_count);
+                    read_log++;
+                }
+            }
+
             val = fifo_pop(s);
 
             if (s->rx_count > 0) {

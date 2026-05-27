@@ -5012,6 +5012,27 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             if (op == 0xF6E2 || op == 0xF6E3) {
+                /* CALAD-AT-8353-PROBE (c web review 2026-05-27) : at the
+                 * exact site we know self-loops, dump XPC + full A + delay
+                 * slot state. CALAD per SPRU172C preserves XPC ; the probe
+                 * confirms XPC value at entry (1 → firmware was on far page,
+                 * 0 → firmware threw far-pointer at near call). First hit only. */
+                if (s->pc == 0x8353) {
+                    static int p8353_first = 0;
+                    if (!p8353_first) {
+                        p8353_first = 1;
+                        C54_LOG("PROBE-CALAD-8353-FIRST insn=%u XPC=%u "
+                                "A=%010llx (A_G=0x%02x A_H=0x%04x A_L=0x%04x) "
+                                "B=%010llx SP=0x%04x PMST=0x%04x",
+                                s->insn_count, s->xpc & 0x3,
+                                (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                                (uint8_t)((s->a >> 32) & 0xFF),
+                                (uint16_t)((s->a >> 16) & 0xFFFF),
+                                (uint16_t)(s->a & 0xFFFF),
+                                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                                s->sp, s->pmst);
+                    }
+                }
                 /* BACCD A / CALAD A — delayed branch/call to acc(low).
                  * 1-word op + 2 delay slots. CALAD pushes PC+3 (skip op +
                  * 2 delay slots) per TI convention (cf. CALLD which pushes
@@ -9267,7 +9288,65 @@ int c54x_run(C54xState *s, int n_insns)
         /* STUCK-PROBE (env CALYPSO_STUCK_PROBE=1, c web reframe 2026-05-25 night3) :
          * capture PC+XPC histogramme quand INTM=1 + BRINT0 pending. */
         stuck_probe_check(s);
+
+        /* === CALA-70C3 FORENSIC PROBES (2026-05-27, c web review) ===
+         * Pourquoi : DSP boucle infiniment sur CALA A à PROM0[0x70c3] avec
+         * A=0x0001_70c3 (auto-référence). A_H=0x0001 ne peut PAS venir d'un
+         * `LD Smem,A` sext40-é (qui donne A_H ∈ {0x0000, 0xFFFF}), donc
+         * writer = DLD upstream ou compose H+L. Probes pour identifier :
+         *   1. Source du jump vers 0x70c3 (XPC:PC + opcode@prev_pc), gated
+         *      FIRST-HIT pour échapper à la pollution post-runaway (MMR XPC
+         *      écrasé quand SP rampage à travers data[0x18..0x1F]).
+         *   2. Compteur LD@0x70c1 — si 0, confirme le jump direct (skip LD).
+         *   3. Dernier writer de A (PC qui a posé 0x0001_70c3 dans A).
+         * Active par défaut, coût ~3 branches/insn. */
+        static int      p70c3_first    = 0;
+        static uint64_t p70c1_counter  = 0;
+        static uint16_t p_last_a_pc    = 0xFFFF;
+        static int64_t  p_last_a_val   = 0;
+        int64_t a_before_exec = s->a;
+
+        if (s->pc == 0x70c1) p70c1_counter++;
+
+        if (s->pc == 0x70c3 && !p70c3_first) {
+            p70c3_first = 1;
+            uint16_t prev_pc = pc_ring[(pc_ring_idx - 2) & 255];
+            uint16_t prev_op = prog_fetch(s, prev_pc);
+            C54_LOG("PROBE-CALA70C3-FIRST insn=%u XPC=%u PC=0x%04x op=0x%04x "
+                    "prev_pc=0x%04x prev_op=0x%04x "
+                    "A=%010llx (A_G=0x%02x A_H=0x%04x A_L=0x%04x) "
+                    "LD@70C1_count=%llu last_A_writer_pc=0x%04x last_A_val=%010llx "
+                    "SP=0x%04x BK=0x%04x",
+                    s->insn_count, s->xpc & 0x3, s->pc, prog_fetch(s, s->pc),
+                    prev_pc, prev_op,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    (uint8_t)((s->a >> 32) & 0xFF),
+                    (uint16_t)((s->a >> 16) & 0xFFFF),
+                    (uint16_t)(s->a & 0xFFFF),
+                    (unsigned long long)p70c1_counter,
+                    p_last_a_pc,
+                    (unsigned long long)(p_last_a_val & 0xFFFFFFFFFFULL),
+                    s->sp, s->bk);
+            C54_LOG("PROBE-CALA70C3-TRAIL pc[-12..-1] = "
+                    "%04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x %04x",
+                    pc_ring[(pc_ring_idx-13)&255], pc_ring[(pc_ring_idx-12)&255],
+                    pc_ring[(pc_ring_idx-11)&255], pc_ring[(pc_ring_idx-10)&255],
+                    pc_ring[(pc_ring_idx-9)&255],  pc_ring[(pc_ring_idx-8)&255],
+                    pc_ring[(pc_ring_idx-7)&255],  pc_ring[(pc_ring_idx-6)&255],
+                    pc_ring[(pc_ring_idx-5)&255],  pc_ring[(pc_ring_idx-4)&255],
+                    pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
+        }
+
         consumed = c54x_exec_one(s);
+
+        /* Track A writes (probe 3, post-exec). exec_pc = PC qui vient
+         * d'exécuter. Si A a changé, c'est cet opcode qui a écrit A. */
+        if (s->a != a_before_exec) {
+            p_last_a_pc  = exec_pc;
+            p_last_a_val = s->a;
+        }
+        /* === END CALA-70C3 FORENSIC PROBES === */
+
         /* INT3-CYCLE-TRACE (env CALYPSO_INT3_CYCLE_TRACE=1, c web reframe night5) :
          * record branch decisions during INT3 ISR cycle. */
         int3_cycle_track_branch(s, exec_pc, exec_op, consumed);

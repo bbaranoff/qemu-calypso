@@ -548,6 +548,90 @@ if [ "$MENU_MODE" = "1" ]; then
         ;;
     esac
 
+    # ---- 3e) Advanced debug (optionnel, defaut OFF) ----
+    # Expose 25 env vars C-side jamais exposees en menu auparavant. Gated
+    # par yes/no pour ne pas polluer le flow normal. Cf. inventaire complet :
+    # grep -r CALYPSO_ qemu-src + comm vs run.sh.
+    if whiptail --backtitle "$BACKTITLE" --title "[3/4] Advanced debug" \
+        --defaultno --yesno \
+        "\n Acceder aux options de debug avancees ?\n\n Probes/traces fines, overrides, watchpoints, BSP network.\n Par defaut OFF (vide => env unset)." \
+        12 70 3>&1 1>&2 2>&3; then
+
+      # --- Trace toggles (checklist) ---
+      ADV_TRACES=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] Advanced traces (checklist)" \
+        --notags --separate-output --checklist \
+        "\n Active des traces ciblees (chacune ecrit dans qemu.log).\n" \
+        20 76 11 \
+        "FBDB_PROBE"        "FBDB probe (B@fbd9, A@fbdb, A@fbf3)"          OFF \
+        "INT3_CYCLE_TRACE"  "INT3 ISR cycle branch decisions"              OFF \
+        "STUCK_PROBE"       "PC+XPC histo quand INTM=1 + BRINT0 pending"   OFF \
+        "FCCH_DUMP"         "FCCH I/Q dump (gros volume)"                  OFF \
+        "FORCE_INTM_ONESHOT" "Clear INTM oneshot (sonde arbitrage)"        OFF \
+        "SP_HIST_ARM"       "SP histogram ARM-side"                        OFF \
+        "DBG"               "Generic c54x debug"                           OFF \
+        "UART_TRACE"        "UART read/write trace"                        OFF \
+        "W1C_LATCH"         "W1C latch a_sync_demod cells (dev assist)"    OFF \
+        "BSP_IQ_PASSTHROUGH" "BSP IQ passthrough mode"                     OFF \
+        "DSP_IDLE_FF"       "DSP idle fast-forward (perf, non-hack)"       ON \
+        3>&1 1>&2 2>&3) || _cancel
+      for tr in $ADV_TRACES; do
+        export "CALYPSO_${tr}=1"
+      done
+
+      # --- Override numerique : FORCE_INTM_AT_PC ---
+      INTM_PC=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] FORCE_INTM_AT_PC (hex, vide=off)" \
+        --inputbox "\n Forcer le clear INTM quand PC == valeur.\n Vide ou 0 = desactive.\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$INTM_PC" ] && [ "$INTM_PC" != "0" ] && export CALYPSO_FORCE_INTM_AT_PC="$INTM_PC"
+
+      # --- Override numerique : A_TRACE_PC ---
+      ATRACE=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] A_TRACE_PC (hex, vide=off)" \
+        --inputbox "\n Trace A writes quand PC == valeur.\n Vide ou 0 = desactive.\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$ATRACE" ] && [ "$ATRACE" != "0" ] && export CALYPSO_A_TRACE_PC="$ATRACE"
+
+      # --- Override numerique : NDB_D_RACH_OFFSET ---
+      RACH_OFF=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] NDB_D_RACH_OFFSET (hex, vide=defaut 0x1CB)" \
+        --inputbox "\n Override DSP NDB d_rach word offset.\n Default = 0x1CB (firmware DSP==33 layout).\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$RACH_OFF" ] && export CALYPSO_NDB_D_RACH_OFFSET="$RACH_OFF"
+
+      # --- Override numerique : RACH_FORCE_BSIC ---
+      BSIC=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] RACH_FORCE_BSIC (0..63, vide=off)" \
+        --inputbox "\n Force BSIC dans RACH encoder.\n Match osmo-bsc.cfg base_station_id_code.\n Vide = override OFF.\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$BSIC" ] && export CALYPSO_RACH_FORCE_BSIC="$BSIC"
+
+      # --- BSP network override (host:port) ---
+      BSP_NET=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] BSP host:port (vide=defaut 127.0.0.1:6702)" \
+        --inputbox "\n Override BSP UDP endpoint.\n Format : host:port. Vide = defaut.\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      if [ -n "$BSP_NET" ]; then
+        export CALYPSO_BSP_HOST="${BSP_NET%%:*}"
+        export CALYPSO_BSP_PORT="${BSP_NET##*:}"
+      fi
+
+      # --- Watchpoint : TRAP_CHECKPOINT ---
+      TRAP_CP=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] TRAP_CHECKPOINT (vide=off)" \
+        --inputbox "\n Trap c54x sur checkpoint (format module-specific).\n Vide = off.\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$TRAP_CP" ] && export CALYPSO_TRAP_CHECKPOINT="$TRAP_CP"
+
+      # --- Override numerique : STICK_ARFCN (deja existant en run.sh) ---
+      STICK=$(whiptail --backtitle "$BACKTITLE" \
+        --title "[3/4] STICK_ARFCN (mobile cfg override, vide=defaut)" \
+        --inputbox "\n Pin ARFCN pour mobile.cfg.\n Vide = pas d'override (mobile.cfg origine).\n" \
+        12 70 "" 3>&1 1>&2 2>&3) || _cancel
+      [ -n "$STICK" ] && export CALYPSO_STICK_ARFCN="$STICK"
+    fi  # fin Advanced debug
+
     export CALYPSO_DSP_SHUNT CALYPSO_MODE CALYPSO_MTTCG \
            CALYPSO_IRDA_CAPTURE CALYPSO_AUTO_GEN_DOC
     export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
