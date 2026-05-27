@@ -619,7 +619,14 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
         uint8_t b = 0;
         rx_pop(s, &b);
         update_irq(s);                                  /* maybe clear IT_RX */
-        if (rx_count(s) == 0) schedule_wt(s);           /* arm WT when FIFO drains */
+        /* (Moved 2026-05-27, probe-validated) schedule_wt déplacé dans
+         * MASKIT write handler. Avant : armé ici dès FIFO drained → WT
+         * fire pendant delay_ms(100) post-CMDSTART du firmware, AVANT le
+         * `bl calypso_sim_receive`. Handler set rxDoneFlag=1, puis
+         * sim_receive L351 écrase à 0 → poll forever.
+         * Probe [rxDone] confirme chrono : #3 WR val=1 PC=0x8228c4 vt=11ms,
+         * #4 WR val=0 PC=0x8229b4 vt=17ms (5ms après). Inversion fatale.
+         * Maintenant WT armé quand sim_receive unmask IT_WT → fire APRÈS. */
         return b | (1 << 8);                            /* parity OK */
     }
     case CALYPSO_SIM_REG_DTX:    return 0;
@@ -676,10 +683,27 @@ void calypso_sim_reg_write(CalypsoSim *s, hwaddr off, uint16_t val)
         s->it &= ~CALYPSO_SIM_IT_TX;
         update_irq(s);
         break;
-    case CALYPSO_SIM_REG_MASKIT:
+    case CALYPSO_SIM_REG_MASKIT: {
+        /* Arm WT timer quand firmware unmask IT_WT (= sim_receive L358 :
+         * `writew(~(MASK_RX|MASK_WT), MASKIT)`). À ce moment, sim_receive
+         * a déjà fait son rxDoneFlag=0 (L351). Le WT fire APRÈS, handler
+         * set rxDoneFlag=1, poll exit. Ordre garanti dans toutes les
+         * icount modes.
+         *
+         * Condition : WT bit UNMASKED (bit clear) + FIFO empty + IT_WT
+         * not already set. Idempotent : timer_mod_ns ré-arme si déjà armé.
+         * Pas de check sur transition prev_mask→val (MASKIT default BSS=0
+         * dans QEMU = déjà unmasked, transition jamais détectée).
+         * Probe-validated 2026-05-27. */
         s->maskit = val;
-        update_irq(s);     /* re-evaluate line after mask change */
+        update_irq(s);
+        bool wt_unmasked = (val & CALYPSO_SIM_IT_WT) == 0;
+        bool wt_not_pending = (s->it & CALYPSO_SIM_IT_WT) == 0;
+        if (wt_unmasked && wt_not_pending && rx_count(s) == 0) {
+            schedule_wt(s);
+        }
         break;
+    }
     case CALYPSO_SIM_REG_IT_CD:   s->it_cd  = val; break;
     default: break;
     }

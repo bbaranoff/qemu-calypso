@@ -10,6 +10,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/core/cpu.h"          /* current_cpu, CPUClass::get_pc — rxDone probe */
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
 #include "hw/misc/unimp.h"
@@ -138,6 +139,84 @@ static void add_stub(MemoryRegion *sys, const char *name,
 }
 
 /* ================================================================
+ * rxDoneFlag PROBE (env-gated CALYPSO_RXDONE_PROBE=1)
+ * ================================================================
+ * Overlay IO region 4 bytes @ 0x008302d4 (= rxDoneFlag, BSS firmware).
+ * Intercepts reads/writes, logs PC+vtime+seqnum+value, forwards to backing.
+ * Replicates ce que faisait `gdb watch *(unsigned int*)0x008302d4` + log,
+ * sans gdb attaché (donc sans perturbation hbreak TCG).
+ *
+ * Caveat (c web 2026-05-27) : transforme cette 4-byte zone en MMIO,
+ * perturbe le chemin d'accès TCG (slow-path au lieu de direct RAM load).
+ * OK pour capturer la chronologie en un run ; ne pas laisser actif en prod.
+ */
+static uint32_t rxdone_probe_backing = 0;
+static uint64_t rxdone_probe_seq = 0;
+
+static uint64_t rxdone_probe_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint8_t *p = (uint8_t *)&rxdone_probe_backing;
+    uint64_t val = 0;
+    if (size == 4)      val = rxdone_probe_backing;
+    else if (size == 2) val = *(uint16_t *)(p + addr);
+    else                val = *(p + addr);
+    /* RD log silenced by default (busy-poll = flood). Decommente si besoin. */
+    /* fprintf(stderr, "[rxDone] RD +%lx size=%u = 0x%lx\n", addr, size, val); */
+    return val;
+}
+
+static void rxdone_probe_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    uint8_t *p = (uint8_t *)&rxdone_probe_backing;
+    uint32_t prev = rxdone_probe_backing;
+
+    /* Guest PC at the write instant. cpu->cc->get_pc is the generic
+     * CPUClass accessor (avoids target/arm/cpu.h include here). */
+    uint64_t pc = 0;
+    if (current_cpu && current_cpu->cc && current_cpu->cc->get_pc) {
+        pc = current_cpu->cc->get_pc(current_cpu);
+    }
+    uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (size == 4)      rxdone_probe_backing = (uint32_t)val;
+    else if (size == 2) *(uint16_t *)(p + addr) = (uint16_t)val;
+    else                *(p + addr) = (uint8_t)val;
+
+    rxdone_probe_seq++;
+    fprintf(stderr,
+            "[rxDone] #%llu WR +%lu size=%u val=0x%lx (was 0x%x) PC=0x%lx vt=%lu\n",
+            (unsigned long long)rxdone_probe_seq,
+            (unsigned long)addr, size,
+            (unsigned long)val, prev,
+            (unsigned long)pc,
+            (unsigned long)vt);
+}
+
+static const MemoryRegionOps rxdone_probe_ops = {
+    .read = rxdone_probe_read,
+    .write = rxdone_probe_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl  = { .min_access_size = 1, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static MemoryRegion rxdone_probe_mr;
+
+static void rxdone_probe_install(MemoryRegion *sysmem, DeviceState *dev)
+{
+    const char *e = getenv("CALYPSO_RXDONE_PROBE");
+    if (!e || e[0] != '1') return;
+    memory_region_init_io(&rxdone_probe_mr, OBJECT(dev), &rxdone_probe_ops,
+                          NULL, "rxdone_probe", 4);
+    /* Priority 1 > IRAM (priority 0) → ARM accès au 4-byte 0x008302d4
+     * passe par cette IO region. Reads gdb (debug accès) idem. */
+    memory_region_add_subregion_overlap(sysmem, 0x008302d4, &rxdone_probe_mr, 1);
+    fprintf(stderr,
+            "[rxDone] PROBE installed @ 0x008302d4 (overlay prio=1, "
+            "covers 4 bytes rxDoneFlag)\n");
+}
+
+/* ================================================================
  * SoC realize
  * ================================================================ */
 
@@ -158,6 +237,10 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(sysmem, CALYPSO_IRAM_BASE, &s->iram);
     fprintf(stderr, "[SOC] IRAM @ 0x%08x (%d KiB) — NO alias at 0x00000000\n",
             CALYPSO_IRAM_BASE, CALYPSO_IRAM_SIZE / 1024);
+
+    /* rxDoneFlag debug probe — overlay IO sur 0x008302d4 si env activé.
+     * Install APRÈS IRAM (subregion_overlap avec prio plus haute). */
+    rxdone_probe_install(sysmem, dev);
 
     /* ---- INTH ---- */
     object_initialize_child(OBJECT(dev), "inth", &s->inth, TYPE_CALYPSO_INTH);

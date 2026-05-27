@@ -574,6 +574,8 @@ if [ "$MENU_MODE" = "1" ]; then
         "W1C_LATCH"         "W1C latch a_sync_demod cells (dev assist)"    OFF \
         "BSP_IQ_PASSTHROUGH" "BSP IQ passthrough mode"                     OFF \
         "DSP_IDLE_FF"       "DSP idle fast-forward (perf, non-hack)"       ON \
+        "QEMU_HALT"         "QEMU start halted (-S) - attache gdb avant boot" OFF \
+        "GDB_PANE"          "Tmux window gdb (gdb top + tail qemu.log bottom)" OFF \
         3>&1 1>&2 2>&3) || _cancel
       for tr in $ADV_TRACES; do
         export "CALYPSO_${tr}=1"
@@ -1027,7 +1029,9 @@ fi
 
 # Regle 5 : MTTCG XOR icount auto. Deja gere ailleurs (CALYPSO_MTTCG=1
 # force ICOUNT=off plus bas), mais logger ici pour tracabilite.
-if [ "${CALYPSO_MTTCG:-0}" = "1" ] && [ "${CALYPSO_ICOUNT:-off}" != "off" ]; then
+# Default icount = auto depuis 2026-05-27 (cf L1087), donc le fallback ici
+# doit aussi être "auto" pour que le check mutex soit correct.
+if [ "${CALYPSO_MTTCG:-0}" = "1" ] && [ "${CALYPSO_ICOUNT:-auto}" != "off" ]; then
     echo "[run.sh] MUTEX MTTCG <-> icount -- sera force ICOUNT=off (cf bloc MTTCG)"
 fi
 
@@ -1082,7 +1086,7 @@ export CALYPSO_W1C_LATCH \
 #   auto              shift dynamic, wall-clock aligned (recommended)
 #   shift=N,sleep=on  fixed shift (1<<N instr ~= 1ns), explicit sleep
 #   off               disable (legacy default-clock mode)
-CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"  # default off = wall-clock (auto bloque actuellement, debug en cours)
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"  # default auto since 2026-05-27 SIM fix (read-to-clear + WT timer on MASKIT unmask, calypso_sim.c). Pipeline complet OK sous auto.
 export CALYPSO_ICOUNT
 
 # ---- MTTCG mode (Phase C : multi-thread TCG, ARM en thread distinct
@@ -1215,6 +1219,16 @@ else
     QEMU_GDB_FLAG=""
 fi
 
+# CALYPSO_QEMU_HALT=1 : ajoute -S (start halted) au launch QEMU.
+# Permet à un gdb client d'attacher AVANT que le firmware tourne,
+# pose ses BPs, puis 'c' pour lancer. Utilisé par run_gdb_sim.sh.
+if [ "${CALYPSO_QEMU_HALT:-0}" = "1" ]; then
+    QEMU_HALT_FLAG="-S"
+    echo "[run.sh] CALYPSO_QEMU_HALT=1 -- QEMU lancé HALTED (-S). Attache gdb + 'c' pour démarrer firmware."
+else
+    QEMU_HALT_FLAG=""
+fi
+
 # Override delibere : pour le child QEMU seulement, L1CTL_SOCK pointe vers
 # le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c cree son socket a
 # cette adresse-poubelle (= L1CTL QEMU desactive). Le VRAI socket L1CTL
@@ -1226,6 +1240,7 @@ L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
     $QEMU_ICOUNT_FLAG \
     $QEMU_ACCEL_FLAG \
     $QEMU_GDB_FLAG \
+    $QEMU_HALT_FLAG \
     -serial pty -serial pty \
     -monitor "unix:${MON_SOCK},server,nowait" \
     -kernel "$FW_ELF" \
@@ -1480,12 +1495,28 @@ _ALL_SPECS=("osmocon|$OSMOCON_LOG")
 [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
 [ "${CALYPSO_SKIP_BTS:-0}" != "1" ] && _ALL_SPECS+=("bts|$BTS_LOG")
 [ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
+# gdb pane dans la window 'all'. Default OFF (CALYPSO_SKIP_GDB_PANE=1).
+# Activer avec CALYPSO_SKIP_GDB_PANE=0 (= opt-in pour debug). Le pane gdb
+# attache au gdb-stub QEMU au démarrage, prêt pour b/c/info reg.
+[ "${CALYPSO_SKIP_GDB_PANE:-1}" != "1" ] && _ALL_SPECS+=("gdb|__GDB__")
 for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
     if [ "$log" = "__TCPDUMP__" ]; then
         # Live tcpdump hex + ASCII (sans -w pour ne pas dupliquer le pcap
         # canonique gere par la fenetre `gsmtap`).
         cmd="clear; echo '=== $name ==='; sleep 5 && tcpdump -i any -X udp port 4729"
+    elif [ "$log" = "__GDB__" ]; then
+        # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
+        # finir son init et binder le port. Pas de script -x : prompt vide
+        # pour usage interactif. Override script via CALYPSO_GDB_PANE_SCRIPT.
+        _GDB_ELF="${CALYPSO_GDB_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
+        _GDB_PORT="${CALYPSO_GDB_PORT:-1234}"
+        if [ -n "${CALYPSO_GDB_PANE_SCRIPT:-}" ]; then
+            _GDB_X="-x $CALYPSO_GDB_PANE_SCRIPT"
+        else
+            _GDB_X=""
+        fi
+        cmd="clear; echo '=== $name (attach :$_GDB_PORT) ==='; sleep 3 && gdb-multiarch -q -iex 'set pagination off' -iex 'set confirm off' -iex 'set architecture armv5te' -iex 'target remote :$_GDB_PORT' $_GDB_X $_GDB_ELF ; echo '[gdb exited, press Enter]'; read"
     else
         cmd="clear; echo '=== $name ==='; tail -F $log"
     fi
@@ -1563,6 +1594,36 @@ fi
 
 # ---------- shell + attach ----------
 tmux new-window -t "$SESSION" -n shell
+
+# ---------- GDB window (CALYPSO_GDB_PANE=1) ----------
+# Crée une window tmux 'gdb' avec gdb-multiarch attaché à QEMU + tail qemu.log
+# en split. Optionnel, gated par CALYPSO_GDB_PANE=1 (menu Advanced "GDB_PANE").
+# Si CALYPSO_QEMU_HALT=1 aussi, gdb attache à QEMU halted -> set BPs + 'c'.
+# Script gdb optionnel via CALYPSO_GDB_SCRIPT=/path/to/script.gdb (default :
+# script minimal qui attache et continue).
+if [ "${CALYPSO_GDB_PANE:-0}" = "1" ]; then
+    GDB_SCRIPT_DEFAULT=/tmp/run_sh_gdb.gdb
+    if [ -z "${CALYPSO_GDB_SCRIPT:-}" ]; then
+        cat > "$GDB_SCRIPT_DEFAULT" <<GDB_EOF
+set pagination off
+set confirm off
+set architecture armv5te
+target remote :${CALYPSO_GDB_PORT:-1234}
+# Default : juste attacher et continuer. Override via CALYPSO_GDB_SCRIPT.
+c
+GDB_EOF
+        CALYPSO_GDB_SCRIPT="$GDB_SCRIPT_DEFAULT"
+    fi
+    GDB_ELF="${CALYPSO_GDB_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
+    tmux new-window -t "$SESSION" -n gdb \
+        "gdb-multiarch -q -iex 'set pagination off' -iex 'set confirm off' \
+         -x $CALYPSO_GDB_SCRIPT $GDB_ELF ; \
+         echo '[run.sh] gdb exited, press Enter'; read"
+    tmux split-window -t "$SESSION:gdb" -v -p 40 "tail -f $QEMU_LOG"
+    tmux select-pane -t "$SESSION:gdb.0"
+    echo "[run.sh] CALYPSO_GDB_PANE=1 -- window tmux 'gdb' créée (top=gdb / bottom=tail qemu.log)"
+    echo "         gdb script : $CALYPSO_GDB_SCRIPT"
+fi
 
 echo
 echo "Pipeline launched. Attach with: tmux attach -t $SESSION"
