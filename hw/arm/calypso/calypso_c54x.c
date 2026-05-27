@@ -9079,6 +9079,66 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
+        /* === SP-FLOOR guard + delta histogram (2026-05-27, c web review) ===
+         * Trip on FIRST SP descent below SP_FLOOR — that snapshot is BEFORE
+         * the MMR auto-corruption (SP at MMR data[0x18]), so it captures the
+         * cause not the crash. Plus running delta histogram to identify
+         * leaking call/ret pairs (FAR push 2 vs near pop 1 = -1 per pair).
+         * Active by default — minimal cost (a few branches per insn). */
+        #define SP_FLOOR 0x0080
+        {
+            static int sp_floor_tripped = 0;
+            static uint64_t sp_delta_pushf = 0;  /* delta == -2 */
+            static uint64_t sp_delta_pushn = 0;  /* delta == -1 */
+            static uint64_t sp_delta_popn  = 0;  /* delta == +1 */
+            static uint64_t sp_delta_popf  = 0;  /* delta == +2 */
+            static uint64_t sp_delta_other = 0;  /* anything else (jumps, LD#k,SP) */
+            static uint64_t sp_delta_log_n = 0;
+
+            int delta = (int)(int16_t)(s->sp - sp_before);
+            if (delta != 0) {
+                switch (delta) {
+                    case -2: sp_delta_pushf++; break;
+                    case -1: sp_delta_pushn++; break;
+                    case  1: sp_delta_popn++;  break;
+                    case  2: sp_delta_popf++;  break;
+                    default: sp_delta_other++; break;
+                }
+                /* Log first 80 SP changes + every 5000 — enough to characterize
+                 * the leaking call/ret pair WITHOUT drowning the 1.3 GB log. */
+                sp_delta_log_n++;
+                if (sp_delta_log_n <= 80 || (sp_delta_log_n % 5000) == 0) {
+                    C54_LOG("SP-Δ #%llu PC=0x%04x op=0x%04x XPC=%u Δ%+d  SP 0x%04x→0x%04x insn=%u",
+                            (unsigned long long)sp_delta_log_n,
+                            exec_pc, exec_op, s->xpc & 0x3,
+                            delta, sp_before, s->sp, s->insn_count);
+                }
+            }
+
+            if (!sp_floor_tripped && s->sp < SP_FLOOR) {
+                sp_floor_tripped = 1;
+                long long net_push = (long long)(sp_delta_pushf*2 + sp_delta_pushn);
+                long long net_pop  = (long long)(sp_delta_popf *2 + sp_delta_popn);
+                C54_LOG("================================================");
+                C54_LOG("SP-FLOOR TRIPPED  SP=0x%04x < 0x%04x  insn=%u",
+                        s->sp, (unsigned)SP_FLOOR, s->insn_count);
+                C54_LOG("  trigger PC=0x%04x op=0x%04x XPC=%u Δ%+d (SP 0x%04x→0x%04x)",
+                        exec_pc, exec_op, s->xpc & 0x3, delta, sp_before, s->sp);
+                C54_LOG("  ST1 INTM=%d  IFR=0x%04x  IMR=0x%04x",
+                        !!(s->st1 & ST1_INTM), s->ifr, s->imr);
+                C54_LOG("SP delta histogram :");
+                C54_LOG("  push far  (Δ=-2) : %llu", (unsigned long long)sp_delta_pushf);
+                C54_LOG("  push near (Δ=-1) : %llu", (unsigned long long)sp_delta_pushn);
+                C54_LOG("  pop  near (Δ=+1) : %llu", (unsigned long long)sp_delta_popn);
+                C54_LOG("  pop  far  (Δ=+2) : %llu", (unsigned long long)sp_delta_popf);
+                C54_LOG("  other            : %llu", (unsigned long long)sp_delta_other);
+                C54_LOG("  net push - pop   : %lld words (positive = SP leaked downward)",
+                        net_push - net_pop);
+                C54_LOG("================================================");
+            }
+        }
+        #undef SP_FLOOR
+
         /* v2 SP observability — only when CALYPSO_TRAP_OOR=1.
          * (a) sp_trail[256] : |Δ|>32 events (scheduler reloads + big allocs)
          * (b) sp_low watermark : every new low, PC-coalesced power-of-10

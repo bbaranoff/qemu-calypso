@@ -689,6 +689,33 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         bsp.bursts_written++;
         sl->valid = false;  /* consumed */
 
+        /* RX I/Q tap : si BSP_DUMP_RX_FILE est set, append le burst brut
+         * (n int16_t LE I/Q interleaved) au fichier. Header 12B par burst :
+         *   magic 'IQ16' (4B) | fn (4B LE) | tn (1B) | n_int16 (2B LE) | _pad (1B)
+         * Permet ensuite python3 fcch_ref.py <dump> --fmt int16 --burst N. */
+        {
+            static FILE *rx_dump_f = NULL;
+            static int   rx_dump_init = 0;
+            if (!rx_dump_init) {
+                rx_dump_init = 1;
+                const char *p = getenv("BSP_DUMP_RX_FILE");
+                if (p && *p) rx_dump_f = fopen(p, "ab");
+            }
+            if (rx_dump_f) {
+                uint8_t hdr[12] = {
+                    'I','Q','1','6',
+                    (uint8_t)(sl->fn      ), (uint8_t)(sl->fn >>  8),
+                    (uint8_t)(sl->fn >> 16), (uint8_t)(sl->fn >> 24),
+                    tn,
+                    (uint8_t)(n      ), (uint8_t)(n >> 8),
+                    0
+                };
+                fwrite(hdr, 1, 12, rx_dump_f);
+                fwrite(sl->iq, sizeof(int16_t), n, rx_dump_f);
+                fflush(rx_dump_f);
+            }
+        }
+
         if (bsp.bursts_written <= 10 || (bsp.bursts_written % 1000) == 0) {
             BSP_LOG("DMA tn=%u fn=%u n=%d total=%llu stale=%llu qfull=%llu",
                     tn, sl->fn, n,
