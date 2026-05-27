@@ -8,6 +8,7 @@ in a per-run folder and a final .zip at session end.
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import zipfile
@@ -1101,6 +1102,32 @@ def _gen_abstract_audit(folder: Path) -> str:
         return f"_exception en exécutant `abstract.py` : {type(e).__name__}: {e}_\n"
 
 
+_ANSI_ESC_RE  = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_ANSI_TEXT_RE = re.compile(r'\[[0-9]+(?:;[0-9]+)*m')  # leftover post-stripped ESC
+
+def _strip_for_markdown(txt: str) -> str:
+    """Sanitize log text for Pandoc/Quarto embedding :
+    - strip ANSI color escapes (0x1B [ ... m) — Pandoc avec markdown=1 trippe
+      sur des séquences ESC brutes et génère des warnings Div parasites
+    - strip leftover text-form ANSI patterns "[1;32m" etc. — quand ESC a été
+      stripped en amont (e.g., conversion .md→.qmd), le texte garde "[1;32m"
+      que Pandoc lit comme `[link]` non-fermé
+    - strip d'autres bytes de contrôle (sauf \\n, \\t)
+    - normalise les fins de ligne CR → LF
+    Préserve le contenu lisible. """
+    txt = _ANSI_ESC_RE.sub('', txt)
+    txt = _ANSI_TEXT_RE.sub('', txt)
+    txt = txt.replace('\r', '')
+    # filter non-printable (keep \n, \t)
+    out = []
+    for ch in txt:
+        c = ord(ch)
+        if c < 0x20 and c not in (0x09, 0x0A):
+            continue
+        out.append(ch)
+    return ''.join(out)
+
+
 def _gen_diag_bundle_annex() -> str:
     """Annexe bundle : appelle `make_diag_bundle.sh` puis embarque les
     *digests* texte du tar (parse_summary, source_excerpts, static_decode,
@@ -1153,6 +1180,8 @@ def _gen_diag_bundle_annex() -> str:
                     txt = fp.read().decode("utf-8", errors="replace")
                 except Exception:
                     continue
+                # Sanitize for Pandoc/Quarto embedding : strip ANSI, control chars
+                txt = _strip_for_markdown(txt)
                 lines = txt.splitlines()
                 n = len(lines)
                 # Tronquage proportionnel : gros fichiers = head + tail
@@ -1167,9 +1196,14 @@ def _gen_diag_bundle_annex() -> str:
                             "\n".join(lines[-200:]))
                 else:
                     body = txt
+                # Ligne vide AVANT le <details> + close suivi de ligne vide :
+                # Pandoc/Quarto avec markdown="1" perd parfois la frontière
+                # entre balises HTML inline sans blank line entre elles.
+                out.append("")  # blank line separator
                 out.append(f"<details><summary><code>{m.name}</code> "
                            f"({m.size:,} bytes, {n} lignes)"
-                           f"</summary>\n\n```\n{body}\n```\n\n</details>\n")
+                           f"</summary>\n\n```\n{body}\n```\n\n</details>")
+                out.append("")  # blank line separator
         return "\n".join(out)
     except Exception as e:
         return f"_exception en générant l'annexe bundle : {type(e).__name__}: {e}_\n"

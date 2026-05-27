@@ -1346,6 +1346,151 @@ static void read_stats_trigger_check(C54xState *s)
             (unsigned long long)delta[RR_OTHER]);
 }
 
+/* === NOP-region guard + transfer ring + A-write ring (2026-05-27 Plan B) ===
+ * Trip ONCE on first entry into the unmapped prog zone (= PC < 0x7000 in
+ * bank 0, outside OVLY DARAM 0x80-0x27FF). At trip, dump :
+ *   (a) trigger transfer (the call/branch that landed in NOP zone)
+ *   (b) N last control-flow transfers (most recent → oldest)
+ *   (c) N last A-writes
+ * Together they name the racine without spéculation. */
+#define NOP_RING_N 32
+
+typedef struct {
+    uint16_t src_pc;
+    uint8_t  src_xpc;
+    uint16_t op;
+    uint16_t tgt_pc;
+    uint8_t  tgt_xpc;
+    int64_t  a_val;
+    uint64_t insn;
+    char     type[8];   /* "B", "BACC", "CALA", "FB", "FCALL", "FBACC", "FCALA", "RET", "FRET", "OTHER" */
+} XferLog;
+
+typedef struct {
+    uint16_t pc;
+    uint8_t  xpc;
+    uint16_t op;
+    int64_t  old_a;
+    int64_t  new_a;
+    uint64_t insn;
+} AWriteLog;
+
+static XferLog   g_xfer_ring[NOP_RING_N];
+static unsigned  g_xfer_idx;
+static AWriteLog g_awrite_ring[NOP_RING_N];
+static unsigned  g_awrite_idx;
+static int       g_nop_tripped;
+
+static const char *classify_xfer_op(uint16_t op)
+{
+    if ((op & 0xFF80) == 0xF880) return "FB";
+    if ((op & 0xFF80) == 0xF980) return "FCALL";
+    if ((op & 0xFF80) == 0xFA80) return "FBD";
+    if ((op & 0xFF80) == 0xFB80) return "FCALLD";
+    if (op == 0xF4E2 || op == 0xF5E2) return "BACC";
+    if (op == 0xF4E3 || op == 0xF5E3) return "CALA";
+    if (op == 0xF4E6 || op == 0xF5E6) return "FBACC";
+    if (op == 0xF4E7 || op == 0xF5E7) return "FCALA";
+    if (op == 0xF6E6) return "FBACCD";
+    if (op == 0xF6E7) return "FCALAD";
+    if (op == 0xF4E4) return "FRET";
+    if (op == 0xF4EB) return "RETE";
+    if (op == 0xF6E4 || op == 0xF6E5) return "FRETD";
+    if (op == 0xF073 || op == 0xF273) return "RET";
+    if (op == 0xF074) return "B";
+    if (op == 0xF274) return "CALL";
+    return "OTHER";
+}
+
+static void xfer_log_push(uint16_t src_pc, uint8_t src_xpc, uint16_t op,
+                          uint16_t tgt_pc, uint8_t tgt_xpc, int64_t a_val,
+                          uint64_t insn)
+{
+    XferLog *e = &g_xfer_ring[g_xfer_idx % NOP_RING_N];
+    e->src_pc = src_pc;
+    e->src_xpc = src_xpc;
+    e->op = op;
+    e->tgt_pc = tgt_pc;
+    e->tgt_xpc = tgt_xpc;
+    e->a_val = a_val;
+    e->insn = insn;
+    const char *t = classify_xfer_op(op);
+    /* strncpy without padding */
+    int k = 0;
+    while (k < 7 && t[k]) { e->type[k] = t[k]; k++; }
+    e->type[k] = '\0';
+    g_xfer_idx++;
+}
+
+static void awrite_log_push(uint16_t pc, uint8_t xpc, uint16_t op,
+                            int64_t old_a, int64_t new_a, uint64_t insn)
+{
+    AWriteLog *e = &g_awrite_ring[g_awrite_idx % NOP_RING_N];
+    e->pc = pc;
+    e->xpc = xpc;
+    e->op = op;
+    e->old_a = old_a;
+    e->new_a = new_a;
+    e->insn = insn;
+    g_awrite_idx++;
+}
+
+/* NOP-region predicate :
+ *   xpc == 0 && pc < 0x7000 && !(OVLY && pc in [0x80, 0x2800])
+ * Anything that lands here is in the unmapped prog area = NOP slide. */
+static inline int pc_in_nop_region(const C54xState *s, uint16_t pc, uint8_t xpc)
+{
+    if (xpc != 0) return 0;                 /* banque sup : géré ailleurs */
+    if (pc >= 0x7000) return 0;             /* PROM0 + PROM1 mirror = valid */
+    if ((s->pmst & PMST_OVLY) && pc >= 0x80 && pc < 0x2800)
+        return 0;                           /* OVLY DARAM mapping = valid */
+    return 1;
+}
+
+static void nop_guard_dump(C54xState *s, uint16_t pc, uint8_t xpc)
+{
+    if (g_nop_tripped) return;
+    g_nop_tripped = 1;
+    C54_LOG("================================================");
+    C54_LOG("NOP-REGION GUARD TRIPPED");
+    C54_LOG("  trigger PC=0x%04x XPC=%u  prog[lin]=0x%04x  insn=%u",
+            pc, xpc, s->prog[((uint32_t)xpc << 16) | pc], s->insn_count);
+    C54_LOG("  state : A=%010llx B=%010llx SP=0x%04x ST1=0x%04x INTM=%d "
+            "AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x",
+            (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+            (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+            s->sp, s->st1, !!(s->st1 & ST1_INTM),
+            s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+            s->ar[4], s->ar[5], s->ar[6], s->ar[7]);
+
+    C54_LOG("--- last %d control-flow transfers (oldest → newest) ---", NOP_RING_N);
+    unsigned start = g_xfer_idx > NOP_RING_N ? (g_xfer_idx - NOP_RING_N) : 0;
+    for (unsigned i = start; i < g_xfer_idx; i++) {
+        const XferLog *t = &g_xfer_ring[i % NOP_RING_N];
+        C54_LOG("  [%u] %-7s src=(xpc=%u,pc=0x%04x) op=0x%04x → tgt=(xpc=%u,pc=0x%04x) "
+                "A=%010llx insn=%llu",
+                i, t->type, t->src_xpc, t->src_pc, t->op,
+                t->tgt_xpc, t->tgt_pc,
+                (unsigned long long)(t->a_val & 0xFFFFFFFFFFULL),
+                (unsigned long long)t->insn);
+    }
+
+    C54_LOG("--- last %d A-writes (oldest → newest) ---", NOP_RING_N);
+    unsigned astart = g_awrite_idx > NOP_RING_N ? (g_awrite_idx - NOP_RING_N) : 0;
+    for (unsigned i = astart; i < g_awrite_idx; i++) {
+        const AWriteLog *a = &g_awrite_ring[i % NOP_RING_N];
+        int64_t do_old = a->old_a & 0xFFFFFFFFFFLL;
+        int64_t do_new = a->new_a & 0xFFFFFFFFFFLL;
+        C54_LOG("  [%u] PC=0x%04x xpc=%u op=0x%04x  A: %010llx → %010llx "
+                "(Δ=%+lld) insn=%llu",
+                i, a->pc, a->xpc, a->op,
+                (unsigned long long)do_old, (unsigned long long)do_new,
+                (long long)(do_new - do_old),
+                (unsigned long long)a->insn);
+    }
+    C54_LOG("================================================");
+}
+
 static uint16_t data_read_locked(C54xState *s, uint16_t addr);
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
@@ -3454,6 +3599,51 @@ static int c54x_exec_one(C54xState *s)
             s->pc = tgt;
             return 0;
         }
+        /* F4E6 = FBACC A   FL_FAR  (far branch acc, no push, no delay)
+         * F4E7 = FCALA A   FL_FAR  (far call  acc, push 2 mots, no delay)
+         * F5E6 = FBACC B / F5E7 = FCALA B  (acc B variants)
+         *
+         * Per binutils tic54x-opc.c (FL_FAR flag) and SPRU172C :
+         *   XPC = A(22:16), PC = A(15:0). FCALA push XPC puis ret_pc (PC+1),
+         *   ordre compatible avec FRET (F4E4 — pop PC d'abord puis XPC).
+         *
+         * 2026-05-27 (c web review): non-delayed variants WERE NOP-fallthrough
+         * via the F4E0-F4FF block below. Pre-XPC-fix le code far-acc n'était
+         * jamais atteint, post-fix il l'est → silent control-flow derailment.
+         * Sémantique identique au FCALAD/FBACCD (F6E6/F6E7) existant, sans
+         * delay slots. */
+        if (op == 0xF4E6 || op == 0xF4E7 || op == 0xF5E6 || op == 0xF5E7) {
+            int is_b    = (op & 0x0100) != 0;
+            int is_call = (op & 1) != 0;
+            int64_t acc = is_b ? s->b : s->a;
+            uint16_t tgt     = (uint16_t)(acc & 0xFFFF);
+            uint8_t  new_xpc = (uint8_t)((acc >> 16) & 0xFF);
+            if (new_xpc > 3) new_xpc &= 3;
+            static uint64_t facc_total;
+            facc_total++;
+            if (facc_total <= 30 || (facc_total % 5000) == 0) {
+                C54_LOG("%s%c FAR #%llu PC=0x%04x → XPC=%u PC=0x%04x "
+                        "(A=%010llx SP=0x%04x was XPC=%u)",
+                        is_call ? "FCALA" : "FBACC",
+                        is_b ? 'B' : 'A',
+                        (unsigned long long)facc_total,
+                        s->pc, new_xpc, tgt,
+                        (unsigned long long)(acc & 0xFFFFFFFFFFULL),
+                        s->sp, s->xpc & 0x3);
+            }
+            if (is_call) {
+                /* FCALA : push XPC first (deeper in stack), then ret_pc (top).
+                 * FRET (F4E4) pops PC d'abord puis XPC — ordre compatible. */
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, s->xpc);
+                uint16_t ret_pc = (uint16_t)(s->pc + 1);
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, ret_pc);
+            }
+            s->xpc = new_xpc;
+            s->pc  = tgt;
+            return 0;
+        }
         /* F4E0-F4FF: RSBX/SSBX status bits — treat as NOP (most don't affect emulation) */
         if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
             return consumed + s->lk_used;
@@ -5542,8 +5732,15 @@ static int c54x_exec_one(C54xState *s)
     case 0x6: case 0x7:
         /* 7Exx: READA Smem — read prog[A_low] → data[Smem]
          * Per tic54x-opc.c: reada 0x7E00 mask 0xFF00 (1 word).
+         * Per SPRU131G : program address = (XPC[6:0] | A[15:0]). A.high is
+         * NOT used as XPC source — XPC reg is. prog_read already implements
+         * this via c54x_prog_xlate for addr ≥ 0x8000.
          * Under RPT, the prog address auto-increments each iteration;
-         * accumulator A is preserved (we mirror via mvpd_src state). */
+         * accumulator A is preserved (we mirror via mvpd_src state).
+         *
+         * 2026-05-27 c web review revert : a speculative 23-bit fix
+         * (A.high → XPC override) was tried but contradicts SPRU131G and
+         * did not move the symptom — reverted to canonical semantics. */
         if (hi8 == 0x7E) {
             addr = resolve_smem(s, op, &ind);
             uint16_t psrc = s->rpt_active ? s->mvpd_src : (uint16_t)(s->a & 0xFFFF);
@@ -8838,6 +9035,12 @@ int c54x_run(C54xState *s, int n_insns)
 
         /* Track SP changes inside RPTB loops */
         uint16_t sp_before = s->sp;
+        /* === Plan B captures (c web review) : snapshot for transfer ring,
+         * A-write ring, NOP-region guard. */
+        uint16_t pre_pc  = s->pc;
+        uint8_t  pre_xpc = s->xpc & 0x3;
+        uint16_t pre_op  = prog_fetch(s, s->pc);
+        int64_t  pre_a   = s->a;
 
         /* Trace EB04 loop — dump first 20 iterations */
         if (s->pc == 0xEB04) {
@@ -9113,6 +9316,28 @@ int c54x_run(C54xState *s, int n_insns)
                             exec_pc, exec_op, s->xpc & 0x3,
                             delta, sp_before, s->sp, s->insn_count);
                 }
+            }
+
+            /* === Plan B detectors (run once per insn AFTER exec_one) === */
+            /* (1) A-write ring : track each modification of s->a */
+            if (s->a != pre_a) {
+                awrite_log_push(pre_pc, pre_xpc, pre_op, pre_a, s->a, s->insn_count);
+            }
+            /* (2) Transfer ring : detect non-sequential PC change.
+             *   exec_one returns `consumed` = instruction size in words. If
+             *   new PC != pre_pc + consumed (and no delay-slot pending), it's
+             *   a transfer. We also catch XPC changes (FAR transfers). */
+            uint16_t expected_pc = (uint16_t)(pre_pc + consumed);
+            if ((s->pc != expected_pc || (s->xpc & 0x3) != pre_xpc)
+                && s->delay_slots == 0) {
+                xfer_log_push(pre_pc, pre_xpc, pre_op,
+                              s->pc, s->xpc & 0x3, pre_a, s->insn_count);
+            }
+            /* (3) NOP-region guard : trip ONCE at first entry into the
+             * unmapped prog zone (PC <0x7000 in bank 0, outside OVLY DARAM
+             * 0x80-0x27FF). Dumps trigger + transfer ring + A-write ring. */
+            if (!g_nop_tripped && pc_in_nop_region(s, s->pc, s->xpc & 0x3)) {
+                nop_guard_dump(s, s->pc, s->xpc & 0x3);
             }
 
             if (!sp_floor_tripped && s->sp < SP_FLOOR) {
