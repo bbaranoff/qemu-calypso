@@ -16,10 +16,12 @@ SESSION="calypso"
 # `calypso` existante et y bascule pour montrer le run pytest en direct.
 GEN_DOC_MODE=0
 MENU_MODE=0
+DEBUG_FULL_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --gen-doc-local) GEN_DOC_MODE=1 ;;
         --menu) MENU_MODE=1 ;;
+        --debug-full) DEBUG_FULL_MODE=1 ;;
         --run-all)
             echo "[run.sh] --run-all : delegating to run-all.sh"
             exec "$(dirname "$0")/run-all.sh" "${@:2}"
@@ -33,31 +35,165 @@ for arg in "$@"; do
             exec "$(dirname "$0")/select-verdict.sh" "${@:2}"
             ;;
         -h|--help)
-            cat <<EOF
-Usage: $0 [--gen-doc-local] [--menu]
+            cat <<'EOF'
+Usage: ./run.sh [FLAG]
 
-Default : launch the full Calypso pipeline (QEMU + osmocon + calypso-ipc-device
-+ osmo-trx-ipc + bts + mobile + gsmtap + irda) in a tmux session and attach.
+Lance le pipeline Calypso complet : QEMU (ARM + DSP c54x emulé) + osmocon
+(romload stub) + bridge ipc-device|trx-ipc|bridge.py + osmo-bts-trx +
+mobile/L2 client + gsmtap capture + irda capture. Tout dans une session
+tmux 'calypso'. Par défaut attache la session en fin.
 
---menu      : interactive profile selection before launch (hack-free /
-              dev-assist / full-diag / custom). Sets CALYPSO_* env vars
-              and re-execs.
+═══════════════════════════════════════════════════════════════════════════
+FLAGS
+═══════════════════════════════════════════════════════════════════════════
 
---gen-doc-local : skip pipeline launch, run pytest in the container "trying"
-            (no requirement that qemu-system-arm be running -- tests can
-            still fail/skip if dependencies missing). Output lands in a new
-            tmux window 'gen-doc' of the calypso session (if it exists);
-            otherwise streamed to the current terminal.
-            Artefacts (inside container):
-              /tmp/report.md           (machine-friendly summary)
-              /tmp/test_results.md     (full GitHub-flavored)
-              /tmp/test_results.qmd    (Quarto source)
-              /tmp/test_results_<ts>/  (per-run folder with mmd, csv, json)
-            Host copy: /tmp/calypso_report.md
+  --menu         Sélection interactive (whiptail) du profile avant launch.
+                 Mode, components, L2 client, DIAG profile, advanced toggles.
+
+  --debug-full   Active TOUTES les probes debug (CALYPSO_*_TRACE/PROBE)
+                 sur le mode courant (default 'full', ou celui sélectionné
+                 via --menu). icount=auto + DIAG full + gdb pane on.
+                 Lourd en log (~1-2 GB/min qemu.log). SINGLE-SHOT.
+
+  --gen-doc-local  Skip launch, lance pytest in-container, génère doc.
+                   Artefacts /tmp/report.md, test_results.md, .qmd, etc.
+
+  --run-all      Sweep tous les modes (full shunt shunt-ipc bridge bare)
+                 via run-all.sh, 60s chacun, compare outputs. BENCH.
+  --run-all-debug  Idem run-all mais debug-friendly : 180s/mode, logs
+                   verbose, sessions tmux gardées. Ajouter --full pour
+                   activer toutes les c54x probes (équiv. --debug-full
+                   appliqué à chaque mode). COVERAGE + BENCH.
+  --select-verdict  Outil de sélection verdict pour tests.
+
+  -h, --help     Affiche ce help.
+
+═══════════════════════════════════════════════════════════════════════════
+ENV VARS (override default)
+═══════════════════════════════════════════════════════════════════════════
+
+QEMU accel:
+  CALYPSO_ICOUNT=auto|off|shift=N,sleep=on   default auto (depuis 2026-05-27
+                                              SIM fix)
+  CALYPSO_MTTCG=0|1                          multi-thread TCG (XOR icount)
+  CALYPSO_QEMU_HALT=0|1                      -S au launch (gdb attach avant
+                                              boot, BPs fire dès reset)
+
+Pipeline:
+  CALYPSO_L2_CLIENT=mobile|ccch_scan|cell_log      L2 app
+  CALYPSO_SKIP_IPC_DEVICE|TRX_IPC|BTS|L2|GSMTAP|BRIDGE_PY=0|1
+  CALYPSO_DSP_SHUNT=0|1                            canned FB+SB shunt
+  CALYPSO_IRDA_CAPTURE=0|1                         /tmp/fw-irda.log
+  CALYPSO_BSP_IQ_PASSTHROUGH=0|1                   BSP DL soft-bits → GMSK IQ
+  CALYPSO_NO_ATTACH=0|1                            skip final tmux attach
+
+Tmux panes:
+  CALYPSO_SKIP_GDB_PANE=0|1                  gdb pane in window 'all'
+                                              (default 1 = skip)
+  CALYPSO_GDB_PANE_SCRIPT=/path/to.gdb       auto-load gdb script
+  CALYPSO_GDB_ELF=/path/to/firmware.elf      default highram.elf
+  CALYPSO_GDB_PORT=N                          default 1234
+
+Diag/probes (verbose):
+  CALYPSO_RXDONE_PROBE=1     overlay IO sur 0x008302d4 (rxDoneFlag writes)
+  CALYPSO_FBDB_PROBE=1       FBDB trace B@fbd9, A@fbdb, A@fbf3
+  CALYPSO_INT3_CYCLE_TRACE=1 INT3 ISR cycle branch decisions
+  CALYPSO_STUCK_PROBE=1      PC+XPC histo si INTM=1+BRINT0 pending
+  CALYPSO_FORCE_INTM_ONESHOT=1  clear INTM oneshot (sonde arbitrage)
+  CALYPSO_SP_RING=1          SP delta ring buffer
+  CALYPSO_SP_ABS_TRACE=1     SP absolute trace
+  CALYPSO_SP_HIST_ARM=1      SP histogram ARM-side
+  CALYPSO_AR_TRACE=0xFF      AR registers trace bitmask
+  CALYPSO_WATCH_3FBE=1       DARAM[0x3FBE] watch
+  CALYPSO_CORRELATOR_TRACE=1 FB-det corrélateur
+  CALYPSO_MVPD_TRACE=1       MVPD opcode trace
+  CALYPSO_RSBX_INTM_TRACE=1  RSBX INTM transitions
+  CALYPSO_UART_TRACE=1       UART read/write trace
+  CALYPSO_TIMER=1            tdma_tick/frame_irq/kick fprintf
+  CALYPSO_W1C_LATCH=1        a_sync_demod cells W1C latch (dev assist)
+  CALYPSO_DBG=1              generic c54x debug
+
+Overrides numériques:
+  CALYPSO_FORCE_INTM_AT_PC=0xPC      force INTM clear when PC == valeur
+  CALYPSO_FORCE_INTM_CLEAR_AT=N      insn count threshold
+  CALYPSO_A_TRACE_PC=0xPC            trace A writes from this PC
+  CALYPSO_NDB_D_RACH_OFFSET=0xNNN    DSP NDB d_rach offset (default 0x1CB)
+  CALYPSO_RACH_FORCE_BSIC=N          force BSIC 0..63 in RACH encoder
+  CALYPSO_STICK_ARFCN=N              pin mobile cfg ARFCN
+  CALYPSO_BSP_DARAM_ADDR=0xNNNN      BSP DARAM addr (default 0x3fb0)
+  CALYPSO_BSP_HOST=ip / CALYPSO_BSP_PORT=N   BSP UDP endpoint
+  CALYPSO_TRAP_CHECKPOINT=...        c54x trap on checkpoint
+  CALYPSO_TRAP_OOR=...               c54x trap out-of-range
+
+═══════════════════════════════════════════════════════════════════════════
+EXEMPLES
+═══════════════════════════════════════════════════════════════════════════
+
+  ./run.sh                              # default (icount=auto, no probes)
+  ./run.sh --menu                       # interactive setup
+  ./run.sh --debug-full                 # all probes ON, gdb pane visible
+  CALYPSO_L2_CLIENT=ccch_scan ./run.sh  # CCCH scanner au lieu de mobile
+  CALYPSO_ICOUNT=off ./run.sh           # fallback wall-clock mode
+  CALYPSO_NO_ATTACH=1 ./run.sh          # ne pas attacher tmux à la fin
+
+═══════════════════════════════════════════════════════════════════════════
+FICHIERS / LOGS
+═══════════════════════════════════════════════════════════════════════════
+
+  /root/qemu.log           QEMU + c54x DSP probes
+  /tmp/osmocon.log         osmocon (romload + bridge)
+  /tmp/bridge.py.log       bridge.py si mode bridge-py
+  /tmp/calypso-ipc-device.log  si mode ipc-device
+  /tmp/osmo-trx-ipc.log    GMSK modem
+  /tmp/bts.log             osmo-bts-trx
+  /tmp/mobile.log          mobile L2 (ou ccch_scan/cell_log)
+  /tmp/fw-irda.log         IrDA capture (firmware D11)
+  /tmp/mobile-gsmtap.pcap  GSMTAP capture (port 4729)
+
+  Attach tmux : tmux a -t calypso
+  Kill session : tmux kill-session -t calypso
+
 EOF
             exit 0 ;;
     esac
 done
+
+# ---- --debug-full : export toutes les probes en une commande ----
+if [ "$DEBUG_FULL_MODE" = "1" ]; then
+    echo "[run.sh] --debug-full : exporting all debug probes"
+    export CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
+    export CALYPSO_L2_CLIENT="${CALYPSO_L2_CLIENT:-mobile}"
+    # Runtime probes
+    export CALYPSO_RXDONE_PROBE=1
+    export CALYPSO_FBDB_PROBE=1
+    export CALYPSO_INT3_CYCLE_TRACE=1
+    export CALYPSO_STUCK_PROBE=1
+    export CALYPSO_FORCE_INTM_ONESHOT=1
+    # DIAG full
+    export CALYPSO_PROBE_BOOTSTUB=0
+    export CALYPSO_SP_RING=1
+    export CALYPSO_SP_RING_TRIG=bootstub
+    export CALYPSO_SP_RING_INSN_MIN=1000000
+    export CALYPSO_SP_ABS_TRACE=1
+    export CALYPSO_AR_TRACE=0xFF
+    export CALYPSO_WATCH_3FBE=1
+    export CALYPSO_CORRELATOR_TRACE=1
+    export CALYPSO_MVPD_TRACE=1
+    export CALYPSO_MVPD_BOOT_LIMIT=500000
+    export CALYPSO_RSBX_INTM_TRACE=1
+    # Extra traces
+    export CALYPSO_UART_TRACE=1
+    export CALYPSO_TIMER=1
+    export CALYPSO_SP_HIST_ARM=1
+    export CALYPSO_DBG=1
+    # Pipeline + gdb pane
+    export CALYPSO_IRDA_CAPTURE=1
+    export CALYPSO_BSP_IQ_PASSTHROUGH=1
+    export CALYPSO_SKIP_GDB_PANE=0
+    # gen-doc off pour pas polluer en debug
+    export CALYPSO_AUTO_GEN_DOC=0
+    echo "[run.sh] --debug-full env exported. Log path : /root/qemu.log (peut faire 1-2 GB/min)"
+fi
 
 # `--gen-doc-local` = synonyme de "lance le pipeline normal ET force la
 # generation de doc auto" (qui se declenche T+30s apres QEMU launch dans une
