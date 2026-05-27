@@ -2601,34 +2601,31 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     s->data[addr] = val;
 }
 
-/* Instruction fetch: uses mirrored PROM1 at 0x8000-0xFFFF, ignores XPC */
+/* 23-bit program address translation : honors XPC for ≥0x8000 (extended
+ * program memory / banked area), passes through for <0x8000 (common bank 0).
+ * Shared by prog_fetch and prog_read so they cannot diverge again.
+ * OVLY (DARAM mirror) is handled at call site because it routes to s->data[]. */
+static inline uint32_t c54x_prog_xlate(const C54xState *s, uint16_t addr16)
+{
+    if (addr16 >= 0x8000) {
+        return (((uint32_t)s->xpc << 16) | addr16) & (C54X_PROG_SIZE - 1);
+    }
+    return addr16;
+}
+
 static uint16_t prog_fetch(C54xState *s, uint16_t pc)
 {
-    /* OVLY: map DARAM into program space 0x0080-0x27FF only.
-     * Calypso has 10K words DARAM (0x0000-0x27FF).
-     * PROM0 (0x7000-0xDFFF) is always accessible in program space. */
     if ((s->pmst & PMST_OVLY) && pc >= 0x80 && pc < 0x2800)
         return s->data[pc];
-    /* prog_fetch: PC is always 16-bit, never uses XPC banking.
-     * Per version 222807: only OVLY overlay applies to instruction fetch.
-     * XPC is only used by prog_read (data/operand reads). */
-    return s->prog[pc];
+    return s->prog[c54x_prog_xlate(s, pc)];
 }
+
 static uint16_t prog_read(C54xState *s, uint32_t addr)
 {
     uint16_t addr16 = addr & 0xFFFF;
-    /* OVLY: DARAM visible in program space for 0x0080-0x27FF */
     if ((s->pmst & PMST_OVLY) && addr16 >= 0x80 && addr16 < 0x2800)
         return s->data[addr16];
-    /* For addresses >= 0x8000: use XPC to select extended page.
-     * prog_read is used for data/operand reads (MVPD, FIRS coeff, etc.)
-     * which need XPC banking — unlike prog_fetch which is PC-only. */
-    if (addr16 >= 0x8000) {
-        uint32_t ext = ((uint32_t)s->xpc << 16) | addr16;
-        ext &= (C54X_PROG_SIZE - 1);
-        return s->prog[ext];
-    }
-    return s->prog[addr16];
+    return s->prog[c54x_prog_xlate(s, addr16)];
 }
 
 static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint16_t val)
