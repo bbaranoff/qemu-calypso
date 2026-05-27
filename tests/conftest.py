@@ -172,9 +172,22 @@ def pytest_runtest_makereport(item, call):
     })
 
 
+_MERMAID_RESERVED = {"default", "end", "subgraph", "graph", "flowchart",
+                     "direction", "class", "classDef", "style", "linkStyle",
+                     "click", "href", "interpolate"}
+
 def _sanitize_node_id(s: str) -> str:
-    """Mermaid node IDs must be alphanumeric+underscore."""
-    return "".join(c if c.isalnum() else "_" for c in s)[:48]
+    """Mermaid node IDs must be alphanumeric+underscore.
+
+    Mermaid 10.2 (Quarto built-in) tokenizes some reserved words inside node
+    IDs (`default`, `end`, …) as keywords, breaking `class T_xxx_default fail;`
+    statements. We rewrite the word in place so the ID is still readable but
+    no longer collides with the keyword.
+    """
+    cleaned = "".join(c if c.isalnum() else "_" for c in s)[:48]
+    parts = cleaned.split("_")
+    parts = [p + "X" if p in _MERMAID_RESERVED else p for p in parts]
+    return "_".join(parts)
 
 
 def _label(text: str) -> str:
@@ -1643,20 +1656,11 @@ def pytest_sessionfinish(session, exitstatus):
             # 1. Replace ALL <br/> with space (handles multi-line labels with
             #    2+ <br/> like `name<br/>marker<br/>3.15s`).
             line = line.replace("<br/>", " ").replace("<br>", " ")
-            # 2. Strip outer `["..."]` quotes in node labels (Quarto escapes
-            #    them as &quot; which mermaid does not parse).
-            line = _re.sub(r'\["([^"\n]*?)"\]',
-                           lambda m: f'[{m.group(1)}]', line)
+            # 2. KEEP outer `["..."]` quotes. Mermaid 10.2 (Quarto built-in)
+            #    rejects unquoted labels containing ` - `, em-dash, parens.
+            #    Quarto passes ```{mermaid}``` blocks verbatim — quotes survive.
             # 3. Emojis dans edge labels   `-.->|🛑|`  →  `-.->|BREAK|`
             line = _re.sub(r'\|🛑\|', '|BREAK|', line)
-            # 4. Parentheses inside `[...]` labels confuse Mermaid parser
-            #    (interprétées comme stadium shape `id(...)`). Ex:
-            #    `T_007[test_inject_si(1) inject_frames 0.33s]` casse.
-            #    On les neutralise (espace) uniquement à l'intérieur des [].
-            line = _re.sub(
-                r'\[([^\[\]\n]*)\]',
-                lambda m: '[' + m.group(1).replace('(', ' ').replace(')', ' ') + ']',
-                line)
             out.append(line)
         return "\n".join(out)
 
@@ -1854,17 +1858,11 @@ def _gen_detail_per_category_qmd(tree: dict) -> str:
         lines = []
         for line in block.splitlines():
             line = line.replace("<br/>", " ").replace("<br>", " ")
-            # Mermaid 10.2 (Quarto built-in) parse mal certains chars dans
-            # labels sans guillemets : `·` (U+00B7) → rejeté, `|` → consommé
-            # comme délimiteur de edge label, `(` `)` → stadium shape. Le
-            # séparateur safe est `-` simple (rien qui ne soit syntaxe mermaid).
-            line = line.replace(" · ", " - ")
-            line = _re_q.sub(r'\["([^"\n]*?)"\]', lambda m: f'[{m.group(1)}]', line)
+            # KEEP `["..."]` quotes : Mermaid 10.2 (Quarto built-in) rejette
+            # tout label non quoté contenant ` - `, em-dash, `(`, `)`. Quarto
+            # passe les blocs ```{mermaid}``` verbatim — les guillemets
+            # survivent. ` · ` reste OK à l'intérieur des quotes.
             line = _re_q.sub(r'\|🛑\|', '|BREAK|', line)
-            line = _re_q.sub(
-                r'\[([^\[\]\n]*)\]',
-                lambda m: '[' + m.group(1).replace('(', ' ').replace(')', ' ') + ']',
-                line)
             lines.append(line)
         return "\n".join(lines)
     for cat in sorted(graphs):
