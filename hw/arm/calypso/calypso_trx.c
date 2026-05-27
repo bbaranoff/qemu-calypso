@@ -1248,19 +1248,32 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     g_kick_timer = timer_new_ns(QEMU_CLOCK_REALTIME,calypso_kick_cb,NULL);
     timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
 
-    /* C54x DSP emulator */
+    /* C54x DSP emulator.
+     * Default tries .bin (COFF1 TIC54X) first, then falls back to .txt dump.
+     * c54x_load_rom() auto-detects format by magic. */
     {
-        const char *rom_path = getenv("CALYPSO_DSP_ROM");
-        if (!rom_path) rom_path = "/opt/GSM/calypso_dsp.txt";
+        const char *env = getenv("CALYPSO_DSP_ROM");
+        const char *candidates[] = {
+            env,
+            "/opt/GSM/qemu-src/dsp.bin",
+            "/opt/GSM/dsp.bin",
+            "/opt/GSM/calypso_dsp.txt",
+            NULL
+        };
         s->dsp = c54x_init();
         if (s->dsp) {
             c54x_set_api_ram(s->dsp, s->dsp_ram);
-            if (c54x_load_rom(s->dsp, rom_path) == 0) {
-                c54x_reset(s->dsp);
-                calypso_bsp_init(s->dsp);
-                TRX_LOG("C54x DSP loaded from %s", rom_path);
-            } else {
-                TRX_LOG("C54x DSP ROM not found at %s", rom_path);
+            int loaded = 0;
+            for (int i = 0; candidates[i] && !loaded; i++) {
+                if (c54x_load_rom(s->dsp, candidates[i]) == 0) {
+                    c54x_reset(s->dsp);
+                    calypso_bsp_init(s->dsp);
+                    TRX_LOG("C54x DSP loaded from %s", candidates[i]);
+                    loaded = 1;
+                }
+            }
+            if (!loaded) {
+                TRX_LOG("C54x DSP ROM not found in any candidate path");
                 free(s->dsp);
                 s->dsp = NULL;
             }

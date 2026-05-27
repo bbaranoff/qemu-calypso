@@ -9317,17 +9317,118 @@ int c54x_run(C54xState *s, int n_insns)
  * ROM loader
  * ================================================================ */
 
+/* COFF1 (TIC54X) binary parser. Format (cf. include/coff/tic54x.h + ti.h) :
+ *   file header  (22B) : magic(2) nscns(2) timdat(4) symptr(4) nsyms(4)
+ *                        opthdr(2) flags(2) target_id(2)
+ *   section hdr  (40B) : name(8) paddr(4) vaddr(4) size(4) scnptr(4)
+ *                        relptr(4) lnnoptr(4) nreloc(2) nlnno(2) flags(4)
+ *   raw data : `size` LE 16-bit words at file offset `scnptr`
+ *
+ * Mapping vers s->prog / s->data :
+ *   paddr < 0x7000 → data space (regs + DROM/PDROM)
+ *   paddr ≥ 0x7000 → program space (PROM0..PROM3, banked via XPC)
+ * Mirror PROM1 (0x18000-0x1FFFF) onto bank-0 alias 0xE000-0xFF7F pour le
+ * fetch des vecteurs au reset (XPC=0, PC=0xFF80). Identique à la logique
+ * historique du parser texte. */
+static int c54x_load_rom_coff(C54xState *s, FILE *f)
+{
+    uint8_t fh[22];
+    if (fread(fh, 1, 22, f) != 22) {
+        C54_LOG("COFF: short file header");
+        return -1;
+    }
+    uint16_t magic = (uint16_t)(fh[0] | (fh[1] << 8));
+    uint16_t nscns = (uint16_t)(fh[2] | (fh[3] << 8));
+    uint16_t tid   = (uint16_t)(fh[20] | (fh[21] << 8));
+    if (magic != 0x00C1) {
+        C54_LOG("COFF: bad magic 0x%04x (expected 0x00C1)", magic);
+        return -1;
+    }
+    if (tid != 0x0098) {
+        C54_LOG("COFF: target_id 0x%04x not TIC54X (0x0098)", tid);
+        return -1;
+    }
+    if (nscns == 0 || nscns > 64) {
+        C54_LOG("COFF: nscns=%u invalid", nscns);
+        return -1;
+    }
+
+    /* Read all section headers in-order */
+    struct { uint32_t paddr, size, scnptr; char name[9]; } secs[64];
+    for (uint16_t i = 0; i < nscns; i++) {
+        uint8_t sh[40];
+        if (fread(sh, 1, 40, f) != 40) {
+            C54_LOG("COFF: short section header #%u", i);
+            return -1;
+        }
+        memcpy(secs[i].name, sh, 8);
+        secs[i].name[8] = '\0';
+        secs[i].paddr  = (uint32_t)(sh[8]  | (sh[9]<<8)  | (sh[10]<<16) | (sh[11]<<24));
+        secs[i].size   = (uint32_t)(sh[16] | (sh[17]<<8) | (sh[18]<<16) | (sh[19]<<24));
+        secs[i].scnptr = (uint32_t)(sh[20] | (sh[21]<<8) | (sh[22]<<16) | (sh[23]<<24));
+    }
+
+    int total_words = 0;
+    for (uint16_t i = 0; i < nscns; i++) {
+        if (!secs[i].size) continue;
+        if (fseek(f, secs[i].scnptr, SEEK_SET) != 0) {
+            C54_LOG("COFF: seek failed for section %s", secs[i].name);
+            return -1;
+        }
+        for (uint32_t w = 0; w < secs[i].size; w++) {
+            uint8_t wb[2];
+            if (fread(wb, 1, 2, f) != 2) {
+                C54_LOG("COFF: short read at %s+%u", secs[i].name, w);
+                return -1;
+            }
+            uint16_t word = (uint16_t)(wb[0] | (wb[1] << 8));
+            uint32_t addr = secs[i].paddr + w;
+
+            if (addr < 0x7000) {
+                /* data space (regs 0x00-0x5F, DROM, PDROM) */
+                if (addr < C54X_DATA_SIZE) s->data[addr] = word;
+            } else {
+                /* program space, banked via XPC */
+                if (addr < C54X_PROG_SIZE) s->prog[addr] = word;
+                /* Mirror PROM1 (0x18000-0x1FFFF) to 0xE000-0xFF7F for the
+                 * bank-0 vector fetch. 0xFF80-0xFFFF reserved for boot ROM. */
+                if (addr >= 0x18000 && addr < 0x20000) {
+                    uint16_t a16 = (uint16_t)(addr & 0xFFFF);
+                    if (a16 >= 0xE000 && a16 < 0xFF80) {
+                        s->prog[a16] = word;
+                    }
+                }
+            }
+            total_words++;
+        }
+        C54_LOG("COFF: %-8s @0x%05x  %u words  (scnptr=0x%x)",
+                secs[i].name, secs[i].paddr, secs[i].size, secs[i].scnptr);
+    }
+    C54_LOG("Loaded ROM (COFF1): %d words total, %u sections", total_words, nscns);
+    return 0;
+}
+
 int c54x_load_rom(C54xState *s, const char *path)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "rb");
     if (!f) {
         C54_LOG("Cannot open ROM dump: %s", path);
         return -1;
     }
+    /* Auto-detect COFF1 (magic 0x00C1 LE at offset 0) vs legacy text dump */
+    uint8_t mb[2];
+    if (fread(mb, 1, 2, f) == 2 && mb[0] == 0xC1 && mb[1] == 0x00) {
+        rewind(f);
+        int rc = c54x_load_rom_coff(s, f);
+        fclose(f);
+        return rc;
+    }
+    rewind(f);
+    C54_LOG("ROM: parsing as legacy text dump (%s)", path);
 
     char line[1024];
     int section = -1; /* 0=regs, 1=DROM, 2=PDROM, 3-6=PROM0-3 */
-    
+
     int total_words = 0;
 
     while (fgets(line, sizeof(line), f)) {
