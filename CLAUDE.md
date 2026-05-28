@@ -4,6 +4,37 @@
 
 Quand l'user me donne un nouvel ordre, je **continue les taches precedentes en parallele**. Je n'abandonne PAS le contexte courant. Si un fix etait en cours et l'user demande autre chose, je termine le fix ET je traite la nouvelle demande. La file de taches s'enchaine, elle ne se reset pas.
 
+## ⚠️ RUNS NON-DÉTERMINISTES — RÈGLE INVARIANTE
+
+**Le runtime QEMU+stack est non-déterministe**. Démontré 2026-05-28 par 3 runs
+manuels du même binaire produisant 3 signatures complètement différentes :
+- `d_fb_det LATCH-CONSUME` varie (87× 0x1ef8 / 96× 0x1255 / 0 / 27× 0x0c4a / ...)
+- `BURST-IN` count varie (10..600+)
+- `SOFT-RESET-TRIG` count varie (6, 60, 26)
+- Hot poll cells varient (0x2e80 vs 0xFFEx vs ailleurs)
+- Mêmes `a_pm` valeurs jamais reproduites entre runs
+
+**Cause** : pipeline real-time, BSP recvfrom socket UDP wall-clock-paced, drain
+timer virtual mais supply async. Tout cascade.
+
+**RÈGLE pour Code dans cette session ET futures** :
+- **JAMAIS conclure d'un seul run** qu'un fix a marché ou échoué.
+- Une signature observée dans 1 run = un *tirage* parmi la distribution possible.
+- Pour valider un fix : observer un **invariant structurel** (= ce qui se passe
+  dans CHAQUE run même si les valeurs précises varient). Exemples d'invariants
+  valides :
+  - Existence d'un type d'event qui n'existait pas (BRINT0 fire avant/après)
+  - Disparition d'un hot poll dominant (0x16b3 polling stopped post-BRINT0 fix)
+  - Type de routine atteint (PC=0xda79 real publisher vs stale-AR 0x821a)
+- Pour confirmer un blocage : 2-3 runs same-binary, vérifier que le pattern
+  RESTE même si les valeurs précises varient.
+- Si une seule run est interprétée → préciser à l'user "cette observation
+  vient d'1 run, peut varier au prochain".
+
+**Anti-pattern à éviter** : dire "telle valeur prouve telle chose" ou
+"ce fix a marché" sur la base d'1 run. Ce qu'il faut dire : "cette valeur
+observée dans 1 run suggère X ; à confirmer cross-run".
+
 ## Dual-agent setup
 
 L'user travaille en parallèle avec **Claude Code** (ici, accès fichiers/git/build)

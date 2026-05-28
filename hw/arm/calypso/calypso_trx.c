@@ -108,41 +108,6 @@ static CalypsoTRX *g_trx;
 static CalypsoFbsb g_fbsb;
 static bool        g_fbsb_inited;
 
-/* W1C latches for FB-detection result snapshot.
- * Set by c54x data_write when DSP writes a_sync_SNR (LAST cell of
- * fb-det iteration sequence) from a real fb-det PC. Snapshot captures
- * d_fb_det/d_fb_mode/a_sync_demod[*] coherent for the iteration.
- * Consumed by ARM read; survives DSP-side clears and stack-stomp at
- * PC=0x0662. Order in DSP firmware:
- *   d_fb_det → d_fb_mode → a_sync_TOA → PM → ANG → SNR (insn N..N+150)
- * Snapshot at SNR ensures all values are this-iter values. */
-uint16_t g_d_fb_det_latch;
-uint16_t g_d_fb_mode_latch;
-uint16_t g_a_sync_TOA_latch;
-uint16_t g_a_sync_PM_latch;
-uint16_t g_a_sync_ANG_latch;
-uint16_t g_a_sync_SNR_latch;
-bool     g_a_sync_valid;
-
-/* CALYPSO_W1C_LATCH=1 enables the W1C latch system : DSP writes at the
- * a_sync_demod iteration end (PCs 0x8d33/0x8eb9/0x8f51) snapshot all 6
- * cells, ARM reads consume them. Mitigates a race window where DSP sets
- * d_fb_mode then clears within a tight loop, and ARM polls between.
- * Default 0 = ARM reads NDB directly. Read once at first call, cached. */
-int calypso_w1c_latch_enabled(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("CALYPSO_W1C_LATCH");
-        cached = (e && *e == '1') ? 1 : 0;
-        fprintf(stderr,
-                "[calypso-trx] CALYPSO_W1C_LATCH=%d (%s)\n",
-                cached, cached ? "latch on a_sync_SNR snapshot, consume on ARM read"
-                               : "ARM reads NDB direct");
-    }
-    return cached;
-}
-
 /* All firmware patches removed — verified that the layer1.highram.elf
  * runs unmodified against the current QEMU emulation (PM scan, FBSB,
  * RESET cycle stable for >1 minute with NO patches applied).
@@ -221,37 +186,6 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
             val = DSP_DL_STATUS_BOOT;
         }
     }
-    /* W1C latch consume — snapshot at fb-det iteration end (a_sync_SNR
-     * write by real fb-det PC).
-     * d_fb_det read consumes the latch (ARM acks detection); a_sync_*
-     * remain valid for the subsequent burst-read until next snapshot
-     * overwrites them. */
-    if (calypso_w1c_latch_enabled() &&
-        offset == 0x01F0 && size == 2 && g_a_sync_valid &&
-        g_d_fb_det_latch != 0) {
-        uint16_t v = g_d_fb_det_latch;
-        g_d_fb_det_latch = 0;
-        TRX_LOG("ARM RD d_fb_det LATCH-CONSUME = 0x%04x (cleared) fn=%u",
-                v, s->fn);
-        return v;
-    }
-    if (calypso_w1c_latch_enabled() && g_a_sync_valid && size == 2) {
-        uint16_t v = 0;
-        const char *name = NULL;
-        switch (offset) {
-        case 0x01F2: v = g_d_fb_mode_latch;  name = "d_fb_mode";  break;
-        case 0x01F4: v = g_a_sync_TOA_latch; name = "a_sync_TOA"; break;
-        case 0x01F6: v = g_a_sync_PM_latch;  name = "a_sync_PM";  break;
-        case 0x01F8: v = g_a_sync_ANG_latch; name = "a_sync_ANG"; break;
-        case 0x01FA: v = g_a_sync_SNR_latch; name = "a_sync_SNR"; break;
-        }
-        if (name) {
-            TRX_LOG("ARM RD %s LATCH = 0x%04x (s=%d) fn=%u",
-                    name, v, (int)(int16_t)v, s->fn);
-            return v;
-        }
-    }
-
     /* ARM-read trace on d_fb_det / d_fb_mode / a_sync_demod cells:
      *   0x01F0 = d_fb_det        (DSP word 0x08F8)
      *   0x01F2 = d_fb_mode       (DSP word 0x08F9)
@@ -484,15 +418,9 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             }
 
             /* FBSB orchestration hook: ARM has just written d_task_md.
-             * Initialise on first call, then dispatch to the host-side
-             * state machine which publishes synthetic FB/SB results
-             * into NDB so ARM can progress past l1s_fbdet_resp. */
+             * Initialise on first call, then log task changes (no host-
+             * side synthesis remaining as of 2026-05-28 cleanup). */
             if (!g_fbsb_inited) {
-                /* 2026-05-15 fix : pointer le synth sur s->dsp->data[] qui
-                 * est désormais la source de vérité pour ARM reads (cf fix
-                 * DSP→ARM mirror dans calypso_dsp_read). Sinon le synth écrit
-                 * dans s->dsp_ram[] (ARM-side legacy array) qu'ARM ne lit
-                 * plus → publish_fb_found/sb_found invisibles à firmware. */
                 uint16_t *ndb_target = (s->dsp && s->dsp->data)
                                        ? &s->dsp->data[0x0800]
                                        : s->dsp_ram;
@@ -800,13 +728,6 @@ static void calypso_tdma_tick(void *opaque) {
     tdma_ticks++;
     int dsp_n_exec_2 = 0, dsp_n_exec_5 = 0; /* updated by c54x_run calls */
 
-    /* FBSB host-side state machine frame tick. Detects DSP-side
-     * d_fb_det transitions (real correlator finds burst) and pushes
-     * the state machine FB0_SEARCH → FB0_FOUND so ARM L1 progresses. */
-    if (g_fbsb_inited) {
-        calypso_fbsb_on_frame_tick(&g_fbsb, (uint64_t)s->fn);
-    }
-
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
     if (s->clk_fd >= 0) {
         uint8_t pkt[4];
@@ -1039,26 +960,60 @@ static void calypso_tdma_tick(void *opaque) {
      * sont perdues mais le timer ne dérive pas et le main loop n'est pas saturé
      * par des back-to-back catch-up. */
     {
-        /* Use the same clock as tdma_timer for the rearm computation,
-         * else we'd schedule REALTIME targets from VIRTUAL anchors. */
+        /* === Monotonic timer (drift-free rearm) 2026-05-28 ===
+         *
+         * Previous code used `entry_t_clk + GSM_TDMA_NS` as the next target.
+         * entry_t_clk = wall time when the handler was actually dispatched,
+         * which already includes any BQL/IRQ/work latency from the previous
+         * fire. Therefore target absorbed that latency : on every late
+         * dispatch (~200µs typical at 217 ticks/s), the next deadline
+         * drifted by +200µs. After 1 wall second : ~45ms accumulated drift.
+         * BTS measured 207 FN/sec wall vs expected 217 FN/sec — exactly
+         * the 4.6% gap.
+         *
+         * Fix : anchor target on `last_target + GSM_TDMA_NS` (the IDEAL
+         * deadline of the previous tick), not on `now`. Drift no longer
+         * accumulates. If a deadline is already in the past at wake-up
+         * (handler took >4.615ms), skip frames to stay on the absolute
+         * TDMA grid and advance FN to match (mimics silicon : late frames
+         * are *lost*, not retransmitted, but the timeline never lags).
+         *
+         * Activé seulement quand CALYPSO_TDMA_REALTIME=1 (= REALTIME clock).
+         * En mode VIRTUAL legacy, virtual time advance is already lockstep
+         * with guest cycles → drift par construction.
+         */
         QEMUClockType tclk = calypso_tdma_clock();
-        int64_t entry_t_clk = (tclk == QEMU_CLOCK_REALTIME) ?
-                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) :
-                              entry_t;
-        int64_t target = entry_t_clk + GSM_TDMA_NS;
         int64_t now = qemu_clock_get_ns(tclk);
+        static int64_t last_target = 0;
+        if (last_target == 0) {
+            /* First tick: seed last_target from entry time so initial
+             * scheduling is normal-paced. */
+            last_target = (tclk == QEMU_CLOCK_REALTIME)
+                          ? now
+                          : entry_t;
+        }
+        int64_t target = last_target + GSM_TDMA_NS;
         int skipped = 0;
         while (target <= now) {
             target += GSM_TDMA_NS;
             skipped++;
         }
+        last_target = target;
+
+        /* FN catchup : advance FN by `skipped` extra frames so the FN
+         * timeline matches wall progress. The +1 was already done at
+         * entry (s->fn = (s->fn+1) % HYPERFRAME). */
+        if (skipped > 0) {
+            s->fn = (s->fn + skipped) % GSM_HYPERFRAME;
+        }
 
         {
             static int rearm_log_count = 0;
             if (rearm_log_count < 50) {
-                fprintf(stderr, "[rearm-fix] entry_t=%" PRId64 " target=%" PRId64
-                        " now=%" PRId64 " gap_to_now=%" PRId64 " skipped=%d\n",
-                        entry_t, target, now, target - now, skipped);
+                fprintf(stderr, "[rearm-fix] last_target=%" PRId64 " target=%" PRId64
+                        " now=%" PRId64 " gap_to_now=%" PRId64 " skipped=%d fn=%u\n",
+                        last_target - (int64_t)GSM_TDMA_NS, target, now,
+                        target - now, skipped, s->fn);
                 rearm_log_count++;
             }
         }
@@ -1069,15 +1024,7 @@ static void calypso_tdma_tick(void *opaque) {
         }
 
         if (s->tdma_running) {
-            /* Gate re-arm : si pcb tick thread actif, c'est lui qui ticke. */
-            static int pcb_threaded = -1;
-            if (pcb_threaded < 0) {
-                const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
-                pcb_threaded = (e && e[0] == '1') ? 1 : 0;
-            }
-            if (!pcb_threaded) {
-                timer_mod_ns(s->tdma_timer, target);
-            }
+            timer_mod_ns(s->tdma_timer, target);
         }
     }
 
@@ -1130,17 +1077,8 @@ static void calypso_tdma_start(CalypsoTRX *s)
     s->tdma_running = true;
     s->fn = 0;
     TRX_LOG("TDMA started");
-    {
-        static int pcb_threaded = -1;
-        if (pcb_threaded < 0) {
-            const char *e = getenv("CALYPSO_PCB_TICK_THREADS");
-            pcb_threaded = (e && e[0] == '1') ? 1 : 0;
-        }
-        if (!pcb_threaded) {
-            timer_mod_ns(s->tdma_timer,
-                         qemu_clock_get_ns(calypso_tdma_clock()) + GSM_TDMA_NS);
-        }
-    }
+    timer_mod_ns(s->tdma_timer,
+                 qemu_clock_get_ns(calypso_tdma_clock()) + GSM_TDMA_NS);
 }
 
 /* ---- kick ----

@@ -80,14 +80,15 @@
 #define NDB_D_FB_DET        0x48
 #define NDB_D_FB_MODE       0x4A
 #define NDB_A_SYNC_DEMOD    0x4C   /* [4] words */
-#define NDB_A_CD            0x1FC  /* a_cd[15] : CCCH demod result.
-                                       EMPIRIQUE 2026-05-26 night : valide via HMP stop +
-                                       GDB read + analyse DATA_IND mobile.
-                                       fire_crc=0x02 + biterr=0xFF match NDB+0x1FC content
-                                       (= bytes 0x40 0x00 0x8F 0xF4 0xF8 0x82 ...).
-                                       DWARF disait 0x1DC mais c'est une autre struct variant
-                                       (DSP=34/36 unused). CLAUDE.md disait 0x1F8 — proche
-                                       mais off by 4. La firmware ARM lit a_cd[3] a NDB+0x202. */
+#define NDB_A_CD            0x1DC  /* a_cd[15] : CCCH demod result.
+                                       FIX 2026-05-28 : 0x1FC → 0x1DC.
+                                       Validated end-to-end via DSP L1 stub (scripts/
+                                       make_dsp_bin_L1.py) : stub écrit SI3 LAPDm bytes
+                                       à NDB+0x1DC, mobile firmware decode et accepte les SI.
+                                       Confirme DWARF 2026-05-26 (CLAUDE.md). L'empirique
+                                       précédent à 0x1FC observait probablement un autre
+                                       struct variant (a_cd doublé ou aliasé), pas le slot
+                                       que la firmware ARM lit réellement. */
 #define NDB_A_SCH26         0x54   /* [5] words */
 
 /* ---- l1_environment.h constants ---- */

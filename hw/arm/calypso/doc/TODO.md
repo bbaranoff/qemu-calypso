@@ -30,3 +30,10 @@ post-merge #17 "removing_hacks"). Autorisation explicite utilisateur.
    `a_sync_demod[*]` sont **nonzero** (= mesure de puissance réelle publiée)
 3. Vérifier que mobile L1 `PM MEAS` retourne un dBm réaliste (pas -138 floor)
 4. Retirer `bsp.bypass_bdlena` + tout son code de garde
+
+## CALYPSO_FORCE_ANGLE_ZERO — RETIRÉ 2026-05-28
+
+Remplacé par le modèle TWL3025 chip qui fait le vrai taf (DAC →
+phase rotation des samples BSP RX, sans env gate, armé par défaut).
+Firmware ferme la boucle AFC normalement comme sur silicon, plus de
+court-circuit. Cf. `hw/arm/calypso/calypso_twl3025.c`.

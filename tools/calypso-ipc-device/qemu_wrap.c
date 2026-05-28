@@ -479,13 +479,56 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         zeros_init = true;
     }
 
-    /* ---- WALL-PACED UL heartbeat (cf. calypso-ipc-device historical design) ----
-     * osmo-trx-ipc has internal wall-clock TX deadlines. Pacing the UL
-     * stream on QEMU's icount-slow qfn (~16 fn/s) starves it → crash.
-     * Strategy : UL stream stays at wall-clock rate (osmo-trx happy), and
-     * the DL→BSP path uses FN-rewrite in qemu_wrap_write to tag bursts with
-     * the live g_qemu_qfn so they fall in the BSP match window.
-     * 625 samples × 1/270833 ≈ 2.31 ms. usleep 2300 µs ≈ near real-time. */
+    /* ---- QFN-PACED UL heartbeat (2026-05-28 fix anti-drift BTS) ----
+     *
+     * Ancien design : `usleep(2300)` → wall-paced à ~2.3ms, mais usleep
+     * délivre 2.4ms en moyenne sous charge → rate ~260k samples/sec wall
+     * au lieu de 270833 attendu → osmo-trx voit ts advancer ~4% slow →
+     * BTS reçoit CLK_IND à ~208 FN/sec wall au lieu de 217 → mobile
+     * perd FCCH lock après quelques secondes.
+     *
+     * Nouveau design : ancré sur les qfn ticks que QEMU envoie via UDP
+     * 6700 (g_qemu_qfn). 1 qfn = 1 GSM frame = 1250 samples = 2 chunks
+     * de 625. Donc chaque appel uhdwrap_read attend que qfn ait avancé
+     * d'au moins 0.5 frame depuis le dernier appel. Drift-free :
+     * osmo-trx tracking sample timeline = QEMU FN timeline exactement.
+     *
+     * Le commentaire historique "qfn pacing would starve osmo-trx" était
+     * vrai quand QEMU tournait à 16 fn/s (icount-slow). Avec le fix
+     * monotonic REALTIME dans calypso_trx.c::calypso_tdma_tick, QEMU
+     * envoie 216.7 fn/sec wall = exactement la cadence GSM. Donc qfn
+     * pacing = wall pacing exact, mais traçable à la source. */
+    extern volatile uint32_t g_qemu_qfn;
+    extern volatile int      g_qfn_seen;
+
+    static uint64_t call_count = 0;
+    static uint32_t qfn_baseline = 0;
+    static bool     baseline_set = false;
+
+    /* Attendre la première tick QEMU avant de commencer le pacing. */
+    if (g_qfn_seen) {
+        if (!baseline_set) {
+            qfn_baseline = __atomic_load_n(&g_qemu_qfn, __ATOMIC_ACQUIRE);
+            baseline_set = true;
+            call_count = 0;
+        }
+        /* 1 qfn tick = 2 calls (= 2 chunks de 625 samples = 1250 = 1 frame).
+         * Donc call_count / 2 = nombre de qfn attendus depuis baseline. */
+        uint32_t expected_qfn_advance = (uint32_t)(call_count / 2);
+        uint32_t target_qfn = qfn_baseline + expected_qfn_advance;
+        /* Spin-wait with brief sleep — qfn comes via UDP recv loop at
+         * 4.6 ms cadence, max wait ~4.6ms. */
+        for (int spin = 0; spin < 100; spin++) {
+            uint32_t cur = __atomic_load_n(&g_qemu_qfn, __ATOMIC_ACQUIRE);
+            if (cur >= target_qfn) break;
+            usleep(100);
+        }
+    } else {
+        /* Pre-qfn-seen : fall back to wall pacing so osmo-trx-ipc startup
+         * sees a moving clock and can complete its open_cnf handshake. */
+        usleep(2300);
+    }
+
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {
         if (!ios_rx_from_device[c]) continue;
         int32_t rc = ipc_shm_enqueue(ios_rx_from_device[c],
@@ -501,7 +544,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         }
     }
     d->rx_ts += CALYPSO_SHM_BUFSIZE;
-    usleep(2300);
+    call_count++;
 
     return CALYPSO_SHM_BUFSIZE;
 }

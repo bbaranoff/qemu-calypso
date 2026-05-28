@@ -13,19 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* W1C latches for FB-detection iteration snapshot — defined in
- * calypso_trx.c. Set here in data_write when DSP writes a_sync_SNR
- * (LAST cell of fb-det sequence) from a real fb-det PC. Snapshot
- * captures all 6 cells coherent. Consumed by ARM read. */
-extern uint16_t g_d_fb_det_latch;
-extern uint16_t g_d_fb_mode_latch;
-extern int calypso_w1c_latch_enabled(void);
-extern uint16_t g_a_sync_TOA_latch;
-extern uint16_t g_a_sync_PM_latch;
-extern uint16_t g_a_sync_ANG_latch;
-extern uint16_t g_a_sync_SNR_latch;
-extern bool     g_a_sync_valid;
-
 static int g_boot_trace = 0;
 
 #define C54_LOG(fmt, ...) \
@@ -2067,6 +2054,42 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
+    /* === SYNC-DEMOD-WR probe (2026-05-28) ===
+     * Trace writes to a_sync_demod cells [0x08FA..0x08FD] (= TOA/PM/ANGLE/SNR
+     * per NDB layout, indices D_TOA=0 D_PM=1 D_ANGLE=2 D_SNR=3).
+     * Filter OUT les PCs stale-AR connus (0x821a 0x8213 0x8217) qui sont
+     * juste du AR4-walk garbage. Le but est de capturer le VRAI publisher
+     * (= la routine FB-det code DSP qui calcule les vraies valeurs). Si
+     * apres tout le run on ne voit que les 3 PCs garbage → le vrai code
+     * n'est jamais atteint. Cap 200 entries. */
+    if (addr >= 0x08FA && addr <= 0x08FD) {
+        if (s->pc != 0x821a && s->pc != 0x8213 && s->pc != 0x8217) {
+            static unsigned sd_log;
+            const unsigned LIMIT = 200;
+            if (sd_log < LIMIT) {
+                const char *name = (addr == 0x08FA) ? "TOA"
+                                 : (addr == 0x08FB) ? "PM"
+                                 : (addr == 0x08FC) ? "ANGLE"
+                                 : "SNR";
+                fprintf(stderr,
+                        "[c54x] SYNC-DEMOD-WR #%u %s[0x%04x] <- 0x%04x "
+                        "(was 0x%04x) PC=0x%04x op=0x%04x "
+                        "A=0x%010llx B=0x%010llx "
+                        "AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                        sd_log, name, addr, val, s->data[addr],
+                        s->pc, s->prog[s->pc],
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                        (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                        s->ar[2], s->ar[3], s->ar[4], s->ar[5],
+                        s->insn_count);
+                sd_log++;
+                if (sd_log == LIMIT)
+                    fprintf(stderr,
+                            "[c54x] SYNC-DEMOD-WR log capped at %u\n", LIMIT);
+            }
+        }
+    }
+
     /* === FB-DET-WR probe (2026-05-28) ===
      * Trace specifically writes to d_fb_det (DSP word 0x08F8) by PC.
      * Run post-option-A shows d_fb_det stuck at 0x1255 (96×), no varied
@@ -2790,104 +2813,10 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
          *   (α) never written → "FB confirmed" code path unreached
          *   (β) written =0 explicitly → DSP scans, never matches threshold
          *   (γ) written !=0 but ARM reads 0 → coherence bug */
-        /* W1C latch on d_fb_mode for real fb-det PCs.
-         * Race-window evidence (200M run, 2026-04-29) :
-         *   DSP writes d_fb_mode = 0x0001 30× from PC=0x8d33/0x8f51
-         *   ARM reads d_fb_mode 1× and sees 0x0000
-         * → DSP sets, then clears within tight loop, ARM polls between
-         *   → 100% of detections lost.
-         * Latch: real-fb-det PC with non-zero val sets g_d_fb_mode_latch.
-         * ARM read in calypso_trx.c::calypso_dsp_read consumes & clears. */
-        /* Snapshot trigger: DSP writes a_sync_SNR (0x08FD, LAST cell of
-         * fb-det iteration) from a real fb-det PC. At this moment all 6
-         * cells (d_fb_det, d_fb_mode, a_sync_TOA/PM/ANG/SNR) are coherent
-         * for the just-completed iteration. Snapshot atomically; survives
-         * subsequent stack-stomp at PC=0x0662 etc.
-         * Order observed: d_fb_det → d_fb_mode → a_sync_TOA → PM → ANG
-         * → SNR (insn N..N+150). */
-        if (calypso_w1c_latch_enabled() &&
-            addr == 0x08FD && val != 0 &&
-            (s->pc == 0x8d33 || s->pc == 0x8eb9 || s->pc == 0x8f51)) {
-            g_d_fb_det_latch   = s->data[0x08F8];
-            g_d_fb_mode_latch  = s->data[0x08F9];
-            g_a_sync_TOA_latch = s->data[0x08FA];
-            g_a_sync_PM_latch  = s->data[0x08FB];
-            g_a_sync_ANG_latch = s->data[0x08FC];
-            g_a_sync_SNR_latch = val;
-            g_a_sync_valid     = true;
-        }
-
-        /* === Direct d_fb_det + a_sync_demod latch trigger (2026-05-23) ===
-         *
-         * Phase 1 (initial fix) : direct latch sur d_fb_det. ARM consume
-         * empirique confirmé (LATCH-CONSUME = 0x001e fn=164). Mais FBSB
-         * RESP result=255 (fail) parce que d_fb_mode + a_sync_TOA/PM/ANG/SNR
-         * tous lus à 0 — pcap : "FBSB RESP: result=255".
-         *
-         * Phase 2 (extension this commit) : latch chaque cellule individu-
-         * ellement quand DSP write avec val != 0, any PC. Le clobber 0x821a
-         * (val=0) ne fire pas. Chaque cellule a son propre lifecycle
-         * indépendant : DSP write → latch, ARM read → consume & clear.
-         *
-         * Cellules couvertes :
-         *   0x08F8 d_fb_det     (FB detection magic value)
-         *   0x08F9 d_fb_mode    (FB detection mode, BSIC etc.)
-         *   0x08FA a_sync_TOA   (Time of Arrival)
-         *   0x08FB a_sync_PM    (Power Measurement)
-         *   0x08FC a_sync_ANG   (Angle/phase)
-         *   0x08FD a_sync_SNR   (Signal-to-Noise Ratio)
-         *
-         * Pour SB sync à converger, firmware lit les 6 cellules en
-         * séquence. Toutes doivent être valides post-FB-det iteration. */
-        if (calypso_w1c_latch_enabled() && val != 0) {
-            switch (addr) {
-            case 0x08F8: g_d_fb_det_latch   = val; g_a_sync_valid = true; break;
-            case 0x08F9: g_d_fb_mode_latch  = val; g_a_sync_valid = true; break;
-            case 0x08FA: g_a_sync_TOA_latch = val; g_a_sync_valid = true; break;
-            case 0x08FB: g_a_sync_PM_latch  = val; g_a_sync_valid = true; break;
-            case 0x08FC: g_a_sync_ANG_latch = val; g_a_sync_valid = true; break;
-            case 0x08FD: g_a_sync_SNR_latch = val; g_a_sync_valid = true; break;
-            }
-        }
-
-        /* === Phase 3 atomic snapshot (2026-05-23) ===
-         *
-         * Phase 2 latch chaque cellule indépendamment, mais empiriquement
-         * (pcap : FBSB RESP result=255 + firmware "TOA=0, Power=-138dBm"),
-         * le DSP au PC=0x778a écrit 4 cellules sur 6 — TOA et PM restent
-         * non-écrites (= cached old values, probablement 0).
-         *
-         * Le firmware lit TOA=0 + PM=0 → noise floor → FB jugé invalide.
-         *
-         * Phase 3 mimique le SNR-based trigger original : quand a_sync_SNR
-         * (dernière cellule de la séquence DSP fb-det) fire non-zero, snap-
-         * shot atomique des 6 cellules depuis s->data[] — même si TOA/PM
-         * y sont à 0 (capture l'état réel post-iteration DSP). Ça remplit
-         * tous les latches avec ce que DSP a effectivement écrit (et 0
-         * pour ce qui n'a pas été touché), donc firmware lit ces 0 mais
-         * AU MOINS les cellules qui ONT été écrites en Phase 2 sont
-         * préservées dans les latches individuels (l'OR des deux gates). */
-        if (calypso_w1c_latch_enabled() && addr == 0x08FD && val != 0) {
-            /* Atomic snapshot all 6 cells - PHASE 3 ANY PC trigger.
-             * Capture l'état DSP au moment où SNR (last cell) est écrit.
-             * Si DSP path incomplet (TOA/PM = 0 dans s->data), le latch
-             * capture quand même les zeros — le vrai fix est upstream
-             * (timer management / cascade), pas une synthesis ici. */
-            if (g_d_fb_det_latch   == 0) g_d_fb_det_latch   = s->data[0x08F8];
-            if (g_d_fb_mode_latch  == 0) g_d_fb_mode_latch  = s->data[0x08F9];
-            if (g_a_sync_TOA_latch == 0) g_a_sync_TOA_latch = s->data[0x08FA];
-            if (g_a_sync_PM_latch  == 0) g_a_sync_PM_latch  = s->data[0x08FB];
-            if (g_a_sync_ANG_latch == 0) g_a_sync_ANG_latch = s->data[0x08FC];
-            g_a_sync_SNR_latch = val;
-            g_a_sync_valid     = true;
-        }
-        /* Phase 3.5/3.6 RETIRÉES 2026-05-23 — étaient des synth hacks
-         * (PM=0x280 si nul, SNR=0x64 si bit haut). User redirection :
-         * "pas de hack, c'est la gestion du temps" — le vrai problème
-         * est timer/IRQ management côté DSP (IMR=0 → INT3 jamais
-         * servicé → DSP ne tourne pas ses tâches schedulées → FB-det
-         * incomplet, ALLC jamais firé, pas de SI). Fix upstream pas
-         * downstream. */
+        /* W1C latch system removed 2026-05-28 (FBSB host-side synth purge).
+         * The only env-gated override on the a_sync_demod read path is now
+         * CALYPSO_FORCE_ANGLE_ZERO (calypso_trx.c). DSP writes pass
+         * straight through to s->data[] and ARM reads them direct. */
         /* Full a_sync_demod + d_fb_mode WR watch — every cell, no PC
          * filter (so we catch real-fb-det writes AND stomp candidates).
          * Stomp zone PC=0x06xx tagged for easy grep. */

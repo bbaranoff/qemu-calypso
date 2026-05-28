@@ -109,18 +109,6 @@ void calypso_fbsb_reset(CalypsoFbsb *s);
 /* Hooks. */
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn);
-void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn);
-
-/* Direct write helpers (used by the orchestration to publish results
- * into NDB so the ARM firmware sees them). */
-void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
-                                   int16_t toa, uint16_t pm,
-                                   int16_t angle, uint16_t snr);
-void calypso_fbsb_clear_fb(CalypsoFbsb *s);
-
-/* SB synthesis: writes a_sch[0..4] in BOTH db_r pages so l1s_sbdet_resp
- * sees CRC=OK + a decodable sync burst regardless of d_dsp_page state. */
-void calypso_fbsb_publish_sb_found(CalypsoFbsb *s, uint8_t bsic);
 
 /* Trace helper — single-line dump of current state. */
 void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag);

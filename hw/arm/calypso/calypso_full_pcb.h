@@ -52,47 +52,19 @@ extern QemuMutex calypso_pcb_sim_lock;      /* SIM controller it/fifo */
 extern QemuMutex calypso_pcb_bsp_q_lock;    /* BSP UDP queue */
 extern QemuMutex calypso_pcb_tpu_lock;      /* TPU registers + scenarios */
 
-/* === Thread state (one per autonomous chip/unit) ======================== */
-typedef enum {
-    CALYPSO_THREAD_DSP = 0,
-    CALYPSO_THREAD_BSP,
-    CALYPSO_THREAD_TPU,
-    CALYPSO_THREAD_SIM,
-    CALYPSO_THREAD_IOTA,
-    CALYPSO_THREAD_MAX
-} CalypsoThreadId;
-
 typedef struct CalypsoPcb CalypsoPcb;
 
 /* === API publique ======================================================== */
 
-/* Initialize PCB orchestrator: locks, thread state, IRQ routing table.
+/* Initialize PCB orchestrator: locks + IRQ routing table.
  * Called once during SoC init (from calypso_soc.c). */
 CalypsoPcb *calypso_pcb_init(qemu_irq *inth_inputs);
 
-/* Spawn threads per the threading plan. Gated by env CALYPSO_PCB_THREADS=1
- * (default OFF — legacy single-thread behavior).
- *
- * Si OFF : tous les composants restent dans le main TCG thread (existant).
- * Si ON  : chaque composant tourne dans son QemuThread, sync via locks +
- *          qemu_set_irq atomic.
- *
- * Phase rollout par env (selon THREADING_TODO.md) :
- *   CALYPSO_PCB_THREAD_SIM=1   → spawn sim_thread
- *   CALYPSO_PCB_THREAD_BSP=1   → spawn bsp_thread
- *   CALYPSO_PCB_THREAD_DSP=1   → spawn dsp_thread
- *   CALYPSO_PCB_THREAD_TPU=1   → spawn tpu_thread
- *   CALYPSO_PCB_THREAD_IOTA=1  → spawn iota_thread
- *   CALYPSO_PCB_THREADS=1      → tout activer
- */
+/* No-op stubs kept for API compat with calypso_soc.c. */
 void calypso_pcb_start_threads(CalypsoPcb *pcb);
-
-/* Stop all threads cleanly (joins). Called at SoC shutdown. */
 void calypso_pcb_stop_threads(CalypsoPcb *pcb);
 
-/* IRQ helper : raise a Calypso IRQ from any thread.
- * Thread-safe (qemu_set_irq is atomic). Wrapper pour traçabilité +
- * logging optionnel. */
+/* IRQ helper : raise/lower a Calypso IRQ. Thread-safe. */
 void calypso_pcb_raise_irq(CalypsoPcb *pcb, int irq_nr);
 void calypso_pcb_lower_irq(CalypsoPcb *pcb, int irq_nr);
 
@@ -100,18 +72,8 @@ void calypso_pcb_lower_irq(CalypsoPcb *pcb, int irq_nr);
  * Pour les sites de log haute fréquence (UART IER, tdma tick, etc.) qui
  * fire depuis ARM TCG main thread. fprintf inline bloque le TCG (stdio
  * lock + write syscall). Cette queue les défère vers un drain thread
- * dédié — TCG juste enqueue (mutex bref) et continue.
- *
- * Toujours dispo (init dans calypso_pcb_init, indépendant des thread flags). */
+ * dédié — TCG juste enqueue (mutex bref) et continue. */
 void calypso_async_log(const char *fmt, ...) __attribute__((format(printf,1,2)));
-
-/* Thread entry points — implémentés ailleurs, déclarés ici pour le
- * orchestrateur qui les spawn. Chacun prend `CalypsoPcb *` en arg. */
-void *calypso_pcb_dsp_thread(void *arg);
-void *calypso_pcb_bsp_thread(void *arg);
-void *calypso_pcb_tpu_thread(void *arg);
-void *calypso_pcb_sim_thread(void *arg);
-void *calypso_pcb_iota_thread(void *arg);
 
 /* === DARAM access helpers (cross-thread safety) =========================
  *
