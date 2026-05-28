@@ -2,7 +2,7 @@
 # Read DSP ROM word at a given address from the dump file
 # Usage: dsp_read.sh <section> <addr_hex>
 # Sections: regs, drom, pdrom, prom0, prom1, prom2, prom3
-DUMP="${CALYPSO_DSP_ROM:-/opt/GSM/calypso_dsp.txt}"
+DUMP="${CALYPSO_DSP_ROM_TXT:-/opt/GSM/calypso_dsp.txt}"
 SECTION="${1:-prom0}"
 ADDR="$2"
 

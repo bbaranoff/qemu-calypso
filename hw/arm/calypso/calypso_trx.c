@@ -8,6 +8,7 @@
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "sysemu/runstate.h"          /* runstate_is_running() — gate DSP tick on ARM halt */
 #include "exec/address-spaces.h"
 #include "hw/irq.h"
 #include "hw/arm/calypso/calypso_trx.h"
@@ -714,8 +715,39 @@ static void calypso_frame_irq_lower(void *o){
     calypso_dsp_shunt_on_frame_tick();
 }
 
+/* CALYPSO_TDMA_REALTIME=1 : pin tdma_timer to QEMU_CLOCK_REALTIME so
+ * the 4.6 ms GSM frame cadence is wall-clock, independent of guest
+ * cycle rate. Fixes L23 sync timeouts under icount=auto (tdma_tick
+ * was firing at ~17 Hz instead of 217 Hz when virtual time lagged).
+ * Default unset = VIRTUAL clock (legacy behaviour). Decision made
+ * once at first tick and cached. */
+static QEMUClockType calypso_tdma_clock(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_TDMA_REALTIME");
+        cached = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr, "[calypso-trx] tdma_timer clock = %s\n",
+                cached ? "REALTIME (wall-clock 217 Hz)" : "VIRTUAL (legacy)");
+    }
+    return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
+}
+
 static void calypso_tdma_tick(void *opaque) {
     CalypsoTRX *s = opaque;
+
+    /* Halt-sync : if the ARM CPU is paused (GDB stop, monitor stop),
+     * also pause DSP ticking. Otherwise tdma_timer (REALTIME) keeps
+     * firing, c54x_run keeps advancing the DSP, qemu.log keeps growing
+     * — making GDB inspection useless because the system state drifts
+     * under the breakpoint. Re-arm timer so we resume cleanly. */
+    if (!runstate_is_running()) {
+        if (s->tdma_running) {
+            timer_mod_ns(s->tdma_timer,
+                         qemu_clock_get_ns(calypso_tdma_clock()) + GSM_TDMA_NS);
+        }
+        return;
+    }
+
     int64_t entry_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t_clk = 0, t_uart = 0, t_dspboot = 0, t_dspirq = 0,
             t_bsp = 0, t_ul = 0;
@@ -727,6 +759,13 @@ static void calypso_tdma_tick(void *opaque) {
     static uint64_t dsp_insn_total = 0;
     tdma_ticks++;
     int dsp_n_exec_2 = 0, dsp_n_exec_5 = 0; /* updated by c54x_run calls */
+
+    /* FBSB host-side state machine frame tick. Detects DSP-side
+     * d_fb_det transitions (real correlator finds burst) and pushes
+     * the state machine FB0_SEARCH → FB0_FOUND so ARM L1 progresses. */
+    if (g_fbsb_inited) {
+        calypso_fbsb_on_frame_tick(&g_fbsb, (uint64_t)s->fn);
+    }
 
     /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
     if (s->clk_fd >= 0) {
@@ -960,8 +999,14 @@ static void calypso_tdma_tick(void *opaque) {
      * sont perdues mais le timer ne dérive pas et le main loop n'est pas saturé
      * par des back-to-back catch-up. */
     {
-        int64_t target = entry_t + GSM_TDMA_NS;
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        /* Use the same clock as tdma_timer for the rearm computation,
+         * else we'd schedule REALTIME targets from VIRTUAL anchors. */
+        QEMUClockType tclk = calypso_tdma_clock();
+        int64_t entry_t_clk = (tclk == QEMU_CLOCK_REALTIME) ?
+                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) :
+                              entry_t;
+        int64_t target = entry_t_clk + GSM_TDMA_NS;
+        int64_t now = qemu_clock_get_ns(tclk);
         int skipped = 0;
         while (target <= now) {
             target += GSM_TDMA_NS;
@@ -1052,7 +1097,8 @@ static void calypso_tdma_start(CalypsoTRX *s)
             pcb_threaded = (e && e[0] == '1') ? 1 : 0;
         }
         if (!pcb_threaded) {
-            timer_mod_ns(s->tdma_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GSM_TDMA_NS);
+            timer_mod_ns(s->tdma_timer,
+                         qemu_clock_get_ns(calypso_tdma_clock()) + GSM_TDMA_NS);
         }
     }
 }
@@ -1277,7 +1323,7 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     memory_region_init_io(&s->sim_iomem,NULL,&calypso_sim_ops,s,"calypso.sim",CALYPSO_SIM_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_SIM_BASE,&s->sim_iomem);
 
-    s->tdma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_tdma_tick,s);
+    s->tdma_timer = timer_new_ns(calypso_tdma_clock(), calypso_tdma_tick, s);
     s->dsp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_dsp_done,s);
     s->frame_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,calypso_frame_irq_lower,s);
 

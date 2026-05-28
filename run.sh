@@ -1175,10 +1175,20 @@ export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
        CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
 
 # ---- DSP / DIAG instruments (override at command line if needed) ----
-CALYPSO_DSP_ROM="${CALYPSO_DSP_ROM:-/opt/GSM/calypso_dsp.txt}"
+# CALYPSO_DSP_ROM (legacy single-txt) supprime — utilise CALYPSO_DSP_ROM_TXT
+# pour la source .txt auto-splitee en per-section bins (cf L1422+).
 CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x3fb0}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
-export CALYPSO_DSP_ROM CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG
+# tdma_timer = REALTIME by default → 217 Hz wall-clock cadence
+# independent of guest CPU. Critical for L23 sync under icount=auto.
+# Set to 0 to revert to legacy VIRTUAL clock behaviour.
+CALYPSO_TDMA_REALTIME="${CALYPSO_TDMA_REALTIME:-1}"
+# W1C latch on by default : ARM reads of a_sync_* / d_fb_det return the
+# host-side state machine's published values (stable) instead of DSP
+# transient writes (which flicker set→clear in ~18 cycles, losing the
+# race for ARM read). Required for FBSB_CONF emission.
+CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-1}"
+export CALYPSO_BSP_DARAM_ADDR CALYPSO_SIM_CFG CALYPSO_TDMA_REALTIME CALYPSO_W1C_LATCH
 
 # === Defaults no-hack ===
 # Politique : aucun bypass de chemin firmware. Tous les hacks env-gated
@@ -1934,7 +1944,6 @@ echo "=========================="
 echo
 
 echo "ENV summary:"
-echo "  CALYPSO_DSP_ROM             = $CALYPSO_DSP_ROM"
 echo "  CALYPSO_BSP_DARAM_ADDR      = $CALYPSO_BSP_DARAM_ADDR"
 echo "  CALYPSO_SIM_CFG             = $CALYPSO_SIM_CFG"
 echo "  CALYPSO_PROBE_BOOTSTUB      = $CALYPSO_PROBE_BOOTSTUB        (0=normal, 1=HACK probe-inject bootstub)"

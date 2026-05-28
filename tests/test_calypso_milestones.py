@@ -49,7 +49,7 @@ QEMU_LOG       = HOST_ROOT / "qemu.log" # backup mount, peut être stale
 MOBILE_PCAP    = HOST_ROOT / "mobile-gsmtap.pcap"
 
 REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/opt/GSM/qemu-src"))
-DSP_ROM_TXT    = Path(os.environ.get("CALYPSO_DSP_ROM", str(REPO_ROOT / "calypso_dsp.txt")))
+DSP_ROM_TXT    = Path(os.environ.get("CALYPSO_DSP_ROM_TXT", str(REPO_ROOT / "calypso_dsp.txt")))
 
 # Sondes connues (rapport 05-14)
 PC_FB_DET_WR_SITE     = 0x8f51       # 50 captures D_FB_DET-WR-SITE

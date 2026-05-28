@@ -1900,6 +1900,50 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* === BLOB-WR diagnostic for dsp_blobs/ test harness ===
+     * Logs writes either targeting scratch [0x2000..0x200F] (dsp-deadbeef
+     * etc.) or carrying a known blob signature value. Self-throttled to
+     * 5000 hits per process. Zero impact when no blob test is running. */
+    {
+        static unsigned blob_wr_count = 0;
+        bool is_scratch = (addr >= 0x2000 && addr <= 0x200F);
+        bool is_magic = (val == 0xCAFE || val == 0xBEEF || val == 0xDEAD ||
+                         val == 0x2B2B || val == 0x4906 || val == 0x1B00 ||
+                         val == 0x7080 || val == 0x4000);
+        if ((is_scratch || is_magic) && blob_wr_count < 5000) {
+            blob_wr_count++;
+            fprintf(stderr,
+                    "[c54x] BLOB-WR data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
+                    addr, val, s->pc, s->insn_count);
+        }
+    }
+
+    /* === SP-CATASTROPHE fix : DROM[0x9187] silicon-correct read-only ===
+     * Per SPRU172C : when PMST.DROM=1, the DSP ROM in data space is
+     * read-only. Our emulator previously allowed writes which corrupted
+     * data[0x9187] (0xFF86 → 0xF6B7) via a walking `STH B,*AR2+` inside
+     * the RPTB body [0x815E..0x8176]. Dispatcher at 0x8341..0x8353 then
+     * read the corrupted value and computed CALAD-A target = 0x70C3
+     * (= the CALA-A opcode itself in PROM0) instead of the legit MAC
+     * routine 0x8261, falling into a self-call loop. Each iteration
+     * pushed one word, SP eventually reached MMR_SP (0x0018), the push
+     * aliased SP itself → SP-CATASTROPHE Δ=+28843.
+     *
+     * Surgical : only data[0x9187] needs protection (the dispatcher LUT
+     * slot). Wider ranges break other firmware paths (calibrated against
+     * historical SARAM-overlay writability). Drop silently — matches
+     * silicon. Probe first 20 attempts for diag. */
+    if (addr == 0x9187 && (s->pmst & PMST_DROM)) {
+        static unsigned drom_w_attempts = 0;
+        if (drom_w_attempts++ < 20) {
+            fprintf(stderr,
+                    "[c54x] DROM-W-DROP data[0x9187] <- 0x%04x (was 0x%04x) "
+                    "PC=0x%04x insn=%u  (silicon: ROM, read-only)\n",
+                    val, s->data[addr], s->pc, s->insn_count);
+        }
+        return;
+    }
+
     /* FBDB-PROBE write to 0x3DC0 (= SARAM flag polled by fc63 BITF).
      * Env CALYPSO_FBDB_PROBE=1. Logs old→new + which bits set, with focus
      * on bit 4 (= 0x0010) since that's the bit fc63 tests via BITF. */

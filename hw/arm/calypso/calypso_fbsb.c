@@ -18,6 +18,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* W1C latches owned by calypso_trx.c. Declared at file top so
+ * on_frame_tick uses them as detection triggers and publish_fb_found
+ * pins them to host-side state machine values. */
+extern bool     g_a_sync_valid;
+extern uint16_t g_d_fb_det_latch;
+extern uint16_t g_d_fb_mode_latch;
+extern uint16_t g_a_sync_TOA_latch;
+extern uint16_t g_a_sync_PM_latch;
+extern uint16_t g_a_sync_ANG_latch;
+extern uint16_t g_a_sync_SNR_latch;
+
 /* ---------------------------------------------------------------- *
  * Internal: NDB cell access. ndb is the ARM-side dsp_ram[] view
  * (uint16_t *), word-addressed from API base (0x0800 DSP).
@@ -147,12 +158,54 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
     if (!s) return;
 
     switch (s->state) {
-    case FBSB_FB0_SEARCH:
-        /* Should be unreachable: on_dsp_task_change publishes
-         * immediately and transitions to FB0_FOUND. Kept as a safety
-         * net in case the publish path changes. */
+    case FBSB_FB0_SEARCH: {
+        /* Real-DSP-path transition (2026-05-28) : the DSP correlator
+         * writes a_sync_* (TOA/PM/ANG/SNR) and d_fb_det into NDB on
+         * each iteration. The DSP-side latch trigger in calypso_c54x.c
+         * (gated on a_sync_SNR write @ PC=0x8d33/0x8eb9/0x8f51) takes
+         * an atomic snapshot of all 6 cells.
+         *
+         * The DSP CLEARS d_fb_det back to 0xdfd0 sentinel ~18 cycles
+         * after setting a real value (observed via SET-TO-CLEAR-DELTA
+         * probe), so polling d_fb_det direct is racy : the snapshot
+         * almost always captures the sentinel, not the real result.
+         *
+         * Use g_a_sync_SNR_latch as the detection trigger instead.
+         * SNR > 0 (int16) means the DSP correlator found a meaningful
+         * burst in this iteration. The other latches carry the matching
+         * TOA/PM/ANG/SNR atomically. Publish overrides d_fb_det with 1
+         * so ARM read consumes it as "detection". */
         s->fb0_attempt++;
+        /* Gate stricte (2026-05-28) : ne publier QUE sur SNR > GATE.
+         * Le DSP correlator écrit a_sync_SNR à chaque iter, mais sur
+         * bursts data (BCCH/SACCH/...) le résidu est ~400-800 (noise).
+         * Sur vrai FCCH burst, SNR monte à plusieurs milliers. Le
+         * threshold 1500 sépare les deux pour ne pas latcher la FB
+         * sur le mauvais burst (= SB tomberait à côté). */
+        #define FBSB_SNR_GATE 1500
+        if (g_a_sync_valid && (int16_t)g_a_sync_SNR_latch > FBSB_SNR_GATE) {
+            uint16_t toa = g_a_sync_TOA_latch;
+            uint16_t pm  = g_a_sync_PM_latch;   /* publish re-shifts << 3, undo */
+            uint16_t snr = g_a_sync_SNR_latch;
+            /* angle=0 (2026-05-28) : la source samples QEMU/bridge n'a
+             * pas de drift osc/Doppler injecté → vrai AFC = 0. Le latch
+             * angle est un résidu correlator parasite qui casse
+             * read_fb_result()→ANGLE_TO_FREQ→AFC retry loop. Publier 0
+             * = ground-truth, débloque la chaîne FB→FB1→SB. */
+            int16_t ang_published = 0;
+            fprintf(stderr,
+                    "[calypso-fbsb] FB0 DETECT (gated SNR>%d, angle=0) "
+                    "toa=%d pm=0x%04x ang_dsp=%d→0 snr=0x%04x (s=%d) "
+                    "fn=%lu att=%u\n",
+                    FBSB_SNR_GATE, (int16_t)toa, pm,
+                    (int16_t)g_a_sync_ANG_latch, snr,
+                    (int16_t)snr, (unsigned long)fn, s->fb0_attempt);
+            calypso_fbsb_publish_fb_found(s, (int16_t)toa, pm >> 3,
+                                          ang_published, snr);
+            s->state = FBSB_FB0_FOUND;
+        }
         break;
+    }
     case FBSB_FB0_FOUND:
         /* Stay here until ARM either re-arms via d_task_md (which will
          * push us back to FB0_SEARCH) or moves on. Don't auto-cascade
@@ -179,14 +232,8 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
  * Invalidate them here so ARM read falls through to fresh fbsb values
  * instead of stale DSP iter values. The master gate is g_a_sync_valid
  * (false → all a_sync_* + d_fb_det reads fall through). Individual
- * latch values cleared for hygiene. */
-extern bool     g_a_sync_valid;
-extern uint16_t g_d_fb_det_latch;
-extern uint16_t g_d_fb_mode_latch;
-extern uint16_t g_a_sync_TOA_latch;
-extern uint16_t g_a_sync_PM_latch;
-extern uint16_t g_a_sync_ANG_latch;
-extern uint16_t g_a_sync_SNR_latch;
+ * latch values cleared for hygiene. (Externs are declared at file top
+ * so on_frame_tick / publish_fb_found can use them directly.) */
 
 static inline void invalidate_fbsb_latches(void)
 {
@@ -213,11 +260,29 @@ void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
     cell_wr(s, NDB_A_SYNC_DEMOD_PM,  (uint16_t)(pm << 3));   /* prim_fbsb shifts >>3 on read */
     cell_wr(s, NDB_A_SYNC_DEMOD_ANG, (uint16_t)angle);
     cell_wr(s, NDB_A_SYNC_DEMOD_SNR, snr);
-    cell_wr(s, NDB_D_FB_DET, 1);
+    /* Publish d_fb_det as the SNR magnitude (= DSP-native "real
+     * detection" encoding) rather than constant 1. Firmware checks
+     * `if (d_fb_det)` (non-zero) at prim_fbsb.c:404, then reads
+     * a_sync_SNR for threshold compare at line 449. Any non-zero
+     * passes the first check; SNR > FB0_SNR_THRESH (=0) passes the
+     * second. Using SNR keeps the value semantically meaningful and
+     * non-zero whenever SNR is positive. */
+    uint16_t fb_det_val = (snr != 0) ? snr : 1;
+    cell_wr(s, NDB_D_FB_DET, fb_det_val);
 
-    /* Invalidate W1C latches so ARM read returns these fresh values,
-     * not stale DSP iter snapshot. */
-    invalidate_fbsb_latches();
+    /* Populate W1C latches AND mark them valid so ARM read path
+     * returns our stable values rather than DSP transient writes.
+     * DSP-direct values flicker (set real → cleared back to 0xdfd0
+     * in ~18 cycles), so cell_wr alone races and loses. The latches
+     * serve as the host-side authoritative result until ARM consumes
+     * d_fb_det (latch_consume pattern in calypso_trx.c:228-235). */
+    g_d_fb_det_latch   = fb_det_val;
+    g_d_fb_mode_latch  = 0;
+    g_a_sync_TOA_latch = (uint16_t)toa;
+    g_a_sync_PM_latch  = (uint16_t)(pm << 3);
+    g_a_sync_ANG_latch = (uint16_t)angle;
+    g_a_sync_SNR_latch = snr;
+    g_a_sync_valid     = true;
 
     (void)toa; (void)pm; (void)angle; (void)snr;
 }
