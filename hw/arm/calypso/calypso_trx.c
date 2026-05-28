@@ -579,6 +579,85 @@ static void calypso_dsp_done(void *opaque) {
 }
 static void calypso_tdma_start(CalypsoTRX *s);
 
+/* === CLK-master pthread =================================================
+ *
+ * Sends a 4-byte FN counter UDP packet to calypso-ipc-device every
+ * 4.615 ms wall-clock. Uses clock_nanosleep(CLOCK_MONOTONIC, ABSTIME)
+ * for sub-µs precision — bypasses the QEMU mainloop ±20ms jitter that
+ * the previous in-tick send had.
+ *
+ * The CLK packet drives the qfn-paced UL in calypso-ipc-device
+ * (qemu_wrap.c), which then advances osmo-trx-ipc's TX timeline and
+ * generates CLK_IND to BTS. Précision wall ici = précision drift TRX↔BTS.
+ *
+ * The pthread maintains its own g_wall_fn counter. tdma_tick reads it
+ * (via __atomic_load) so the DSP/BSP work uses wall-aligned FN values.
+ */
+
+#include <time.h>
+#include <pthread.h>
+
+static volatile uint32_t g_wall_fn = 0;
+static volatile bool     g_clk_master_running = false;
+static pthread_t         g_clk_master_thread;
+static int               g_clk_master_fd = -1;
+static struct sockaddr_in g_clk_master_peer;
+
+#define WALL_TDMA_NS  4615000LL  /* 4.615 ms = 1 GSM frame */
+
+static void *clk_master_loop(void *arg)
+{
+    (void)arg;
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
+    fprintf(stderr,
+            "[clk-master] pthread armed (CLOCK_MONOTONIC ABSTIME, %lld ns/frame)\n",
+            (long long)WALL_TDMA_NS);
+
+    while (g_clk_master_running) {
+        next.tv_nsec += WALL_TDMA_NS;
+        while (next.tv_nsec >= 1000000000LL) {
+            next.tv_nsec -= 1000000000LL;
+            next.tv_sec  += 1;
+        }
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        if (rc != 0 && rc != EINTR) {
+            /* Unrecoverable — log once and bail. */
+            static int err_logged = 0;
+            if (!err_logged++) {
+                fprintf(stderr, "[clk-master] clock_nanosleep rc=%d, exiting\n", rc);
+            }
+            break;
+        }
+
+        uint32_t fn = __atomic_add_fetch(&g_wall_fn, 1, __ATOMIC_RELEASE)
+                    % GSM_HYPERFRAME;
+        if (g_clk_master_fd >= 0) {
+            uint8_t pkt[4];
+            pkt[0] = (fn >> 24) & 0xFF;
+            pkt[1] = (fn >> 16) & 0xFF;
+            pkt[2] = (fn >>  8) & 0xFF;
+            pkt[3] =  fn        & 0xFF;
+            (void)sendto(g_clk_master_fd, pkt, 4, 0,
+                         (struct sockaddr *)&g_clk_master_peer,
+                         sizeof(g_clk_master_peer));
+        }
+    }
+    return NULL;
+}
+
+static void calypso_trx_start_clk_master_thread(CalypsoTRX *s)
+{
+    if (g_clk_master_running) return;
+    g_clk_master_fd   = s->clk_fd;
+    g_clk_master_peer = s->clk_peer;
+    g_clk_master_running = true;
+    pthread_create(&g_clk_master_thread, NULL, clk_master_loop, NULL);
+    pthread_setname_np(g_clk_master_thread, "cal-clk-master");
+    TRX_LOG("CLK-master pthread started (4.615ms wall, jitter-free)");
+}
+
 /* Called by calypso_tint0.c on each TDMA frame tick.
  * Forward declaration — actual tdma_tick is defined below. */
 static void calypso_tdma_tick(void *opaque);
@@ -719,7 +798,19 @@ static void calypso_tdma_tick(void *opaque) {
     int64_t entry_t = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t t_clk = 0, t_uart = 0, t_dspboot = 0, t_dspirq = 0,
             t_bsp = 0, t_ul = 0;
-    s->fn = (s->fn+1) % GSM_HYPERFRAME;
+    /* Sync s->fn to the wall-clock fn from clk_master_thread. The
+     * pthread is the source of truth for "current GSM frame number" —
+     * it ticks at exact 4.615ms wall using clock_nanosleep ABSTIME.
+     * Si le pthread est encore en init (g_wall_fn=0), on garde notre
+     * propre compteur en fallback pour ne pas freeze le DSP. */
+    {
+        uint32_t wfn = __atomic_load_n(&g_wall_fn, __ATOMIC_ACQUIRE);
+        if (wfn != 0) {
+            s->fn = wfn % GSM_HYPERFRAME;
+        } else {
+            s->fn = (s->fn + 1) % GSM_HYPERFRAME;
+        }
+    }
 
     /* TDMA tick counter — log thinned 1/1000 (~4.6s wall) pour drift detection.
      * Variables locales pour cumul DSP insn (utilisées plus bas). */
@@ -728,16 +819,7 @@ static void calypso_tdma_tick(void *opaque) {
     tdma_ticks++;
     int dsp_n_exec_2 = 0, dsp_n_exec_5 = 0; /* updated by c54x_run calls */
 
-    /* ── 0. Send CLK tick to bridge (QEMU is clock master) ── */
-    if (s->clk_fd >= 0) {
-        uint8_t pkt[4];
-        pkt[0] = (s->fn >> 24) & 0xFF;
-        pkt[1] = (s->fn >> 16) & 0xFF;
-        pkt[2] = (s->fn >>  8) & 0xFF;
-        pkt[3] =  s->fn        & 0xFF;
-        sendto(s->clk_fd, pkt, 4, 0,
-               (struct sockaddr *)&s->clk_peer, sizeof(s->clk_peer));
-    }
+    /* ── 0. CLK send delegated to clk_master_thread (jitter-free) ── */
     t_clk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /* ── 1. UART poll: deliver pending chardev bytes to firmware ── */
@@ -1000,12 +1082,8 @@ static void calypso_tdma_tick(void *opaque) {
         }
         last_target = target;
 
-        /* FN catchup : advance FN by `skipped` extra frames so the FN
-         * timeline matches wall progress. The +1 was already done at
-         * entry (s->fn = (s->fn+1) % HYPERFRAME). */
-        if (skipped > 0) {
-            s->fn = (s->fn + skipped) % GSM_HYPERFRAME;
-        }
+        /* No FN catchup needed — s->fn is sync'd to g_wall_fn at entry,
+         * which is incremented by clk_master_thread independently. */
 
         {
             static int rearm_log_count = 0;
@@ -1391,7 +1469,13 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     TRX_LOG("=== Hardware ready ===");
 
     /* CLK UDP: QEMU sends TDMA ticks to bridge on port 6700.
-     * Bridge is clock-slave — no independent timer. */
+     * Bridge is clock-slave — no independent timer.
+     *
+     * Le send est délégué à un pthread dédié (clk_master_thread) pour
+     * éviter le jitter ±20ms du QEMU mainloop dispatcher sur le
+     * tdma_timer callback. Le pthread utilise clock_nanosleep ABSTIME
+     * sur CLOCK_MONOTONIC → précision sub-µs au déclenchement, contre
+     * ~ms via QEMU timer. */
     {
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd >= 0) {
@@ -1402,6 +1486,8 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             s->clk_peer.sin_port = htons(6700);
             s->clk_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             TRX_LOG("CLK UDP → bridge 127.0.0.1:6700");
+
+            calypso_trx_start_clk_master_thread(s);
         }
     }
 }

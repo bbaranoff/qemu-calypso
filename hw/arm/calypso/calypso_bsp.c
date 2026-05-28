@@ -184,9 +184,15 @@ static QEMUTimer   *replay_timer  = NULL;
 static inline void bsp_daram_wr_bucket(uint16_t addr)
 {
     bsp.wr_total++;
+    /* target zone suit le runtime daram_addr (= ce que BSP écrit pour de vrai).
+     * Anciennes bornes hardcodées 0x3FB0..0x3FFF étaient avant le canary fix
+     * 2026-05-28 qui a changé le default à 0x2a00. Si daram_addr=0 (= discovery
+     * mode), pas de target zone — tous les writes sont "other". */
+    uint16_t tgt_lo = bsp.daram_addr;
+    uint16_t tgt_hi = bsp.daram_addr ? (uint16_t)(bsp.daram_addr + bsp.daram_len - 1) : 0;
     if (addr <= BSP_BUCKET_LOW_HI) {
         bsp.wr_low++;
-    } else if (addr >= BSP_BUCKET_TARGET_LO && addr <= BSP_BUCKET_TARGET_HI) {
+    } else if (tgt_lo && addr >= tgt_lo && addr <= tgt_hi) {
         bsp.wr_target++;
     } else if (addr >= BSP_BUCKET_WRAP_LO && addr <= BSP_BUCKET_WRAP_HI) {
         bsp.wr_wrap++;
@@ -298,7 +304,17 @@ static uint16_t parse_uint_env(const char *name, uint16_t def)
 {
     const char *v = getenv(name);
     if (!v || !*v) return def;
-    return (uint16_t)strtoul(v, NULL, 0);
+    /* Auto-detect hex even sans préfixe 0x : si la chaîne contient
+     * un digit hex non-décimal (a-f / A-F), force base 16. Évite le
+     * piège strtoul base=0 qui parse "2a00" comme décimal → 2. */
+    int base = 0;
+    for (const char *p = v; *p; p++) {
+        if ((*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            base = 16;
+            break;
+        }
+    }
+    return (uint16_t)strtoul(v, NULL, base);
 }
 
 uint16_t calypso_bsp_get_daram_addr(void) { return bsp.daram_addr; }
@@ -498,19 +514,32 @@ static void bsp_trxd_readable(void *opaque)
 
 /* ---- Init ---- */
 
-/* Virtual-clock drain callback: pulls BSP UDP queue into DSP DMA at virtual
- * rate, locked to the same QEMU_CLOCK_VIRTUAL as TINT0/tdma_tick/ARM fn.
- * Pre-2026-05-24 this timer ran on QEMU_CLOCK_REALTIME, which caused a
- * cumulative drift vs ARM cur_fn under icount=auto (BTS delta grew ~1300 fr
- * in 6 s wall). Locking to VIRTUAL eliminates the drift at the source. */
+/* REALTIME drain callback (2026-05-29) : pulls BSP UDP queue into DSP DMA
+ * à la cadence wall-clock 5ms (= 200/sec). Monotonic anti-drift rearm sur
+ * `last_target + period` pour éviter accumulation de jitter dispatcher.
+ *
+ * Historique : pre-2026-05-24 c'était REALTIME → drift vs VIRTUAL sous
+ * icount=auto. Switch vers VIRTUAL fixait ce drift. 2026-05-29 : maintenant
+ * que tdma_tick est REALTIME monotonic + clk_master pthread, virtual et
+ * wall sont alignés. On peut repasser drain en REALTIME — la cadence wall
+ * matche la cadence ARM frame_irq/tdma. Et surtout : sous load DSP heavy,
+ * VIRTUAL tournait moins vite que wall → drain trop lent → BSP queue
+ * overflow → 95% des bursts droppés. */
 static void bsp_drain_cb(void *opaque)
 {
+    static int64_t last_target = 0;
     if (bsp.dsp) {
         uint32_t cur_fn = calypso_trx_get_fn();
         calypso_bsp_deliver_buffered(cur_fn);
     }
-    timer_mod(bsp.drain_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (last_target == 0) last_target = now;
+    int64_t target = last_target + BSP_DRAIN_PERIOD_NS;
+    while (target <= now) {
+        target += BSP_DRAIN_PERIOD_NS;
+    }
+    last_target = target;
+    timer_mod(bsp.drain_timer, target);
 }
 
 /* Replay callback : enqueue 1 burst per virtual TN slot. */
@@ -725,12 +754,15 @@ skip_udp_listener:
     (void)d_rach_word_offset();
     (void)rach_force_bsic();
 
-    /* Arm virtual-clock drain timer — locked to QEMU_CLOCK_VIRTUAL like
-     * TINT0/tdma_tick/ARM fn. Fix 2026-05-24 e2e BTS↔L1 drift. */
-    bsp.drain_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, bsp_drain_cb, NULL);
+    /* Arm REALTIME drain timer — wall-paced 5ms, monotonic anti-drift dans
+     * bsp_drain_cb. Aligné sur le même CLOCK_MONOTONIC que le pthread
+     * clk_master (calypso_trx.c). 2026-05-29 : sortie de VIRTUAL parce
+     * qu'on droppait 95% des bursts sous load DSP (virtual lag → drain
+     * trop lent). */
+    bsp.drain_timer = timer_new_ns(QEMU_CLOCK_REALTIME, bsp_drain_cb, NULL);
     timer_mod(bsp.drain_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BSP_DRAIN_PERIOD_NS);
-    BSP_LOG("BSP drain timer armed: %dms virtual period (VIRTUAL clock, drift-locked)",
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + BSP_DRAIN_PERIOD_NS);
+    BSP_LOG("BSP drain timer armed: %dms REALTIME wall-paced, monotonic",
             BSP_DRAIN_PERIOD_MS);
 
     BSP_LOG("init dsp=%p daram_addr=0x%04x len=%u%s%s",
@@ -859,8 +891,15 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
     for (int tn = 0; tn < BSP_NUM_TN; tn++) {
-        BspBurstSlot *sl = bsp_take_for_fn(tn, current_fn);
-        if (!sl) continue;
+        /* Drain ALL matchable bursts per call (2026-05-29 fix anti-stale).
+         * Avant : 1 burst/appel → sous contention BQL le drain rate effectif
+         * tombe sous le rate d'arrivée IPC → queue fills → bursts > 64 FN
+         * derriere cur_fn marqués stale (= 87% drop observé).
+         * Maintenant : drain catch-up jusqu'à plus aucun match. Bornage
+         * via la fenêtre BSP_FN_MATCH_WINDOW dans bsp_take_for_fn — pas de
+         * runaway. */
+        BspBurstSlot *sl;
+        while ((sl = bsp_take_for_fn(tn, current_fn)) != NULL) {
 
         /* HACK env-gated CALYPSO_BSP_BYPASS_BDLENA=1 : skip BDLENA gate
          * (probing-only). Voir banner cleaning ds calypso_bsp_init. */
@@ -1025,6 +1064,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             c54x_interrupt_ex(bsp.dsp, 21, 5);
             if (bsp.dsp->idle) bsp.dsp->idle = false;
         }
+        }  /* end while drain */
     }
 }
 
