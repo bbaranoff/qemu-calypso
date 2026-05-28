@@ -1514,6 +1514,21 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
+    /* D_TASK_MD-RD probe : trace DSP reads of d_task_md (write page 0
+     * @ data[0x0804], write page 1 @ data[0x0818]). The DSP dispatcher
+     * reads task_md then branches to FB / SB / ALLC / etc. routines.
+     * If only one PC reads it, that's the single dispatcher. Capped 30. */
+    if (addr == 0x0804 || addr == 0x0818) {
+        static unsigned tm_log = 0;
+        if (tm_log++ < 30) {
+            fprintf(stderr,
+                    "[c54x] D_TASK_MD-RD data[0x%04x]=0x%04x page=%d "
+                    "PC=0x%04x insn=%u\n",
+                    addr, s->data[addr],
+                    (addr == 0x0804) ? 0 : 1,
+                    s->pc, s->insn_count);
+        }
+    }
     /* FBDB-PROBE read 0x3DC0 (= SARAM flag polled by fc63 BITF).
      * Env CALYPSO_FBDB_PROBE=1. Logs first 30 reads + each 10000th. */
     if (addr == 0x3DC0 && g_fbdb_probe_enabled > 0) {
@@ -1900,6 +1915,52 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* === NDB-CTL-WR : trace ARM-side writes to NDB control flags in
+     * [data[0x08F8]..data[0x0900]] = d_fb_det, d_fb_mode, a_sync_demod[],
+     * d_sb_ext, etc. The firmware writes mode flags before scheduling
+     * SB task — finding which flag toggles SB vs FB tells the DSP
+     * dispatcher selector. Capped 50. */
+    {
+        bool ndb_ctl = (addr >= 0x08F8 && addr <= 0x0900);
+        /* Filter on s->pc to identify ARM-side writes : ARM has no PC
+         * concept here (it writes via MMIO callback), so s->pc reflects
+         * the DSP PC at the moment. ARM-side calls land via calypso_dsp_write
+         * which does direct s->data[] write, NOT data_write_locked → so
+         * this probe sees only DSP-side writes to NDB. Both paths are
+         * useful to discriminate. */
+        if (ndb_ctl) {
+            static unsigned ndb_log = 0;
+            if (ndb_log++ < 50) {
+                fprintf(stderr,
+                        "[c54x] NDB-CTL-WR data[0x%04x] <- 0x%04x "
+                        "(was 0x%04x) PC=0x%04x insn=%u\n",
+                        addr, val, s->data[addr], s->pc, s->insn_count);
+            }
+        }
+    }
+
+    /* === A_SCH-WR probe : trace DSP writes to a_sch[0..4] in both db_r
+     * pages. If DSP never writes these cells, firmware reads stale RAM
+     * → random BSIC in FBSB_CONF. If DSP writes garbage, the SCH demod
+     * path is broken upstream. Helps discriminate the SB sync root cause.
+     * Capped at 50 logged hits to avoid spam. */
+    {
+        bool a_sch_p0 = (addr >= 0x0837 && addr <= 0x083B);  /* page 0 a_sch[0..4] */
+        bool a_sch_p1 = (addr >= 0x084B && addr <= 0x084F);  /* page 1 a_sch[0..4] */
+        if (a_sch_p0 || a_sch_p1) {
+            static unsigned a_sch_log = 0;
+            if (a_sch_log++ < 50) {
+                fprintf(stderr,
+                        "[c54x] A_SCH-WR data[0x%04x] <- 0x%04x page=%d "
+                        "idx=%d PC=0x%04x insn=%u\n",
+                        addr, val,
+                        a_sch_p0 ? 0 : 1,
+                        (int)(addr - (a_sch_p0 ? 0x0837 : 0x084B)),
+                        s->pc, s->insn_count);
+            }
+        }
+    }
+
     /* === BLOB-WR diagnostic for dsp_blobs/ test harness ===
      * Logs writes either targeting scratch [0x2000..0x200F] (dsp-deadbeef
      * etc.) or carrying a known blob signature value. Self-throttled to

@@ -176,14 +176,17 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
          * TOA/PM/ANG/SNR atomically. Publish overrides d_fb_det with 1
          * so ARM read consumes it as "detection". */
         s->fb0_attempt++;
-        /* Gate stricte (2026-05-28) : ne publier QUE sur SNR > GATE.
+        /* SNR gate (2026-05-28) : ne publier QUE sur SNR > threshold.
          * Le DSP correlator écrit a_sync_SNR à chaque iter, mais sur
          * bursts data (BCCH/SACCH/...) le résidu est ~400-800 (noise).
-         * Sur vrai FCCH burst, SNR monte à plusieurs milliers. Le
-         * threshold 1500 sépare les deux pour ne pas latcher la FB
-         * sur le mauvais burst (= SB tomberait à côté). */
-        #define FBSB_SNR_GATE 1500
-        if (g_a_sync_valid && (int16_t)g_a_sync_SNR_latch > FBSB_SNR_GATE) {
+         * Sur vrai FCCH burst, SNR monte à plusieurs milliers.
+         * Threshold via env CALYPSO_FBSB_SNR_GATE (default 1500). */
+        static int snr_gate = -1;
+        if (snr_gate < 0) {
+            const char *e = getenv("CALYPSO_FBSB_SNR_GATE");
+            snr_gate = (e && *e) ? (int)strtol(e, NULL, 0) : 1500;
+        }
+        if (g_a_sync_valid && (int16_t)g_a_sync_SNR_latch > snr_gate) {
             uint16_t toa = g_a_sync_TOA_latch;
             uint16_t pm  = g_a_sync_PM_latch;   /* publish re-shifts << 3, undo */
             uint16_t snr = g_a_sync_SNR_latch;
@@ -197,7 +200,7 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
                     "[calypso-fbsb] FB0 DETECT (gated SNR>%d, angle=0) "
                     "toa=%d pm=0x%04x ang_dsp=%d→0 snr=0x%04x (s=%d) "
                     "fn=%lu att=%u\n",
-                    FBSB_SNR_GATE, (int16_t)toa, pm,
+                    snr_gate, (int16_t)toa, pm,
                     (int16_t)g_a_sync_ANG_latch, snr,
                     (int16_t)snr, (unsigned long)fn, s->fb0_attempt);
             calypso_fbsb_publish_fb_found(s, (int16_t)toa, pm >> 3,
@@ -219,9 +222,20 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
         s->sb_attempt = 0;
         break;
     case FBSB_SB_SEARCH:
-        /* TODO: synthesize a plausible SCH result (BSIC, FN, ToA) so
-         * l1s_sbdet_resp can complete and the firmware moves on to
-         * BCCH reception. Not implemented yet. */
+        /* Real-DSP path : DSP correlator demods the SCH burst from
+         * BSP samples and writes a_sch[3..4] with the encoded SB word
+         * (bsic + t1/t2/t3). Firmware l1s_sbdet_resp reads a_sch[],
+         * decodes via l1s_decode_sb, sends L1CTL_FBSB_CONF with the
+         * real BSIC.
+         *
+         * No host-side synthesis here (= no hack). If BSIC comes out
+         * random, the bug is upstream :
+         *   - BSP feed delivers wrong SCH timing
+         *   - DSP correlator doesn't decode SCH properly
+         *   - a_sch[] left uninitialised → firmware reads garbage
+         * Each of those is the real fix to chase, not a synth that
+         * hides the gap. */
+        s->sb_attempt++;
         break;
     default:
         break;

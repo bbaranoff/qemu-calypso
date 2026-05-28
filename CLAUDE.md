@@ -73,6 +73,15 @@ DEFAULTS (run_si.sh)
 > et SPRU172C avant de patcher**, jamais contourner. Tout contournement
 > temporaire jugé inévitable doit être documenté dans `hw/arm/calypso/doc/TODO.md`
 > avec un critère de retrait.
+>
+> **Disclosure obligatoire.** Si malgré tout un hack/synth/bypass est
+> introduit (même temporaire, même env-gated), écrire EXACTEMENT en
+> tête de la réponse utilisateur :
+>
+> `ATTENTION HACK HACK HACK !!!!!!!!`
+>
+> Puis nommer le hack, son site (file:line), et le critère de retrait.
+> L'absence de ce préambule = manquement à la règle.
 
 ## Architecture
 

@@ -82,7 +82,6 @@ typedef struct CalypsoTRX {
     QEMUTimer   *dsp_timer;
     uint32_t     fn;
     bool         tdma_running;
-    uint8_t      sync_bsic;
 
     /* C54x DSP emulator */
     C54xState   *dsp;
@@ -1303,7 +1302,7 @@ void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 {
     CalypsoTRX *s = g_new0(CalypsoTRX, 1);
-    g_trx = s; s->irqs = irqs; s->sync_bsic = 7;
+    g_trx = s; s->irqs = irqs;
     s->clk_fd = -1;
     TRX_LOG("=== Calypso hardware init ===");
 
