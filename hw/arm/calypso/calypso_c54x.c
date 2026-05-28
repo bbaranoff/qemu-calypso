@@ -9876,9 +9876,71 @@ void c54x_set_api_ram(C54xState *s, uint16_t *api_ram)
     s->api_ram = api_ram;
 }
 
+void c54x_set_initial_pc(C54xState *s, uint32_t pc)
+{
+    s->pc = pc;
+    s->blob_loaded = true;
+    C54_LOG("set_initial_pc: PC=0x%05x (blob_loaded=1)", pc);
+}
+
+int c54x_load_blob_daram(C54xState *s, const char *path, uint16_t daram_addr)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        C54_LOG("load_blob_daram: cannot open '%s'", path);
+        return -1;
+    }
+    int words = 0;
+    uint32_t addr = daram_addr;
+    uint8_t buf[2];
+    while (addr < C54X_DATA_SIZE && fread(buf, 1, 2, f) == 2) {
+        uint16_t w = buf[0] | ((uint16_t)buf[1] << 8);
+        s->data[addr] = w;
+        if (s->api_ram &&
+            addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
+            s->api_ram[addr - C54X_API_BASE] = w;
+        addr++;
+        words++;
+    }
+    fclose(f);
+    C54_LOG("load_blob_daram: %d words at DARAM[0x%04x..0x%04x] from %s",
+            words, daram_addr, addr - 1, path);
+    return words;
+}
+
+int c54x_load_section(C54xState *s, const char *path,
+                      uint32_t start_addr, bool is_program)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        C54_LOG("load_section: cannot open '%s'", path);
+        return -1;
+    }
+    uint16_t *mem = is_program ? s->prog : s->data;
+    uint32_t limit = is_program ? C54X_PROG_SIZE : C54X_DATA_SIZE;
+    int words = 0;
+    uint32_t addr = start_addr;
+    uint8_t buf[2];
+    while (addr < limit && fread(buf, 1, 2, f) == 2) {
+        uint16_t w = buf[0] | ((uint16_t)buf[1] << 8);
+        mem[addr] = w;
+        if (!is_program && s->api_ram &&
+            addr >= C54X_API_BASE && addr < C54X_API_BASE + C54X_API_SIZE)
+            s->api_ram[addr - C54X_API_BASE] = w;
+        addr++;
+        words++;
+    }
+    fclose(f);
+    C54_LOG("load_section: %d words at %s[0x%05x..0x%05x] from %s",
+            words, is_program ? "prog" : "data",
+            start_addr, addr - 1, path);
+    return words;
+}
+
 void c54x_reset(C54xState *s)
 {
     g_boot_trace = 50;
+    s->blob_loaded = false;  /* explicit reset exits dsp-blob fixture mode */
     s->a = 0; s->b = 0;
     /* AR registers aligned with silicon spec (doc/datasheets/README.md §3,
      * 2026-05-25). Cross-checked 3 ROM dumps (3311/3416/3606) + local osmocom :

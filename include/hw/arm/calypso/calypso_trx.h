@@ -8,6 +8,7 @@
 
 #include "hw/irq.h"
 #include "exec/memory.h"
+#include "hw/arm/calypso/calypso_c54x.h"
 
 /* IRQ map */
 #define CALYPSO_IRQ_WATCHDOG       0
@@ -97,6 +98,18 @@
 #define DSP_API_VERSION       0x3606
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
+
+/* Test fixture: return the C54x DSP state pointer for `-M calypso,dsp-blob=`.
+ * Returns NULL if calypso_trx_init() hasn't run or the DSP ROM load failed. */
+C54xState *calypso_trx_get_dsp(void);
+
+/* Per-section ROM paths — called by mb.c machine_init BEFORE sysbus_realize
+ * so trx_init can load each section at its silicon-correct DSP address
+ * before c54x_reset() (PROM→DARAM auto-copy depends on prog[] populated).
+ * Pass NULL for sections that should be left empty. */
+void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
+                                   const char *prom2, const char *prom3,
+                                   const char *drom,  const char *pdrom);
 
 /* W1C (Write-1-to-Clear) latch toggle for ARM↔DSP a_sync_* cells.
  * Returns 1 if CALYPSO_W1C_LATCH=1 env is set, 0 otherwise. Used by

@@ -486,13 +486,20 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 cpu_physical_memory_write(0xFFFFFA08, &mask, 2);
                 TRX_LOG("DSP ready — unmasked API IRQ (mask=0x%04x)", mask);
             }
-            /* Reset C54x DSP — boot runs in TDMA ticks (parallel with ARM) */
-            if (s->dsp) {
+            /* Reset C54x DSP — boot runs in TDMA ticks (parallel with ARM).
+             * Skip if dsp-blob fixture is active: another reset would
+             * re-run the PROM→DARAM auto-copy and overwrite the loaded
+             * blob plus the PC override. */
+            if (s->dsp && !s->dsp->blob_loaded) {
                 c54x_reset(s->dsp);
                 s->dsp->running = true;
                 s->dsp_init_done = false;
                 s->dsp_ram[0x01A8/2] = 0;
                 TRX_LOG("C54x DSP reset — boot via TDMA ticks");
+            } else if (s->dsp) {
+                TRX_LOG("DSP_DL_STATUS_READY received but dsp-blob mode "
+                        "active — skipping reset (PC=0x%04x preserved)",
+                        s->dsp->pc);
             }
         }
     }
@@ -1217,6 +1224,35 @@ void calypso_trx_tx_burst_poll(void)
     }
 }
 
+/* Expose DSP state to machine_init for the `-M calypso,dsp-blob=` fixture.
+ * Returns NULL if calypso_trx_init() hasn't run or the ROM load failed. */
+C54xState *calypso_trx_get_dsp(void)
+{
+    return g_trx ? g_trx->dsp : NULL;
+}
+
+/* Per-section ROM bin paths, set by mb.c machine_init BEFORE sysbus_realize
+ * so that trx_init can load each section into prog[]/data[] **before**
+ * c54x_reset() — the reset's PROM→DARAM auto-copy needs prog[] populated. */
+static const char *g_section_prom0;
+static const char *g_section_prom1;
+static const char *g_section_prom2;
+static const char *g_section_prom3;
+static const char *g_section_drom;
+static const char *g_section_pdrom;
+
+void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
+                                   const char *prom2, const char *prom3,
+                                   const char *drom,  const char *pdrom)
+{
+    g_section_prom0 = prom0;
+    g_section_prom1 = prom1;
+    g_section_prom2 = prom2;
+    g_section_prom3 = prom3;
+    g_section_drom  = drom;
+    g_section_pdrom = pdrom;
+}
+
 /* ---- Init ---- */
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 {
@@ -1248,35 +1284,83 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
     g_kick_timer = timer_new_ns(QEMU_CLOCK_REALTIME,calypso_kick_cb,NULL);
     timer_mod_ns(g_kick_timer,qemu_clock_get_ns(QEMU_CLOCK_REALTIME)+5000000);
 
-    /* C54x DSP emulator.
-     * Default tries .bin (COFF1 TIC54X) first, then falls back to .txt dump.
-     * c54x_load_rom() auto-detects format by magic. */
+    /* C54x DSP emulator — explicit ROM loading only.
+     *
+     * Two modes, both opt-in (no implicit/hardcoded ROM path anymore) :
+     *   1. Per-section (machine props dsp-prom0/prom1/prom2/prom3/drom/pdrom
+     *      set via mb.c before sysbus_realize). Each section is written at
+     *      its silicon-correct DSP address, BEFORE c54x_reset so the
+     *      PROM→DARAM auto-copy sees the bytes.
+     *   2. DARAM blob (-M calypso,dsp-blob=<path>). No ROM is loaded; the
+     *      blob in DARAM[0x100..] is the only DSP code. mb.c applies it
+     *      after c54x_reset.
+     *
+     * If neither is set, the DSP runs with empty prog[]/data[]. No more
+     * legacy candidate-loop fallback (was: CALYPSO_DSP_ROM env + hardcoded
+     * /opt/GSM/calypso_dsp.txt). Use dsp_txt2bin.py to produce per-section
+     * .bin files from a legacy .txt dump if needed. */
     {
-        const char *env = getenv("CALYPSO_DSP_ROM");
-        const char *candidates[] = {
-            env,
-            "/opt/GSM/qemu-src/dsp.bin",
-            "/opt/GSM/dsp.bin",
-            "/opt/GSM/calypso_dsp.txt",
-            NULL
-        };
         s->dsp = c54x_init();
         if (s->dsp) {
             c54x_set_api_ram(s->dsp, s->dsp_ram);
-            int loaded = 0;
-            for (int i = 0; candidates[i] && !loaded; i++) {
-                if (c54x_load_rom(s->dsp, candidates[i]) == 0) {
-                    c54x_reset(s->dsp);
-                    calypso_bsp_init(s->dsp);
-                    TRX_LOG("C54x DSP loaded from %s", candidates[i]);
-                    loaded = 1;
+            bool have_sections = g_section_prom0 || g_section_prom1 ||
+                                 g_section_prom2 || g_section_prom3 ||
+                                 g_section_drom  || g_section_pdrom;
+            const char *blob = getenv("CALYPSO_DSP_BLOB");
+
+            /* Blob wins over per-section: when both are set (shouldn't happen
+             * if run.sh is used, but defensive), the DARAM blob is the only
+             * code source, sections are ignored. The C54x emulator can't
+             * sensibly execute both at once. */
+            if (blob && *blob) {
+                TRX_LOG("DSP ROM mode: dsp-blob (CALYPSO_DSP_BLOB=%s) — "
+                        "no ROM loaded, blob in DARAM is the only code", blob);
+                if (have_sections) {
+                    TRX_LOG("  (per-section paths were also set but are "
+                            "ignored — blob takes priority)");
                 }
+            } else if (have_sections) {
+                TRX_LOG("DSP ROM mode: explicit per-section loads");
+                if (g_section_prom0) {
+                    c54x_load_section(s->dsp, g_section_prom0, 0x07000, true);
+                }
+                if (g_section_prom1) {
+                    int n = c54x_load_section(s->dsp, g_section_prom1,
+                                              0x18000, true);
+                    /* Mirror PROM1 into 16-bit prog space (0xE000..0xFFFF),
+                     * matching legacy c54x_load_rom. Only words whose 16-bit
+                     * alias is >= 0xE000 are mirrored. c54x_reset overwrites
+                     * the IVT at 0xFF80..0xFF83 after this — boot stub wins. */
+                    for (int i = 0; i < n; i++) {
+                        uint32_t paddr = 0x18000 + i;
+                        uint16_t alias = paddr & 0xFFFF;
+                        if (alias >= 0xE000) {
+                            s->dsp->prog[alias] = s->dsp->prog[paddr];
+                        }
+                    }
+                    TRX_LOG("PROM1 mirror: lower-16 alias 0xE000.. populated");
+                }
+                if (g_section_prom2) {
+                    c54x_load_section(s->dsp, g_section_prom2, 0x28000, true);
+                }
+                if (g_section_prom3) {
+                    c54x_load_section(s->dsp, g_section_prom3, 0x38000, true);
+                }
+                if (g_section_drom) {
+                    c54x_load_section(s->dsp, g_section_drom, 0x09000, false);
+                }
+                if (g_section_pdrom) {
+                    c54x_load_section(s->dsp, g_section_pdrom, 0x0E000, false);
+                }
+            } else {
+                TRX_LOG("DSP ROM mode: NONE — empty prog[]/data[]. "
+                        "Use -M calypso,dsp-prom0=.. (et al.) or dsp-blob=..");
             }
-            if (!loaded) {
-                TRX_LOG("C54x DSP ROM not found in any candidate path");
-                free(s->dsp);
-                s->dsp = NULL;
-            }
+            /* Reset + bsp_init: silicon-valid state regardless of ROM mode.
+             * machine_init may layer a DARAM blob via the dsp-blob hook
+             * after this returns. */
+            c54x_reset(s->dsp);
+            calypso_bsp_init(s->dsp);
         }
     }
 

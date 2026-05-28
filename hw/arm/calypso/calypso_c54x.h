@@ -198,6 +198,11 @@ typedef struct C54xState {
     /* State */
     bool     running;
     bool     idle;       /* IDLE instruction executed */
+    bool     blob_loaded; /* Test fixture: set by c54x_set_initial_pc().
+                           * Suppresses the secondary c54x_reset() that
+                           * normally fires when ARM writes DSP_DL_STATUS_READY,
+                           * which would otherwise clobber the user's blob
+                           * via the reset-time PROM→DARAM auto-copy. */
     uint64_t cycles;
     uint32_t insn_count;
 
@@ -262,5 +267,24 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit);
 
 /* Wake from IDLE */
 void c54x_wake(C54xState *s);
+
+/* Test fixture: override PC after reset.
+ * Used by `-M calypso,dsp-blob=<path>` to start execution at a custom
+ * address instead of the silicon-default reset vector (IPTR * 0x80). */
+void c54x_set_initial_pc(C54xState *s, uint32_t pc);
+
+/* Test fixture: load a raw binary blob into DARAM starting at daram_addr.
+ * File bytes are read pairwise as little-endian DSP words.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_blob_daram(C54xState *s, const char *path, uint16_t daram_addr);
+
+/* Explicit per-section ROM load: write raw LE 16-bit words from `path`
+ * into either prog[] (when is_program=true) or data[] (when false),
+ * starting at DSP word address `start_addr`. Used by the per-section
+ * machine properties (dsp-prom0/prom1/prom2/prom3/drom/pdrom) to load
+ * each ROM section at its silicon-correct DSP address.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_section(C54xState *s, const char *path,
+                       uint32_t start_addr, bool is_program);
 
 #endif /* CALYPSO_C54X_H */

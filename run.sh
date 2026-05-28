@@ -1365,6 +1365,118 @@ else
     QEMU_HALT_FLAG=""
 fi
 
+# DSP code-loading env vars (all opt-in, all forwarded to -M calypso,KEY=PATH) :
+#
+#   CALYPSO_DSP_BLOB=path   → DARAM fixture : raw 16-bit LE blob loaded at
+#                             DARAM[0x100] with PC override. C54x emulator test
+#                             fixture, ROM TI bypassed (legacy fallback also
+#                             skipped). See c54x_load_blob_daram + set_initial_pc.
+#
+#   CALYPSO_DSP_PROM0=path  → prog[0x07000..] (28K words max)
+#   CALYPSO_DSP_PROM1=path  → prog[0x18000..] (32K) + mirror prog[0xE000..]
+#   CALYPSO_DSP_PROM2=path  → prog[0x28000..] (32K)
+#   CALYPSO_DSP_PROM3=path  → prog[0x38000..] (8K)
+#   CALYPSO_DSP_DROM=path   → data[0x09000..] (20K)
+#   CALYPSO_DSP_PDROM=path  → data[0x0E000..] (8K)
+#
+# Per-section bins are produced by dsp_txt2bin.py from a legacy calypso_dsp.txt :
+#   python3 dsp_txt2bin.py calypso_dsp.txt calypso_dsp.bin
+# → calypso_dsp.PROM0.bin, calypso_dsp.PROM1.bin, …
+#
+# All env vars are OFF by default. With nothing set, DSP runs with empty
+# prog[]/data[] (no implicit /opt/GSM/calypso_dsp.txt fallback anymore).
+#
+# Mutually exclusive : dsp-blob is for DARAM-only fixtures, per-section is for
+# real ROM loads at silicon-correct addresses. Both at once = blob wins (no
+# section loads), per code path in calypso_trx.c.
+
+MACHINE_ARG="calypso"
+
+_dsp_check_file() {
+    local var="$1"; local path="$2"
+    if [ ! -r "$path" ]; then
+        echo "[run.sh] $var=$path : fichier introuvable ou illisible" >&2
+        exit 1
+    fi
+}
+
+# When CALYPSO_DSP_BLOB is set, the blob is the sole DSP code source.
+# Force-clear ALL per-section env vars before defaults run, so the launch sees
+# only the blob (no ROM loaded into prog[], no overlay collision in DARAM).
+# Done BEFORE the default block so the `${VAR+x}` defaultedness check below
+# treats these as "set-empty" → defaults skipped → no section ends up loaded.
+if [ -n "${CALYPSO_DSP_BLOB:-}" ]; then
+    CALYPSO_DSP_PROM0=""
+    CALYPSO_DSP_PROM1=""
+    CALYPSO_DSP_PROM2=""
+    CALYPSO_DSP_PROM3=""
+    CALYPSO_DSP_DROM=""
+    CALYPSO_DSP_PDROM=""
+    echo "[run.sh] CALYPSO_DSP_BLOB=$CALYPSO_DSP_BLOB → all dsp-prom*/drom/pdrom force-disabled (blob is sole DSP code source)"
+fi
+
+# DSP txt source → auto-split to per-section .bins on demand.
+# Source path (override via CALYPSO_DSP_ROM_TXT). Defaults to /opt/GSM/calypso_dsp.txt.
+# The .bin files are generated next to the txt :
+#   <dir>/<base>.PROM0.bin, .PROM1.bin, ..., .DROM.bin, .PDROM.bin
+: "${CALYPSO_DSP_ROM_TXT:=/opt/GSM/calypso_dsp.txt}"
+_DSP_TXT_DIR="$(dirname "$CALYPSO_DSP_ROM_TXT")"
+_DSP_TXT_BASE="$(basename "$CALYPSO_DSP_ROM_TXT" .txt)"
+
+if [ -r "$CALYPSO_DSP_ROM_TXT" ]; then
+    _need_split=0
+    for _sec in PROM0 PROM1 PROM2 PROM3 DROM PDROM; do
+        _bin="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.${_sec}.bin"
+        if [ ! -r "$_bin" ] || [ "$CALYPSO_DSP_ROM_TXT" -nt "$_bin" ]; then
+            _need_split=1
+            break
+        fi
+    done
+    if [ "$_need_split" = "1" ]; then
+        echo "[run.sh] auto-split $CALYPSO_DSP_ROM_TXT → ${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.{PROM0..3,DROM,PDROM}.bin"
+        python3 "$(dirname "$0")/dsp_txt2bin.py" \
+            "$CALYPSO_DSP_ROM_TXT" \
+            "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.bin" || {
+                echo "[run.sh] dsp_txt2bin.py failed — continuing without auto-split" >&2
+            }
+    fi
+    unset _need_split _sec _bin
+fi
+
+# Per-section defaults — chacun pointe sur sa ROM précise (dérivée du txt).
+# Logique par ligne : si l'env var est UNSET (pas juste vide) ET que le fichier
+# existe, on assigne. Empty preserved → disable. User-set → kept.
+[ -z "${CALYPSO_DSP_PROM0+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM0.bin" ] && CALYPSO_DSP_PROM0="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM0.bin"
+[ -z "${CALYPSO_DSP_PROM1+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM1.bin" ] && CALYPSO_DSP_PROM1="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM1.bin"
+[ -z "${CALYPSO_DSP_PROM2+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM2.bin" ] && CALYPSO_DSP_PROM2="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM2.bin"
+[ -z "${CALYPSO_DSP_PROM3+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM3.bin" ] && CALYPSO_DSP_PROM3="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM3.bin"
+[ -z "${CALYPSO_DSP_DROM+x}"  ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"  ] && CALYPSO_DSP_DROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"
+[ -z "${CALYPSO_DSP_PDROM+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin" ] && CALYPSO_DSP_PDROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin"
+unset _DSP_TXT_DIR _DSP_TXT_BASE
+# CALYPSO_DSP_BLOB has NO default — DARAM fixture is opt-in only.
+# Usage examples:
+#   CALYPSO_DSP_PROM2= ./run.sh                          # disable PROM2
+#   CALYPSO_DSP_PROM0=/tmp/patched.bin ./run.sh          # override PROM0
+#   CALYPSO_DSP_BLOB=/path/to/blob.bin ./run.sh          # DARAM fixture mode
+#   CALYPSO_DSP_ROM_TXT=/tmp/other-dsp.txt ./run.sh      # other ROM source
+
+if [ -n "${CALYPSO_DSP_BLOB:-}" ]; then
+    _dsp_check_file CALYPSO_DSP_BLOB "$CALYPSO_DSP_BLOB"
+    MACHINE_ARG="${MACHINE_ARG},dsp-blob=${CALYPSO_DSP_BLOB}"
+    echo "[run.sh] CALYPSO_DSP_BLOB=$CALYPSO_DSP_BLOB (DARAM fixture)"
+fi
+for _sec in PROM0 PROM1 PROM2 PROM3 DROM PDROM; do
+    _var="CALYPSO_DSP_${_sec}"
+    _val="${!_var:-}"
+    if [ -n "$_val" ]; then
+        _dsp_check_file "$_var" "$_val"
+        _prop="$(echo "$_sec" | tr '[:upper:]' '[:lower:]')"
+        MACHINE_ARG="${MACHINE_ARG},dsp-${_prop}=${_val}"
+        echo "[run.sh] $_var=$_val → -M ...,dsp-${_prop}=${_val}"
+    fi
+done
+unset _sec _var _val _prop
+
 # Override delibere : pour le child QEMU seulement, L1CTL_SOCK pointe vers
 # le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c cree son socket a
 # cette adresse-poubelle (= L1CTL QEMU desactive). Le VRAI socket L1CTL
@@ -1372,7 +1484,7 @@ fi
 # ou L1CTL_SOCK garde sa valeur d'origine = /tmp/osmocom_l2). Hors de
 # cette ligne, $L1CTL_SOCK reste = /tmp/osmocom_l2 partout dans run.sh.
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
-"$QEMU" -M calypso -cpu arm946 \
+"$QEMU" -M "$MACHINE_ARG" -cpu arm946 \
     $QEMU_ICOUNT_FLAG \
     $QEMU_ACCEL_FLAG \
     $QEMU_GDB_FLAG \
