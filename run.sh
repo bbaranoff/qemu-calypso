@@ -121,9 +121,17 @@ Overrides numériques:
   CALYPSO_RACH_FORCE_BSIC=N          force BSIC 0..63 in RACH encoder
   CALYPSO_STICK_ARFCN=N              pin mobile cfg ARFCN
   CALYPSO_BSP_DARAM_ADDR=0xNNNN      BSP DARAM addr (default 0x3fb0)
-  CALYPSO_BSP_HOST=ip / CALYPSO_BSP_PORT=N   BSP UDP endpoint
+  CALYPSO_BSP_HOST=ip / CALYPSO_BSP_PORT=N   BSP UDP endpoint (def 6702)
   CALYPSO_TRAP_CHECKPOINT=...        c54x trap on checkpoint
   CALYPSO_TRAP_OOR=...               c54x trap out-of-range
+  CALYPSO_DOPPLER_HZ=N               Doppler injection Hz dans bridge IQ
+                                     (def 0 = no-op ; ex 200 = 200Hz drift)
+  CALYPSO_SAMPLE_RATE=N              Hz sample rate (def 270833 = 1sps GSM)
+  CALYPSO_BURST_PRINT=0|1            dump bursts I/Q (def 0 ; off recommend.)
+  CALYPSO_BURST_MAX=N                cap dumps (def 50)
+  CALYPSO_BURST_HEAD=N               nb premiers I/Q affichés (def 12)
+  CALYPSO_BRIDGE_PYTHON=path         python avec gnuradio/gr-gsm/numpy
+                                     (def /root/.env/bin/python3)
 
 ═══════════════════════════════════════════════════════════════════════════
 EXEMPLES
@@ -1181,8 +1189,10 @@ CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x3fb0}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
 # tdma_timer = REALTIME by default → 217 Hz wall-clock cadence
 # independent of guest CPU. Critical for L23 sync under icount=auto.
-# Set to 0 to revert to legacy VIRTUAL clock behaviour.
-CALYPSO_TDMA_REALTIME="${CALYPSO_TDMA_REALTIME:-1}"
+# Forced to 1 (the prior :- fallback was being silently overridden to 0 by
+# external env / menu wrappers, which broke L23 sync under icount=auto).
+# To revert to legacy VIRTUAL clock behaviour, edit this line directly.
+CALYPSO_TDMA_REALTIME=1
 # W1C latch on by default : ARM reads of a_sync_* / d_fb_det return the
 # host-side state machine's published values (stable) instead of DSP
 # transient writes (which flicker set→clear in ~18 cycles, losing the
@@ -1637,9 +1647,13 @@ if [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ]; then
     BRIDGE_LOG="${BRIDGE_LOG:-/tmp/bridge.py.log}"
     if [ -x "$BRIDGE_PY" ]; then
         tmux new-window -t "$SESSION" -n bridge-py
+        # /root/.env = venv avec gnuradio/gr-gsm/numpy/scipy.
+        # Fallback python3 si venv absent (env minimal).
+        BRIDGE_PYTHON="${CALYPSO_BRIDGE_PYTHON:-/root/.env/bin/python3}"
+        [ -x "$BRIDGE_PYTHON" ] || BRIDGE_PYTHON=python3
         tmux send-keys -t "$SESSION:bridge-py" \
-            ": > $BRIDGE_LOG && BRIDGE_BSP_IQ=${BRIDGE_BSP_IQ:-1} python3 -u $BRIDGE_PY 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
-        echo "[run.sh] bridge.py lance (legacy mode)"
+            ": > $BRIDGE_LOG && BRIDGE_BSP_IQ=${BRIDGE_BSP_IQ:-1} CALYPSO_DOPPLER_HZ=${CALYPSO_DOPPLER_HZ:-0} CALYPSO_BURST_PRINT=${CALYPSO_BURST_PRINT:-0} $BRIDGE_PYTHON -u $BRIDGE_PY 2>&1 | $TSLOG | tee $BRIDGE_LOG" C-m
+        echo "[run.sh] bridge.py lance (legacy mode, python=$BRIDGE_PYTHON)"
     else
         echo "[run.sh] WARN bridge.py introuvable ($BRIDGE_PY) -- mode bridge casse"
     fi

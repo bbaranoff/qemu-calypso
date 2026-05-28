@@ -248,9 +248,13 @@ is fixed.
 ```bash
 # Mobile config must have `stick <arfcn>` in `ms 1` block, otherwise
 # mobile abandons FBSB after 2 retries → d_task_md stays at 1.
-CALYPSO_BSP_DARAM_ADDR=0x3fb0 ./run.sh
-# DARAM 0x3fb0 covers the DSP-read range 0x3fb3-0x3fbf (verified via
-# DARAM RD HIST). 0x3fc0 was off by 16 words.
+# 2026-05-28 : default DARAM addr fixe a 0x2a00 (via canary discovery, cf
+# doc/BOOT_TO_FBSB_SEQUENCE.md + commentaire dans calypso_bsp_init). L'ancien
+# 0x3fb0 etait FAUX (zone unmapped). Override via CALYPSO_BSP_DARAM_ADDR si besoin.
+./run.sh
+# Le default 0x2a00 couvre la zone DSP-read 0x2a00-0x2b5e (= BK=0x015e=350 mots,
+# = burst GSM oversample size). Confirme via canary 0xCAFE injecte → DSP lu
+# par PC=0x93a5 AR3=0x2a00+offset.
 ```
 
 ### Old blockers (resolved)

@@ -16,6 +16,7 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'calypso_bsp.c',
     'calypso_dbg.c',
     'calypso_iota.c',
+    'calypso_twl3025.c',
     'l1ctl_sock.c',
     'sercomm_gate.c',
     'calypso_tint0.c',

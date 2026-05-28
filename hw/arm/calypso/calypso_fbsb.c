@@ -190,21 +190,16 @@ void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn)
             uint16_t toa = g_a_sync_TOA_latch;
             uint16_t pm  = g_a_sync_PM_latch;   /* publish re-shifts << 3, undo */
             uint16_t snr = g_a_sync_SNR_latch;
-            /* angle=0 (2026-05-28) : la source samples QEMU/bridge n'a
-             * pas de drift osc/Doppler injecté → vrai AFC = 0. Le latch
-             * angle est un résidu correlator parasite qui casse
-             * read_fb_result()→ANGLE_TO_FREQ→AFC retry loop. Publier 0
-             * = ground-truth, débloque la chaîne FB→FB1→SB. */
-            int16_t ang_published = 0;
+            int16_t ang = (int16_t)g_a_sync_ANG_latch;
             fprintf(stderr,
-                    "[calypso-fbsb] FB0 DETECT (gated SNR>%d, angle=0) "
-                    "toa=%d pm=0x%04x ang_dsp=%d→0 snr=0x%04x (s=%d) "
+                    "[calypso-fbsb] FB0 DETECT (gated SNR>%d) "
+                    "toa=%d pm=0x%04x ang=%d snr=0x%04x (s=%d) "
                     "fn=%lu att=%u\n",
                     snr_gate, (int16_t)toa, pm,
-                    (int16_t)g_a_sync_ANG_latch, snr,
+                    ang, snr,
                     (int16_t)snr, (unsigned long)fn, s->fb0_attempt);
             calypso_fbsb_publish_fb_found(s, (int16_t)toa, pm >> 3,
-                                          ang_published, snr);
+                                          ang, snr);
             s->state = FBSB_FB0_FOUND;
         }
         break;

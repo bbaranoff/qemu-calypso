@@ -125,6 +125,29 @@ class SercommParser:
         return frames
 
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "tools"))
+
+try:
+    from doppler import apply_doppler as _doppler_apply, dump_burst as _doppler_dump
+except Exception as _doppler_exc:
+    print(f"bridge: doppler module unavailable ({_doppler_exc}) — pass-through",
+          flush=True)
+    def _doppler_apply(iq_bytes, *_a, **_kw): return iq_bytes
+    def _doppler_dump(*_a, **_kw): pass
+
+# Prefer gr-gsm spec-conforme GMSK modulator over our custom impl.
+# Fallback silencieux sur soft_bits_to_gmsk_iq custom si gnuradio absent.
+try:
+    from gmsk_grgsm import bits_to_iq_grgsm as _grgsm_mod
+    print("bridge: GMSK modulator = gr-gsm (gnuradio.digital.gmskmod_bc)",
+          flush=True)
+except Exception as _grgsm_exc:
+    _grgsm_mod = None
+    print(f"bridge: gr-gsm unavailable ({_grgsm_exc}) — fallback custom GMSK",
+          flush=True)
+
+
 def soft_to_int16(soft_bit):
     """Convert osmocom soft bit (0=strong 1, 255=strong 0) to int16."""
     return max(-32768, min(32767, int((127 - soft_bit) * 32767 / 127)))
@@ -1052,7 +1075,16 @@ class Bridge:
         # soft-bits par défaut ; activer BRIDGE_BSP_IQ après avoir
         # adapté calypso_bsp.c side, sinon les bursts deviennent garbage).
         if BSP_IQ_MODE and payload:
-            iq_bytes = soft_bits_to_gmsk_iq(payload)
+            # gr-gsm spec-conforme si dispo, sinon fallback custom impl.
+            if _grgsm_mod is not None:
+                iq_bytes = _grgsm_mod(payload)
+            else:
+                iq_bytes = soft_bits_to_gmsk_iq(payload)
+            # Doppler/AFC rotation injection — env-gated CALYPSO_DOPPLER_HZ.
+            # No-op si Doppler=0. Permet AFC convergence vs résidu correlator
+            # parasite (cf bug FBSB chain).
+            iq_bytes = _doppler_apply(iq_bytes)
+            _doppler_dump(iq_bytes, tag="DL", fn=sent_fn, tn=tn)
             # Pour N soft bits : 2N int16 = 4N bytes IQ payload (interleaved
             # I,Q,I,Q,...). Total UDP = 8 hdr + 4N. Pour 148 bits = 600 B,
             # pour 146 bits (BTS truncate) = 592 B. BSP attend iq_bytes >= 4*nbits.

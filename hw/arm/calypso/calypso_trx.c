@@ -17,6 +17,7 @@
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* api_ram_lock pour MTTCG race fix */
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_sim.h"
 #include "hw/arm/calypso/calypso_fbsb.h"
 #include "chardev/char-fe.h"
@@ -342,6 +343,20 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                     (unsigned)offset, (unsigned)value, size, s->fn);
     }
 
+    /* AFC hook : firmware afc_load_dsp() écrit dsp_api.db_w->d_afc.
+     * Word 15 du WP : page0 = byte 0x001E, page1 = byte 0x0046.
+     * Propage le DAC value vers TWL3025 → rotation samples BSP.
+     * Chaîne complete : firmware → ce hook → twl3025 → BSP rotation. */
+    if ((offset == 0x001E || offset == 0x0046) && size == 2) {
+        int16_t dac_value = (int16_t)(uint16_t)value;
+        calypso_twl3025_set_afc_dac(dac_value);
+        static int afc_log = 0;
+        if (++afc_log <= 50)
+            TRX_LOG("AFC WR page=%d dac=%d hz=%.1f fn=%u",
+                    (offset == 0x001E) ? 0 : 1, dac_value,
+                    calypso_twl3025_get_afc_hz(), s->fn);
+    }
+
     /* d_rach offset finder — circular buffer of recent NDB writes.
      * NDB starts at byte offset 0x01A8 in API RAM (= dsp_ram + 0x01A8).
      * We capture every non-zero ARM-side write to NDB range and dump the
@@ -441,6 +456,32 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
                         (unsigned)offset, (unsigned)value, s->fn);
             task_log++;
+
+            /* === TASK6-IRQ snapshot (2026-05-28) ===
+             * À chaque ARM TASK WR = 6 (SB demanded), snapshot IMR + IFR du
+             * DSP. Bit 5 = BRINT0 (BSP RX DMA-complete). Discrimine deux
+             * causes pour "SB jamais locké" :
+             *   IMR_bit5 = 0 + IFR_bit5 = 0 → bit 5 jamais armé par firmware
+             *     (= bug STM-vers-MMR upstream, ou firmware skip arm)
+             *   IMR_bit5 = 1 + IFR_bit5 = 0 → bit 5 armé mais aucune source
+             *     d'IT ne le set → émulateur McBSP DMA-complete pas modélisé
+             *   IMR_bit5 = 1 + IFR_bit5 = 1 → bit 5 armé + pending, mais
+             *     ISR ne dispatch pas vers PROM3 → bug dispatcher (item 5)
+             *   IMR_bit5 = 0 + IFR_bit5 = 1 → impossible normalement (IFR
+             *     set sans IMR = source assert sans arm — bug émulateur) */
+            if (value == 6 && s->dsp) {
+                static unsigned t6_log;
+                if (t6_log < 50) {
+                    uint16_t imr = s->dsp->imr;
+                    uint16_t ifr = s->dsp->ifr;
+                    TRX_LOG("TASK6-IRQ #%u fn=%u IMR=0x%04x (bit5=%d) "
+                            "IFR=0x%04x (bit5=%d) insn=%u",
+                            t6_log, s->fn, imr, !!(imr & (1<<5)),
+                            ifr, !!(ifr & (1<<5)),
+                            s->dsp->insn_count);
+                    t6_log++;
+                }
+            }
 
             /* FBSB orchestration hook: ARM has just written d_task_md.
              * Initialise on first call, then dispatch to the host-side
