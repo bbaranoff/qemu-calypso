@@ -30,8 +30,10 @@
 extern CalypsoUARTState *g_uart_modem;
 extern CalypsoUARTState *g_uart_irda;
 
+#include "hw/arm/calypso/calypso_debug.h"
 #define TRX_LOG(fmt, ...) \
-    fprintf(stderr, "[calypso-trx] " fmt "\n", ##__VA_ARGS__)
+    do { if (calypso_debug_enabled("TRX")) \
+        fprintf(stderr, "[calypso-trx] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* CALYPSO_TIMER=1 enables timer-side fprintf tracing (frame_irq, tdma_tick,
  * kick). =0 (default) drops the calls entirely so the run is silent and
@@ -146,6 +148,25 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
 
+    /* === Hypothesis #4 probe : ARM reads R_PAGE_X (= DSP responses) ===
+     * ARM lit a_pm via R_PAGE_X. R_PAGE_0 = 0x0050, R_PAGE_1 = 0x0078.
+     * Si firmware lit toujours R_PAGE_0 (jamais R_PAGE_1) → r_page jamais
+     * flipped → reading garbage from previous page après DSP write.
+     * Gated par CALYPSO_DEBUG=R_PAGE_SPLIT. */
+    if (calypso_debug_enabled("R_PAGE_SPLIT")) {
+        bool is_r0 = (offset >= 0x0050 && offset < 0x0078);
+        bool is_r1 = (offset >= 0x0078 && offset < 0x00A0);
+        if (is_r0 || is_r1) {
+            static unsigned r0_count = 0, r1_count = 0;
+            if (is_r0) r0_count++; else r1_count++;
+            if ((r0_count + r1_count) <= 30 || ((r0_count + r1_count) % 500) == 0) {
+                fprintf(stderr,
+                    "[calypso-trx] R_PAGE_SPLIT r0=%u r1=%u (last off=0x%04x fn=%u)\n",
+                    r0_count, r1_count, (unsigned)offset, s->fn);
+            }
+        }
+    }
+
     /* === FIX 2026-05-15 : DSP→ARM mirror was missing ===
      *
      * Bug : `s->dsp_ram[]` et `s->dsp->data[]` sont deux arrays distincts.
@@ -243,6 +264,29 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+
+    /* === Unconditional probe : count ALL writes by offset range ===
+     * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone
+     * pour voir si ARM hit les bonnes zones (page 0 task 0x00-0x1F, page 1
+     * task 0x28-0x47, NDB 0x1A8+). Si compteurs = 0 dans la PM zone alors
+     * que pm_resp fire → write path ne passe PAS par ce hook. */
+    if (calypso_debug_enabled("DSP_WRITE_COUNT")) {
+        static uint64_t c_p0 = 0, c_p1 = 0, c_ndb = 0, c_other = 0;
+        if (offset < 0x0028)      c_p0++;
+        else if (offset < 0x0050) c_p1++;
+        else if (offset >= 0x01A8 && offset < 0x0800) c_ndb++;
+        else c_other++;
+        uint64_t tot = c_p0 + c_p1 + c_ndb + c_other;
+        if (tot <= 30 || (tot % 1000) == 0) {
+            fprintf(stderr,
+                "[calypso-trx] DSP_WRITE_COUNT p0=%llu p1=%llu ndb=%llu other=%llu "
+                "(last off=0x%04x val=0x%llx sz=%u fn=%u)\n",
+                (unsigned long long)c_p0, (unsigned long long)c_p1,
+                (unsigned long long)c_ndb, (unsigned long long)c_other,
+                (unsigned)offset, (unsigned long long)value, size, s->fn);
+        }
+    }
+
     if (size == 2) s->dsp_ram[offset/2] = value;
     else if (size == 4) { s->dsp_ram[offset/2] = value; s->dsp_ram[offset/2+1] = value >> 16; }
     else ((uint8_t *)s->dsp_ram)[offset] = value;
@@ -275,6 +319,60 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         if (++wp_log <= 100)
             TRX_LOG("DSP WR [0x%04x] = 0x%04x (sz=%d) fn=%u",
                     (unsigned)offset, (unsigned)value, size, s->fn);
+    }
+
+    /* === d_task_md probe — fires SANS filter value=0 ===
+     * Si d_task_md write = 0 (= memset only), pm_cmd jamais appelé.
+     * Si d_task_md write = 1 (= pm_cmd writes), notre probe ARM TASK WR
+     * devrait fire — mais on voit count=0 → contradiction à investiguer.
+     * Gated par CALYPSO_DEBUG=D_TASK_MD_ALL. */
+    if ((offset == 0x0008 || offset == 0x0030) && size == 2) {
+        if (calypso_debug_enabled("D_TASK_MD_ALL")) {
+            static unsigned dtm_log = 0;
+            if (dtm_log < 30 || (dtm_log % 100) == 0) {
+                fprintf(stderr,
+                    "[calypso-trx] D_TASK_MD_ALL #%u off=0x%04x val=0x%04x fn=%u\n",
+                    dtm_log, (unsigned)offset, (unsigned)value, s->fn);
+                dtm_log++;
+            }
+        }
+    }
+
+    /* === Hypothesis #1 probe : d_dsp_page WR (NDB+0 = ARM 0x01A8) ===
+     * Écrit par dsp_end_scenario(): `ndb->d_dsp_page = B_GSM_TASK | w_page`.
+     * Si jamais hit → dsp_end_scenario jamais fired → w_page stuck à 0.
+     * Gated par CALYPSO_DEBUG=D_DSP_PAGE. */
+    if (offset == 0x01A8 && size == 2) {
+        if (calypso_debug_enabled("D_DSP_PAGE")) {
+            static unsigned ddp_log = 0;
+            if (ddp_log < 50) {
+                fprintf(stderr,
+                    "[calypso-trx] D_DSP_PAGE WR #%u val=0x%04x (B_GSM_TASK=%d w_page=%d) fn=%u\n",
+                    ddp_log, (unsigned)value,
+                    !!(value & 2), !!(value & 1),  /* B_GSM_TASK=(1<<1)=0x02, w_page=bit 0 */
+                    s->fn);
+                ddp_log++;
+            }
+        }
+    }
+
+    /* === Hypothesis #2 probe : ARM WR per-page split (= cur_bucket advance) ===
+     * Si bucket n'avance pas, tous les ARM TASK WR continuent à page 0.
+     * Compteur séparé page 0 vs page 1 sur task_d/task_md à chaque frame. */
+    if (calypso_debug_enabled("PAGE_SPLIT")) {
+        bool is_p0 = (offset == 0x0000 || offset == 0x0008 || offset == 0x000E ||
+                      offset == 0x000A);
+        bool is_p1 = (offset == 0x0028 || offset == 0x0030 || offset == 0x0036 ||
+                      offset == 0x0032);
+        if ((is_p0 || is_p1) && value != 0 && size == 2) {
+            static unsigned p0_count = 0, p1_count = 0;
+            if (is_p0) p0_count++; else p1_count++;
+            if ((p0_count + p1_count) <= 30 || ((p0_count + p1_count) % 50) == 0) {
+                fprintf(stderr,
+                    "[calypso-trx] PAGE_SPLIT p0=%u p1=%u (last off=0x%04x val=%u fn=%u)\n",
+                    p0_count, p1_count, (unsigned)offset, (unsigned)value, s->fn);
+            }
+        }
     }
 
     /* AFC hook : firmware afc_load_dsp() écrit dsp_api.db_w->d_afc.
@@ -708,7 +806,22 @@ static const MemoryRegionOps calypso_tpu_ops = {
     .valid={.min_access_size=1,.max_access_size=4},.impl={.min_access_size=1,.max_access_size=4},
 };
 static uint64_t calypso_tpu_ram_read(void *o,hwaddr off,unsigned sz){CalypsoTRX*s=o;return(off/2<CALYPSO_TPU_RAM_SIZE/2)?s->tpu_ram[off/2]:0;}
-static void calypso_tpu_ram_write(void *o,hwaddr off,uint64_t v,unsigned sz){CalypsoTRX*s=o;if(off/2<CALYPSO_TPU_RAM_SIZE/2)s->tpu_ram[off/2]=v;}
+static void calypso_tpu_ram_write(void *o,hwaddr off,uint64_t v,unsigned sz){
+    CalypsoTRX*s=o;
+    if(off/2<CALYPSO_TPU_RAM_SIZE/2) s->tpu_ram[off/2]=v;
+    /* Probe gated par CALYPSO_DEBUG=TPU_RAM. Log les 50 premières writes
+     * + chaque 1000ème pour visualiser le rythme de programmation TPU
+     * par le firmware (l1s_rx_win_ctrl, tpu_enq_*, etc.). */
+    static unsigned tpu_ram_wr = 0;
+    tpu_ram_wr++;
+    if (tpu_ram_wr <= 50 || (tpu_ram_wr % 1000) == 0) {
+        if (calypso_debug_enabled("TPU_RAM")) {
+            fprintf(stderr,
+                "[calypso-trx] TPU_RAM WR #%u off=0x%04x val=0x%04x fn=%u\n",
+                tpu_ram_wr, (unsigned)off, (unsigned)v, s->fn);
+        }
+    }
+}
 static const MemoryRegionOps calypso_tpu_ram_ops={.read=calypso_tpu_ram_read,.write=calypso_tpu_ram_write,.endianness=DEVICE_LITTLE_ENDIAN,.valid={.min_access_size=1,.max_access_size=4},.impl={.min_access_size=1,.max_access_size=4},};
 
 /* ---- TSP ---- */

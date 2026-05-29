@@ -695,9 +695,25 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
                 uart_log_raw("/tmp/qemu-irda-tx.raw", &ch, 1);
             }
 
-            qemu_chr_fe_write_all(&s->chr, &ch, 1);
+            /* Non-blocking TX (2026-05-29 fix — observer-effect kill).
+             *
+             * `qemu_chr_fe_write_all` est synchrone : bloque ARM jusqu'à ce
+             * que tout soit écrit dans le chardev backend (PTY). Sous LOST
+             * cascade firmware (20-char × 217/sec = 37% du wall en sercomm
+             * print à 115200 bps), ARM saturait → frame_irq pas servicé →
+             * next check_lost_frame voit pire diff → encore LOST → boucle
+             * self-amplifiante. La mesure était la maladie.
+             *
+             * Maintenant : write non-blocking. Si le backend ne peut pas
+             * absorber tout immédiatement, on DROP (= la trace diagnostique
+             * a priorité moindre que l'avancement firmware). Firmware ne
+             * voit jamais le backpressure → frame_irq toujours servicé à
+             * temps → boucle LOST cassée. */
+            (void)qemu_chr_fe_write(&s->chr, &ch, 1);
 
-            /* Feed TX byte to L1CTL socket (sercomm parser) */
+            /* Feed TX byte to L1CTL socket (sercomm parser).
+             * Cette voie n'a pas le problème de backpressure (= unix socket
+             * non-bloquant by default), on la laisse synchrone. */
             if (s->label && !strcmp(s->label, "modem")) {
                 l1ctl_sock_uart_tx_byte(ch);
             }

@@ -15,8 +15,13 @@
 
 static int g_boot_trace = 0;
 
+#include "hw/arm/calypso/calypso_debug.h"
+
+/* Legacy C54_LOG : gated par CALYPSO_DEBUG containing "C54X" or "ALL".
+ * Pour gating fin par probe, utiliser C54_DBG("PROBE_NAME", fmt, ...). */
 #define C54_LOG(fmt, ...) \
-    fprintf(stderr, "[c54x] " fmt "\n", ##__VA_ARGS__)
+    do { if (calypso_debug_enabled("C54X")) \
+        fprintf(stderr, "[c54x] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* ================================================================
  * Helpers
@@ -3253,6 +3258,44 @@ static int c54x_exec_one(C54xState *s)
     s->lk_used = false;  /* reset before each instruction */
     s->writer_kind = WK_UNKNOWN;  /* attribution tag for DATA-W-MMR */
 
+    /* === AR-CLOBBER probe (2026-05-29) ===
+     * Track AR1/AR2/AR6/AR7 transitions to 0 — when an AR pointer
+     * becomes 0, any subsequent indirect store *ARx will write to
+     * data[0x00] = IMR MMR (= clobber). Documented as the 2026-05-25
+     * fix reason (cf c54x_reset comment). Capture l'instruction qui
+     * a fait la transition (= last_exec_pc + s->prog[last_exec_pc])
+     * pour identifier le coupable. Gated CALYPSO_DEBUG=AR_CLOBBER. */
+    {
+        static uint16_t prev_ar1, prev_ar2, prev_ar6, prev_ar7;
+        static bool init_done = false;
+        static unsigned clob_log = 0;
+        if (!init_done) {
+            prev_ar1 = s->ar[1]; prev_ar2 = s->ar[2];
+            prev_ar6 = s->ar[6]; prev_ar7 = s->ar[7];
+            init_done = true;
+        }
+        for (int i = 0; i < 4; i++) {
+            int idx = (int[]){1, 2, 6, 7}[i];
+            uint16_t *prev = (uint16_t*[]){&prev_ar1, &prev_ar2,
+                                            &prev_ar6, &prev_ar7}[i];
+            if (*prev != 0 && s->ar[idx] == 0) {
+                if (calypso_debug_enabled("AR_CLOBBER") && clob_log < 30) {
+                    uint16_t culprit_op = prog_fetch(s, s->last_exec_pc);
+                    fprintf(stderr,
+                            "[c54x] AR-CLOBBER #%u AR%d %04x->0 by "
+                            "PC=0x%04x op=0x%04x cur_PC=0x%04x cur_op=0x%04x "
+                            "SP=0x%04x insn=%u\n",
+                            clob_log, idx, *prev,
+                            s->last_exec_pc, culprit_op,
+                            s->pc, op, s->sp, s->insn_count);
+                    fflush(stderr);
+                    clob_log++;
+                }
+            }
+            *prev = s->ar[idx];
+        }
+    }
+
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
@@ -3547,6 +3590,59 @@ static int c54x_exec_one(C54xState *s)
                 }
             }
         }
+        /* === INT3-VEC-TRACE probe (2026-05-29) ===
+         * Trigger à PC=0xFFCC (= INT3 vector entry, IPTR=0x1FF + vec 19*4).
+         * Capture les ~32 PCs suivants pour voir le chemin ISR.
+         * Objectif : identifier où DSP saute hors path attendu (= soit RSBX
+         * INTM dans zone 0xA4D0+, soit retour normal via RETE). Si DSP finit
+         * à 0x0000 boot stub → identifier l'opcode/PC qui dérive le saut.
+         * Gated par CALYPSO_DEBUG=INT3_VEC ou ALL. */
+        {
+            static int trace_n = -1;        /* -1 = not active, ≥0 = countdown */
+            static uint16_t trace_pcs[64];
+            static uint16_t trace_ops[64];
+            static int trace_idx = 0;
+            static unsigned trace_dumps = 0;
+            const unsigned DUMP_LIMIT = 8;   /* max 8 full traces logged */
+
+            if (s->pc == 0xFFCC && trace_n < 0 && trace_dumps < DUMP_LIMIT) {
+                trace_n = 32;                /* capture next 32 insns */
+                trace_idx = 0;
+                if (calypso_debug_enabled("INT3_VEC")) {
+                    fprintf(stderr,
+                            "[c54x] INT3-VEC-TRACE BEGIN #%u pc=0xFFCC "
+                            "ST1=0x%04x INTM=%d IFR=0x%04x IMR=0x%04x SP=0x%04x\n",
+                            trace_dumps + 1, s->st1, !!(s->st1 & ST1_INTM),
+                            s->ifr, s->imr, s->sp);
+                }
+            }
+            if (trace_n >= 0 && trace_idx < 64) {
+                trace_pcs[trace_idx] = s->pc;
+                trace_ops[trace_idx] = prog_fetch(s, s->pc);
+                trace_idx++;
+                trace_n--;
+                if (trace_n <= 0) {
+                    if (calypso_debug_enabled("INT3_VEC")) {
+                        fprintf(stderr,
+                                "[c54x] INT3-VEC-TRACE END #%u captured=%d "
+                                "final_ST1=0x%04x INTM=%d\n",
+                                trace_dumps + 1, trace_idx,
+                                s->st1, !!(s->st1 & ST1_INTM));
+                        for (int i = 0; i < trace_idx; i++) {
+                            fprintf(stderr,
+                                    "[c54x] INT3-VEC-TRACE #%u step %02d: "
+                                    "PC=0x%04x op=0x%04x\n",
+                                    trace_dumps + 1, i,
+                                    trace_pcs[i], trace_ops[i]);
+                        }
+                        fflush(stderr);
+                    }
+                    trace_dumps++;
+                    trace_n = -1;            /* re-arm */
+                }
+            }
+        }
+
         /* D_FB_DET-WR-SITE probe : à PC=0x8f51 (le PC qui écrit d_fb_det).
          * Snapshot AR0..AR7 + data[AR0/1/2] + BK + A pour identifier la
          * zone DARAM lue par le correlator FB-det au moment de produire
@@ -3945,8 +4041,21 @@ static int c54x_exec_one(C54xState *s)
             s->pc  = tgt;
             return 0;
         }
-        /* F4E0-F4FF: RSBX/SSBX status bits — treat as NOP (most don't affect emulation) */
-        if (op >= 0xF4E0 && op <= 0xF4FF && op != 0xF4E4 && op != 0xF4EB) {
+        /* F4E0-F4FF catch-all : NOP par défaut, sauf opcodes connus qui ont
+         * leur handler dédié. Comment historique "RSBX/SSBX" était faux
+         * (RSBX=F4B0, SSBX=F5B0 hors range). En fait ce range contient :
+         *   F4E1: IDLE 1            ← exception (handler ligne ~4058)
+         *   F4E2: BACC A            (handler ligne ~3920)
+         *   F4E3: CALA A            (handler ligne ~3920)
+         *   F4E4: FRET              ← exception (handler ligne ~4041)
+         *   F4E6: FBACC             (handler ligne ~3974)
+         *   F4E7: FCALA             (handler ligne ~3974)
+         *   F4EB: RETE              ← exception (handler ligne ~4012)
+         * Sans l'exception F4E1, IDLE 1 était silencieusement avalé en NOP,
+         * empêchant DSP de signaler s->idle=true → IRQ handler ne dispatchait
+         * jamais → INTM stuck à 1 (2026-05-29 fix). */
+        if (op >= 0xF4E0 && op <= 0xF4FF &&
+            op != 0xF4E1 && op != 0xF4E4 && op != 0xF4EB) {
             return consumed + s->lk_used;
         }
         /* F4EB = RETE (return from interrupt). Pop PC, pop XPC iff APTS=1.
@@ -5892,6 +6001,32 @@ static int c54x_exec_one(C54xState *s)
                                 (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
                                 !!(s->st1 & ST1_INTM), s->insn_count);
                     }
+                    /* DEEP-TRAIL : pour les 5 premiers POST-BOOTSTUB-RET,
+                     * dump pc_ring[-64..-1] pour révéler le caller chain
+                     * qui mène au stack-underflow loop. Gated par
+                     * CALYPSO_DEBUG=BOOTSTUB_TRAIL. */
+                    if (bsr <= 5 && calypso_debug_enabled("BOOTSTUB_TRAIL")) {
+                        fprintf(stderr,
+                            "[c54x] BOOTSTUB DEEP-TRAIL #%u (last 64 PCs):\n",
+                            bsr);
+                        for (int row = 0; row < 8; row++) {
+                            fprintf(stderr, "[c54x] BS-DEEP[%3d..%3d] :",
+                                    -64 + row*8, -57 + row*8);
+                            for (int col = 0; col < 8; col++) {
+                                int idx = -64 + row*8 + col;
+                                fprintf(stderr, " %04x",
+                                    pc_ring[(pc_ring_idx + idx) & 255]);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        /* Dump aussi 16 valeurs sur la pile à partir de SP. */
+                        fprintf(stderr, "[c54x] BS-DEEP stack[SP..SP+15] :");
+                        for (int i = 0; i < 16; i++) {
+                            fprintf(stderr, " %04x",
+                                s->data[(s->sp + i) & 0xFFFF]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
                 s->pc = ra;
                 return 0;
@@ -7336,7 +7471,7 @@ static int c54x_exec_one(C54xState *s)
          */
         if (hi8 == 0xA4 || hi8 == 0xA5 || hi8 == 0xA6 || hi8 == 0xA7 ||
             hi8 == 0xB4 || hi8 == 0xB5 || hi8 == 0xB6 || hi8 == 0xB7 ||
-            hi8 == 0xB0 || hi8 == 0xB1 || hi8 == 0xB2) {
+            hi8 == 0xB0 || hi8 == 0xB1 || hi8 == 0xB2 || hi8 == 0xB3) {
             int xar_d = (op >> 4) & 0x07;
             int yar_d = op & 0x07;
             uint16_t xval_d = data_read(s, s->ar[xar_d]);
@@ -7568,16 +7703,11 @@ ba_handler:
             s->mvpd_src = psrc + 1;
             return consumed + s->lk_used;
         }
-        if (hi8 == 0xB3) {
-            /* LD #lk, dst (long immediate, 2 words) */
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            int dst = (op >> 0) & 1;
-            int64_t v = (s->st1 & ST1_SXM) ? (int16_t)op2 : op2;
-            if (dst) s->b = sext40(v << 16);
-            else     s->a = sext40(v << 16);
-            return consumed + s->lk_used;
-        }
+        /* 0xB3 = MACR Xmem, Ymem, B (1-word, handled above with MAC family).
+         * Fix 2026-05-29 : avant ce handler décodait 0xB3xx comme
+         * `LD #lk, dst` (2-word), ce qui faisait drift le PC de +1 dans
+         * une routine RPTBD à 0x820e..0x820f → boucle infinie au PC=
+         * 0x821a (= IMR clobber via délai-slot du BANZD). */
         /* ADD #lk, src[, dst] */
         if (hi8 == 0xA2) {
             op2 = prog_fetch(s, s->pc + 1);
@@ -8950,27 +9080,12 @@ int c54x_run(C54xState *s, int n_insns)
     }
 
     while (executed < n_insns && s->running && !s->idle) {
-        /* === Silicon-boot-ROM redirect (option A, 2026-05-28 v3) ===
-         * The C54x silicon boot ROM (mask-ROM internal to TI) is not part of
-         * the dumped PROM image. Its job at reset is to init SP=0x5AC8 +
-         * IMR/MMR and jump to PROM0[0x7120] (the legitimate firmware entry,
-         * verified by static analysis : 0x7120 starts with STM #0x5AC8,SP
-         * and has no caller in any ROM page = textbook missing-on-chip-ROM-
-         * target). We emulate that ROM by redirecting PC=0xff80 → 0x7120
-         * once, gated on SP==0x1100 (= silicon-reset SP, untouched by any
-         * firmware STM #imm,SP yet). After the first redirect SP becomes
-         * 0x5AC8, the condition no longer holds, and any later sequential
-         * walk into 0xff80 by normal firmware code executes the real PROM1
-         * mirror opcode (0x56d0...) untouched. */
-        if (s->pc == 0xFF80 && s->sp == 0x1100) {
-            static int redirect_log;
-            if (redirect_log < 3) {
-                C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x7120 "
-                        "insn=%u (silicon-reset path)", s->insn_count);
-                redirect_log++;
-            }
-            s->pc = 0x7120;
-        }
+        /* === SILICON-BOOT-REDIRECT disabled 2026-05-29 (combo test avec IDLE 1 fix) ===
+         * Tentative 2 : avec IDLE 1 catch-all fix (~line 4006) appliqué,
+         * relancer DSP via PC=0xFF80 réel pour voir si le pb précédent
+         * (regression cycle 2) disparait. Le redirect remplaçait un
+         * mask-ROM silicon manquant ; sans lui, DSP exec PROM1[0xFF80..]
+         * directement (= 4×RET puis CALL pmad 0x9F87). */
         /* === SOFT-RESET-TRIGGER probe (2026-05-28) ===
          * SP-CATASTROPHE trace montre PC=0x7120 (boot init via notre override
          * 0xFF80) re-firing à insn=190M. C'est un soft-reset interne firmware.
@@ -8979,6 +9094,28 @@ int c54x_run(C54xState *s, int n_insns)
          * Trail pc_ring[-16..-1] + SP/AR/IMR/IFR/INTM → on voit l'instr qui
          * a sauté ici. */
         if ((s->pc == 0xFF80 || s->pc == 0x7120) && s->insn_count > 100000) {
+            /* Deeper trail probe — gated par CALYPSO_DEBUG=SOFT_RESET_TRAIL.
+             * pc[-64..-1] permet de remonter ~64 instructions avant la
+             * réception du soft-reset pour identifier le caller chain. */
+            if (calypso_debug_enabled("SOFT_RESET_TRAIL")) {
+                static unsigned deep_log;
+                if (deep_log < 5) {
+                    fprintf(stderr,
+                        "[c54x] SOFT-RESET DEEP-TRAIL #%u (last 64 PCs):\n",
+                        deep_log);
+                    for (int row = 0; row < 8; row++) {
+                        fprintf(stderr, "[c54x] SR-DEEP[%2d-%2d] :",
+                                -64 + row*8, -57 + row*8);
+                        for (int col = 0; col < 8; col++) {
+                            int idx = -64 + row*8 + col;
+                            fprintf(stderr, " %04x",
+                                pc_ring[(pc_ring_idx + idx) & 255]);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                    deep_log++;
+                }
+            }
             static unsigned srt_log;
             if (srt_log < 30) {
                 C54_LOG("SOFT-RESET-TRIG #%u PC=0x%04x insn=%u SP=0x%04x "
@@ -10665,14 +10802,18 @@ void c54x_reset(C54xState *s)
      * + same IMR change=0). FRET stub kept: prevents stack runaway when
      * CALAA targets the stub area, with no downside.
      *
-     * Fallback per slot:
-     *   - 0x0000: LDMM SP, B (real boot ROM behaviour)
-     *   - 0x0001: RET (paired with the CALL at 0x770A)
-     *   - rest:   FRET (0xF4E4) — return immediately to caller. */
+     * Fallback per slot (2026-05-29 fix : remplace LDMM/RET par IDLE 1) :
+     *   - 0x0000: IDLE 1 (0xF4E1) — halt jusqu'à IRQ
+     *   - 0x0001: IDLE 1 (0xF4E1) — pareil (= au cas où IRQ entry land ici)
+     *   - rest:   IDLE 1 — uniforme, jamais sortir sauf via IRQ
+     *
+     * Avant : LDMM SP,B + RET → pop stack=0 → PC=0 → loop infini sans
+     * jamais wake-on-IRQ.  Maintenant : IDLE clear s->idle quand IRQ
+     * fire (c54x.c lignes 10775-10776), DSP exec INT3 handler, RETE
+     * retourne à PC=0x0000 où IDLE redémarre. C'est le pattern silicon
+     * réel : core halt entre les frames TDMA. */
     for (int i = 0; i < 0x80; i++)
-        s->prog[i] = 0xF4E4;  /* FRET fallback — return-from-far */
-    s->prog[0x0000] = 0xBA18;  /* LDMM SP, B */
-    s->prog[0x0001] = 0xFC00;  /* RET */
+        s->prog[i] = 0xF4E1;  /* IDLE 1 — wait-for-IRQ */
 
     /* Reset vector: IPTR * 0x80 */
     uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;

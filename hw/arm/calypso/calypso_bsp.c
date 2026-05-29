@@ -42,8 +42,10 @@
 static uint32_t d_rach_word_offset(void);
 static int rach_force_bsic(void);
 
+#include "hw/arm/calypso/calypso_debug.h"
 #define BSP_LOG(fmt, ...) \
-    do { fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
+    do { if (calypso_debug_enabled("BSP")) \
+        fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 #define BSP_TRXD_PORT  6702   /* bridge forwards DL bursts here (5702 is bridge's own) */
 
@@ -802,19 +804,33 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         return;
     }
 
-    /* On real hw the BSP serial link only carries samples while IOTA's
-     * BDLENA pin is asserted.
-     * HACK env-gated CALYPSO_BSP_BYPASS_BDLENA=1 : skip ce gate pour livrer
-     * tous les bursts (probing only — voir banner ci-dessus). */
-    if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn)) {
-        bsp.bursts_dropped_no_window++;
-        if (bsp.bursts_dropped_no_window <= 5 ||
-            (bsp.bursts_dropped_no_window % 100000) == 0) {
-            BSP_LOG("DROP fn=%u tn=%u (no BDLENA window, dropped=%llu)",
-                    fn, tn,
-                    (unsigned long long)bsp.bursts_dropped_no_window);
+    /* 2026-05-29 : remplacement du gate BDLENA. Anciennement on droppait
+     * le burst si pas de pulse IOTA matching ; maintenant on délivre
+     * inconditionnellement. AUCUNE écriture de d_dsp_page ici — c'est
+     * firmware qui pilote le page flip via dsp_end_scenario (MMIO WR
+     * sur 0x01A8). On signale juste l'arrivée samples au DSP via INT3
+     * (= silicon BDLENA→BSP→DSP arm_done equivalent).
+     *
+     * Probe read-only sur d_dsp_page : on log la valeur vue par DSP
+     * au moment du burst (= ce que firmware a écrit). Sans modifier. */
+    if (bsp.dsp && bsp.dsp->api_ram) {
+        static uint32_t obs_n = 0;
+        uint16_t cur = bsp.dsp->api_ram[0x08D4 - 0x0800];
+        obs_n++;
+        if (calypso_debug_enabled("PUMP") &&
+            (obs_n <= 20 || obs_n % 37 == 0)) {
+            fprintf(stderr, "[bsp-page] #%u rx_burst fn=%u tn=%u "
+                    "d_dsp_page=0x%04x (B_GSM_TASK=%d w_page=%d)\n",
+                    obs_n, fn, tn, cur, !!(cur & 2), !!(cur & 1));
+            fflush(stderr);
         }
-        return;
+    }
+    /* Gate INT3 fire : skip si IFR.bit3 déjà set = DSP pas encore servi
+     * le précédent. Évite stacking d'IRQs quand DSP traite plus lentement
+     * que BSP delivery rate. */
+    if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+        c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) — vec 19, IMR bit 3 */
+        if (bsp.dsp->idle) bsp.dsp->idle = false;
     }
 
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
@@ -901,10 +917,26 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         BspBurstSlot *sl;
         while ((sl = bsp_take_for_fn(tn, current_fn)) != NULL) {
 
-        /* HACK env-gated CALYPSO_BSP_BYPASS_BDLENA=1 : skip BDLENA gate
-         * (probing-only). Voir banner cleaning ds calypso_bsp_init. */
-        if (!bsp.bypass_bdlena && !calypso_iota_take_bdl_pulse(tn))
-            continue;
+        /* 2026-05-29 : pas d'écriture d_dsp_page, juste INT3 (arm_done).
+         * Probe read-only voir commentaire dans calypso_bsp_rx_burst. */
+        if (bsp.dsp && bsp.dsp->api_ram) {
+            static uint32_t obs_n = 0;
+            uint16_t cur = bsp.dsp->api_ram[0x08D4 - 0x0800];
+            obs_n++;
+            if (calypso_debug_enabled("PUMP") &&
+                (obs_n <= 20 || obs_n % 37 == 0)) {
+                fprintf(stderr, "[bsp-page] #%u drain fn=%u tn=%u "
+                        "d_dsp_page=0x%04x (B_GSM_TASK=%d w_page=%d)\n",
+                        obs_n, current_fn, tn, cur,
+                        !!(cur & 2), !!(cur & 1));
+                fflush(stderr);
+            }
+        }
+        /* Gate INT3 : skip si IFR.bit3 déjà set (cf rx_burst). */
+        if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+            c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) */
+            if (bsp.dsp->idle) bsp.dsp->idle = false;
+        }
 
         int n = sl->n < (int)bsp.daram_len ? sl->n : (int)bsp.daram_len;
 
@@ -997,7 +1029,10 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          *   2. DSP polls *(0x3fab) bits via dispatcher table at data[0x16b3]
          *   3. *(0x3fab) bits sont OR'ed par ISR triggered par BRINT0
          *   4. Sans BRINT0 → pas d'ISR → pas de bit set → loop infini */
-        if (bsp.dsp) {
+        /* Gate : skip si BRINT0 précédent pas encore servi par DSP — évite
+         * iota pending queue overflow quand DSP traite ISR plus lentement
+         * que BSP rate (= GSM 217 Hz wall vs DSP-processed BRINT0). */
+        if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5))) {
             c54x_interrupt_ex(bsp.dsp, 21, 5);
         }
 

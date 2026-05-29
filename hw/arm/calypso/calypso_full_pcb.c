@@ -26,8 +26,10 @@
 #include <string.h>
 #include <stdarg.h>
 
+#include "hw/arm/calypso/calypso_debug.h"
 #define PCB_LOG(fmt, ...) \
-    fprintf(stderr, "[pcb] " fmt "\n", ##__VA_ARGS__)
+    do { if (calypso_debug_enabled("PCB")) \
+        fprintf(stderr, "[pcb] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* === Shared locks (extern in .h) ========================================= */
 QemuMutex calypso_pcb_daram_lock;

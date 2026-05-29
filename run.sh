@@ -104,7 +104,7 @@ Diag/probes (verbose):
   CALYPSO_SP_ABS_TRACE=1     SP absolute trace
   CALYPSO_SP_HIST_ARM=1      SP histogram ARM-side
   CALYPSO_AR_TRACE=0xFF      AR registers trace bitmask
-  CALYPSO_WATCH_3FBE=1       DARAM[0x3FBE] watch
+  CALYPSO_WATCH_3FBE=1       DARAM[0x3FBE] watch (legacy, now DARAM[0x2A0E] with daram_addr=0x2a00)
   CALYPSO_CORRELATOR_TRACE=1 FB-det corrélateur
   CALYPSO_MVPD_TRACE=1       MVPD opcode trace
   CALYPSO_RSBX_INTM_TRACE=1  RSBX INTM transitions
