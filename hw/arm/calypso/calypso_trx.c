@@ -884,10 +884,15 @@ static void calypso_frame_irq_lower(void *o){
 static QEMUClockType calypso_tdma_clock(void) {
     static int cached = -1;
     if (cached < 0) {
+        /* DEFAULT ON : la cadence frame GSM doit être wall-clock pour que
+         * l1_sync (donc afc_load_dsp / AFC WR + FB-det) tourne à 217 Hz.
+         * Sous icount=auto le clock VIRTUAL décroche (~17 Hz) → la sync L23
+         * timeout et l'AFC n'est jamais appelé. C'est la "méthode d'appel"
+         * du commit fbsb. Opt-out legacy via CALYPSO_TDMA_REALTIME=0. */
         const char *e = getenv("CALYPSO_TDMA_REALTIME");
-        cached = (e && *e == '1') ? 1 : 0;
+        cached = (e && *e == '0') ? 0 : 1;
         fprintf(stderr, "[calypso-trx] tdma_timer clock = %s\n",
-                cached ? "REALTIME (wall-clock 217 Hz)" : "VIRTUAL (legacy)");
+                cached ? "REALTIME (wall-clock 217 Hz, default)" : "VIRTUAL (legacy, opt-out)");
     }
     return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
 }

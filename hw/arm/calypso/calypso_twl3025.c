@@ -49,14 +49,15 @@
  * DAC=0    (= "+700 LSB au-dessus de la calib") → effective=+700 → +200900Hz
  */
 #define TWL3025_AFC_SLOPE_HZ_PER_LSB    287.0
-/* ⚠️ NON-DÉFINITIF / TESTING 2026-05-29 : baseline 0, pas -700.
- * Pirelli rf_tables.c défaut = -700, MAIS readcal lit la cal TIFFS et en
- * QEMU (pas de flash cal) afcdac_shifted=0 -> afc_initial_dac_value=0.
- * Le firmware écrit donc d_afc=0 comme baseline "no correction". Avec
- * INITIAL=-700 le modèle appliquait effective=+700 LSB = +200900 Hz sur
- * CHAQUE burst -> FCCH hors capture DSP (±20 kHz) -> FB jamais détecté.
- * Baseline 0 : dac=0 -> 0 rotation -> FCCH au carrier -> détectable. */
-#define TWL3025_AFC_INITIAL_DAC_VALUE   (0)
+/* ⚠️ TESTING 2026-05-29 v2 : baseline -700 + init dac=-700 (cal Compal/Pirelli).
+ * osmocom : afc_reset() -> dac=afc_initial_dac_value(-700) PUIS afc_correct
+ * CONVERGE. Le modèle DOIT démarrer à -700 (effective=0, pas de rotation) et
+ * tourner avec le firmware. Bug v1 : twl.dac_value=0 au boot + baseline -700
+ * -> effective=+700 = +200kHz spurious AVANT que le firmware charge sa cal ->
+ * FCCH hors capture DSP (±20kHz) -> jamais détecté. Fix : init dac=-700 dans
+ * twl3025_lazy_env -> effective=0 au boot ; set_afc_dac filtre les writes 0 du
+ * firmware (garde -700) ; converge dès que afc_correct ajuste le DAC. */
+#define TWL3025_AFC_INITIAL_DAC_VALUE   (-700)
 #define GSM_SAMPLE_RATE_HZ              270833.0  /* 1 sps GSM baseband */
 
 /* GSM TDMA timing constants (1 sample/bit BSP rate) :
@@ -80,6 +81,10 @@ static void twl3025_lazy_env(void)
     twl.env_loaded = true;
     const char *h = getenv("CALYPSO_TWL3025_AFC_HZ");
     twl.force_hz = (h && *h) ? atoi(h) : 0;
+    /* Init DAC au point de calibration (-700) = "VCXO nominal" en QEMU :
+     * le firmware démarre son AFC à afc_initial_dac_value puis converge.
+     * Sans ça (dac=0 au boot) le modèle voit +700 LSB = +200kHz spurious. */
+    twl.dac_value = TWL3025_AFC_INITIAL_DAC_VALUE;
     fprintf(stderr,
             "[twl3025] chip model armed (slope=%.1f Hz/LSB, force_hz=%d)\n",
             TWL3025_AFC_SLOPE_HZ_PER_LSB, twl.force_hz);

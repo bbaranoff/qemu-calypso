@@ -3098,7 +3098,7 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
             static int ar2_drop = -1;
             if (ar2_drop < 0) {
                 const char *e = getenv("CALYPSO_AR2_FLOOR_DROP");
-                ar2_drop = (e && *e == '1') ? 1 : 0;
+                ar2_drop = (e && *e == '1') ? 1 : 0;  /* env-gated, OFF par défaut */
             }
             if (calypso_debug_enabled("AR2-FLOOR"))
                 C54_DBG("AR2-FLOOR",
@@ -3318,6 +3318,23 @@ static int c54x_exec_one(C54xState *s)
 
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
+
+    /* DISP-TRACE (CALYPSO_DEBUG=DISP-TRACE) : trace le dispatcher de tâches
+     * 0x8341-0x8353 qui calcule la cible CALAD (0x8353 = CALAD A). Le bug :
+     * A_L finit = 0x70c3 (garbage) au lieu d'une entrée de la branch-table
+     * 0x8359 (B 0x8365/0x8394/...). On veut A à l'ENTRÉE (0x8341) = l'index
+     * pré-chargé par l'appelant (sélecteur de tâche / d_task_md). Si A est
+     * déjà garbage à 0x8341 → bug upstream confirmé (dispatcher innocent). */
+    if (s->pc >= 0x8341 && s->pc <= 0x8354 && calypso_debug_enabled("DISP-TRACE")) {
+        static unsigned disp_n = 0;
+        if (disp_n++ < 300)
+            fprintf(stderr,
+                "[c54x] DISP-TRACE PC=0x%04x op=0x%04x A=0x%010llx T=0x%04x "
+                "DP=0x%03x XPC=%d AR1=%04x AR2=%04x AR4=%04x AR5=%04x data[0x4187]=0x%04x insn=%u\n",
+                s->pc, op, (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->t,
+                (unsigned)(s->st0 & 0x1FF), s->xpc,
+                s->ar[1], s->ar[2], s->ar[4], s->ar[5], s->data[0x4187], s->insn_count);
+    }
 
     /* Coarse default: any MMR write happening inside this opcode handler
      * gets attributed to the opcode family so we can read the trace. */
@@ -7519,8 +7536,15 @@ static int c54x_exec_one(C54xState *s)
             if (s->st1 & ST1_FRCT) prod <<= 1;
             /* Round if R bit set (odd hi8) */
             if (hi8 & 0x01) prod += 0x8000;
-            /* Determine dest and operation */
-            int is_sub = (hi8 >= 0xB4 && hi8 <= 0xB7);
+            /* Determine dest and operation.
+             * FIX 2026-05-29 (binutils tic54x-opc.c, confirmé) : 0xB4-0xB7 =
+             * MACR = mac+round = ADDITION (0xB400/0xFC00), PAS soustraction.
+             * MAS/MASR (soustraction) = 0xB8-0xBF, gérés dans des handlers
+             * séparés (L7582/L7564). Ce handler ne reçoit que 0xA4-A7 + 0xB0-B7,
+             * tous des accumulations (ADD). L'ancien `is_sub=(hi8 0xB4..B7)`
+             * inversait le signe de l'op dominant du corrélateur FCCH (0xb4aa)
+             * → corrélation = -B*T*X → jamais de pic → snr=0 → pas de FB lock. */
+            int is_sub = 0;
             int dst_b;
             if (hi8 >= 0xA4 && hi8 <= 0xA7) dst_b = (hi8 >= 0xA6);
             else if (hi8 >= 0xB4 && hi8 <= 0xB7) dst_b = (hi8 >= 0xB6);
@@ -10766,18 +10790,25 @@ void c54x_reset(C54xState *s)
      * + same IMR change=0). FRET stub kept: prevents stack runaway when
      * CALAA targets the stub area, with no downside.
      *
-     * Fallback per slot (2026-05-29 fix : remplace LDMM/RET par IDLE 1) :
-     *   - 0x0000: IDLE 1 (0xF4E1) — halt jusqu'à IRQ
-     *   - 0x0001: IDLE 1 (0xF4E1) — pareil (= au cas où IRQ entry land ici)
-     *   - rest:   IDLE 1 — uniforme, jamais sortir sauf via IRQ
+     * Fallback per slot (2026-05-29 v3 — RET@0x0000 équilibre le near-CALA) :
+     *   - 0x0000/0x0001: RET (0xFC00) — pop ret_pc, retour ÉQUILIBRÉ.
+     *   - rest (0x02..0x7F): FRET (0xF4E4) — retour-from-far (far-call→stub).
      *
-     * Avant : LDMM SP,B + RET → pop stack=0 → PC=0 → loop infini sans
-     * jamais wake-on-IRQ.  Maintenant : IDLE clear s->idle quand IRQ
-     * fire (c54x.c lignes 10775-10776), DSP exec INT3 handler, RETE
-     * retourne à PC=0x0000 où IDLE redémarre. C'est le pattern silicon
-     * réel : core halt entre les frames TDMA. */
+     * Pourquoi RET@0x0000 (et pas IDLE/LDMM) : le firmware fait des near-CALA
+     * `CALA → 0x0000` avec A=0 (chemin handler-nul/défaut ; ex. LDU@0xfa7e lit
+     * un ptr de table = 0 → CALA A=0). Un near-CALA push 1 mot (ret_pc) ; RET
+     * pop 1 mot → ÉQUILIBRÉ → retour propre au caller → le boot continue.
+     *   - IDLE (v2) ne retournait pas → halt+slide 0x0000→0x0002 → FRET-loop
+     *     → fuite SP (0x1106→0x4d75).
+     *   - LDMM SP,B+RET (old/good 2026-05-28) retournait MAIS posait SP=B :
+     *     si B=0 → SP=0 → pop garbage ("wake-on-IRQ" loop de v1).
+     * Le rest reste FRET : les far-calls (FCALA, push 2) qui tombent dans la
+     * zone sont équilibrés par FRET (pop 2). Le firmware idle à son vrai
+     * point (IDLE de la table TDMA slots, cf doc/DSP_ROM_MAP.md). */
     for (int i = 0; i < 0x80; i++)
-        s->prog[i] = 0xF4E1;  /* IDLE 1 — wait-for-IRQ */
+        s->prog[i] = 0xF4E4;  /* FRET — retour-from-far (far-call-into-stub) */
+    s->prog[0x0000] = 0xFC00;  /* RET — pop ret_pc, équilibre le near-CALA→0 */
+    s->prog[0x0001] = 0xFC00;  /* RET — idem */
 
     /* Reset vector: IPTR * 0x80 */
     uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
