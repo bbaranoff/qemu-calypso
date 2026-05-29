@@ -109,6 +109,10 @@ static CalypsoTRX *g_trx;
  * Update without requiring physical RF AFC simulation. */
 static CalypsoFbsb g_fbsb;
 static bool        g_fbsb_inited;
+/* Définis dans calypso_c54x.c — posés ici quand l'ARM écrit d_task_md=5,
+ * lus par la sonde D_TASK_MD-RD (test H1 timing/EA write-vs-read). */
+extern uint32_t g_arm_taskmd5_insn;
+extern uint16_t g_arm_taskmd5_ea;
 
 /* All firmware patches removed — verified that the layer1.highram.elf
  * runs unmodified against the current QEMU emulation (PM scan, FBSB,
@@ -488,6 +492,14 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 TRX_LOG("ARM TASK WR [0x%04x] = %u fn=%u",
                         (unsigned)offset, (unsigned)value, s->fn);
             task_log++;
+
+            /* Test H1 : mémorise insn DSP + EA data DSP quand l'ARM commande
+             * FB (d_task_md=5), pour que la sonde D_TASK_MD-RD timestampe les
+             * reads DSP par rapport à ce write et compare les EA. */
+            if (value == 5 && s->dsp) {
+                g_arm_taskmd5_insn = s->dsp->insn_count;
+                g_arm_taskmd5_ea   = (uint16_t)(offset/2 + 0x0800);
+            }
 
             /* === TASK6-IRQ snapshot (2026-05-28) ===
              * À chaque ARM TASK WR = 6 (SB demanded), snapshot IMR + IFR du
@@ -884,15 +896,18 @@ static void calypso_frame_irq_lower(void *o){
 static QEMUClockType calypso_tdma_clock(void) {
     static int cached = -1;
     if (cached < 0) {
-        /* DEFAULT ON : la cadence frame GSM doit être wall-clock pour que
-         * l1_sync (donc afc_load_dsp / AFC WR + FB-det) tourne à 217 Hz.
-         * Sous icount=auto le clock VIRTUAL décroche (~17 Hz) → la sync L23
-         * timeout et l'AFC n'est jamais appelé. C'est la "méthode d'appel"
-         * du commit fbsb. Opt-out legacy via CALYPSO_TDMA_REALTIME=0. */
+        /* DEFAULT VIRTUAL (2026-05-29 v2, single-domain) : tout le système
+         * (ARM, DSP, radio via clk-master FN, mobile) doit partager UNE base
+         * de temps = le temps virtuel QEMU, comme le HW partage l'horloge RF.
+         * Le défaut REALTIME (wall-clock) faisait courir la radio/mobile à
+         * 100% wall pendant que l'ARM virtuel traîne à ~7% → drift → LOST.
+         * En VIRTUAL le tdma_tick devient maître du FN (cf section 0) et la
+         * radio suit le rythme virtuel : lent en wall mais zéro drift, et
+         * insensible au debug/charge host. Opt-in wall via CALYPSO_TDMA_REALTIME=1. */
         const char *e = getenv("CALYPSO_TDMA_REALTIME");
-        cached = (e && *e == '0') ? 0 : 1;
+        cached = (e && *e == '1') ? 1 : 0;
         fprintf(stderr, "[calypso-trx] tdma_timer clock = %s\n",
-                cached ? "REALTIME (wall-clock 217 Hz, default)" : "VIRTUAL (legacy, opt-out)");
+                cached ? "REALTIME (wall-clock 217 Hz, opt-in)" : "VIRTUAL (single-domain, default)");
     }
     return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
 }
@@ -922,11 +937,31 @@ static void calypso_tdma_tick(void *opaque) {
      * Si le pthread est encore en init (g_wall_fn=0), on garde notre
      * propre compteur en fallback pour ne pas freeze le DSP. */
     {
-        uint32_t wfn = __atomic_load_n(&g_wall_fn, __ATOMIC_ACQUIRE);
-        if (wfn != 0) {
-            s->fn = wfn % GSM_HYPERFRAME;
+        if (calypso_tdma_clock() == QEMU_CLOCK_VIRTUAL) {
+            /* SINGLE-DOMAIN (default) : le tdma_tick VIRTUAL est le MAÎTRE du
+             * FN — il avance g_wall_fn d'une frame par tick virtuel ET envoie
+             * le CLK à la radio (cf section 0). La radio (ipc-device/trx-ipc)
+             * suit donc le temps virtuel de QEMU → zéro drift ARM↔radio↔mobile.
+             * (Le pthread wall clk-master n'est PAS démarré dans ce mode.) */
+            uint32_t fn = __atomic_add_fetch(&g_wall_fn, 1, __ATOMIC_RELEASE)
+                        % GSM_HYPERFRAME;
+            s->fn = fn;
+            if (s->clk_fd >= 0) {
+                uint8_t pkt[4];
+                pkt[0] = (fn >> 24) & 0xFF; pkt[1] = (fn >> 16) & 0xFF;
+                pkt[2] = (fn >>  8) & 0xFF; pkt[3] =  fn        & 0xFF;
+                (void)sendto(s->clk_fd, pkt, 4, 0,
+                             (struct sockaddr *)&s->clk_peer, sizeof(s->clk_peer));
+            }
         } else {
-            s->fn = (s->fn + 1) % GSM_HYPERFRAME;
+            /* REALTIME (opt-in) : le pthread wall clk-master est maître, on le
+             * suit. Si encore en init (g_wall_fn=0), fallback compteur local. */
+            uint32_t wfn = __atomic_load_n(&g_wall_fn, __ATOMIC_ACQUIRE);
+            if (wfn != 0) {
+                s->fn = wfn % GSM_HYPERFRAME;
+            } else {
+                s->fn = (s->fn + 1) % GSM_HYPERFRAME;
+            }
         }
     }
 
@@ -1608,7 +1643,15 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             s->clk_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             TRX_LOG("CLK UDP → bridge 127.0.0.1:6700");
 
-            calypso_trx_start_clk_master_thread(s);
+            /* Le pthread wall clk-master n'est démarré qu'en mode REALTIME.
+             * En VIRTUAL (défaut), c'est le tdma_tick qui envoie le CLK (FN
+             * virtuel-paced) — pas de pthread wall (sinon double-maître + drift). */
+            if (calypso_tdma_clock() == QEMU_CLOCK_REALTIME) {
+                calypso_trx_start_clk_master_thread(s);
+                TRX_LOG("clk-master wall pthread started (REALTIME mode)");
+            } else {
+                TRX_LOG("clk-master = tdma_tick virtual-paced (VIRTUAL mode, no wall pthread)");
+            }
         }
     }
 }

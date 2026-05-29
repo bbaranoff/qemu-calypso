@@ -433,6 +433,26 @@ static void ar6_at_iter(C54xState *s, uint16_t prev_pc, uint16_t prev_op)
 static uint64_t g_rsbx_intm_hits = 0;
 static int      g_rsbx_intm_enabled = -1;
 
+/* DISP-ENTRY discriminateur (c web 2026-05-29) : capture du contexte de
+ * préemption d'IT, pour trancher "dispatcher atteint via vecteur IT avec DP
+ * foreground sale" (b) vs "DP clobbé" (a). C54x n'empile PAS ST0/DP à l'IT →
+ * l'ISR hérite du DP du code interrompu. Si les entrées dispatcher KO
+ * (DP≠0x124) corrèlent avec une IT récente → préemption confirmée. */
+static uint64_t g_last_intr_insn  = 0;      /* insn_count de la dernière IT servie */
+static int      g_last_intr_vec   = -1;     /* vecteur de la dernière IT */
+static uint16_t g_last_intr_fg_pc = 0;      /* PC foreground préempté */
+static uint16_t g_last_intr_fg_dp = 0;      /* DP foreground préempté */
+/* dernier LDP (qui a posé DP) + PC prédécesseur (comment on arrive à 0x8341) */
+static uint16_t g_last_ldp_pc  = 0;         /* PC de l'instruction qui a posé DP */
+static uint16_t g_last_ldp_val = 0;         /* valeur DP posée */
+static int      g_last_ldp_kind = 0;        /* 1=LDP#k(5902) 2=LDP#k9(6262) 3=LD Smem,DP(7049) */
+static uint16_t g_prev_pc = 0;              /* PC de l'instruction exécutée juste avant */
+static uint16_t g_last_st0w_pc  = 0;        /* PC du dernier write ST0 entier (POPM ST0/STLM) */
+static uint16_t g_last_st0w_val = 0;        /* valeur ST0 restaurée */
+static uint16_t g_last_st0w_op  = 0;        /* opcode de l'instruction qui écrit ST0 */
+static uint16_t g_last_st0w_xpc = 0;        /* XPC au moment du write (0xf48b dépend de XPC) */
+static uint16_t g_last_st0w_prev = 0;       /* PC prédécesseur du write (comment on y arrive) */
+
 static void rsbx_intm_check(C54xState *s, uint16_t op)
 {
     if (g_rsbx_intm_enabled < 0) {
@@ -648,7 +668,13 @@ static CorrReadEntry g_corr_read_hist[CORR_READ_HIST_MAX];
 static unsigned    g_corr_read_used    = 0;
 static int         g_corr_trace_enabled = -1; /* -1 uninit, 0 off, 1 on */
 static unsigned    g_corr_entry_count  = 0;
-static unsigned    g_corr_entry_log_cap = 20;
+static unsigned    g_corr_entry_log_cap = 100000;  /* uncap : voir le par-frame post-+3s */
+
+/* Posés par calypso_trx.c quand l'ARM écrit d_task_md=5 (commande FB).
+ * La sonde D_TASK_MD-RD timestampe les reads DSP par rapport à ce write
+ * (test H1 : EA write ARM vs EA read DSP + ordre). */
+uint32_t g_arm_taskmd5_insn = 0;
+uint16_t g_arm_taskmd5_ea   = 0;
 static uint64_t    g_corr_read_total   = 0;
 static uint16_t    g_corr_last_pc      = 0xFFFF; /* track PC transitions */
 
@@ -1510,16 +1536,33 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
      * @ data[0x0804], write page 1 @ data[0x0818]). The DSP dispatcher
      * reads task_md then branches to FB / SB / ALLC / etc. routines.
      * If only one PC reads it, that's the single dispatcher. Capped 30. */
-    if (addr == 0x0804 || addr == 0x0818) {
-        static unsigned tm_log = 0;
-        if (tm_log++ < 30) {
+    if ((addr == 0x0804 || addr == 0x0818) && calypso_debug_enabled("D_TASK_MD-RD")) {
+        /* UNCAP (gated par token) + EA/page/val + Δ depuis le write ARM=5.
+         * Si après le write (Δ>0) la valeur lue ≠ 5 → le 5 n'atteint pas cette
+         * EA : compare ARM5_EA (EA écrite par l'ARM) vs EA (EA lue par le DSP).
+         *  - mêmes EA, val≠5 → timing/ordre (read avant write dans la frame)
+         *  - EA ≠ ARM5_EA (stride page) → parité de flip w_page/r_page. */
+        fprintf(stderr,
+                "[c54x] D_TASK_MD-RD EA=0x%04x page=%d val=0x%04x "
+                "ARM5_EA=0x%04x dArm5=%lld PC=0x%04x insn=%u\n",
+                addr, (addr == 0x0804) ? 0 : 1, s->data[addr],
+                g_arm_taskmd5_ea,
+                (long long)((int64_t)s->insn_count - (int64_t)g_arm_taskmd5_insn),
+                s->pc, s->insn_count);
+    }
+    /* DISP-POLL (CALYPSO_DEBUG=DISP-POLL) : le busy-loop dispatcher (d1xx↔da0d)
+     * polle la zone flag DARAM[0x60-0x70]. On veut voir EN STEADY-STATE (post
+     * +1.9s) CE qu'il lit (quel slot) et si ce flag devient jamais non-zéro
+     * (= qqn le pose). Throttlé : 1ère/40000 par slot pour éviter l'explosion
+     * du busy-loop, + TOUTE valeur non-zéro (l'évènement qui compte). */
+    if (addr >= 0x0060 && addr <= 0x0070 && calypso_debug_enabled("DISP-POLL")) {
+        static uint64_t poll_n = 0;
+        uint16_t v = s->data[addr];
+        if (v != 0 || (poll_n++ % 40000) == 0)
             fprintf(stderr,
-                    "[c54x] D_TASK_MD-RD data[0x%04x]=0x%04x page=%d "
-                    "PC=0x%04x insn=%u\n",
-                    addr, s->data[addr],
-                    (addr == 0x0804) ? 0 : 1,
-                    s->pc, s->insn_count);
-        }
+                "[c54x] DISP-POLL-RD data[0x%04x]=0x%04x PC=0x%04x INTM=%d insn=%u%s\n",
+                addr, v, s->pc, !!(s->st1 & ST1_INTM), s->insn_count,
+                v ? "  <-- NON-ZERO (flag posé !)" : "");
     }
     /* FBDB-PROBE read 0x3DC0 (= SARAM flag polled by fc63 BITF).
      * Env CALYPSO_FBDB_PROBE=1. Logs first 30 reads + each 10000th. */
@@ -2190,14 +2233,21 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * CALAD-A=0x70c3 au lieu de 0x8239 → self-CALA → SP drain → snr=0.
      * On bloque uniquement les writes DROM à offset 0x07 (la colonne LUT) :
      * le scratch firmware est à d'autres offsets (0x00/0x42/0x60…), préservé. */
-    if (addr >= 0x9000 && addr <= 0xDFFF && (addr & 0x7F) == 0x07
-        && (s->pmst & PMST_DROM)) {
+    /* DROM-LUT column protection — garde PMST.DROM RETIRÉE 2026-05-29.
+     * Preuve (run 459M, /root/qemu.log) : PMST=0x70c4 vu 149× = PMST(MMR 0x1D)
+     * lui-même clobbé par le self-CALA 0x70c3 (SP drain) → bit DROM(0x08)=0 →
+     * la garde se désactivait elle-même → LUT 0x9207 re-corrompue → 0x70c3 →
+     * boucle auto-entretenue (148838× le self-CALA). DROM-W-DROP n'avait fiché
+     * que 2× (DROM encore =1) puis silence. Le firmware ne tourne JAMAIS
+     * légitimement en DROM=0 (PMST légit = 0xffa8/0xffb8, DROM=1 dans les deux)
+     * → offset 0x07 read-only SANS garde DROM. */
+    if (addr >= 0x9000 && addr <= 0xDFFF && (addr & 0x7F) == 0x07) {
         static unsigned drom_w_attempts = 0;
         if (drom_w_attempts++ < 40) {
             if (calypso_debug_enabled("DROM-W-DROP")) fprintf(stderr,
                     "[c54x] DROM-W-DROP data[0x%04x] <- 0x%04x (was 0x%04x) "
-                    "PC=0x%04x insn=%u  (silicon: ROM, read-only)\n",
-                    addr, val, s->data[addr], s->pc, s->insn_count);
+                    "PC=0x%04x insn=%u pmst=0x%04x (LUT col, read-only)\n",
+                    addr, val, s->data[addr], s->pc, s->insn_count, s->pmst);
         }
         return;
     }
@@ -2610,7 +2660,13 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             }
             s->imr = val; return;
         case MMR_IFR:  s->ifr &= ~val; return;  /* write 1 to clear */
-        case MMR_ST0:  s->st0 = val; return;
+        case MMR_ST0:  s->st0 = val;
+            /* DISP-ENTRY : trace restauration ST0 entière (POPM ST0/STLM) =
+             * chemin NON-LDP qui change DP. C'est ICI que DP devient 0x087. */
+            g_last_st0w_pc = s->pc; g_last_st0w_val = val;
+            g_last_st0w_op = prog_fetch(s, s->pc); g_last_st0w_xpc = s->xpc;
+            g_last_st0w_prev = g_prev_pc;
+            return;
         case MMR_ST1:  s->st1 = val; return;
         case MMR_AL:   s->a = (s->a & ~0xFFFF) | val; return;
         case MMR_AH:   s->a = (s->a & ~((int64_t)0xFFFF << 16)) | ((int64_t)val << 16); return;
@@ -3328,6 +3384,36 @@ static int c54x_exec_one(C54xState *s)
 
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
+
+    /* DISP-ENTRY (CALYPSO_DEBUG=DISP-ENTRY, c web 2026-05-29) : discriminateur
+     * préemption-IT vs clobber. Logge UNIQUEMENT l'entrée dispatcher 0x8341,
+     * avec DP/ST0/SP/AR2 + état IT (INTM/IFR/INT3-pending) + contexte de la
+     * DERNIÈRE IT servie (vec, Δinsn, PC+DP foreground préemptés) + prédiction
+     * du slot LUT qui sera lu à 0x834d = data[(DP<<7)|0x07] → handler vs garbage.
+     * DIFF entrées OK (DP=0x124) vs KO (DP≠0x124) : si KO ⟺ IT récente (Δinsn
+     * petit, fg_dp=DP-KO) → (b) préemption confirmée, root = INTM/IT. */
+    if (s->pc == 0x8341 && calypso_debug_enabled("DISP-ENTRY")) {
+        static unsigned de_n = 0;
+        if (de_n++ < 20000) {
+            uint16_t lut_ea = (uint16_t)(((s->st0 & 0x1FF) << 7) | 0x07);
+            uint16_t lut    = s->data[lut_ea];
+            uint64_t d_intr = s->insn_count - g_last_intr_insn;
+            fprintf(stderr,
+                "[c54x] DISP-ENTRY DP=0x%03x ST0=0x%04x SP=0x%04x AR2=0x%04x "
+                "INTM=%d IFR=0x%04x INT3pend=%d  lut[0x%04x]=0x%04x %s  "
+                "prevPC=0x%04x  lastLDP{pc=0x%04x val=0x%03x kind=%d}  "
+                "lastST0w{pc=0x%04x op=0x%04x xpc=%u val=0x%04x prev=0x%04x}  "
+                "lastIT{vec=%d dInsn=%llu fgPC=0x%04x fgDP=0x%03x} insn=%u\n",
+                (unsigned)(s->st0 & 0x1FF), s->st0, s->sp, s->ar[2],
+                !!(s->st1 & ST1_INTM), s->ifr, !!(s->ifr & (1 << 3)),
+                lut_ea, lut, (lut == 0xff72 ? "OK" : "BAD"),
+                g_prev_pc, g_last_ldp_pc, g_last_ldp_val, g_last_ldp_kind,
+                g_last_st0w_pc, g_last_st0w_op, g_last_st0w_xpc,
+                g_last_st0w_val, g_last_st0w_prev,
+                g_last_intr_vec, (unsigned long long)d_intr,
+                g_last_intr_fg_pc, g_last_intr_fg_dp, s->insn_count);
+        }
+    }
 
     /* DISP-TRACE (CALYPSO_DEBUG=DISP-TRACE) : trace le dispatcher de tâches
      * 0x8341-0x8353 qui calcule la cible CALAD (0x8353 = CALAD A). Le bug :
@@ -5834,7 +5920,9 @@ static int c54x_exec_one(C54xState *s)
             case 0x8: /* F78x: LD #k8, T */
                 s->t = (s->st1 & ST1_SXM) ? (uint16_t)(int8_t)k : k; break;
             case 0x9: /* F79x: LD #k8, DP */
-                s->st0 = (s->st0 & ~ST0_DP_MASK) | (k & ST0_DP_MASK); break;
+                s->st0 = (s->st0 & ~ST0_DP_MASK) | (k & ST0_DP_MASK);
+                g_last_ldp_pc = s->pc; g_last_ldp_val = (k & ST0_DP_MASK); g_last_ldp_kind = 1;
+                break;
             case 0xA: /* F7Ax: LD #k8, ARP */
                 s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
             case 0xB: s->ar[7] = k; break; /* F7Bx: LD #k8, AR7 */
@@ -6195,6 +6283,7 @@ static int c54x_exec_one(C54xState *s)
             uint16_t k9 = op & 0x01FF;
             uint16_t old_dp = s->st0 & ST0_DP_MASK;
             s->st0 = (s->st0 & ~ST0_DP_MASK) | k9;
+            g_last_ldp_pc = s->pc; g_last_ldp_val = k9; g_last_ldp_kind = 2;
             {
                 static uint64_t dpc;
                 dpc++;
@@ -6982,6 +7071,7 @@ static int c54x_exec_one(C54xState *s)
                 addr = resolve_smem(s, op, &ind);
                 uint16_t val = data_read(s, addr);
                 s->st0 = (s->st0 & ~ST0_DP_MASK) | (val & ST0_DP_MASK);
+                g_last_ldp_pc = s->pc; g_last_ldp_val = (val & ST0_DP_MASK); g_last_ldp_kind = 3;
                 return consumed + s->lk_used;
             }
             if (op8 == 0x47) {
@@ -10247,6 +10337,12 @@ int c54x_run(C54xState *s, int n_insns)
                     pc_ring[(pc_ring_idx-3)&255],  pc_ring[(pc_ring_idx-2)&255]);
         }
 
+        {
+            /* DISP-ENTRY : prédécesseur = PC exécuté à l'itération précédente */
+            static uint16_t s_last_run_pc = 0;
+            g_prev_pc = s_last_run_pc;
+            s_last_run_pc = s->pc;
+        }
         consumed = c54x_exec_one(s);
 
         /* Track A writes (probe 3, post-exec). exec_pc = PC qui vient
@@ -10393,8 +10489,12 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static int trap_armed = -1;
             if (trap_armed < 0) {
-                const char *e = cdbg_env("TRAP-OOR");
-                trap_armed = (e && *e == '1') ? 1 : 0;
+                const char *e = cdbg_env("TRAP-OOR"); (void)e;
+                /* TRAP-OOR RETIRED 2026-05-29 : c'était l'analyse de descente
+                 * SP / SP-CATASTROPHE, résolue (0x70c3 self-CALA / DROM-LUT /
+                 * stub). Le site 2 faisait s->running=0 au checkpoint 4.2M =
+                 * LE bottleneck (CALYPSO_DEBUG=ALL haltait le DSP). Forcé OFF. */
+                trap_armed = 0;
             }
             if (trap_armed && s->sp != sp_before && s->insn_count > 33754) {
                 int16_t delta = (int16_t)(s->sp - sp_before);
@@ -10494,8 +10594,12 @@ int c54x_run(C54xState *s, int n_insns)
             static int tripped = 0;
             static unsigned checkpoint = 0;
             if (trap_armed < 0) {
-                const char *e = cdbg_env("TRAP-OOR");
-                trap_armed = (e && *e == '1') ? 1 : 0;
+                const char *e = cdbg_env("TRAP-OOR"); (void)e;
+                /* TRAP-OOR RETIRED 2026-05-29 : c'était l'analyse de descente
+                 * SP / SP-CATASTROPHE, résolue (0x70c3 self-CALA / DROM-LUT /
+                 * stub). Le site 2 faisait s->running=0 au checkpoint 4.2M =
+                 * LE bottleneck (CALYPSO_DEBUG=ALL haltait le DSP). Forcé OFF. */
+                trap_armed = 0;
                 const char *c = getenv("CALYPSO_TRAP_CHECKPOINT");
                 checkpoint = (c && *c) ? (unsigned)strtoul(c, NULL, 0) : 4200000u;
             }
@@ -10504,6 +10608,31 @@ int c54x_run(C54xState *s, int n_insns)
                 dsp_trap_dump(s, exec_pc, exec_op, sp_before, "CHECKPOINT");
                 s->running = 0;
             }
+        }
+
+        /* === VARIATEUR DE VITESSE osmocon (gated, CALYPSO_DSP_YIELD=N) ===
+         * Le DSP c54x tourne SYNCHRONE dans tdma_tick sur le thread principal.
+         * Tant que c54x_run mouline, l'ARM TCG + la mainloop (I/O radio/UART/
+         * socket osmocon) sont gelés → osmocon starve → LOST. C'est ce que le
+         * fprintf débloquait par accident (write bloquant = yield).
+         * Ici : version propre et RÉGLABLE. Tous les N insns DSP, on sort de
+         * c54x_run → tdma_tick rend la main → la mainloop pompe l'I/O → osmocon
+         * reçoit ses frames à temps.
+         *   N PETIT  = yield fréquent = osmocon RAPIDE (DSP ralenti)
+         *   N GRAND  = yield rare     = DSP rapide   (osmocon ralenti)
+         *   0/unset  = OFF (legacy, pas de yield) — le DSP garde tout le budget.
+         * C'est le "variateur de vitesse" : dose le partage thread DSP↔I/O. */
+        {
+            static int dsp_yield = -1;
+            if (dsp_yield < 0) {
+                const char *e = getenv("CALYPSO_DSP_YIELD");
+                dsp_yield = (e && *e) ? atoi(e) : 0;
+                if (dsp_yield < 0) dsp_yield = 0;
+                fprintf(stderr, "[c54x] CALYPSO_DSP_YIELD = %d insn/yield %s\n",
+                        dsp_yield, dsp_yield ? "(variateur ON)" : "(OFF, legacy)");
+            }
+            if (dsp_yield > 0 && executed >= dsp_yield)
+                break;   /* sort de c54x_run → mainloop sert l'I/O (osmocon) */
         }
 
         /* === DUAL-OP-INTERPRET diagnostic ===
@@ -10880,6 +11009,9 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             g_sp_ledger.irq_words_pushed++;
             g_sp_ledger.irq_entries++;
             s->st1 |= ST1_INTM;
+            /* DISP-ENTRY : capture contexte préempté (DP foreground inchangé) */
+            g_last_intr_insn = s->insn_count; g_last_intr_vec = vec;
+            g_last_intr_fg_pc = (uint16_t)(s->pc + 1); g_last_intr_fg_dp = dp(s);
             s->xpc = 0;                            /* fetch vecteur sur page 0 */
             uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
             s->pc = (iptr * 0x80) + vec * 4;
@@ -10899,6 +11031,9 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         g_sp_ledger.irq_words_pushed++;
         g_sp_ledger.irq_entries++;
         s->st1 |= ST1_INTM;
+        /* DISP-ENTRY : capture contexte préempté (DP foreground inchangé) */
+        g_last_intr_insn = s->insn_count; g_last_intr_vec = vec;
+        g_last_intr_fg_pc = (uint16_t)s->pc; g_last_intr_fg_dp = dp(s);
         s->xpc = 0;                                /* fetch vecteur sur page 0 */
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;

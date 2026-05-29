@@ -1208,12 +1208,14 @@ export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
 # pour la source .txt auto-splitee en per-section bins (cf L1422+).
 CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x2a00}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
-# tdma_timer = REALTIME by default → 217 Hz wall-clock cadence
-# independent of guest CPU. Critical for L23 sync under icount=auto.
-# Forced to 1 (the prior :- fallback was being silently overridden to 0 by
-# external env / menu wrappers, which broke L23 sync under icount=auto).
-# To revert to legacy VIRTUAL clock behaviour, edit this line directly.
-CALYPSO_TDMA_REALTIME=1
+# tdma_timer = REALTIME by default (revert 2026-05-29 v2).
+# Le single-domain VIRTUAL (QEMU esclave du temps virtuel) ne suffit PAS :
+# le BTS (osmo-bts-trx) + osmo-trx-ipc restent des process WALL non esclavés
+# au FN virtuel → en VIRTUAL ils poussent les DL à 217 Hz wall pendant que
+# QEMU consomme à ~10 Hz virtuel → FIFO ipc-device overflow (4095) → LOST.
+# REALTIME au moins aligne QEMU sur le BTS wall (reste le drift ARM icount,
+# autre combat). Opt-in single-domain virtuel (incomplet) : CALYPSO_TDMA_REALTIME=0.
+CALYPSO_TDMA_REALTIME="${CALYPSO_TDMA_REALTIME:-1}"
 # W1C latch on by default : ARM reads of a_sync_* / d_fb_det return the
 # host-side state machine's published values (stable) instead of DSP
 # transient writes (which flicker set→clear in ~18 cycles, losing the
@@ -1388,6 +1390,14 @@ echo "L2 client = $CALYPSO_L2_CLIENT"
 echo "CALYPSO_BSP_IQ_PASSTHROUGH = $CALYPSO_BSP_IQ_PASSTHROUGH"
 
 # ---------- cleanup ----------
+# Archive le log osmocon du run précédent AVANT de l'effacer : on veut
+# garder TOUT osmocon.log pour CHAQUE run (sinon le rm/truncate ci-dessous
+# n'en laisse qu'un, et on perd l'historique). Timestamp = run-id.
+if [ -f "$OSMOCON_LOG" ] && [ -s "$OSMOCON_LOG" ]; then
+    _OSMOCON_ARCHIVE="${OSMOCON_LOG%.log}.$(date +%Y%m%d_%H%M%S).log"
+    mv "$OSMOCON_LOG" "$_OSMOCON_ARCHIVE" 2>/dev/null \
+        && echo "[run.sh] osmocon.log précédent archivé → $_OSMOCON_ARCHIVE"
+fi
 rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$OSMO_TRX_IPC_LOG" "$IPC_DEVICE_LOG" \
       "$MON_SOCK" "$L1CTL_SOCK" "$QEMU_DUMMY_SOCK" \
@@ -1663,7 +1673,7 @@ fi
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
 tmux send-keys -t "$SESSION:osmocon" \
-    ": > $OSMOCON_LOG && $OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
+    ": > $OSMOCON_LOG && stdbuf -oL -eL $OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
 
 echo -n "Waiting for osmocon to expose $L1CTL_SOCK..."
 for i in $(seq 1 30); do
@@ -1790,8 +1800,12 @@ if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
     tmux new-window -t "$SESSION" -n "$CALYPSO_L2_CLIENT"
     case "$CALYPSO_L2_CLIENT" in
         mobile)
+            # Timer 3s sur le mobile : après le wait-socket L1CTL, laisser le
+            # firmware/pipeline se stabiliser avant que le mobile se connecte
+            # (l'émulation tourne lent en wall ; le socket peut exister avant
+            # que la L1 soit prête). Overridable via CALYPSO_MOBILE_DELAY.
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-                ": > $MOBILE_LOG && $L1CTL_WAIT && mobile -c $MOBILE_CFG -d $CALYPSO_MOBILE_DEBUG 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
+                ": > $MOBILE_LOG && $L1CTL_WAIT && sleep ${CALYPSO_MOBILE_DELAY:-3} && mobile -c $MOBILE_CFG -d $CALYPSO_MOBILE_DEBUG 2>&1 | $TSLOG | tee $MOBILE_LOG" C-m
             ;;
         ccch_scan)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
