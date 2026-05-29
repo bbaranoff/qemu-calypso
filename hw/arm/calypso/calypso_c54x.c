@@ -2181,13 +2181,23 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * slot). Wider ranges break other firmware paths (calibrated against
      * historical SARAM-overlay writability). Drop silently — matches
      * silicon. Probe first 20 attempts for diag. */
-    if (addr == 0x9187 && (s->pmst & PMST_DROM)) {
+    /* 2026-05-29 v2 : protège la COLONNE LUT du dispatcher dans la DROM, PAS
+     * toute la DROM (le full-DROM v1 bloquait le scratch firmware 0x9380/
+     * 0x93c2/0xd4xx → readback stale → DSP coincé en 0xebf0). Le dispatcher
+     * lit une LUT par-tâche à data[(DP<<7)|0x07] = 0x9187, 0x9207, 0x9287…
+     * (toujours offset 0x07 ; DP = numéro de tâche). Le `STH B,*AR2+` walking
+     * (RPTB 0x815E-0x8176) corrompait 0x9207 (natif 0xff72 → 0xf6b7) →
+     * CALAD-A=0x70c3 au lieu de 0x8239 → self-CALA → SP drain → snr=0.
+     * On bloque uniquement les writes DROM à offset 0x07 (la colonne LUT) :
+     * le scratch firmware est à d'autres offsets (0x00/0x42/0x60…), préservé. */
+    if (addr >= 0x9000 && addr <= 0xDFFF && (addr & 0x7F) == 0x07
+        && (s->pmst & PMST_DROM)) {
         static unsigned drom_w_attempts = 0;
-        if (drom_w_attempts++ < 20) {
+        if (drom_w_attempts++ < 40) {
             if (calypso_debug_enabled("DROM-W-DROP")) fprintf(stderr,
-                    "[c54x] DROM-W-DROP data[0x9187] <- 0x%04x (was 0x%04x) "
+                    "[c54x] DROM-W-DROP data[0x%04x] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x insn=%u  (silicon: ROM, read-only)\n",
-                    val, s->data[addr], s->pc, s->insn_count);
+                    addr, val, s->data[addr], s->pc, s->insn_count);
         }
         return;
     }
@@ -3327,13 +3337,19 @@ static int c54x_exec_one(C54xState *s)
      * déjà garbage à 0x8341 → bug upstream confirmé (dispatcher innocent). */
     if (s->pc >= 0x8341 && s->pc <= 0x8354 && calypso_debug_enabled("DISP-TRACE")) {
         static unsigned disp_n = 0;
-        if (disp_n++ < 300)
+        if (disp_n++ < 300) {
+            /* À 0x834d (op 0x6f07 = LD Smem<<1,A) : calcule l'EA direct exact
+             * (DP<<7)|dma et logge la valeur lue — c'est elle qui devient A.
+             * Légit = 0xff86 (→ A_L=0x8261) ; corrompu = 0xf6b7 (→ 0x70c3). */
+            uint16_t ea = (uint16_t)(((s->st0 & 0x1FF) << 7) | (op & 0x7F));
             fprintf(stderr,
-                "[c54x] DISP-TRACE PC=0x%04x op=0x%04x A=0x%010llx T=0x%04x "
-                "DP=0x%03x XPC=%d AR1=%04x AR2=%04x AR4=%04x AR5=%04x data[0x4187]=0x%04x insn=%u\n",
-                s->pc, op, (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->t,
-                (unsigned)(s->st0 & 0x1FF), s->xpc,
-                s->ar[1], s->ar[2], s->ar[4], s->ar[5], s->data[0x4187], s->insn_count);
+                "[c54x] DISP-TRACE PC=0x%04x op=0x%04x A=0x%010llx DP=0x%03x EA=0x%04x "
+                "data[EA]=0x%04x d[9187]=0x%04x d[9207]=0x%04x AR1=%04x AR5=%04x insn=%u\n",
+                s->pc, op, (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                (unsigned)(s->st0 & 0x1FF), ea, s->data[ea],
+                s->data[0x9187], s->data[0x9207],
+                s->ar[1], s->ar[5], s->insn_count);
+        }
     }
 
     /* Coarse default: any MMR write happening inside this opcode handler
