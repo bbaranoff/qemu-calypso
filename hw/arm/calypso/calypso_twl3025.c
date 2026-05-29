@@ -29,6 +29,7 @@
 #include <math.h>
 
 #include "hw/arm/calypso/calypso_twl3025.h"
+#include "hw/arm/calypso/calypso_debug.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -48,7 +49,14 @@
  * DAC=0    (= "+700 LSB au-dessus de la calib") → effective=+700 → +200900Hz
  */
 #define TWL3025_AFC_SLOPE_HZ_PER_LSB    287.0
-#define TWL3025_AFC_INITIAL_DAC_VALUE   (-700)
+/* ⚠️ NON-DÉFINITIF / TESTING 2026-05-29 : baseline 0, pas -700.
+ * Pirelli rf_tables.c défaut = -700, MAIS readcal lit la cal TIFFS et en
+ * QEMU (pas de flash cal) afcdac_shifted=0 -> afc_initial_dac_value=0.
+ * Le firmware écrit donc d_afc=0 comme baseline "no correction". Avec
+ * INITIAL=-700 le modèle appliquait effective=+700 LSB = +200900 Hz sur
+ * CHAQUE burst -> FCCH hors capture DSP (±20 kHz) -> FB jamais détecté.
+ * Baseline 0 : dac=0 -> 0 rotation -> FCCH au carrier -> détectable. */
+#define TWL3025_AFC_INITIAL_DAC_VALUE   (0)
 #define GSM_SAMPLE_RATE_HZ              270833.0  /* 1 sps GSM baseband */
 
 /* GSM TDMA timing constants (1 sample/bit BSP rate) :
@@ -145,6 +153,19 @@ void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,
     twl.apply_calls++;
 
     double step = calypso_twl3025_get_afc_phase_step();
+    /* ⚠️ NON-DÉFINITIF / TESTING 2026-05-29 : marqueur — confirme si CETTE
+     * fonction tourne en boucle et avec quel offset (hz). Si elle applique
+     * un offset énorme (ex +200900 Hz) sur chaque burst → elle tue la FCCH
+     * (capture DSP ±20 kHz) → FB jamais détecté → boucle FBSB. */
+    if (calypso_debug_enabled("AFC-APPLY") &&
+        (twl.apply_calls <= 20 || (twl.apply_calls % 2000) == 0)) {
+        fprintf(stderr, "[twl3025] AFC-APPLY #%llu hz=%.1f dac=%d step=%.6f "
+                "n=%d fn=%u tn=%u\n",
+                (unsigned long long)twl.apply_calls,
+                calypso_twl3025_get_afc_hz(), twl.dac_value, step,
+                n_samples, fn, tn);
+        fflush(stderr);
+    }
     if (step == 0.0) return;   /* DAC=0 et pas de force_hz : no-op */
 
     /* Sample offset absolu depuis FN=0,TN=0 = phase de reference système.

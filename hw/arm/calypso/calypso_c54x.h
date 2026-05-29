@@ -249,9 +249,6 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n);
 /* Create and initialize C54x state */
 C54xState *c54x_init(void);
 
-/* Load ROM dump from text file */
-int c54x_load_rom(C54xState *s, const char *path);
-
 /* Link API RAM (shared memory with ARM) */
 void c54x_set_api_ram(C54xState *s, uint16_t *api_ram);
 

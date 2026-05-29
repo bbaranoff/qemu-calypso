@@ -55,4 +55,13 @@ bool calypso_debug_enabled(const char *probe_name);
 #define TWL3025_DBG(probe, fmt, ...) \
     CALYPSO_DBG(probe, "[twl3025] " fmt "\n", ##__VA_ARGS__)
 
+/* cdbg_env : shim retro-compat pour les sites qui testaient
+ * getenv("CALYPSO_X")=="1". Retourne "1" si le token est actif dans
+ * CALYPSO_DEBUG, NULL sinon. Migre un gate getenv vers un token en
+ * changeant seulement l'appel getenv -> cdbg_env. */
+static inline const char *cdbg_env(const char *token)
+{
+    return calypso_debug_enabled(token) ? "1" : NULL;
+}
+
 #endif /* HW_ARM_CALYPSO_DEBUG_H */

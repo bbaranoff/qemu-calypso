@@ -474,7 +474,10 @@ static void bsp_trxd_readable(void *opaque)
          * CALYPSO_TWL3025_AFC != 1. Convergence AFC chain dépend de ça :
          * firmware applique AFC delta → DSP TSP → TWL3025 DAC → samples
          * rotated → DSP correlator voit la convergence. */
-        calypso_twl3025_apply_phase(iq, copy_count / 2, fn, tn);
+        /* ⚠️ TESTING 2026-05-29 : apply_phase déplacé décode -> delivery
+         * (l'AFC doit s'appliquer quand le DSP voit les samples = dac courant,
+         * pas au décode où le dac est stale de ~lookahead frames). */
+        /* calypso_twl3025_apply_phase(iq, copy_count / 2, fn, tn); */
         static int pt_log = 0;
         if (pt_log < 10 || (pt_log % 5000) == 0) {
             BSP_LOG("IQ passthrough #%d fn=%u tn=%u bytes=%d nbits=%d "
@@ -779,6 +782,16 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
                           const int16_t *iq, int n_int16)
 {
     bsp.bursts_seen++;
+    /* ⚠️ TESTING 2026-05-29 : marqueur — si ça fire, rx_burst EST vivant
+     * (et il faudra y appliquer l'AFC aussi). Sinon = code mort. */
+    {
+        static unsigned rxb_n;
+        if (calypso_debug_enabled("BSP-RXBURST") &&
+            (rxb_n <= 20 || rxb_n % 2000 == 0))
+            fprintf(stderr, "[BSP] BSP-RXBURST #%u fn=%u tn=%u n=%d\n",
+                    rxb_n, (unsigned)fn, (unsigned)tn, n_int16);
+        rxb_n++;
+    }
 
     /* GATE DSP_SHUNT : si le shunt est actif, le c54x ne tourne pas et
      * le mock écrit directement NDB/read-page. Toute écriture BSP vers
@@ -836,18 +849,33 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
 
     /* Load samples into BSP serial port buffer (PORTR PA=0x0034).
-     * The DSP reads one sample per PORTR instruction from this buffer. */
-    uint16_t samples[148];
-    for (int i = 0; i < n && i < 148; i++)
-        samples[i] = (uint16_t)iq[i];
-    c54x_bsp_load(bsp.dsp, samples, n > 148 ? 148 : n);
+     * The DSP reads one sample per PORTR instruction from this buffer.
+     * ⚠️ NON-DÉFINITIF / TESTING 2026-05-29 (hypothèse, à valider/débugger).
+     * FIX 2026-05-29 : livrer le burst COMPLET (iq[] = I/Q interleaved,
+     * 2*nbits int16, jusqu'à 296), PAS tronqué à 148. Tronquer à 148 int16
+     * ne donnait au corrélateur que 74 symboles complexes = la MOITIÉ du
+     * burst → la tonalité FCCH (FB) ne pouvait jamais corréler → FBSB_CONF
+     * jamais émis. On borne sur n_int16 (taille réelle du burst), pas n
+     * (qui était clampé à daram_len pour l'écriture DARAM). */
+    {
+        uint16_t samples[296];
+        int ns = n_int16 > 296 ? 296 : n_int16;
+        for (int i = 0; i < ns; i++)
+            samples[i] = (uint16_t)iq[i];
+        c54x_bsp_load(bsp.dsp, samples, ns);
+    }
 
     /* Also write to DARAM for code that reads samples directly.
      * Wrap the whole burst write + post-write log in a single DARAM lock
      * section — sans ça, DSP thread (Phase 2 PCB) racerait avec ce write
      * et lirait des samples partiellement écrits. Cost = 1 mutex op pour
      * ~157 itérations ≈ négligeable. */
-    static unsigned woff = 0;
+    /* ⚠️ NON-DÉFINITIF / TESTING 2026-05-29 (hypothèse, à valider/débugger).
+     * FIX 2026-05-29 : woff LOCAL (était static) — chaque burst écrit aligné
+     * à daram_addr[0..n-1]. Le static faisait rouler l'offset cross-burst :
+     * le burst FB d'une frame atterrissait à un offset que le DSP ne lit pas
+     * (fragmenté sur le wrap) → corrélateur sur données désalignées. */
+    unsigned woff = 0;
     calypso_pcb_daram_lock_acquire();
     for (int i = 0; i < n; i++) {
         uint16_t a = (uint16_t)(bsp.daram_addr + woff);
@@ -996,12 +1024,26 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             }
         }
 
+        /* ⚠️ TESTING 2026-05-29 : marqueur (cette fonction boucle-t-elle ?)
+         * + apply_phase ICI (delivery, dac courant) — théorie : le chemin
+         * vivant n'appliquait pas l'AFC sur les samples livrés au corrélateur. */
+        {
+            static unsigned dlv_n;
+            if (calypso_debug_enabled("BSP-DELIVER") &&
+                (dlv_n <= 20 || dlv_n % 2000 == 0))
+                fprintf(stderr, "[BSP] BSP-DELIVER #%u fn=%u tn=%u n=%d (apply AFC)\n",
+                        dlv_n, (unsigned)sl->fn, (unsigned)tn, n);
+            dlv_n++;
+        }
+        calypso_twl3025_apply_phase(sl->iq, sl->n / 2, sl->fn, (uint8_t)tn);
+
         uint16_t samples[296];
         for (int i = 0; i < n && i < 296; i++)
             samples[i] = (uint16_t)sl->iq[i];
         c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
 
-        static unsigned woff = 0;
+        /* ⚠️ TESTING : woff LOCAL (était static rolling cross-burst). */
+        unsigned woff = 0;
         calypso_pcb_daram_lock_acquire();
         for (int i = 0; i < n; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);

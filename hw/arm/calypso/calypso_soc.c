@@ -30,6 +30,7 @@ CalypsoUARTState *g_uart_irda;
 #include "chardev/char.h"
 #include "qemu/error-report.h"
 #include "hw/arm/calypso/calypso_uart.h"
+#include "hw/arm/calypso/calypso_debug.h"
 
 /* ---- Memory map ---- */
 #define CALYPSO_IRAM_BASE     0x00800000
@@ -204,7 +205,7 @@ static MemoryRegion rxdone_probe_mr;
 
 static void rxdone_probe_install(MemoryRegion *sysmem, DeviceState *dev)
 {
-    const char *e = getenv("CALYPSO_RXDONE_PROBE");
+    const char *e = cdbg_env("RXDONE");
     if (!e || e[0] != '1') return;
     memory_region_init_io(&rxdone_probe_mr, OBJECT(dev), &rxdone_probe_ops,
                           NULL, "rxdone_probe", 4);

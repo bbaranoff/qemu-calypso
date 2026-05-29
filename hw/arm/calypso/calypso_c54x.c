@@ -212,8 +212,8 @@ static void ar_write_track(C54xState *s, unsigned idx, uint16_t new_val)
 {
     if (g_ar_enabled < 0) {
         const char *e = getenv("CALYPSO_AR_TRACE");
-        g_ar_mask = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0;
-        g_ar_enabled = (g_ar_mask != 0) ? 1 : 0;
+        g_ar_mask = (e && *e) ? (unsigned)strtoul(e, NULL, 0) : 0xFFu;
+        g_ar_enabled = calypso_debug_enabled("AR-TRACE") ? 1 : 0;
         if (g_ar_enabled) {
             fprintf(stderr,
                 "[c54x] AR-TRACE enabled, mask=0x%02x (AR0..AR7), "
@@ -303,8 +303,8 @@ static void a_track_init_lazy(void)
 {
     if (g_a_trace_enabled >= 0) return;
     const char *e = getenv("CALYPSO_A_TRACE_PC");
-    if (e && *e) {
-        g_a_trace_pc = (uint16_t)strtoul(e, NULL, 0);
+    if (calypso_debug_enabled("A-TRACE")) {
+        g_a_trace_pc = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0;
         g_a_trace_enabled = 1;
         fprintf(stderr,
             "[c54x] A-TRACE enabled, trigger PC=0x%04x log_cap=%u\n",
@@ -376,8 +376,8 @@ static void ar6_at_init_lazy(void)
 {
     if (g_ar6_at_enabled >= 0) return;
     const char *e = getenv("CALYPSO_AR6_AT_PC");
-    if (e && *e) {
-        g_ar6_at_pc = (uint16_t)strtoul(e, NULL, 0);
+    if (calypso_debug_enabled("AR6-AT")) {
+        g_ar6_at_pc = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0;
         g_ar6_at_enabled = 1;
         const char *lo = getenv("CALYPSO_AR6_WIN_LO");
         const char *hi = getenv("CALYPSO_AR6_WIN_HI");
@@ -436,7 +436,7 @@ static int      g_rsbx_intm_enabled = -1;
 static void rsbx_intm_check(C54xState *s, uint16_t op)
 {
     if (g_rsbx_intm_enabled < 0) {
-        const char *e = getenv("CALYPSO_RSBX_INTM_TRACE");
+        const char *e = cdbg_env("RSBX-INTM");
         g_rsbx_intm_enabled = (e && *e == '1') ? 1 : 0;
         if (g_rsbx_intm_enabled) {
             fprintf(stderr, "[c54x] RSBX-INTM-TRACE enabled (op=0xF6BB)\n");
@@ -500,7 +500,7 @@ static unsigned   g_sp_abs_log_cap  = 50;
 static void sp_abs_track(C54xState *s, uint16_t new_val, uint8_t site)
 {
     if (g_sp_abs_enabled < 0) {
-        const char *e = getenv("CALYPSO_SP_ABS_TRACE");
+        const char *e = cdbg_env("SP-ABS");
         g_sp_abs_enabled = (e && *e == '1') ? 1 : 0;
         if (g_sp_abs_enabled) {
             fprintf(stderr, "[c54x] SP-ABS-TRACE enabled, log_cap=%u hist_max=%u\n",
@@ -570,7 +570,7 @@ static int      g_mvpd_dumped        = 0;
 static void mvpd_trace_init_lazy(void)
 {
     if (g_mvpd_trace_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_MVPD_TRACE");
+    const char *e = cdbg_env("MVPD");
     g_mvpd_trace_enabled = (e && *e == '1') ? 1 : 0;
     const char *l = getenv("CALYPSO_MVPD_BOOT_LIMIT");
     g_mvpd_boot_limit = (l && *l) ? (unsigned)strtoul(l, NULL, 0) : 500000u;
@@ -655,7 +655,7 @@ static uint16_t    g_corr_last_pc      = 0xFFFF; /* track PC transitions */
 static void corr_trace_init_lazy(void)
 {
     if (g_corr_trace_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_CORRELATOR_TRACE");
+    const char *e = cdbg_env("CORRELATOR");
     g_corr_trace_enabled = (e && *e == '1') ? 1 : 0;
     if (g_corr_trace_enabled) {
         fprintf(stderr, "[c54x] CORRELATOR-TRACE enabled, range=[0x%04x..0x%04x) "
@@ -718,7 +718,7 @@ static unsigned g_addr3dc0_rd_count = 0;
 static void fbdb_probe_init_lazy(void)
 {
     if (g_fbdb_probe_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_FBDB_PROBE");
+    const char *e = cdbg_env("FBDB");
     g_fbdb_probe_enabled = (e && *e == '1') ? 1 : 0;
     if (g_fbdb_probe_enabled) {
         fprintf(stderr,
@@ -798,7 +798,7 @@ static unsigned g_stuck_dump_count = 0;
 static void stuck_probe_init_lazy(void)
 {
     if (g_stuck_probe_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_STUCK_PROBE");
+    const char *e = cdbg_env("STUCK");
     g_stuck_probe_enabled = (e && *e == '1') ? 1 : 0;
     if (g_stuck_probe_enabled) {
         fprintf(stderr,
@@ -839,7 +839,7 @@ static void stuck_probe_dump(uint64_t cur_insn, const char *trig)
             g_stuck_hist[best] = tmp;
         }
     }
-    fprintf(stderr,
+    if (calypso_debug_enabled("STUCK-HIST")) fprintf(stderr,
         "[c54x] STUCK-HIST [%s] duration=%u insn since insn=%llu (now=%llu) top:\n",
         trig, g_stuck_duration,
         (unsigned long long)g_stuck_start_insn,
@@ -968,7 +968,7 @@ static int g_int3_trace_enabled = -1;
 static void int3_trace_init_lazy(void)
 {
     if (g_int3_trace_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_INT3_CYCLE_TRACE");
+    const char *e = cdbg_env("INT3-CYCLE");
     g_int3_trace_enabled = (e && *e == '1') ? 1 : 0;
     if (g_int3_trace_enabled) {
         fprintf(stderr,
@@ -1036,7 +1036,7 @@ static void int3_cycle_start(C54xState *s, uint16_t target_pc)
     g_int3_cycle_entry_insn = s->insn_count;
     g_int3_trace_count = 0;
     g_int3_trace_overflow = 0;
-    fprintf(stderr,
+    if (calypso_debug_enabled("INT3-CYCLE")) fprintf(stderr,
         "[c54x] INT3-CYCLE #%llu START @insn=%llu PC→0x%04x SP=0x%04x "
         "PMST=0x%04x IFR=0x%04x\n",
         (unsigned long long)g_int3_cycle_id,
@@ -1262,7 +1262,7 @@ static inline void throughput_tick(uint64_t insn_count)
     uint64_t delta_insn = insn_count - g_throughput.last_logged_insn;
     uint64_t rate = (delta_ns > 0)
         ? (delta_insn * 1000000000ULL / (uint64_t)delta_ns) : 0;
-    fprintf(stderr,
+    if (calypso_debug_enabled("INSN-COUNT-STATS")) fprintf(stderr,
             "[c54x] INSN-COUNT-STATS total=%llu delta=%llu elapsed_ms=%lld rate=%llu/s\n",
             (unsigned long long)insn_count,
             (unsigned long long)delta_insn,
@@ -1326,7 +1326,7 @@ static void read_stats_trigger_check(C54xState *s)
         delta[r] = g_read_stats.cumulative[r] - g_read_stats.snapshot[r];
         g_read_stats.snapshot[r] = g_read_stats.cumulative[r];
     }
-    fprintf(stderr,
+    if (calypso_debug_enabled("READ-AMONT")) fprintf(stderr,
             "[c54x] READ-AMONT #%llu PC=0x%04x insn=%u "
             "mmrs=%llu low=%llu apiram=%llu target=%llu wrap=%llu other=%llu\n",
             (unsigned long long)g_read_stats.trigger_count, s->pc, s->insn_count,
@@ -1553,7 +1553,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
         }
         /* Summary toutes les 50000 reads : histogramme valeurs lues */
         if ((dbw_total[page] % 50000) == 0) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("D_BURST_D_W-SUMMARY")) fprintf(stderr,
                     "[c54x] D_BURST_D_W-SUMMARY page=%d total=%llu "
                     "val[0]=%llu [1]=%llu [2]=%llu [3]=%llu other=%llu\n",
                     page, (unsigned long long)dbw_total[page],
@@ -1595,7 +1595,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                     }
                 }
             }
-            fprintf(stderr, "[c54x] PC-HIST-3FB total=%u :", total_3fb);
+            if (calypso_debug_enabled("PC-HIST-3FB")) fprintf(stderr, "[c54x] PC-HIST-3FB total=%u :", total_3fb);
             for (int i = 0; i < 10 && top_cnt[i]; i++) {
                 fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
             }
@@ -1625,7 +1625,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                     }
                 }
             }
-            fprintf(stderr, "[c54x] PC-HIST-3DD total=%u :", total_3dd);
+            if (calypso_debug_enabled("PC-HIST-3DD")) fprintf(stderr, "[c54x] PC-HIST-3DD total=%u :", total_3dd);
             for (int i = 0; i < 10 && top_cnt[i]; i++) {
                 fprintf(stderr, " %04x:%u", top_pc[i], top_cnt[i]);
             }
@@ -1851,7 +1851,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                 }
                 best[p] = c; baddr[p] = (uint16_t)(0x4000 + a);
             }
-            fprintf(stderr,
+            if (calypso_debug_enabled("UPPER-DARAM")) fprintf(stderr,
                     "[c54x] UPPER-DARAM RD HIST (reads=%u): ", ureads);
             for (int i = 0; i < 16 && best[i]; i++)
                 fprintf(stderr, "%04x:%u ", baddr[i], best[i]);
@@ -1880,7 +1880,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                     }
                     best[p] = c; baddr[p] = a;
                 }
-                fprintf(stderr,
+                if (calypso_debug_enabled("DARAM")) fprintf(stderr,
                         "[c54x] DARAM RD HIST (FB-det, reads=%u): ",
                         reads);
                 for (int i = 0; i < 16 && best[i]; i++)
@@ -2051,7 +2051,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         if (ndb_ctl) {
             static unsigned ndb_log = 0;
             if (ndb_log++ < 50) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("NDB-CTL-WR")) fprintf(stderr,
                         "[c54x] NDB-CTL-WR data[0x%04x] <- 0x%04x "
                         "(was 0x%04x) PC=0x%04x insn=%u\n",
                         addr, val, s->data[addr], s->pc, s->insn_count);
@@ -2137,7 +2137,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         if (a_sch_p0 || a_sch_p1) {
             static unsigned a_sch_log = 0;
             if (a_sch_log++ < 50) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("A_SCH-WR")) fprintf(stderr,
                         "[c54x] A_SCH-WR data[0x%04x] <- 0x%04x page=%d "
                         "idx=%d PC=0x%04x insn=%u\n",
                         addr, val,
@@ -2184,7 +2184,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr == 0x9187 && (s->pmst & PMST_DROM)) {
         static unsigned drom_w_attempts = 0;
         if (drom_w_attempts++ < 20) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("DROM-W-DROP")) fprintf(stderr,
                     "[c54x] DROM-W-DROP data[0x9187] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x insn=%u  (silicon: ROM, read-only)\n",
                     val, s->data[addr], s->pc, s->insn_count);
@@ -2255,7 +2255,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             a_cd_corr_total++;
             if (a_cd_corr_total - a_cd_corr_last_log >= 1000) {
                 a_cd_corr_last_log = a_cd_corr_total;
-                fprintf(stderr,
+                if (calypso_debug_enabled("A_CD-BY-BURST")) fprintf(stderr,
                         "[c54x] A_CD-BY-BURST total=%llu "
                         "burst[0]=%llu [1]=%llu [2]=%llu [3]=%llu other=%llu\n",
                         (unsigned long long)a_cd_corr_total,
@@ -2297,7 +2297,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         bool should_log = db_total[page] <= 200
             || (s->insn_count - db_last_log[page]) > 100000;
         if (should_log) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("D_BURST_D-WR")) fprintf(stderr,
                     "[c54x] D_BURST_D-WR page=%d #%llu addr=0x%04x val=0x%04x "
                     "exec_pc=0x%04x prev=%u curr=%u insn=%u\n",
                     page, (unsigned long long)db_total[page], addr, val,
@@ -2306,7 +2306,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
         if (s->insn_count - db_last_summary[page] >= 5000000) {
             db_last_summary[page] = s->insn_count;
-            fprintf(stderr,
+            if (calypso_debug_enabled("D_BURST_D-SUMMARY")) fprintf(stderr,
                     "[c54x] D_BURST_D-SUMMARY page=%d total=%llu trans:",
                     page, (unsigned long long)db_total[page]);
             for (int p = 0; p < 8; p++) {
@@ -2344,7 +2344,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         bool should_log = dt_total[page] <= 200
             || (s->insn_count - dt_last_log[page]) > 100000;
         if (should_log) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("D_TASK_D-WR")) fprintf(stderr,
                     "[c54x] D_TASK_D-WR page=%d #%llu addr=0x%04x val=0x%04x "
                     "exec_pc=0x%04x prev=0x%04x insn=%u\n",
                     page, (unsigned long long)dt_total[page], addr, val,
@@ -2368,7 +2368,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             uint8_t wk = s->writer_kind;
             const char *wkn = (wk < sizeof(wk_name)/sizeof(wk_name[0]))
                               ? wk_name[wk] : "??";
-            fprintf(stderr,
+            if (calypso_debug_enabled("DATA-W-MMR")) fprintf(stderr,
                     "[c54x] DATA-W-MMR addr=0x%02x val=0x%04x "
                     "exec_pc=0x%04x cur_pc=0x%04x cur_op=0x%04x "
                     "xpc=%d wk=%s "
@@ -2406,7 +2406,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         static int      w3fbe_enabled = -1;
         static unsigned w3fbe_total = 0;
         if (w3fbe_enabled < 0) {
-            const char *e = getenv("CALYPSO_WATCH_3FBE");
+            const char *e = cdbg_env("WATCH-3FBE");
             w3fbe_enabled = (e && *e == '1') ? 1 : 0;
             if (w3fbe_enabled) {
                 fprintf(stderr,
@@ -2440,7 +2440,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr == 0x0ffe || addr == 0x0fff || addr == 0x01F0) {
         static unsigned wcount;
         if (wcount++ < 30) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("WATCH-WRITE")) fprintf(stderr,
                     "[c54x] WATCH-WRITE data[0x%04x] <- 0x%04x  (was 0x%04x) "
                     "PC=0x%04x insn=%u\n",
                     addr, val, s->data[addr], s->pc, s->insn_count);
@@ -2453,7 +2453,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr == 0x3f65) {
         static unsigned dpw;
         if (dpw++ < 100) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("DISP-PTR")) fprintf(stderr,
                     "[c54x] DISP-PTR data[0x3f65] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x insn=%u\n",
                     val, s->data[addr], s->pc, s->insn_count);
@@ -2465,7 +2465,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr == 0x4359 || addr == 0x3fab) {
         static unsigned dispw;
         if (dispw++ < 50) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("DISP-WRITE")) fprintf(stderr,
                     "[c54x] DISP-WRITE data[0x%04x] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x insn=%u\n",
                     addr, val, s->data[addr], s->pc, s->insn_count);
@@ -2479,7 +2479,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr >= 0x4180 && addr <= 0x41FF) {
         static unsigned cwz;
         if (cwz++ < 5000) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("CALAD-ZONE-W")) fprintf(stderr,
                     "[c54x] CALAD-ZONE-W data[0x%04x] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x insn=%u\n",
                     addr, val, s->data[addr], s->pc, s->insn_count);
@@ -2506,13 +2506,13 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     if (addr >= 0x0040 && addr <= 0x0090) {
         static unsigned daram_disp_w;
         if (daram_disp_w++ < 1000) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("DISP-FLAG-W")) fprintf(stderr,
                     "[c54x] DISP-FLAG-W data[0x%04x] <- 0x%04x (was 0x%04x) "
                     "PC=0x%04x INTM=%d IFR=0x%04x insn=%u\n",
                     addr, val, s->data[addr], s->pc,
                     !!(s->st1 & ST1_INTM), s->ifr, s->insn_count);
             if (daram_disp_w == 1000) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("DISP-FLAG-W")) fprintf(stderr,
                         "[c54x] DISP-FLAG-W log capped at 1000 — pattern visible above\n");
             }
         }
@@ -2580,7 +2580,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                  * uncapped, so we can identify the buggy code path. */
                 bool to_zero = (val == 0);
                 if (imr_log++ < 50 || to_zero) {
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("IMR-W")) fprintf(stderr,
                             "[c54x] IMR-W %s 0x%04x → 0x%04x PC=0x%04x "
                             "op=0x%04x prev_op=0x%04x SP=0x%04x INTM=%d "
                             "AR0=0x%04x AR1=0x%04x AR2=0x%04x AR3=0x%04x "
@@ -2616,7 +2616,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             s->ar[addr - MMR_AR0] = val; return;
         case MMR_SP:
             if (val >= 0x0800 && val < 0x0900) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("SP-GUARD")) fprintf(stderr,
                         "[c54x] SP-GUARD: refused MMR_SP write 0x%04x "
                         "(API mailbox); keeping 0x%04x PC=0x%04x\n",
                         val, s->sp, s->pc);
@@ -2777,7 +2777,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
          * mailbox region [0x0800..0x08FF]. Only fires when SP has
          * already been corrupted into that range. */
         if (addr == s->sp && addr >= 0x0800 && addr < 0x0900) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("STACK-IN-NDB")) fprintf(stderr,
                     "[c54x] STACK-IN-NDB addr=0x%04x val=0x%04x SP=0x%04x "
                     "PC=0x%04x insn=%u op[pc-2..pc+1]=%04x %04x %04x %04x\n",
                     addr, val, s->sp, s->pc, s->insn_count,
@@ -3089,6 +3089,26 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         int cur_arp = nar;
         uint16_t addr = s->ar[cur_arp];
 
+        /* AR2-FLOOR guard : le pointeur d'écriture corrélateur (AR2) peut
+         * sous-déborder le buffer DARAM (0x0800) jusqu'à l'espace MMR
+         * (0x1E=XPC, 0x00=IMR) → clobber. WARN-log diag (token AR2-FLOOR) ;
+         * DROP expérimental (env CALYPSO_AR2_FLOOR_DROP=1) redirige l'accès
+         * vers un scratch pour voir si le corrélateur converge sans le crash. */
+        if (cur_arp == 2 && addr < 0x0820) {
+            static int ar2_drop = -1;
+            if (ar2_drop < 0) {
+                const char *e = getenv("CALYPSO_AR2_FLOOR_DROP");
+                ar2_drop = (e && *e == '1') ? 1 : 0;
+            }
+            if (calypso_debug_enabled("AR2-FLOOR"))
+                C54_DBG("AR2-FLOOR",
+                    "AR2=0x%04x < floor PC=0x%04x op=0x%04x BK=0x%04x A=%010llx insn=%u",
+                    addr, s->pc, prog_fetch(s, s->pc), s->bk,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+            if (ar2_drop && addr < 0x0800)
+                addr = 0xFFFF;  /* scratch : empêche le clobber MMR (expérience) */
+        }
+
         /* Post-modify */
         switch (mod) {
         case 0x0: /* *ARn */
@@ -3321,7 +3341,7 @@ static int c54x_exec_one(C54xState *s)
             if (itrans_total <= 200) {
                 uint16_t ret = s->data[s->sp];
                 uint16_t ret_p1 = s->data[(uint16_t)(s->sp + 1)];
-                fprintf(stderr,
+                if (calypso_debug_enabled("INTM-TRANS")) fprintf(stderr,
                         "[c54x] INTM-TRANS #%u 0->1 PC=0x%04x insn=%u SP=0x%04x "
                         "RET=%04x RET+1=%04x op=0x%04x IMR=0x%04x IFR=0x%04x\n",
                         itrans_total, s->pc, s->insn_count, s->sp,
@@ -3394,7 +3414,7 @@ static int c54x_exec_one(C54xState *s)
         if (s->pc == 0x8e8c) {
             static int probe_mvdd = -1;
             if (probe_mvdd < 0) {
-                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                const char *e = cdbg_env("BOOTSTUB");
                 probe_mvdd = (e && e[0] == '1') ? 1 : 0;
             }
             if (probe_mvdd) {
@@ -3431,7 +3451,7 @@ static int c54x_exec_one(C54xState *s)
         if (s->pc == 0xdf92 && (prev_pc < 0xdf90 || prev_pc > 0xdfa3)) {
             static int probe_df = -1;
             if (probe_df < 0) {
-                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                const char *e = cdbg_env("BOOTSTUB");
                 probe_df = (e && e[0] == '1') ? 1 : 0;
             }
             if (probe_df) {
@@ -3467,7 +3487,7 @@ static int c54x_exec_one(C54xState *s)
         if (s->pc == 0xb41c && prev_pc != 0xb427 && prev_pc != 0xb433) {
             static int probe_bl = -1;
             if (probe_bl < 0) {
-                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                const char *e = cdbg_env("BOOTSTUB");
                 probe_bl = (e && e[0] == '1') ? 1 : 0;
             }
             if (probe_bl) {
@@ -3510,7 +3530,7 @@ static int c54x_exec_one(C54xState *s)
         if (s->pc == 0xf8de) {
             static int probe_seed = -1;
             if (probe_seed < 0) {
-                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                const char *e = cdbg_env("BOOTSTUB");
                 probe_seed = (e && e[0] == '1') ? 1 : 0;
             }
             if (probe_seed) {
@@ -3555,7 +3575,7 @@ static int c54x_exec_one(C54xState *s)
         if (s->pc == 0x0000) {
             static int probe_bootstub = -1;
             if (probe_bootstub < 0) {
-                const char *e = getenv("CALYPSO_PROBE_BOOTSTUB");
+                const char *e = cdbg_env("BOOTSTUB");
                 probe_bootstub = (e && e[0] == '1') ? 1 : 0;
                 if (probe_bootstub)
                     fprintf(stderr, "[c54x] PROBE-BOOTSTUB enabled\n");
@@ -4061,12 +4081,15 @@ static int c54x_exec_one(C54xState *s)
         /* F4EB = RETE (return from interrupt). Pop PC, pop XPC iff APTS=1.
          * Symmetric with c54x_interrupt_ex push order. */
         if (op == 0xF4EB) {
-            uint16_t ra = data_read(s, s->sp); s->sp++;
             uint16_t prev_xpc = s->xpc;
-            if (s->pmst & PMST_APTS) {
-                s->xpc = data_read(s, s->sp); s->sp++;
-                if (s->xpc > 3) s->xpc &= 3;
-            }
+            /* IT return : pop XPC (top, poussé en 2e par l'entrée IT) PUIS PC.
+             * Inconditionnel (APTS == AVIS). Miroir entrée-IT / FRETED. */
+            uint16_t nx = data_read(s, s->sp); s->sp++;   /* pop XPC */
+            if (nx > 2)
+                C54_DBG("XPC-OOR", "RETE xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
+                        nx, s->pc, s->sp, s->insn_count);
+            s->xpc = nx & 3;
+            uint16_t ra = data_read(s, s->sp); s->sp++;   /* pop PC */
             s->st1 &= ~ST1_INTM;
             /* INT3-CYCLE-TRACE end-good hook NOT here : firmware exits ISR via
              * POPM ST1 + RCD (not RETE 0xF4EB), so this path is dead. Hook
@@ -4092,8 +4115,11 @@ static int c54x_exec_one(C54xState *s)
         if (op == 0xF4E4) {
             uint16_t ra = data_read(s, s->sp); s->sp++;
             uint16_t prev_xpc = s->xpc;
-            s->xpc = data_read(s, s->sp); s->sp++;
-            if (s->xpc > 3) s->xpc &= 3;
+            uint16_t nx = data_read(s, s->sp); s->sp++;
+            if (nx > 2)
+                C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
+                        nx, s->pc, s->sp, s->insn_count);
+            s->xpc = nx & 3;
             {
                 static uint64_t fret_count;
                 fret_count++;
@@ -4578,7 +4604,7 @@ static int c54x_exec_one(C54xState *s)
                 data_write(s, s->sp, (uint16_t)(s->pc + 1));
                 uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 s->pc = (iptr * 0x80) + k * 4;
-                C54_LOG("TRAP #%d → PC=0x%04x (from PC=0x%04x)", k, s->pc,
+                C54_LOG("TRAP-FIRED #%d → PC=0x%04x (from PC=0x%04x) [XPC non sauve : corruption vs RETE pop-2 si fire]", k, s->pc,
                         (uint16_t)(s->pc - (iptr * 0x80 + k * 4) + 1 - 1));
                 return 0;
             }
@@ -5554,7 +5580,7 @@ static int c54x_exec_one(C54xState *s)
                     static uint64_t reted_count;
                     reted_count++;
                     if (reted_count <= 20 || (reted_count % 100) == 0)
-                        C54_LOG("RETED #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x INTM=0",
+                        C54_LOG("RETED-FIRED #%llu PC=0x%04x -> ra=0x%04x SP=0x%04x INTM=0 [XPC non poppe : si fire post-XPC-fix = reopener drain, fix en pending-XPC]",
                                 (unsigned long long)reted_count,
                                 s->pc, ra, s->sp);
                 }
@@ -6404,7 +6430,7 @@ static int c54x_exec_one(C54xState *s)
             op2 = prog_fetch(s, s->pc + 1 + (s->lk_used ? 1 : 0));
             consumed = 2;
             if (hit76_log++ < 30) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("HIT-76")) fprintf(stderr,
                         "[c54x] HIT-76 PC=0x%04x op=0x%04x addr=0x%04x "
                         "lk=0x%04x lk_used=%d insn=%u\n",
                         s->pc, op, addr, op2, s->lk_used, s->insn_count);
@@ -6429,7 +6455,7 @@ static int c54x_exec_one(C54xState *s)
                 if (st1w <= 200 || (st1w % 100) == 0) {
                     int new_intm = !!(op2 & (1 << 11));
                     int cur_intm = !!(s->st1 & ST1_INTM);
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("ST1-WR")) fprintf(stderr,
                             "[c54x] ST1-WR #%u STM #0x%04x,ST1 PC=0x%04x "
                             "cur=0x%04x->0x%04x INTM:%d->%d insn=%u XPC=%d\n",
                             st1w, op2, s->pc, s->st1, op2,
@@ -6519,7 +6545,7 @@ static int c54x_exec_one(C54xState *s)
                 if (tc_after) bitf_tc_set++;
                 else          bitf_tc_clear++;
                 if (bitf_total <= 200 || (bitf_total % 1000) == 0) {
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("BITF-PROBE")) fprintf(stderr,
                             "[c54x] BITF-PROBE #%llu PC=0x%04x addr=0x%04x "
                             "mem=0x%04x mask=0x%04x tc_before=%d tc_after=%d "
                             "(total=%llu set=%llu clear=%llu)\n",
@@ -7160,6 +7186,15 @@ static int c54x_exec_one(C54xState *s)
             uint16_t mmr = op & 0x7F;
             uint16_t val = data_read(s, s->sp);
             s->sp = (s->sp + 1) & 0xFFFF;
+            /* POPM-ST1 probe (CALYPSO_DEBUG=POPM-ST1) : ST1 == MMR 0x07.
+             * Discrimine (a) POPM ST1 jamais exécuté vs (b) exécuté mais
+             * la valeur poppée a déjà INTM=1 → restaure 1, ne clear jamais.
+             * Silent par défaut. */
+            if (mmr == 0x07) {
+                C54_DBG("POPM-ST1",
+                        "POPM ST1 val=0x%04x INTM_bit=%u PC=0x%04x SP=0x%04x insn=%u",
+                        val, !!(val & ST1_INTM), s->pc, s->sp, s->insn_count);
+            }
             data_write(s, mmr, val);
             return consumed + s->lk_used;
         }
@@ -7275,7 +7310,7 @@ static int c54x_exec_one(C54xState *s)
                         }
                         best[p] = c; baddr[p] = (uint16_t)a;
                     }
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("PORTR-DEST-HIST")) fprintf(stderr,
                             "[c54x] PORTR-DEST-HIST (ptotal=%u): ", ptotal);
                     for (int i = 0; i < 10 && best[i]; i++)
                         fprintf(stderr, "%04x:%u ", baddr[i], best[i]);
@@ -8302,7 +8337,7 @@ static void sp_ring_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
 static void sp_ring_init_lazy(void)
 {
     if (g_sp_ring_enabled >= 0) return;
-    const char *e = getenv("CALYPSO_SP_RING");
+    const char *e = cdbg_env("SP-RING");
     g_sp_ring_enabled = (e && *e == '1') ? 1 : 0;
     const char *m = getenv("CALYPSO_SP_RING_MAX");
     g_sp_ring_dump_max = (m && *m) ? (unsigned)strtoul(m, NULL, 0) : 4u;
@@ -8384,7 +8419,7 @@ static void sp_ring_check_bootstub_entry(C54xState *s,
      *     0xfd2a A=AR4. fd28-fd2a est le fix. */
     int sp_in_valid_stack = (prev_sp >= 0x3000 && prev_sp <= 0x5FFF);
     int sp_in_buffer_area = (prev_sp >= 0x2000 && prev_sp <= 0x2FFF);
-    fprintf(stderr,
+    if (calypso_debug_enabled("BOOTSTUB-ENTRY")) fprintf(stderr,
         "[c54x] BOOTSTUB-ENTRY VERDICT: sp_in_valid_stack=%d "
         "sp_in_buffer_area=%d popped_is_zero=%d\n"
         "[c54x]   → %s\n",
@@ -8400,14 +8435,14 @@ static void sp_ring_check_bootstub_entry(C54xState *s,
 
 static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
 {
-    fprintf(stderr,
+    if (calypso_debug_enabled("SP-HIST")) fprintf(stderr,
         "[c54x] SP-HIST DUMP[%s] arm@(insn=%u,sp=0x%04x) now@(insn=%u,sp=0x%04x) "
         "events=%u distinct_pcs=%u\n",
         trig, g_sp_dec_arm_insn, g_sp_dec_arm_sp, insn_now, sp_now,
         g_sp_dec_total_events, g_sp_dec_used);
 
     /* Top-K par dec_count (trickle leak). */
-    fprintf(stderr, "[c54x] SP-HIST TOP BY COUNT (corrupteur trickle):\n");
+    if (calypso_debug_enabled("SP-HIST")) fprintf(stderr, "[c54x] SP-HIST TOP BY COUNT (corrupteur trickle):\n");
     for (unsigned k = 0; k < 20 && k < g_sp_dec_used; k++) {
         unsigned best = k;
         for (unsigned i = k + 1; i < g_sp_dec_used; i++) {
@@ -8419,7 +8454,7 @@ static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
             g_sp_dec_hist[k] = g_sp_dec_hist[best];
             g_sp_dec_hist[best] = tmp;
         }
-        fprintf(stderr,
+        if (calypso_debug_enabled("SP-HIST")) fprintf(stderr,
             "[c54x] SP-HIST #%u pc=0x%04x op_last=0x%04x dec_count=%u "
             "delta_sum=%d\n",
             k + 1, g_sp_dec_hist[k].pc, g_sp_dec_hist[k].op_last,
@@ -8427,7 +8462,7 @@ static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
     }
 
     /* Top-K par |delta_sum| (single-event jump corrupteur — 1 event huge). */
-    fprintf(stderr, "[c54x] SP-HIST TOP BY |delta_sum| (corrupteur single-jump):\n");
+    if (calypso_debug_enabled("SP-HIST")) fprintf(stderr, "[c54x] SP-HIST TOP BY |delta_sum| (corrupteur single-jump):\n");
     for (unsigned k = 0; k < 10 && k < g_sp_dec_used; k++) {
         unsigned best = k;
         int32_t best_abs = g_sp_dec_hist[k].delta_sum < 0
@@ -8444,7 +8479,7 @@ static void sp_hist_dump(const char *trig, unsigned insn_now, uint16_t sp_now)
             g_sp_dec_hist[k] = g_sp_dec_hist[best];
             g_sp_dec_hist[best] = tmp;
         }
-        fprintf(stderr,
+        if (calypso_debug_enabled("SP-HIST")) fprintf(stderr,
             "[c54x] SP-HIST D#%u pc=0x%04x op_last=0x%04x dec_count=%u "
             "delta_sum=%d\n",
             k + 1, g_sp_dec_hist[k].pc, g_sp_dec_hist[k].op_last,
@@ -8467,7 +8502,7 @@ static void sp_hist_account(uint16_t exec_pc, uint16_t exec_op,
         if (dump >= arm) dump = (arm > 0x100) ? (arm - 0x100) : 0;
         g_sp_dec_arm_threshold  = (uint16_t)arm;
         g_sp_dec_dump_threshold = (uint16_t)dump;
-        g_sp_dec_enabled = 1;
+        g_sp_dec_enabled = calypso_debug_enabled("SP-HIST") ? 1 : 0;
         fprintf(stderr,
             "[c54x] SP-HIST gating SP-value : ARM<0x%04x DUMP<0x%04x\n",
             g_sp_dec_arm_threshold, g_sp_dec_dump_threshold);
@@ -8535,7 +8570,7 @@ static void sp_hist_account(uint16_t exec_pc, uint16_t exec_op,
         /* Log first 10 events verbatim — for single-event jumps the corrupteur
          * est dans les premiers events (souvent un seul mot dans le histo). */
         if (g_sp_dec_total_events <= 10) {
-            fprintf(stderr,
+            if (calypso_debug_enabled("SP-HIST")) fprintf(stderr,
                 "[c54x] SP-HIST EVENT #%u pc=0x%04x op=0x%04x "
                 "sp_before=0x%04x sp_now=0x%04x delta=%d insn=%u\n",
                 g_sp_dec_total_events, exec_pc, exec_op,
@@ -8560,12 +8595,12 @@ static void sp_hist_account(uint16_t exec_pc, uint16_t exec_op,
 static void dsp_trap_dump(C54xState *s, uint16_t exec_pc, uint16_t exec_op,
                           uint16_t sp_before, const char *trig)
 {
-    fprintf(stderr,
+    if (calypso_debug_enabled("TRAP")) fprintf(stderr,
         "[c54x] TRAP[%s] insn=%u exec_pc=0x%04x exec_op=0x%04x "
         "next_pc=0x%04x sp_before=0x%04x sp_now=0x%04x INTM=%d\n",
         trig, s->insn_count, exec_pc, exec_op, s->pc,
         sp_before, s->sp, !!(s->st1 & ST1_INTM));
-    fprintf(stderr, "[c54x] TRAP pc_ring[-16..-1]:");
+    if (calypso_debug_enabled("TRAP")) fprintf(stderr, "[c54x] TRAP pc_ring[-16..-1]:");
     for (int i = 16; i >= 1; i--)
         fprintf(stderr, " %04x", pc_ring[(pc_ring_idx - i) & 255]);
     fprintf(stderr, "\n[c54x] TRAP sp_low=0x%04x at last_pc=0x%04x hits_at_pc=%u distinct_pcs=%u\n",
@@ -8658,7 +8693,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         if (s->insn_count >= next_xpc_dump) {
             next_xpc_dump += 100000000u;
-            fprintf(stderr,
+            if (calypso_debug_enabled("XPC-STATS")) fprintf(stderr,
                     "[c54x] XPC-STATS insn=%u counts: 0=%llu 1=%llu 2=%llu 3=%llu | "
                     "first_insn: 0=%llu 1=%llu 2=%llu 3=%llu | last_pc: 0=0x%04x 1=0x%04x 2=0x%04x 3=0x%04x\n",
                     s->insn_count,
@@ -8673,7 +8708,7 @@ int c54x_run(C54xState *s, int n_insns)
                     xpc_last_pc[0], xpc_last_pc[1], xpc_last_pc[2], xpc_last_pc[3]);
             if (xpc1_pc_ring_count > 0) {
                 /* Dernier 16 PCs visités sous XPC=1 (ring buffer) */
-                fprintf(stderr,
+                if (calypso_debug_enabled("XPC1-PC-RING")) fprintf(stderr,
                         "[c54x] XPC1-PC-RING count=%u last16: "
                         "%04x %04x %04x %04x %04x %04x %04x %04x "
                         "%04x %04x %04x %04x %04x %04x %04x %04x\n",
@@ -8753,7 +8788,7 @@ int c54x_run(C54xState *s, int n_insns)
             static unsigned mvmd_hits = 0;
             mvmd_hits++;
             if (mvmd_hits <= 20 || (mvmd_hits % 100) == 0) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("MVMD-AR7-BRC")) fprintf(stderr,
                         "[c54x] MVMD-AR7-BRC #%u AR7=0x%04x BRC_before=0x%04x "
                         "AR0=0x%04x AR1=0x%04x AR2=0x%04x AR6=0x%04x DP=%d insn=%u\n",
                         mvmd_hits, s->ar[7], s->brc,
@@ -8762,7 +8797,7 @@ int c54x_run(C54xState *s, int n_insns)
                 int n_hist = ar7_hist_idx < 16 ? ar7_hist_idx : 16;
                 for (int i = 0; i < n_hist; i++) {
                     int slot = (ar7_hist_idx - n_hist + i) & 15;
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("AR7-HIST")) fprintf(stderr,
                             "[c54x]   AR7-HIST[%d] pc=XPC%u:0x%04x 0x%04x->0x%04x insn=%llu\n",
                             i, ar7_history[slot].xpc, ar7_history[slot].pc,
                             ar7_history[slot].old_val, ar7_history[slot].new_val,
@@ -8776,7 +8811,7 @@ int c54x_run(C54xState *s, int n_insns)
             static unsigned rptb_hits = 0;
             rptb_hits++;
             if (rptb_hits <= 20 || (rptb_hits % 100) == 0) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("RPTB-ARMED")) fprintf(stderr,
                         "[c54x] RPTB-ARMED #%u BRC=0x%04x RSA=0x%04x REA=0x%04x "
                         "ST1=0x%04x (INTM=%d) insn=%u\n",
                         rptb_hits, s->brc, s->rsa, s->rea, s->st1,
@@ -8815,7 +8850,7 @@ int c54x_run(C54xState *s, int n_insns)
 
         if (s->insn_count >= next_blocked_dump) {
             next_blocked_dump += 100000000u;
-            fprintf(stderr,
+            if (calypso_debug_enabled("INT3-BLOCKED")) fprintf(stderr,
                     "[c54x] INT3-BLOCKED insn=%u blocked_total=%llu blocked_samples=%u\n",
                     s->insn_count,
                     (unsigned long long)blocked_count,
@@ -8823,7 +8858,7 @@ int c54x_run(C54xState *s, int n_insns)
             int n = sample_idx < 32 ? sample_idx : 32;
             for (int i = 0; i < n; i++) {
                 int slot = (sample_idx - n + i) & 31;
-                fprintf(stderr,
+                if (calypso_debug_enabled("INT3-BLOCKED-SAMPLE")) fprintf(stderr,
                         "[c54x] INT3-BLOCKED-SAMPLE pc=XPC%u:0x%04x st1=0x%04x brc=0x%04x\n",
                         sample_xpcs[slot], sample_pcs[slot],
                         sample_st1s[slot], sample_brcs[slot]);
@@ -8874,7 +8909,7 @@ int c54x_run(C54xState *s, int n_insns)
                 ? total_service_latency_insn / int3_serviced_count : 0;
             double service_ratio = int3_fire_count > 0
                 ? (double)int3_serviced_count / int3_fire_count : 0.0;
-            fprintf(stderr,
+            if (calypso_debug_enabled("IRQ-FRAME-HEALTH")) fprintf(stderr,
                     "[c54x] IRQ-FRAME-HEALTH insn=%u int3_fire=%llu int3_serviced=%llu "
                     "int3_missed=%llu avg_latency_insn=%llu service_ratio=%.2f\n",
                     s->insn_count,
@@ -8959,7 +8994,7 @@ int c54x_run(C54xState *s, int n_insns)
             uint16_t header = s->prog[s->pc];     /* normally 0xf4e4 */
             uint16_t branch = s->prog[s->pc + 1]; /* normally 0xf074 */
             uint16_t target = s->prog[s->pc + 2];
-            fprintf(stderr,
+            if (calypso_debug_enabled("DISPATCH-ENTRY")) fprintf(stderr,
                     "[c54x] DISPATCH-ENTRY #%u pc=0x%04x entry_idx=%u "
                     "header=0x%04x branch=0x%04x target=0x%04x "
                     "A=0x%010llx insn=%u\n",
@@ -9322,11 +9357,13 @@ int c54x_run(C54xState *s, int n_insns)
                 s->ifr &= ~(1 << imr_bit);
                 s->sp--;
                 data_write(s, s->sp, s->pc);
-                if (s->pmst & PMST_APTS) {
-                    s->sp--;
-                    data_write(s, s->sp, s->xpc);
-                }
+                /* IT C54x = transition far : save XPC inconditionnel (APTS
+                 * == AVIS, zéro sémantique pile) + force page 0 pour le fetch
+                 * du vecteur (sinon vecteur lu via XPC vivant = bug racine). */
+                s->sp--;
+                data_write(s, s->sp, s->xpc);
                 s->st1 |= ST1_INTM;
+                s->xpc = 0;
                 uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
                 s->pc = (iptr * 0x80) + vec * 4;
                 static int pending_log = 0;
@@ -9425,13 +9462,117 @@ int c54x_run(C54xState *s, int n_insns)
             bool was_in = (prev_sp >= 0x0800 && prev_sp < 0x0900);
             bool is_in  = (s->sp  >= 0x0800 && s->sp  < 0x0900);
             if (was_in != is_in) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("SP-WATCH")) fprintf(stderr,
                         "[c54x] SP-WATCH %s SP=0x%04x (prev=0x%04x) "
                         "PC=0x%04x op=0x%04x insn=%u\n",
                         is_in ? "ENTER api" : "LEAVE api",
                         s->sp, prev_sp, s->pc, s->prog[s->pc], s->insn_count);
             }
             prev_sp = s->sp;
+        }
+
+        /* SP-DRAIN probe (CALYPSO_DEBUG=SP-DRAIN) : attribue chaque
+         * décrément net de SP à l'instruction qui vient de s'exécuter
+         * (last_exec_pc/op — capturés en fin de boucle précédente).
+         * Ces blocs tournent AVANT exec_one de l'itération courante, donc
+         * s->sp reflète le résultat de l'insn précédente = last_exec_pc.
+         * Isole l'instruction non-appariée qui draine SP dans le trampoline
+         * boot 0x0000↔0xffcd. Histogramme 8-slots + log des 120 premiers
+         * events. Silent par défaut. */
+        if (calypso_debug_enabled("SP-DRAIN")) {
+            static uint16_t sd_prev_sp = 0xFFFF;
+            static unsigned  sd_log = 0;
+            static uint32_t  sd_cnt[8];
+            static uint16_t  sd_pc[8];
+            static uint32_t  sd_events;
+            if (sd_prev_sp != 0xFFFF) {
+                int delta = (int)(uint16_t)(sd_prev_sp - s->sp); /* >0 = push */
+                if (delta > 0 && delta < 0x100) {
+                    uint16_t cpc = s->last_exec_pc;
+                    int slot = -1, freeslot = -1;
+                    for (int i = 0; i < 8; i++) {
+                        if (sd_cnt[i] && sd_pc[i] == cpc) { slot = i; break; }
+                        if (!sd_cnt[i] && freeslot < 0) freeslot = i;
+                    }
+                    if (slot < 0 && freeslot >= 0) { slot = freeslot; sd_pc[slot] = cpc; }
+                    if (slot >= 0) sd_cnt[slot] += (uint32_t)delta;
+                    if (sd_log < 120) {
+                        sd_log++;
+                        C54_DBG("SP-DRAIN",
+                                "push -%d SP=0x%04x<-0x%04x by PC=0x%04x op=0x%04x insn=%u",
+                                delta, s->sp, sd_prev_sp, cpc,
+                                s->last_exec_op, s->insn_count);
+                    }
+                    if ((++sd_events % 1000) == 0) {
+                        C54_DBG("SP-DRAIN",
+                                "TOP pushers: %04x:%u %04x:%u %04x:%u %04x:%u "
+                                "%04x:%u %04x:%u %04x:%u %04x:%u (events=%u SP=0x%04x)",
+                                sd_pc[0], sd_cnt[0], sd_pc[1], sd_cnt[1],
+                                sd_pc[2], sd_cnt[2], sd_pc[3], sd_cnt[3],
+                                sd_pc[4], sd_cnt[4], sd_pc[5], sd_cnt[5],
+                                sd_pc[6], sd_cnt[6], sd_pc[7], sd_cnt[7],
+                                sd_events, s->sp);
+                    }
+                }
+            }
+            sd_prev_sp = s->sp;
+        }
+
+        /* CALLSITE probe (CALYPSO_DEBUG=CALLSITE) : à l'épilogue RCD 0x7707,
+         * dump l'adresse de retour que RCD va popper + l'opcode du call-site
+         * (FCALL F9xx vs CALL F074) + pc-ring pré-RETD = park-vs-crash. */
+        if (s->pc == 0x7707 && calypso_debug_enabled("CALLSITE")) {
+            static int n7707 = 0;
+            if (n7707 < 8) {
+                n7707++;
+                uint16_t ret = data_read(s, s->sp);
+                C54_DBG("CALLSITE",
+                    "RCD@7707 #%d SP=0x%04x ret=0x%04x caller[ret-2..ret-1]=0x%04x 0x%04x XPC=%d insn=%u",
+                    n7707, s->sp, ret, prog_read(s, (uint16_t)(ret-2)),
+                    prog_read(s, (uint16_t)(ret-1)), s->xpc, s->insn_count);
+                char buf[300]; int o=0;
+                for (int i=20;i>=1;i--)
+                    o+=snprintf(buf+o,sizeof(buf)-o,"%04x ", pc_ring[(pc_ring_idx-i)&255]);
+                C54_DBG("CALLSITE", "  pre-RETD pcring(20): %s", buf);
+            }
+        }
+
+        /* XPC-WR tracer (CALYPSO_DEBUG=XPC-WR) : toute transition de XPC avec
+         * l'instruction qui l'a causée (= origine du XPC=3 garbage). */
+        if (calypso_debug_enabled("XPC-WR")) {
+            static uint8_t xprev = 0xFF;
+            if (xprev != 0xFF && (uint8_t)s->xpc != xprev) {
+                C54_DBG("XPC-WR",
+                    "XPC %u->%u cause prev_exec PC=0x%04x op=0x%04x SP=0x%04x insn=%u",
+                    xprev, (unsigned)(s->xpc & 0xFF), s->last_exec_pc,
+                    s->last_exec_op, s->sp, s->insn_count);
+            }
+            xprev = (uint8_t)s->xpc;
+        }
+
+        /* AR2-WR tracer (CALYPSO_DEBUG=AR2-WR) : discrimine reset vs runaway.
+         * delta==-1 = post-décrément normal (progression, log tous les 200).
+         * delta!=-1 = reset/jump/load = LE discriminateur (#1 reset existe
+         * vs #2 jamais de reset). Reporte BK + la cible du reset. */
+        if (calypso_debug_enabled("AR2-WR")) {
+            static int      ar2_first = 1;
+            static uint16_t ar2_prev = 0;
+            static uint32_t ar2_dec  = 0;
+            uint16_t cur = s->ar[2];
+            if (!ar2_first && cur != ar2_prev) {
+                int delta = (int)(int16_t)(cur - ar2_prev);
+                if (delta == -1) {
+                    if ((++ar2_dec % 200) == 0)
+                        C54_DBG("AR2-WR", "AR2 dec #%u ->0x%04x (linear -1) PC=0x%04x insn=%u",
+                                ar2_dec, cur, s->last_exec_pc, s->insn_count);
+                } else {
+                    C54_DBG("AR2-WR",
+                        "AR2 %s 0x%04x->0x%04x (delta=%+d) cause PC=0x%04x op=0x%04x BK=0x%04x insn=%u",
+                        delta > 0 ? "RESET/UP" : "JUMP-DN", ar2_prev, cur, delta,
+                        s->last_exec_pc, s->last_exec_op, s->bk, s->insn_count);
+                }
+            }
+            ar2_first = 0; ar2_prev = cur;
         }
 
         /* TRACE: dump entry into 0xe260 loop (first 5 hits) */
@@ -9667,7 +9808,7 @@ int c54x_run(C54xState *s, int n_insns)
                 else if (cond_byte == 0x4A) cond = (sext40(s->b) >= 0);
                 else if (cond_byte == 0x4B) cond = (sext40(s->b) < 0);
                 else if (cond_byte == 0x4F) cond = (sext40(s->b) <= 0);
-                fprintf(stderr,
+                if (calypso_debug_enabled("XC-COND")) fprintf(stderr,
                         "[c54x] XC-COND #%u PC=0x%04x op=0x%04x cond=0x%02x "
                         "→ %s | TC=%d C=%d A=%010llx (sgn:%c) "
                         "B=%010llx (sgn:%c) AR4=0x%04x next_op=0x%04x insn=%u\n",
@@ -10093,7 +10234,7 @@ int c54x_run(C54xState *s, int n_insns)
                 static unsigned boot_br_log;
                 const unsigned LIMIT = 8000;
                 if (boot_br_log < LIMIT) {
-                    fprintf(stderr,
+                    if (calypso_debug_enabled("BOOT-BRANCH")) fprintf(stderr,
                             "[c54x] BOOT-BRANCH #%u insn=%u %04x(op=%04x,c=%d) → %04x "
                             "SP=%04x IMR=%04x AR4=%04x AR5=%04x INTM=%d\n",
                             boot_br_log, s->insn_count,
@@ -10102,7 +10243,7 @@ int c54x_run(C54xState *s, int n_insns)
                             !!(s->st1 & ST1_INTM));
                     boot_br_log++;
                     if (boot_br_log == LIMIT) {
-                        fprintf(stderr,
+                        if (calypso_debug_enabled("BOOT-BRANCH")) fprintf(stderr,
                                 "[c54x] BOOT-BRANCH log capped at %u\n", LIMIT);
                     }
                 }
@@ -10212,7 +10353,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static int trap_armed = -1;
             if (trap_armed < 0) {
-                const char *e = getenv("CALYPSO_TRAP_OOR");
+                const char *e = cdbg_env("TRAP-OOR");
                 trap_armed = (e && *e == '1') ? 1 : 0;
             }
             if (trap_armed && s->sp != sp_before && s->insn_count > 33754) {
@@ -10244,7 +10385,7 @@ int c54x_run(C54xState *s, int n_insns)
                         bool milestone = (n == 1 || n == 10 || n == 100 ||
                                           n == 1000 || n == 10000 || n == 100000);
                         if (milestone) {
-                            fprintf(stderr,
+                            if (calypso_debug_enabled("SP-LOW")) fprintf(stderr,
                                 "[c54x] SP-LOW #%u @pc=0x%04x op=0x%04x "
                                 "sp 0x%04x->0x%04x A_low=0x%04x insn=%u\n",
                                 n, exec_pc, exec_op,
@@ -10254,7 +10395,7 @@ int c54x_run(C54xState *s, int n_insns)
                         g_sp_low_pc = exec_pc;
                         g_sp_low_hits_at_pc = 1;
                         g_sp_low_distinct_pcs++;
-                        fprintf(stderr,
+                        if (calypso_debug_enabled("SP-LOW")) fprintf(stderr,
                             "[c54x] SP-LOW NEW (#%u distinct) @pc=0x%04x op=0x%04x "
                             "sp 0x%04x->0x%04x A_low=0x%04x insn=%u\n",
                             g_sp_low_distinct_pcs, exec_pc, exec_op,
@@ -10287,7 +10428,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             int32_t dsp = (int32_t)(int16_t)(s->sp - sp_before);
             if (dsp > 256 || dsp < -256) {
-                fprintf(stderr,
+                if (calypso_debug_enabled("SP-CATASTROPHE")) fprintf(stderr,
                         "[c54x] SP-CATASTROPHE Δ=%+d PC=0x%04x op=0x%04x "
                         "SP 0x%04x → 0x%04x INTM=%d "
                         "AR0..7: %04x %04x %04x %04x %04x %04x %04x %04x "
@@ -10313,7 +10454,7 @@ int c54x_run(C54xState *s, int n_insns)
             static int tripped = 0;
             static unsigned checkpoint = 0;
             if (trap_armed < 0) {
-                const char *e = getenv("CALYPSO_TRAP_OOR");
+                const char *e = cdbg_env("TRAP-OOR");
                 trap_armed = (e && *e == '1') ? 1 : 0;
                 const char *c = getenv("CALYPSO_TRAP_CHECKPOINT");
                 checkpoint = (c && *c) ? (unsigned)strtoul(c, NULL, 0) : 4200000u;
@@ -10443,184 +10584,7 @@ int c54x_run(C54xState *s, int n_insns)
  * ROM loader
  * ================================================================ */
 
-/* COFF1 (TIC54X) binary parser. Format (cf. include/coff/tic54x.h + ti.h) :
- *   file header  (22B) : magic(2) nscns(2) timdat(4) symptr(4) nsyms(4)
- *                        opthdr(2) flags(2) target_id(2)
- *   section hdr  (40B) : name(8) paddr(4) vaddr(4) size(4) scnptr(4)
- *                        relptr(4) lnnoptr(4) nreloc(2) nlnno(2) flags(4)
- *   raw data : `size` LE 16-bit words at file offset `scnptr`
- *
- * Mapping vers s->prog / s->data :
- *   paddr < 0x7000 → data space (regs + DROM/PDROM)
- *   paddr ≥ 0x7000 → program space (PROM0..PROM3, banked via XPC)
- * Mirror PROM1 (0x18000-0x1FFFF) onto bank-0 alias 0xE000-0xFF7F pour le
- * fetch des vecteurs au reset (XPC=0, PC=0xFF80). Identique à la logique
- * historique du parser texte. */
-static int c54x_load_rom_coff(C54xState *s, FILE *f)
-{
-    uint8_t fh[22];
-    if (fread(fh, 1, 22, f) != 22) {
-        C54_LOG("COFF: short file header");
-        return -1;
-    }
-    uint16_t magic = (uint16_t)(fh[0] | (fh[1] << 8));
-    uint16_t nscns = (uint16_t)(fh[2] | (fh[3] << 8));
-    uint16_t tid   = (uint16_t)(fh[20] | (fh[21] << 8));
-    if (magic != 0x00C1) {
-        C54_LOG("COFF: bad magic 0x%04x (expected 0x00C1)", magic);
-        return -1;
-    }
-    if (tid != 0x0098) {
-        C54_LOG("COFF: target_id 0x%04x not TIC54X (0x0098)", tid);
-        return -1;
-    }
-    if (nscns == 0 || nscns > 64) {
-        C54_LOG("COFF: nscns=%u invalid", nscns);
-        return -1;
-    }
 
-    /* Read all section headers in-order */
-    struct { uint32_t paddr, size, scnptr; char name[9]; } secs[64];
-    for (uint16_t i = 0; i < nscns; i++) {
-        uint8_t sh[40];
-        if (fread(sh, 1, 40, f) != 40) {
-            C54_LOG("COFF: short section header #%u", i);
-            return -1;
-        }
-        memcpy(secs[i].name, sh, 8);
-        secs[i].name[8] = '\0';
-        secs[i].paddr  = (uint32_t)(sh[8]  | (sh[9]<<8)  | (sh[10]<<16) | (sh[11]<<24));
-        secs[i].size   = (uint32_t)(sh[16] | (sh[17]<<8) | (sh[18]<<16) | (sh[19]<<24));
-        secs[i].scnptr = (uint32_t)(sh[20] | (sh[21]<<8) | (sh[22]<<16) | (sh[23]<<24));
-    }
-
-    int total_words = 0;
-    for (uint16_t i = 0; i < nscns; i++) {
-        if (!secs[i].size) continue;
-        if (fseek(f, secs[i].scnptr, SEEK_SET) != 0) {
-            C54_LOG("COFF: seek failed for section %s", secs[i].name);
-            return -1;
-        }
-        for (uint32_t w = 0; w < secs[i].size; w++) {
-            uint8_t wb[2];
-            if (fread(wb, 1, 2, f) != 2) {
-                C54_LOG("COFF: short read at %s+%u", secs[i].name, w);
-                return -1;
-            }
-            uint16_t word = (uint16_t)(wb[0] | (wb[1] << 8));
-            uint32_t addr = secs[i].paddr + w;
-
-            if (addr < 0x7000) {
-                /* data space (regs 0x00-0x5F, DROM, PDROM) */
-                if (addr < C54X_DATA_SIZE) s->data[addr] = word;
-            } else {
-                /* program space, banked via XPC */
-                if (addr < C54X_PROG_SIZE) s->prog[addr] = word;
-                /* Mirror PROM1 (0x18000-0x1FFFF) to 0xE000-0xFF7F for the
-                 * bank-0 vector fetch. 0xFF80-0xFFFF reserved for boot ROM. */
-                if (addr >= 0x18000 && addr < 0x20000) {
-                    uint16_t a16 = (uint16_t)(addr & 0xFFFF);
-                    if (a16 >= 0xE000 && a16 < 0xFF80) {
-                        s->prog[a16] = word;
-                    }
-                }
-            }
-            total_words++;
-        }
-        C54_LOG("COFF: %-8s @0x%05x  %u words  (scnptr=0x%x)",
-                secs[i].name, secs[i].paddr, secs[i].size, secs[i].scnptr);
-    }
-    C54_LOG("Loaded ROM (COFF1): %d words total, %u sections", total_words, nscns);
-    return 0;
-}
-
-int c54x_load_rom(C54xState *s, const char *path)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        C54_LOG("Cannot open ROM dump: %s", path);
-        return -1;
-    }
-    /* Auto-detect COFF1 (magic 0x00C1 LE at offset 0) vs legacy text dump */
-    uint8_t mb[2];
-    if (fread(mb, 1, 2, f) == 2 && mb[0] == 0xC1 && mb[1] == 0x00) {
-        rewind(f);
-        int rc = c54x_load_rom_coff(s, f);
-        fclose(f);
-        return rc;
-    }
-    rewind(f);
-    C54_LOG("ROM: parsing as legacy text dump (%s)", path);
-
-    char line[1024];
-    int section = -1; /* 0=regs, 1=DROM, 2=PDROM, 3-6=PROM0-3 */
-
-    int total_words = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        /* Section headers */
-        if (strstr(line, "DSP dump: Registers"))  { section = 0; continue; }
-        if (strstr(line, "DSP dump: DROM"))        { section = 1; continue; }
-        if (strstr(line, "DSP dump: PDROM"))       { section = 2; continue; }
-        if (strstr(line, "DSP dump: PROM0"))       { section = 3; continue; }
-        if (strstr(line, "DSP dump: PROM1"))       { section = 4; continue; }
-        if (strstr(line, "DSP dump: PROM2"))       { section = 5; continue; }
-        if (strstr(line, "DSP dump: PROM3"))       { section = 6; continue; }
-        if (section < 0) continue;
-
-        /* Parse data lines: "ADDR : XXXX XXXX XXXX ..." */
-        uint32_t addr;
-        if (sscanf(line, "%x :", &addr) != 1) continue;
-
-        char *p = strchr(line, ':');
-        if (!p) continue;
-        p++;
-
-        uint16_t word;
-        while (sscanf(p, " %hx%n", &word, (int[]){0}) == 1) {
-            int n;
-            sscanf(p, " %hx%n", &word, &n);
-            p += n;
-
-            if (section == 0) {
-                /* Registers: store in data memory */
-                if (addr < 0x60) s->data[addr] = word;
-            } else if (section == 1 || section == 2) {
-                /* DROM/PDROM: data memory */
-                if (addr < C54X_DATA_SIZE) s->data[addr] = word;
-            } else {
-                /* PROM: program memory.
-                 * The dump uses extended addresses (XPC pages):
-                 *   PROM0: 0x07000-0x0DFFF → prog space 0x7000-0xDFFF
-                 *   PROM1: 0x18000-0x1FFFF → prog space 0x8000-0xFFFF (page 1)
-                 *   PROM2: 0x28000-0x2FFFF → prog space 0x8000-0xFFFF (page 2)
-                 *   PROM3: 0x38000-0x39FFF → prog space 0xF800-0xFFFF (page 3)
-                 * For 16-bit PC access, map all PROM to lower 64K too.
-                 * PROM0 is already at 0x7000. For PROM1-3, also mirror
-                 * to the 16-bit alias (0x8000-0xFFFF). */
-                if (addr < C54X_PROG_SIZE) s->prog[addr] = word;
-                /* Mirror PROM1 (page 1: 0x18000-0x1FFFF) to 16-bit space.
-                 * PROM0 occupies 0x7000-0xDFFF — only mirror PROM1 above that
-                 * (0xE000-0xFFFF) to avoid overwriting PROM0 data.
-                 * This gives us interrupt vectors at 0xFF80. */
-                if (section == 4) {  /* PROM1 only */
-                    uint16_t addr16 = addr & 0xFFFF;
-                    /* Mirror PROM1 to 0xE000-0xFF7F only.
-                     * 0xFF80-0xFFFF is the interrupt vector table,
-                     * populated by the DSP boot ROM (not PROM1). */
-                    if (addr16 >= 0xE000)
-                        s->prog[addr16] = word;
-                }
-            }
-            addr++;
-            total_words++;
-        }
-    }
-
-    fclose(f);
-    C54_LOG("Loaded ROM: %d words from %s", total_words, path);
-    return 0;
-}
 
 /* ================================================================
  * Init / Reset / Interrupts
@@ -10864,13 +10828,12 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             s->sp--;
             data_write(s, s->sp, (uint16_t)(s->pc + 1));
             g_sp_ledger.irq_words_pushed++;
-            if (s->pmst & PMST_APTS) {
-                s->sp--;
-                data_write(s, s->sp, s->xpc);
-                g_sp_ledger.irq_words_pushed++;
-            }
+            s->sp--;
+            data_write(s, s->sp, s->xpc);          /* save XPC inconditionnel */
+            g_sp_ledger.irq_words_pushed++;
             g_sp_ledger.irq_entries++;
             s->st1 |= ST1_INTM;
+            s->xpc = 0;                            /* fetch vecteur sur page 0 */
             uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
             s->pc = (iptr * 0x80) + vec * 4;
         }
@@ -10884,13 +10847,12 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
         g_sp_ledger.irq_words_pushed++;
-        if (s->pmst & PMST_APTS) {
-            s->sp--;
-            data_write(s, s->sp, s->xpc);
-            g_sp_ledger.irq_words_pushed++;
-        }
+        s->sp--;
+        data_write(s, s->sp, s->xpc);              /* save XPC inconditionnel */
+        g_sp_ledger.irq_words_pushed++;
         g_sp_ledger.irq_entries++;
         s->st1 |= ST1_INTM;
+        s->xpc = 0;                                /* fetch vecteur sur page 0 */
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;
         /* INT3-CYCLE-TRACE : hook cycle start for vec=19 (INT3 FRAME) */

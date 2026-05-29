@@ -1,5 +1,19 @@
 # QEMU Calypso — Claude Code Context
 
+## 🔄 SYNC MIROIRS — À FAIRE À CHAQUE ÉDITION
+
+Le **latest / autoritaire** = `trying:/opt/GSM/qemu-src` (conteneur, où on build).
+**Après CHAQUE fichier édité**, propager depuis ce latest vers :
+- `/home/nirvana/qemu-src` (miroir full host)
+- `/home/nirvana/qemu-calypso` (subset curated host, même layout `hw/arm/calypso/` + `include/` + `run.sh`)
+
+**On IGNORE `/opt/GSM/qemu-calypso`.** Commande type (depuis latest) :
+```bash
+for dst in /home/nirvana/qemu-src /home/nirvana/qemu-calypso; do
+  mkdir -p "$dst/$(dirname FILE)"; docker cp trying:/opt/GSM/qemu-src/FILE "$dst/FILE"; done
+```
+Inclure ce CLAUDE.md lui-même dans la propagation.
+
 ## Working style with user
 
 Quand l'user me donne un nouvel ordre, je **continue les taches precedentes en parallele**. Je n'abandonne PAS le contexte courant. Si un fix etait en cours et l'user demande autre chose, je termine le fix ET je traite la nouvelle demande. La file de taches s'enchaine, elle ne se reset pas.

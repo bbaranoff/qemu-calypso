@@ -94,24 +94,29 @@ Tmux panes:
   CALYPSO_GDB_ELF=/path/to/firmware.elf      default highram.elf
   CALYPSO_GDB_PORT=N                          default 1234
 
-Diag/probes (verbose):
-  CALYPSO_RXDONE_PROBE=1     overlay IO sur 0x008302d4 (rxDoneFlag writes)
-  CALYPSO_FBDB_PROBE=1       FBDB trace B@fbd9, A@fbdb, A@fbf3
-  CALYPSO_INT3_CYCLE_TRACE=1 INT3 ISR cycle branch decisions
-  CALYPSO_STUCK_PROBE=1      PC+XPC histo si INTM=1+BRINT0 pending
-  CALYPSO_FORCE_INTM_ONESHOT=1  clear INTM oneshot (sonde arbitrage)
-  CALYPSO_SP_RING=1          SP delta ring buffer
-  CALYPSO_SP_ABS_TRACE=1     SP absolute trace
-  CALYPSO_SP_HIST_ARM=1      SP histogram ARM-side
-  CALYPSO_AR_TRACE=0xFF      AR registers trace bitmask
-  CALYPSO_WATCH_3FBE=1       DARAM[0x3FBE] watch (legacy, now DARAM[0x2A0E] with daram_addr=0x2a00)
-  CALYPSO_CORRELATOR_TRACE=1 FB-det corrélateur
-  CALYPSO_MVPD_TRACE=1       MVPD opcode trace
-  CALYPSO_RSBX_INTM_TRACE=1  RSBX INTM transitions
-  CALYPSO_UART_TRACE=1       UART read/write trace
-  CALYPSO_TIMER=1            tdma_tick/frame_irq/kick fprintf
-  CALYPSO_W1C_LATCH=1        a_sync_demod cells W1C latch (dev assist)
-  CALYPSO_DBG=1              generic c54x debug
+Diag/probes  ->  TOUT via UNE seule var : CALYPSO_DEBUG
+  CALYPSO_DEBUG=ALL            active toutes les sondes (= --debug-full)
+  CALYPSO_DEBUG=tok1,tok2,...  liste de tokens (insensible casse ; - _ . / =>_)
+  CALYPSO_DEBUG (unset)        aucune sonde (silencieux, production-like)
+  Masters composant : C54X (tous C54_LOG c54x) | BSP | TRX | IOTA | PCB
+  Tokens c54x (extrait) :
+    SP-WATCH SP-RING SP-ABS SP-HIST SP-LOW SP-GUARD SP-CATASTROPHE STACK-IN-NDB
+    INTM-TRANS INT3-CYCLE INT3-BLOCKED RSBX-INTM IMR-W ST1-WR POPM-ST1 SP-DRAIN
+    BOOT-BRANCH BOOTSTUB BOOTSTUB-ENTRY DISPATCH-ENTRY IRQ-FRAME-HEALTH XC-COND
+    FBDB CORRELATOR MVPD BITF-PROBE WATCH-3FBE RXDONE TIMER STUCK STUCK-HIST
+    AR-TRACE AR6-AT AR7-HIST A-TRACE XPC-STATS XPC1-PC-RING DARAM UPPER-DARAM
+    NDB-CTL-WR A_SCH-WR A_CD-BY-BURST D_TASK_D-WR D_BURST_D-WR DROM-W-DROP ...
+  Params couples a un token (valeur, pas on/off) :
+    CALYPSO_AR_TRACE=0xFF (mask AR, token AR-TRACE)  CALYPSO_A_TRACE_PC=0xPC
+    CALYPSO_AR6_AT_PC/WIN_LO/WIN_HI/AT_LOG_CAP       CALYPSO_MVPD_BOOT_LIMIT=N
+    CALYPSO_SP_RING_MAX/TRIG/INSN_MIN                CALYPSO_SP_HIST_ARM/DUMP=0xNNNN
+    token TRAP-OOR + CALYPSO_TRAP_CHECKPOINT=N
+  Liste exhaustive des tokens :
+    grep -rho 'calypso_debug_enabled("[^"]*"' hw/arm/calypso | sort -u
+  Autres debug (hors CALYPSO_DEBUG) :
+    CALYPSO_DBG=corrupt,unimpl,...   masque debug generique c54x (calypso_dbg.c)
+    CALYPSO_UART_TRACE=1             trace UART (hw/char/calypso_uart.c)
+
 
 Overrides numériques:
   CALYPSO_FORCE_INTM_AT_PC=0xPC      force INTM clear when PC == valeur
@@ -124,6 +129,7 @@ Overrides numériques:
   CALYPSO_BSP_HOST=ip / CALYPSO_BSP_PORT=N   BSP UDP endpoint (def 6702)
   CALYPSO_TRAP_CHECKPOINT=...        c54x trap on checkpoint
   CALYPSO_TRAP_OOR=...               c54x trap out-of-range
+  CALYPSO_TWL3025_AFC_HZ=N           force AFC offset Hz (TWL3025/Iota ABB, def 0=off)
   CALYPSO_DOPPLER_HZ=N               Doppler injection Hz dans bridge IQ
                                      (def 0 = no-op ; ex 200 = 200Hz drift)
   CALYPSO_SAMPLE_RATE=N              Hz sample rate (def 270833 = 1sps GSM)
@@ -168,39 +174,16 @@ done
 
 # ---- --debug-full : export toutes les probes en une commande ----
 if [ "$DEBUG_FULL_MODE" = "1" ]; then
-    echo "[run.sh] --debug-full : exporting all debug probes"
+    echo "[run.sh] --debug-full : CALYPSO_DEBUG=ALL (toutes les sondes)"
     export CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
     export CALYPSO_L2_CLIENT="${CALYPSO_L2_CLIENT:-mobile}"
-    # Runtime probes
-    export CALYPSO_RXDONE_PROBE=1
-    export CALYPSO_FBDB_PROBE=1
-    export CALYPSO_INT3_CYCLE_TRACE=1
-    export CALYPSO_STUCK_PROBE=1
-    export CALYPSO_FORCE_INTM_ONESHOT=1
-    # DIAG full
-    export CALYPSO_PROBE_BOOTSTUB=0
-    export CALYPSO_SP_RING=1
-    export CALYPSO_SP_RING_TRIG=bootstub
-    export CALYPSO_SP_RING_INSN_MIN=1000000
-    export CALYPSO_SP_ABS_TRACE=1
-    export CALYPSO_AR_TRACE=0xFF
-    export CALYPSO_WATCH_3FBE=1
-    export CALYPSO_CORRELATOR_TRACE=1
-    export CALYPSO_MVPD_TRACE=1
-    export CALYPSO_MVPD_BOOT_LIMIT=500000
-    export CALYPSO_RSBX_INTM_TRACE=1
-    # Extra traces
-    export CALYPSO_UART_TRACE=1
-    export CALYPSO_TIMER=1
-    export CALYPSO_SP_HIST_ARM=1
-    export CALYPSO_DBG=1
-    # Pipeline + gdb pane
+    # UNE seule var pilote TOUTES les sondes diagnostic (c54x + BSP + TRX + ...).
+    export CALYPSO_DEBUG="${CALYPSO_DEBUG:-ALL}"
+    # Assists pipeline (non-probe) utiles en debug
     export CALYPSO_IRDA_CAPTURE=1
-    export CALYPSO_BSP_IQ_PASSTHROUGH=1
     export CALYPSO_SKIP_GDB_PANE=0
-    # gen-doc off pour pas polluer en debug
     export CALYPSO_AUTO_GEN_DOC=0
-    echo "[run.sh] --debug-full env exported. Log path : /root/qemu.log (peut faire 1-2 GB/min)"
+    echo "[run.sh] --debug-full : CALYPSO_DEBUG=$CALYPSO_DEBUG. Log : /root/qemu.log (1-2 GB/min)"
 fi
 
 # `--gen-doc-local` = synonyme de "lance le pipeline normal ET force la
@@ -641,10 +624,11 @@ if [ "$MENU_MODE" = "1" ]; then
       --title "[3/4] Diagnostic profile" \
       --notags --menu \
       "\n Sondes c54x / instrumentation.\n" \
-      14 76 3 \
-      "none"    "none -- production-like (recommended)" \
-      "minimal" "minimal -- hack-free + diag minimal" \
-      "full"    "full -- SP_RING + AR + WATCH + CORR + MVPD" \
+      14 76 4 \
+      "none"    "none -- aucune sonde (production-like, reco)" \
+      "minimal" "minimal -- INTM-TRANS,SP-WATCH,BOOT-BRANCH" \
+      "all"     "all -- CALYPSO_DEBUG=ALL : toutes les sondes (verbeux)" \
+      "custom"  "custom -- saisir une liste de tokens CALYPSO_DEBUG" \
       3>&1 1>&2 2>&3) || _cancel
 
     # 3d) Pytest config (si DOC ON)
@@ -674,21 +658,21 @@ if [ "$MENU_MODE" = "1" ]; then
       export CALYPSO_PYTEST_SCOPE="$PYTEST_SCOPE"
     fi
     case "$DIAG" in
-      minimal)
-        export CALYPSO_PROBE_BOOTSTUB=0
+      none)
+        export CALYPSO_DEBUG=""
         ;;
-      full)
-        export CALYPSO_PROBE_BOOTSTUB=0
-        export CALYPSO_SP_RING=1
-        export CALYPSO_SP_RING_TRIG=bootstub
-        export CALYPSO_SP_RING_INSN_MIN=1000000
-        export CALYPSO_SP_ABS_TRACE=1
-        export CALYPSO_AR_TRACE=0xFF
-        export CALYPSO_WATCH_3FBE=1
-        export CALYPSO_CORRELATOR_TRACE=1
-        export CALYPSO_MVPD_TRACE=1
-        export CALYPSO_MVPD_BOOT_LIMIT=500000
-        export CALYPSO_RSBX_INTM_TRACE=1
+      minimal)
+        export CALYPSO_DEBUG="INTM-TRANS,SP-WATCH,BOOT-BRANCH"
+        ;;
+      all)
+        export CALYPSO_DEBUG="ALL"
+        ;;
+      custom)
+        CD=$(whiptail --backtitle "$BACKTITLE" \
+          --title "[3/4] CALYPSO_DEBUG tokens" \
+          --inputbox "\n Liste de tokens separes par virgule.\n ALL = tout. Vide = aucune sonde.\n Ex: SP-WATCH,INTM-TRANS,FBDB,CORRELATOR\n" \
+          13 76 "" 3>&1 1>&2 2>&3) || _cancel
+        [ -n "$CD" ] && export CALYPSO_DEBUG="$CD"
         ;;
     esac
 
@@ -703,26 +687,28 @@ if [ "$MENU_MODE" = "1" ]; then
 
       # --- Trace toggles (checklist) ---
       ADV_TRACES=$(whiptail --backtitle "$BACKTITLE" \
-        --title "[3/4] Advanced traces (checklist)" \
+        --title "[3/4] Toggles comportementaux / pipeline" \
         --notags --separate-output --checklist \
-        "\n Active des traces ciblees (chacune ecrit dans qemu.log).\n" \
-        20 76 11 \
-        "FBDB_PROBE"        "FBDB probe (B@fbd9, A@fbdb, A@fbf3)"          OFF \
-        "INT3_CYCLE_TRACE"  "INT3 ISR cycle branch decisions"              OFF \
-        "STUCK_PROBE"       "PC+XPC histo quand INTM=1 + BRINT0 pending"   OFF \
-        "FCCH_DUMP"         "FCCH I/Q dump (gros volume)"                  OFF \
-        "FORCE_INTM_ONESHOT" "Clear INTM oneshot (sonde arbitrage)"        OFF \
-        "SP_HIST_ARM"       "SP histogram ARM-side"                        OFF \
-        "DBG"               "Generic c54x debug"                           OFF \
-        "UART_TRACE"        "UART read/write trace"                        OFF \
-        "W1C_LATCH"         "W1C latch a_sync_demod cells (dev assist)"    OFF \
-        "BSP_IQ_PASSTHROUGH" "BSP IQ passthrough mode"                     OFF \
-        "DSP_IDLE_FF"       "DSP idle fast-forward (perf, non-hack)"       ON \
-        "QEMU_HALT"         "QEMU start halted (-S) - attache gdb avant boot" OFF \
-        "GDB_PANE"          "Tmux window gdb (gdb top + tail qemu.log bottom)" OFF \
+        "\n Toggles NON-probe (les sondes = profil DIAG / CALYPSO_DEBUG).\n ON par defaut = comportement nominal.\n" \
+        18 78 8 \
+        "DSP_IDLE_FF"        "DSP idle fast-forward (perf, nominal)"          ON \
+        "W1C_LATCH"          "W1C latch a_sync_demod (nominal, requis FBSB)"  ON \
+        "BSP_IQ_PASSTHROUGH" "BSP DL soft-bits -> GMSK IQ (nominal)"          ON \
+        "FORCE_INTM_ONESHOT" "Clear INTM oneshot (sonde, NON-nominal)"        OFF \
+        "UART_TRACE"         "UART read/write trace"                          OFF \
+        "DBG"                "Generic c54x dbg mask (CALYPSO_DBG)"            OFF \
+        "QEMU_HALT"          "QEMU start halted (-S), gdb avant boot"         OFF \
+        "GDB_PANE"           "Tmux window gdb"                                OFF \
         3>&1 1>&2 2>&3) || _cancel
+      # Toggles ON-par-defaut : reset a 0 puis re-applique la selection
+      # (separate-output ne liste que les coches).
+      export CALYPSO_DSP_IDLE_FF=0 CALYPSO_W1C_LATCH=0 CALYPSO_BSP_IQ_PASSTHROUGH=0
       for tr in $ADV_TRACES; do
-        export "CALYPSO_${tr}=1"
+        case "$tr" in
+          GDB_PANE)  export CALYPSO_SKIP_GDB_PANE=0 ;;
+          DBG)       export CALYPSO_DBG=1 ;;
+          *)         export "CALYPSO_${tr}=1" ;;
+        esac
       done
 
       # --- Override numerique : FORCE_INTM_AT_PC ---
@@ -782,6 +768,41 @@ if [ "$MENU_MODE" = "1" ]; then
            CALYPSO_IRDA_CAPTURE CALYPSO_AUTO_GEN_DOC
     export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
            CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
+
+    # ---- 3f) Expert : editer TOUTE variable CALYPSO_* (menuconfig-style) ----
+    if whiptail --backtitle "$BACKTITLE" --title "[3/4] Expert : toutes les variables" \
+        --defaultno --yesno \
+        "\n Editer n'importe quelle variable CALYPSO_* ?\n\n Liste complete + edition unitaire (vide = unset).\n Les modes de base restent ceux choisis plus haut." \
+        12 72 3>&1 1>&2 2>&3; then
+      _ALLVARS="CALYPSO_DEBUG CALYPSO_MODE CALYPSO_ICOUNT CALYPSO_MTTCG \
+CALYPSO_QEMU_HALT CALYPSO_L2_CLIENT CALYPSO_DSP_SHUNT CALYPSO_BSP_IQ_PASSTHROUGH \
+CALYPSO_IRDA_CAPTURE CALYPSO_W1C_LATCH CALYPSO_DSP_IDLE_FF CALYPSO_DSP_IDLE_RANGE \
+CALYPSO_TDMA_REALTIME CALYPSO_FORCE_INTM_ONESHOT CALYPSO_FORCE_INTM_AT_PC \
+CALYPSO_BSP_DARAM_ADDR CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
+CALYPSO_STICK_ARFCN CALYPSO_BSP_HOST CALYPSO_BSP_PORT CALYPSO_TRAP_OOR \
+CALYPSO_TRAP_CHECKPOINT CALYPSO_AR_TRACE CALYPSO_A_TRACE_PC CALYPSO_AR6_AT_PC \
+CALYPSO_AR6_WIN_LO CALYPSO_AR6_WIN_HI CALYPSO_MVPD_BOOT_LIMIT CALYPSO_SP_RING_MAX \
+CALYPSO_SP_RING_TRIG CALYPSO_SP_RING_INSN_MIN CALYPSO_SP_HIST_ARM CALYPSO_SP_HIST_DUMP \
+CALYPSO_DBG CALYPSO_UART_TRACE CALYPSO_TWL3025_AFC_HZ CALYPSO_DOPPLER_HZ CALYPSO_SAMPLE_RATE \
+CALYPSO_BURST_PRINT CALYPSO_BURST_MAX CALYPSO_BURST_HEAD CALYPSO_BRIDGE_PYTHON \
+CALYPSO_SKIP_GDB_PANE CALYPSO_NO_ATTACH CALYPSO_AUTO_GEN_DOC \
+CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS CALYPSO_SKIP_L2 \
+CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY"
+      while true; do
+        _items=()
+        for _v in $_ALLVARS; do _items+=("$_v" "= ${!_v:-(unset)}"); done
+        _items+=("DONE" "<< terminer l'edition expert")
+        _sel=$(whiptail --backtitle "$BACKTITLE" \
+          --title "[3/4] Expert variables (ENTER = editer)" \
+          --menu "\n Selectionne une variable (nom = valeur), ENTER pour editer.\n" \
+          24 80 16 "${_items[@]}" 3>&1 1>&2 2>&3) || break
+        [ "$_sel" = "DONE" ] && break
+        _new=$(whiptail --backtitle "$BACKTITLE" --title "$_sel" \
+          --inputbox "\n Nouvelle valeur pour $_sel.\n Vide = unset (revient au defaut).\n" \
+          11 76 "${!_sel:-}" 3>&1 1>&2 2>&3) || continue
+        if [ -z "$_new" ]; then unset "$_sel"; else export "$_sel=$_new"; fi
+      done
+    fi
 
     # ---- 4) RESUME + confirm ----
     _ind() { [ "$1" = "0" ] && echo "[ ]" || echo "[X]"; }
@@ -1212,7 +1233,8 @@ CALYPSO_DSP_IDLE_FF="${CALYPSO_DSP_IDLE_FF:-1}"       # perf : fast-forward DSP 
 CALYPSO_DSP_IDLE_RANGE="${CALYPSO_DSP_IDLE_RANGE:-}"
 
 # === Diag / debug (no-hack) ===
-CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-0}"
+# W1C_LATCH=1 par defaut : NOMINAL (requis pour FBSB_CONF, cf bloc plus haut).
+CALYPSO_W1C_LATCH="${CALYPSO_W1C_LATCH:-1}"
 CALYPSO_NDB_D_RACH_OFFSET="${CALYPSO_NDB_D_RACH_OFFSET:-}"
 CALYPSO_RACH_FORCE_BSIC="${CALYPSO_RACH_FORCE_BSIC:-}"
 CALYPSO_UART_TRACE="${CALYPSO_UART_TRACE:-0}"
@@ -1270,6 +1292,36 @@ if [ "$CALYPSO_ICOUNT" = "off" ]; then
     QEMU_ICOUNT_FLAG=""
 else
     QEMU_ICOUNT_FLAG="-icount $CALYPSO_ICOUNT"
+fi
+
+# ============================================================================
+# kconfig-style cross-variable resolver (behavioral/probe relations).
+# Pipeline component mutex/deps = Regles 1-5 plus haut. Ici : behavioral.
+# S'execute APRES que tous les defaults nominaux soient fixes.
+# ============================================================================
+# R6 CONFLICT : DSP_SHUNT bypass le c54x emule -> sondes c54x muettes.
+if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ -n "${CALYPSO_DEBUG:-}" ]; then
+    echo "[kconfig] WARN DSP_SHUNT=1 court-circuite le c54x : sondes CALYPSO_DEBUG c54x sans effet" >&2
+fi
+# R7 SELECT : QEMU_HALT (-S) exige un pane gdb pour relancer (sinon boot fige).
+if [ "${CALYPSO_QEMU_HALT:-0}" = "1" ] && [ "${CALYPSO_SKIP_GDB_PANE:-1}" = "1" ]; then
+    echo "[kconfig] QEMU_HALT=1 SELECT pane gdb (SKIP_GDB_PANE=0) -- sinon QEMU reste halted" >&2
+    CALYPSO_SKIP_GDB_PANE=0; export CALYPSO_SKIP_GDB_PANE
+fi
+# R8 CONFLICT : BSP_IQ_PASSTHROUGH alimente le correlateur ; incompatible
+# avec DSP_SHUNT (court-circuite le BSP). SHUNT gagne.
+if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_BSP_IQ_PASSTHROUGH:-0}" = "1" ]; then
+    echo "[kconfig] CONFLICT DSP_SHUNT <-> BSP_IQ_PASSTHROUGH -- IQ passthrough desactive" >&2
+    CALYPSO_BSP_IQ_PASSTHROUGH=0; export CALYPSO_BSP_IQ_PASSTHROUGH
+fi
+# R9 WARN : FORCE_INTM_ONESHOT = NON-nominal (force le clear INTM, sonde).
+if [ "${CALYPSO_FORCE_INTM_ONESHOT:-0}" = "1" ]; then
+    echo "[kconfig] WARN FORCE_INTM_ONESHOT=1 : NON-nominal (force INTM clear)" >&2
+fi
+# R10 SELECT : DSP_IDLE_RANGE non-vide implique DSP_IDLE_FF actif.
+if [ -n "${CALYPSO_DSP_IDLE_RANGE:-}" ] && [ "${CALYPSO_DSP_IDLE_FF:-1}" = "0" ]; then
+    echo "[kconfig] DSP_IDLE_RANGE set SELECT DSP_IDLE_FF=1" >&2
+    CALYPSO_DSP_IDLE_FF=1; export CALYPSO_DSP_IDLE_FF
 fi
 
 # ---- log paths ----

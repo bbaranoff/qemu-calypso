@@ -43,7 +43,7 @@ static bool calypso_timer_log(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("CALYPSO_TIMER");
+        const char *e = cdbg_env("TIMER");
         on = (e && (*e == '1' || *e == 'y')) ? 1 : 0;
     }
     return on;
@@ -1540,20 +1540,11 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
                     c54x_load_section(s->dsp, g_section_prom0, 0x07000, true);
                 }
                 if (g_section_prom1) {
-                    int n = c54x_load_section(s->dsp, g_section_prom1,
-                                              0x18000, true);
-                    /* Mirror PROM1 into 16-bit prog space (0xE000..0xFFFF),
-                     * matching legacy c54x_load_rom. Only words whose 16-bit
-                     * alias is >= 0xE000 are mirrored. c54x_reset overwrites
-                     * the IVT at 0xFF80..0xFF83 after this — boot stub wins. */
-                    for (int i = 0; i < n; i++) {
-                        uint32_t paddr = 0x18000 + i;
-                        uint16_t alias = paddr & 0xFFFF;
-                        if (alias >= 0xE000) {
-                            s->dsp->prog[alias] = s->dsp->prog[paddr];
-                        }
-                    }
-                    TRX_LOG("PROM1 mirror: lower-16 alias 0xE000.. populated");
+                    /* PROM1 = page 1, chargée en full-address 0x18000+
+                     * (atteignable via XPC=1). PAS de mirror low-64K : la
+                     * plage 0xE000-0xFFFF = PDROM (vecteurs IT), pas PROM1.
+                     * (Fix 2026-05-29 : le mirror clobbait les vecteurs f4eb.) */
+                    c54x_load_section(s->dsp, g_section_prom1, 0x18000, true);
                 }
                 if (g_section_prom2) {
                     c54x_load_section(s->dsp, g_section_prom2, 0x28000, true);
@@ -1565,7 +1556,11 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
                     c54x_load_section(s->dsp, g_section_drom, 0x09000, false);
                 }
                 if (g_section_pdrom) {
+                    /* PDROM = program-DATA ROM : visible côté DATA (0xE000+)
+                     * ET côté PROGRAMME (page-0 haute 0xE000-0xFFFF) où vit la
+                     * table de vecteurs IT (f4eb). Charge les deux espaces. */
                     c54x_load_section(s->dsp, g_section_pdrom, 0x0E000, false);
+                    c54x_load_section(s->dsp, g_section_pdrom, 0x0E000, true);
                 }
             } else {
                 TRX_LOG("DSP ROM mode: NONE — empty prog[]/data[]. "
@@ -1574,6 +1569,14 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             /* Reset + bsp_init: silicon-valid state regardless of ROM mode.
              * machine_init may layer a DARAM blob via the dsp-blob hook
              * after this returns. */
+            /* ROMMAP probe (CALYPSO_DEBUG=ROMMAP) : 4 cases qui tranchent
+             * le mapping vecteur IT (PDROM vs mirror PROM1) — pré-loader-fix. */
+            if (s->dsp && calypso_debug_enabled("ROMMAP"))
+                fprintf(stderr,
+                    "[c54x] ROMMAP data[0x0ffcc]=0x%04x prog[0x0ffcc]=0x%04x "
+                    "prog[0x1ffcc]=0x%04x prog[0x2ffcc]=0x%04x\n",
+                    s->dsp->data[0x0ffcc], s->dsp->prog[0x0ffcc],
+                    s->dsp->prog[0x1ffcc], s->dsp->prog[0x2ffcc]);
             c54x_reset(s->dsp);
             calypso_bsp_init(s->dsp);
         }
