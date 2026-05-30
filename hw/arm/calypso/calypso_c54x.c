@@ -452,6 +452,27 @@ static uint16_t g_last_st0w_val = 0;        /* valeur ST0 restaurée */
 static uint16_t g_last_st0w_op  = 0;        /* opcode de l'instruction qui écrit ST0 */
 static uint16_t g_last_st0w_xpc = 0;        /* XPC au moment du write (0xf48b dépend de XPC) */
 static uint16_t g_last_st0w_prev = 0;       /* PC prédécesseur du write (comment on y arrive) */
+
+/* === ST0 push/pop ring (C-sweep 2026-05-30, gated DISP-ENTRY) ============
+ * Capture PSHM ST0 (push) + POPM/STLM ST0 (write) dans un ring. Dumpé au
+ * dispatcher BAD (lut != 0xff72) pour discriminer le DP périmé en 3 branches :
+ *   - dernier PUSH val=0x3124 mais POP=0x3125 → CLOBBE pile entre push/pop
+ *     (famille SP/circulaire)
+ *   - dernier PUSH val=0x3125 → DP déjà faux au push (LDP sauté en amont)
+ *   - pas de PUSH ST0 apparié au POP → désalignement SP (pop lit autre slot) */
+typedef struct { uint16_t pc, op, val, sp; char kind; } St0Ev; /* kind P=push p=pop L=ldp */
+#define ST0_RING_N 24
+static St0Ev    g_st0_ring[ST0_RING_N];
+static unsigned g_st0_ring_idx = 0;
+static int      g_st0_ring_on  = -1;
+static void st0_ring_rec(C54xState *s, uint16_t val, char kind)
+{
+    if (g_st0_ring_on < 0) g_st0_ring_on = calypso_debug_enabled("DISP-ENTRY") ? 1 : 0;
+    if (!g_st0_ring_on) return;
+    St0Ev *e = &g_st0_ring[g_st0_ring_idx % ST0_RING_N];
+    e->pc = s->pc; e->op = prog_fetch(s, s->pc); e->val = val; e->sp = s->sp; e->kind = kind;
+    g_st0_ring_idx++;
+}
 /* SURGICAL 2026-05-30 : slot LUT lu à l'entrée dispatcher 0x834d (capture
  * silencieuse, pour épingler le DP coupable du self-CALA 0x70c3 sans le
  * spam de DISP-TRACE qui décale le timing et masque le bug). */
@@ -464,6 +485,33 @@ static uint16_t g_disp_lut_val = 0;
 struct sp_evt { uint16_t pc; uint16_t op; int16_t delta; uint16_t sp; };
 static struct sp_evt g_spring[64];
 static uint32_t g_spring_idx = 0;
+
+/* === SHADOW STACK (pairing push/pop, 2026-05-30, c-web) ===
+ * Miroir logique de la pile DSP : à chaque PUSH (CALL/CALLD/PSHM/IRQ → SP-)
+ * on empile {pc,op,kind} ; à chaque POP (RET/RETD/RETE/FRET/RETED/POPM → SP+)
+ * on dépile et on VÉRIFIE l'appariement. Un POP sur shadow VIDE = return SANS
+ * call apparié = LA source de l'over-pop (lit la pile vierge au-dessus de SP_base).
+ * On nomme ce return orphelin (PC/op/SP), ce que les 15 victimes 0xc8be ne disent
+ * pas. Gated CALYPSO_DEBUG=ORPHAN. kind: 'C'=call 'P'=pshm/pshd 'I'=irq 'R'=reti.
+ * Array-only quand off → ~zéro coût. */
+struct shadow_ent { uint16_t pc; uint16_t op; uint16_t sp; char kind; };
+#define SHADOW_N 512
+static struct shadow_ent g_shadow[SHADOW_N];
+static int  g_shadow_depth = 0;     /* nb de mots actuellement empilés (logique) */
+static int  g_shadow_on   = -1;     /* -1 = pas encore résolu le gate */
+static uint64_t g_orphan_hits = 0;  /* nb de POP-orphelins détectés */
+static uint64_t g_mismatch_hits = 0;/* nb de POP avec kind mismatché */
+
+/* Tracker stores directs zone pile [0x1100..0x1140] (AU-DESSUS de SP_base) :
+ * ces slots ne sont JAMAIS écrits par un push (la pile descend SOUS 0x1100),
+ * donc uniquement par un ST direct. Discrimine vecteur-init LÉGIT (slot écrit
+ * par le firmware) vs slot VIERGE (jamais écrit = vrai over-pop garbage). */
+#define STKSLOT_LO 0x1100
+#define STKSLOT_HI 0x1140
+#define STKSLOT_N  (STKSLOT_HI - STKSLOT_LO + 1)
+static uint16_t g_stkslot_wpc[STKSLOT_N];
+static uint16_t g_stkslot_wop[STKSLOT_N];
+static uint8_t  g_stkslot_written[STKSLOT_N];
 
 static void rsbx_intm_check(C54xState *s, uint16_t op)
 {
@@ -2113,8 +2161,49 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val);
 
+/* === Stack-write ring (ORPHAN trace 2026-05-30) : capture les data_write vers
+ * la zone pile, pour nommer AU POPM ST0 @0xf48b qui a écrit le slot lu (clobber
+ * sous SP, famille circulaire/dual-operand). No-fire au dump = personne n'a
+ * écrit le slot dans la frame → slot STALE → SP désaligné (POP sans PUSH). */
+typedef struct { uint16_t addr, val, pc, op; } StkwEv;
+#define STKW_RING_N 48
+static StkwEv   g_stkw_ring[STKW_RING_N];
+static unsigned g_stkw_idx  = 0;
+static int      g_orphan_on = -1;
+static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
+{
+    if (g_orphan_on < 0) g_orphan_on = calypso_debug_enabled("ORPHAN") ? 1 : 0;
+    if (!g_orphan_on) return;
+    if (addr < 0x1000 || addr > 0x6000) return;   /* zone pile (SP dérive 0x1100→0x56xx) */
+    StkwEv *e = &g_stkw_ring[g_stkw_idx % STKW_RING_N];
+    e->addr = addr; e->val = val; e->pc = s->pc; e->op = prog_fetch(s, s->pc);
+    g_stkw_idx++;
+    /* Track-value : nomme le CALL/push qui pose la valeur orpheline (défaut
+     * 0x3125, override CALYPSO_TRACK_STKVAL=0xNNNN) → corréler avec RCD@0x765c
+     * et POPM@0xf48b en ordre insn. */
+    {
+        static int tval = -2;
+        if (tval == -2) {
+            const char *te = getenv("CALYPSO_TRACK_STKVAL");
+            tval = (te && *te) ? (int)strtol(te, NULL, 0) : 0x3125;
+        }
+        if (tval >= 0 && val == (uint16_t)tval)
+            fprintf(stderr, "[c54x] STK-PUSH val=0x%04x addr=0x%04x PC=0x%04x op=0x%04x SP=0x%04x insn=%u\n",
+                    val, addr, s->pc, prog_fetch(s, s->pc), s->sp, s->insn_count);
+    }
+}
+
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    stkw_rec(s, addr, val);   /* ORPHAN : ring écritures pile */
+    /* ORPHAN : tracker stores directs zone [0x1100..0x1140] (vecteur légit vs
+     * vierge). Slots au-dessus de SP_base → jamais touchés par un push. */
+    if (addr >= STKSLOT_LO && addr <= STKSLOT_HI) {
+        int _si = addr - STKSLOT_LO;
+        g_stkslot_wpc[_si] = s->pc;
+        g_stkslot_wop[_si] = prog_fetch(s, s->pc);
+        g_stkslot_written[_si] = 1;
+    }
     /* MVPD overlay occupancy : count writes to [0x0080..0x27FF] during
      * boot phase. Env-gated CALYPSO_MVPD_TRACE=1. */
     if (g_mvpd_trace_enabled > 0) {
@@ -2763,6 +2852,35 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             g_last_st0w_pc = s->pc; g_last_st0w_val = val;
             g_last_st0w_op = prog_fetch(s, s->pc); g_last_st0w_xpc = s->xpc;
             g_last_st0w_prev = g_prev_pc;
+            st0_ring_rec(s, val, 'p'); /* pop/write ST0 (C-sweep) */
+            if (g_orphan_on > 0 && s->pc == 0xf48b) {
+                /* POPM ST0 @0xf48b : le slot juste poppé = data[sp-1]. Cherche
+                 * son dernier écrivain dans le ring pile. NO-WRITER = slot stale
+                 * → SP désaligné (POP sans PUSH apparié, cas b de CC). */
+                uint16_t slot = (uint16_t)(s->sp - 1);
+                fprintf(stderr, "[c54x] ORPHAN@f48b SP=0x%04x slot=0x%04x val=0x%04x(DP=%03x)",
+                        s->sp, slot, val, (unsigned)(val & 0x1FF));
+                int found = 0;
+                unsigned rn = g_stkw_idx < STKW_RING_N ? g_stkw_idx : STKW_RING_N;
+                for (unsigned i = 0; i < rn; i++) {
+                    StkwEv *e = &g_stkw_ring[(g_stkw_idx - 1 - i) % STKW_RING_N];
+                    if (e->addr == slot) {
+                        fprintf(stderr, "  WRITER@%04x op=%04x val=%04x", e->pc, e->op, e->val);
+                        found = 1; break;
+                    }
+                }
+                if (!found)
+                    fprintf(stderr, "  NO-WRITER → slot STALE → SP désaligné (POP sans PUSH)");
+                fprintf(stderr, " insn=%u\n", s->insn_count);
+                /* SP-EVENTS ring : les push/pop récents → le return RET-family
+                 * déséquilibré (pop delta>0 sans push apparié) qui décale SP. */
+                fprintf(stderr, "[c54x]   ORPHAN-SP-RING (anciens→récents, pc:op±delta) :");
+                for (int k = 28; k >= 1; k--) {
+                    struct sp_evt *e = &g_spring[(g_spring_idx - k) & 63];
+                    fprintf(stderr, " %04x:%04x%+d", e->pc, e->op, e->delta);
+                }
+                fprintf(stderr, "\n");
+            }
             return;
         case MMR_ST1:  s->st1 = val; return;
         case MMR_AL:   s->a = (s->a & ~0xFFFF) | val; return;
@@ -3489,6 +3607,25 @@ static int c54x_exec_one(C54xState *s)
      * du slot LUT qui sera lu à 0x834d = data[(DP<<7)|0x07] → handler vs garbage.
      * DIFF entrées OK (DP=0x124) vs KO (DP≠0x124) : si KO ⟺ IT récente (Δinsn
      * petit, fg_dp=DP-KO) → (b) préemption confirmée, root = INTM/IT. */
+    /* ORACLE (border, debug pas fix) : CALYPSO_FORCE_DP=0x124 force le champ DP
+     * de ST0 à l'entrée dispatcher 0x8341. Si FB lock + AFC converge → le bit
+     * est load-bearing, la chasse au DP périmé est justifiée. Sinon → faute DSP
+     * plus profonde DERRIÈRE le dispatcher, et chasser 0x3125 est prématuré. */
+    if (s->pc == 0x8341) {
+        static int inited = 0, force_dp = -1, force_from = -1;
+        if (!inited) {
+            inited = 1;
+            const char *e = getenv("CALYPSO_FORCE_DP");
+            force_dp = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+            const char *ef = getenv("CALYPSO_FORCE_DP_FROM"); /* SCOPÉ : ne force que si DP==FROM */
+            force_from = (ef && *ef) ? (int)strtol(ef, NULL, 0) : -1; /* -1 = global (ancien) */
+        }
+        if (force_dp >= 0) {
+            int cur = s->st0 & 0x1FF;
+            if (force_from < 0 || cur == force_from)
+                s->st0 = (uint16_t)((s->st0 & ~0x1FF) | (force_dp & 0x1FF));
+        }
+    }
     if (s->pc == 0x8341 && calypso_debug_enabled("DISP-ENTRY")) {
         static unsigned de_n = 0;
         if (de_n++ < 20000) {
@@ -3509,6 +3646,18 @@ static int c54x_exec_one(C54xState *s)
                 g_last_st0w_val, g_last_st0w_prev,
                 g_last_intr_vec, (unsigned long long)d_intr,
                 g_last_intr_fg_pc, g_last_intr_fg_dp, s->insn_count);
+            if (lut != 0xff72) {   /* dispatcher BAD → dump ring ST0 push/pop (C-sweep) */
+                fprintf(stderr, "[c54x] ST0-RING@dispBAD DP=0x%03x SP=0x%04x (anciens→récents) :",
+                        (unsigned)(s->st0 & 0x1FF), s->sp);
+                unsigned rn = g_st0_ring_idx < ST0_RING_N ? g_st0_ring_idx : ST0_RING_N;
+                for (unsigned i = 0; i < rn; i++) {
+                    St0Ev *e = &g_st0_ring[(g_st0_ring_idx - rn + i) % ST0_RING_N];
+                    fprintf(stderr, " %c@%04x:%04x v=%04x(DP=%03x)SP=%04x",
+                            e->kind, e->pc, e->op, e->val,
+                            (unsigned)(e->val & 0x1FF), e->sp);
+                }
+                fprintf(stderr, "\n");
+            }
         }
     }
 
@@ -5327,13 +5476,20 @@ static int c54x_exec_one(C54xState *s)
         }
         if (op == 0xF274) {
             /* CALLD pmad — delayed call (2 words, 2 delay slots).
-             * Push PC+4 (past CALLD + 2 delay slots), branch to pmad. */
+             * Push PC+4 (return = past CALLD + 2 delay slots), PUIS exécute les
+             * 2 delay-slots via delayed_pc/delay_slots AVANT de brancher.
+             * Fix 2026-05-30 : était saut immédiat (s->pc=op2; return 0) → les
+             * 2 delay-slots étaient SKIPPÉS ; si un slot contient un push/pop,
+             * la pile se désaligne d'1 mot → POPM ST0 ramasse un PC orphelin
+             * (ex. 0x80fd) → DP garbage → CALA 0x70c3 = trou noir → TOA figé →
+             * AFC bloqué. Arme la machinerie delay_slots (comme RCD/RETED). */
             op2 = prog_fetch(s, s->pc + 1);
             consumed = 2;
             s->sp--;
             data_write(s, s->sp, (uint16_t)(s->pc + 4));
-            s->pc = op2;
-            return 0;
+            s->delayed_pc  = op2;
+            s->delay_slots = 2;
+            return consumed + s->lk_used;
         }
         if (op == 0xF273) {
             /* BD pmad — delayed branch (2 words, 2 delay slots). AUCUNE pile.
@@ -5342,12 +5498,15 @@ static int c54x_exec_one(C54xState *s)
              * Fix 2026-05-30 : était traité comme RETD (pop parasite) → SP
              * désaligné d'1 mot par BD → POPM ST0 0xf48b pop un PC orphelin
              * → DP=0x087 → dispatcher 0x8341 → CALAD 0x70c3 = trou noir.
-             * Identique au B (F073) ci-dessus : saut direct, pas de pile (ce
-             * decoder approxime les branches différées en sautant immédiat,
-             * cf CALLD F274). */
+             * Identique au B (F073) ci-dessus : saut, pas de pile.
+             * Fix 2026-05-30 v2 : était saut IMMÉDIAT (skip des 2 delay-slots) →
+             * si un slot a un push/pop, pile désalignée → POPM ST0 orphelin →
+             * 0x70c3. Arme delay_slots=2 pour exécuter les slots avant le saut. */
             op2 = prog_fetch(s, s->pc + 1);
-            s->pc = op2;
-            return 0;
+            consumed = 2;
+            s->delayed_pc  = op2;
+            s->delay_slots = 2;
+            return consumed + s->lk_used;
         }
         /* === F2xx dispatch (audit F-class 2026-05-25) =====================
          *
@@ -7261,6 +7420,7 @@ static int c54x_exec_one(C54xState *s)
                 /* PSHM MMR — push memory-mapped reg onto stack */
                 int mmr = op & 0x7F;
                 uint16_t val = data_read(s, mmr);
+                if (mmr == MMR_ST0) st0_ring_rec(s, val, 'P'); /* push ST0 (C-sweep) */
                 s->sp = (s->sp - 1) & 0xFFFF;
                 data_write(s, s->sp, val);
                 return consumed + s->lk_used;
@@ -9455,12 +9615,35 @@ int c54x_run(C54xState *s, int n_insns)
     }
 
     while (executed < n_insns && s->running && !s->idle) {
-        /* === SILICON-BOOT-REDIRECT disabled 2026-05-29 (combo test avec IDLE 1 fix) ===
-         * Tentative 2 : avec IDLE 1 catch-all fix (~line 4006) appliqué,
-         * relancer DSP via PC=0xFF80 réel pour voir si le pb précédent
-         * (regression cycle 2) disparait. Le redirect remplaçait un
-         * mask-ROM silicon manquant ; sans lui, DSP exec PROM1[0xFF80..]
-         * directement (= 4×RET puis CALL pmad 0x9F87). */
+        /* === SILICON-BOOT-ROM REDIRECT (réactivé 2026-05-30) ===========
+         * Le dump PROM ne contient PAS le mask-ROM silicon du Calypso. Sur
+         * vrai HW, ce ROM masqué tourne au reset, pose SP=0x5AC8 + MMR, puis
+         * saute à l'entrée firmware PROM0[0x7120] (= STM #0x5AC8,SP vérifié :
+         * prog[0x7120]=0x7718 STM #lk,SP, prog[0x7121]=0x5ac8). On MODÉLISE
+         * ce hardware manquant — ce n'est PAS un override d'instruction
+         * firmware : on route vers l'entrée firmware propre, qui fait elle-
+         * même son init SP.
+         *
+         * RÉGRESSION corrigée : retiré le 29/05 (c3ec660 « relancer via
+         * 0xFF80 réel »). Sans lui, reset → 0xff80(FB) → 0xb410 → CC → 0x76f8
+         * SANS jamais exécuter STM #0x5AC8,SP → SP coincé à 0x1100 (invalide,
+         * = aire MMR/AR0) → over-pop boot (net→-57) → return corrompu →
+         * self-CALA 0x70c3 → spirale (16M pushes) → PMST 0x70C4 fuit en
+         * TOA=28868 côté osmocon → FB jamais locké.
+         *
+         * Gate SP==0x1100 = cold-reset uniquement (valeur silicon-reset). Une
+         * fois SP=0x5AC8 posé par 0x7120, la condition retombe → les walks
+         * séquentiels firmware passant par 0xff80 plus tard NE sont PAS
+         * hijackés (cf SOFT-RESET-TRIG ci-dessous, insn>100k). */
+        if (s->pc == 0xFF80 && s->sp == 0x1100) {
+            static int redirect_log;
+            if (redirect_log < 3) {
+                C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x7120 "
+                        "(modèle mask-ROM manquant ; 0x7120 = STM #0x5AC8,SP)");
+                redirect_log++;
+            }
+            s->pc = 0x7120;
+        }
         /* === SOFT-RESET-TRIGGER probe (2026-05-28) ===
          * SP-CATASTROPHE trace montre PC=0x7120 (boot init via notre override
          * 0xFF80) re-firing à insn=190M. C'est un soft-reset interne firmware.
@@ -10573,6 +10756,106 @@ int c54x_run(C54xState *s, int n_insns)
             g_sp_ledger.net_words += (int16_t)(sp_before_exec - s->sp);
             if ((int16_t)(s->sp - sp_before_exec) < 0) g_sp_ledger.sp_pushes++;
             else g_sp_ledger.sp_pops++;
+
+            /* === SHADOW STACK : appariement push/pop (gate ORPHAN) ===
+             * Nomme LE return orphelin (over-pop), pas les 15 victimes 0xc8be. */
+            if (g_shadow_on < 0) {
+                const char *eo = cdbg_env("ORPHAN");
+                g_shadow_on = (eo && *eo) ? 1 : 0;
+            }
+            if (g_shadow_on) {
+                uint16_t op = e->op;
+                int16_t  d  = e->delta;
+                int is_call = (op==0xF074||op==0xF274||op==0xF4E3||op==0xF4E7||op==0xF6E3);
+                int is_ret  = (op==0xFC00||op==0xFE00||op==0xF4EB||op==0xF4E4||op==0xF6EB
+                               ||(op&0xFF00)==0xFC00);   /* RET/RETD/RETE/FRET/RETED + RC cond */
+                int is_pshm = ((op&0xFF00)==0x4A00||(op&0xFF00)==0x4B00);
+                (void)is_call;
+                if (d < 0) {                 /* PUSH : SP a baissé */
+                    int words = -d, w;
+                    char kind = is_pshm ? 'P' : 'C';   /* PSHM=data ; reste=adresse retour */
+                    for (w = 0; w < words; w++) {
+                        if (g_shadow_depth >= 0 && g_shadow_depth < SHADOW_N) {
+                            g_shadow[g_shadow_depth].pc   = exec_pc;
+                            g_shadow[g_shadow_depth].op   = op;
+                            g_shadow[g_shadow_depth].sp   = s->sp;
+                            g_shadow[g_shadow_depth].kind = kind;
+                        }
+                        g_shadow_depth++;
+                    }
+                } else if (d > 0) {          /* POP : SP a monté */
+                    int words = d, w;
+                    for (w = 0; w < words; w++) {
+                        g_shadow_depth--;
+                        if (is_ret) {
+                            if (g_shadow_depth < 0) {
+                                g_orphan_hits++;
+                                if (g_orphan_hits <= 40) {
+                                    /* cible du return : RETD/RETED arment delayed_pc
+                                     * (commit différé), RET/FRET immédiat = s->pc. */
+                                    uint16_t ret_tgt = (s->delay_slots ? s->delayed_pc : s->pc);
+                                    /* dernier PUSH réel de g_spring (le CALL apparié
+                                     * manquant) : scan arrière sur delta<0. */
+                                    uint16_t lp_pc = 0, lp_op = 0; int lp_found = 0, scan;
+                                    for (scan = 1; scan <= 64; scan++) {
+                                        struct sp_evt *pe = &g_spring[(g_spring_idx - scan) & 63];
+                                        if (pe->delta < 0) { lp_pc = pe->pc; lp_op = pe->op;
+                                                             lp_found = 1; break; }
+                                    }
+                                    fprintf(stderr,
+                                        "[c54x] ORPHAN-RETURN #%llu insn=%u pc=0x%04x op=0x%04x "
+                                        "SP=0x%04x → ret_tgt=0x%04x  lastPUSH=%s(pc=0x%04x op=0x%04x) "
+                                        "net_words=%lld — over-pop (pile vierge au-dessus de SP_base)\n",
+                                        (unsigned long long)g_orphan_hits, s->insn_count,
+                                        exec_pc, op, s->sp, ret_tgt,
+                                        lp_found ? "" : "AUCUN", lp_pc, lp_op,
+                                        (long long)g_sp_ledger.net_words);
+                                    /* slot lu par ce return : écrit (vecteur
+                                     * légit) ou VIERGE (vrai garbage) ? */
+                                    {
+                                        uint16_t rs = (uint16_t)(s->sp - 1);
+                                        if (rs >= STKSLOT_LO && rs <= STKSLOT_HI) {
+                                            int si = rs - STKSLOT_LO;
+                                            if (g_stkslot_written[si])
+                                                fprintf(stderr, "[c54x]     slot 0x%04x ÉCRIT par "
+                                                    "ST@pc=0x%04x op=0x%04x → VECTEUR LÉGIT (pas un bug)\n",
+                                                    rs, g_stkslot_wpc[si], g_stkslot_wop[si]);
+                                            else
+                                                fprintf(stderr, "[c54x]     slot 0x%04x JAMAIS écrit "
+                                                    "→ VIERGE = vrai over-pop garbage\n", rs);
+                                        }
+                                    }
+                                    /* Au TOUT premier orphan : dump complet du ring
+                                     * g_spring (reset→over-pop) pour compter push vs
+                                     * pop directement = racine structurelle vs bug. */
+                                    if (g_orphan_hits == 1) {
+                                        int k;
+                                        fprintf(stderr, "[c54x]   g_spring (anciens→récents, reset→#1):\n");
+                                        for (k = 64; k >= 1; k--) {
+                                            struct sp_evt *pe = &g_spring[(g_spring_idx - k) & 63];
+                                            if (pe->pc == 0 && pe->op == 0 && pe->delta == 0) continue;
+                                            fprintf(stderr, "[c54x]     pc=0x%04x op=0x%04x %s%d SP→0x%04x\n",
+                                                    pe->pc, pe->op, pe->delta < 0 ? "PUSH" : "POP ",
+                                                    pe->delta < 0 ? -pe->delta : pe->delta, pe->sp);
+                                        }
+                                    }
+                                }
+                            } else if (g_shadow[g_shadow_depth].kind != 'C') {
+                                g_mismatch_hits++;
+                                if (g_mismatch_hits <= 40)
+                                    fprintf(stderr,
+                                        "[c54x] MISMATCH-RETURN #%llu insn=%u pc=0x%04x op=0x%04x "
+                                        "SP=0x%04x dépile kind='%c' poussé par pc=0x%04x op=0x%04x — "
+                                        "return lit une valeur non-retour (PSHM)\n",
+                                        (unsigned long long)g_mismatch_hits, s->insn_count,
+                                        exec_pc, op, s->sp, g_shadow[g_shadow_depth].kind,
+                                        g_shadow[g_shadow_depth].pc, g_shadow[g_shadow_depth].op);
+                            }
+                        }
+                    }
+                }
+                if (g_shadow_depth < 0) g_shadow_depth = 0;  /* re-ancre après orphan */
+            }
         }
 
         /* === CORR-ABG probe (2026-05-30, c-web) : la FB-det est FRÉQUENTIELLE
