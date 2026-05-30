@@ -1582,6 +1582,24 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                 (long long)((int64_t)s->insn_count - (int64_t)g_arm_taskmd5_insn),
                 s->pc, s->insn_count);
     }
+    /* WATCH-RD-ADDR (générique, gated CALYPSO_DEBUG=WATCH-RD + env
+     * CALYPSO_WATCH_RD_ADDR=0xNNNN) : log toute LECTURE d'une adresse data
+     * arbitraire (PC + valeur lue + insn) — voir QUI lit une cellule
+     * pointeur-dispatcher (ex. 0x3af7) et AVEC QUELLE valeur (0 avant
+     * peuplement vs valeur valide après). Symétrique du WATCH-WR. */
+    {
+        static int watch_rd_addr = -1;
+        if (watch_rd_addr < 0) {
+            const char *e = getenv("CALYPSO_WATCH_RD_ADDR");
+            watch_rd_addr = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
+        }
+        if (watch_rd_addr && addr == (uint16_t)watch_rd_addr) {
+            C54_DBG("WATCH-RD",
+                "WATCH-RD data[0x%04x] = 0x%04x PC=0x%04x DP=0x%03x insn=%u",
+                addr, s->data[addr], s->pc, (s->st0 & 0x1FF),
+                (unsigned)s->insn_count);
+        }
+    }
     /* DISP-POLL (CALYPSO_DEBUG=DISP-POLL) : le busy-loop dispatcher (d1xx↔da0d)
      * polle la zone flag DARAM[0x60-0x70]. On veut voir EN STEADY-STATE (post
      * +1.9s) CE qu'il lit (quel slot) et si ce flag devient jamais non-zéro
@@ -2503,6 +2521,25 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                     s->sp, dp(s),
                     !!(s->st1 & ST1_INTM),
                     s->insn_count);
+        }
+    }
+
+    /* WATCH-WR-ADDR (générique, gated CALYPSO_DEBUG=WATCH-WR + env
+     * CALYPSO_WATCH_WR_ADDR=0xNNNN) : log tout write vers une adresse data
+     * arbitraire — pour tracer qui écrit (ou jamais) une cellule pointeur-
+     * dispatcher SARAM (ex. 0x3af7) qui tombe à 0 → CALA→0 → bootstub. */
+    {
+        static int watch_wr_addr = -1;
+        if (watch_wr_addr < 0) {
+            const char *e = getenv("CALYPSO_WATCH_WR_ADDR");
+            watch_wr_addr = (e && *e) ? (int)strtol(e, NULL, 0) : 0;
+        }
+        if (watch_wr_addr && addr == (uint16_t)watch_wr_addr) {
+            C54_DBG("WATCH-WR",
+                "WATCH-WR data[0x%04x] <- 0x%04x (was 0x%04x) PC=0x%04x "
+                "DP=0x%03x insn=%u",
+                addr, val, s->data[addr], s->pc, (s->st0 & 0x1FF),
+                (unsigned)s->insn_count);
         }
     }
 
@@ -7021,6 +7058,27 @@ static int c54x_exec_one(C54xState *s)
             break;
         }
         if (dst) s->b = sext40(v); else s->a = sext40(v);
+        /* LDU-PTR (patch #2 diag, gated CALYPSO_DEBUG=LDU-PTR) : au site qui
+         * charge A pour le CALA->0 (defaut PC=0xfa7e, override
+         * CALYPSO_TRACE_LDU_PC=0xNNNN). Dump l'EA lue + valeur + indirect +
+         * AR/DP pour nommer la case = 0 (pointeur table non init / EA fausse). */
+        {
+            static int ldu_trace_pc = -1;
+            if (ldu_trace_pc < 0) {
+                const char *e = getenv("CALYPSO_TRACE_LDU_PC");
+                ldu_trace_pc = (e && *e) ? (int)strtol(e, NULL, 0) : 0xfa7e;
+            }
+            if (s->pc == (uint16_t)ldu_trace_pc) {
+                C54_DBG("LDU-PTR",
+                    "LDU-PTR PC=0x%04x op=0x%04x sub=%d EA=0x%04x val=0x%04x ind=%d "
+                    "DP=0x%03x AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x "
+                    "AR5=%04x AR6=%04x AR7=%04x insn=%u",
+                    s->pc, op, sub, addr, val, ind, (s->st0 & 0x1FF),
+                    s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                    s->ar[4], s->ar[5], s->ar[6], s->ar[7],
+                    (unsigned)s->insn_count);
+            }
+        }
         /* CALAD-zone LD trace: every LD/LDU/LDR that targets A while
          * executing in DARAM near the CALAD cluster. Reveals what
          * address/value is feeding A right before each CALAD A. */
@@ -8267,6 +8325,27 @@ ba_handler:
             int yar   = (op & 0x03) + 2;               /* AR2..AR5 */
             int d_acc = s_acc ? 0 : 1;                 /* LD into the OTHER acc */
             int64_t st_val = s_acc ? s->b : s->a;
+            /* STLD-SP (patch #2 diag, gated CALYPSO_DEBUG=STLD-SP) : au site
+             * SP-CATASTROPHE (défaut PC=0xa0e7, env CALYPSO_TRACE_STLD_PC),
+             * dump la cible RÉELLE = AR[yar] PRÉ-modify + flag MMR_SP. Tranche
+             * le fork CC : si AR[yar]==MMR_SP(0x18) → le ST écrit SP (AR stale
+             * via STM skippé) ; sinon → write DARAM légal. */
+            {
+                static int stld_pc = -1;
+                if (stld_pc < 0) {
+                    const char *e = getenv("CALYPSO_TRACE_STLD_PC");
+                    stld_pc = (e && *e) ? (int)strtol(e, NULL, 0) : 0xa0e7;
+                }
+                if (s->pc == (uint16_t)stld_pc) {
+                    C54_DBG("STLD-SP",
+                        "STLD-SP op=0x%04x PC=0x%04x s_acc=%d yar=AR%d "
+                        "tgt(AR%d_pre)=0x%04x is_MMR_SP=%d xar=AR%d AR%d=0x%04x "
+                        "st_val=0x%010llx",
+                        op, s->pc, s_acc, yar, yar, s->ar[yar],
+                        (s->ar[yar] == MMR_SP), xar, xar, s->ar[xar],
+                        (unsigned long long)(st_val & 0xFFFFFFFFFFULL));
+                }
+            }
             data_write(s, s->ar[yar], (uint16_t)(st_val & 0xFFFF));
             uint16_t ld_val = data_read(s, s->ar[xar]);
             int64_t loaded = (int64_t)(int16_t)ld_val << 16;
@@ -8275,13 +8354,34 @@ ba_handler:
             case 0: break;                             /* *ARi (no mod) */
             case 1: s->ar[xar]++; break;               /* *ARi+ */
             case 2: s->ar[xar]--; break;               /* *ARi- */
-            case 3: s->ar[xar] += s->ar[0]; break;     /* *ARi+0% (linear approx) */
+            case 3:                                    /* *ARi+0% — CIRCULAIRE modulo BK
+                                                        * (était linear += AR0 → AR drift
+                                                        * 16-bit vers 0x18=MMR_SP → SP-CATAS).
+                                                        * Miroir du single-operand case 0xE. */
+                if (s->bk) {
+                    uint16_t base = s->ar[xar] - (s->ar[xar] % s->bk);
+                    uint16_t v = s->ar[xar] + s->ar[0];
+                    if (v >= (uint16_t)(base + s->bk)) v -= s->bk;
+                    s->ar[xar] = v;
+                } else {
+                    s->ar[xar] += s->ar[0];            /* BK=0 → linéaire (pas de circ) */
+                }
+                break;
             }
             switch (ymod) {
             case 0: break;
             case 1: s->ar[yar]++; break;
             case 2: s->ar[yar]--; break;
-            case 3: s->ar[yar] += s->ar[0]; break;
+            case 3:                                    /* *ARi+0% — circulaire modulo BK */
+                if (s->bk) {
+                    uint16_t base = s->ar[yar] - (s->ar[yar] % s->bk);
+                    uint16_t v = s->ar[yar] + s->ar[0];
+                    if (v >= (uint16_t)(base + s->bk)) v -= s->bk;
+                    s->ar[yar] = v;
+                } else {
+                    s->ar[yar] += s->ar[0];
+                }
+                break;
             }
             return consumed + s->lk_used;
         }
