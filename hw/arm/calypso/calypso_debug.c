@@ -29,6 +29,10 @@ static bool     s_all = false;
 static bool     s_inited = false;
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Master gate : -1 = pas encore init, 0 = CALYPSO_DEBUG vide (toutes sondes
+ * OFF, fast-path inliné dans le header), 1 = au moins une sonde active. */
+int calypso_debug_master = -1;
+
 /* Normalize probe name in-place : upper-case, separators → '_'. */
 static void normalize(char *s)
 {
@@ -77,7 +81,19 @@ static void parse_env_locked(void)
     }
 }
 
-bool calypso_debug_enabled(const char *probe_name)
+/* Init unique du master gate : parse l'env et fixe calypso_debug_master.
+ * Appelé depuis l'inline calypso_debug_enabled() du header au 1er passage. */
+void calypso_debug_master_init(void)
+{
+    pthread_mutex_lock(&s_mu);
+    parse_env_locked();
+    calypso_debug_master = (s_all || s_entries_n > 0) ? 1 : 0;
+    pthread_mutex_unlock(&s_mu);
+}
+
+/* Impl réelle (out-of-line). N'est atteinte que quand master == 1, donc
+ * parse_env_locked a déjà tourné — le bloc !s_inited reste par sûreté. */
+bool calypso_debug_enabled_(const char *probe_name)
 {
     if (!probe_name) return false;
 

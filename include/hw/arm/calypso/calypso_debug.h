@@ -23,7 +23,24 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-bool calypso_debug_enabled(const char *probe_name);
+/* Master gate : caché, parsé une fois. Quand CALYPSO_DEBUG est vide,
+ * calypso_debug_master == 0 et calypso_debug_enabled() retourne false en
+ * inline, SANS aucun appel de fonction (supprime l'overhead per-instruction
+ * des 76 call-sites dans la hot-loop DSP). Comportement identique sinon. */
+extern int  calypso_debug_master;
+void        calypso_debug_master_init(void);
+bool        calypso_debug_enabled_(const char *probe_name);   /* impl réelle */
+
+static inline bool calypso_debug_enabled(const char *probe_name)
+{
+    if (__builtin_expect(calypso_debug_master < 0, 0)) {
+        calypso_debug_master_init();
+    }
+    if (__builtin_expect(calypso_debug_master == 0, 1)) {
+        return false;
+    }
+    return calypso_debug_enabled_(probe_name);
+}
 
 /* CALYPSO_DBG : gated fprintf. probe_name est string literal compile-time.
  * fmt inclut le préfixe (ex: "[c54x] IMR-W ...") et le \n final. */
