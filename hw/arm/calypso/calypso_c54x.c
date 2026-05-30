@@ -11735,23 +11735,10 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
     if (imr_bit < 0 || imr_bit >= 16) return;
     s->ifr |= (1 << imr_bit);
 
-    /* === EXPÉRIENCE WIRE585F (env CALYPSO_WIRE585F=1, toggle, unpatch trivial) ===
-     * Le foreground polle data[0x585f] bit7 (0x0080) @0xf7af, les ISR pollent bit8
-     * (0x0100) — JAMAIS posé (FBWATCH-585F=0) = deadlock du producteur. Hypothèse :
-     * c'est un flag "frame ready" que le frame-IRQ (INT3=vec19) doit poser. On le
-     * câble ici pour TESTER si ça débloque le dispatch FB/PM. Débloque → on tient
-     * l'événement producteur manquant. Ne débloque pas → unpatch (env off). */
-    if (vec == 19) {
-        static int wire585f = -1;
-        if (wire585f < 0) wire585f = getenv("CALYPSO_WIRE585F") ? 1 : 0;
-        if (wire585f) {
-            s->data[0x585f] |= 0x0180;
-            static unsigned wlog = 0;
-            if (wlog++ < 20)
-                fprintf(stderr, "[c54x] WIRE585F-FIRED #%u data[0x585f]=0x%04x insn=%u\n",
-                        wlog, s->data[0x585f], s->insn_count);
-        }
-    }
+    /* EXPÉRIENCE WIRE585F RETIRÉE 2026-05-30 : forcer data[0x585f] bit7 au frame-IRQ
+     * a prouvé (mem=0x0180 TC=1) que le mécanisme est sain MAIS que 0x585f n'est
+     * qu'UNE porte d'une chaîne (→ pose 0x3fd3 puis reboucle) — pas le verrou.
+     * Whack-a-mole démontré, pas supposé. cf [[feedback_debug_gate_heisenbug]]. */
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
 
