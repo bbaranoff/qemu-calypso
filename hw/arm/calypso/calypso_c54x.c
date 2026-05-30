@@ -1534,6 +1534,25 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     if (g_corr_trace_enabled > 0 && s->pc >= CORR_PC_LO && s->pc < CORR_PC_HI) {
         corr_read_record(addr);
     }
+    /* IQ-READ tracer (2026-05-30) : qui lit le buffer DMA BSP [0x2a00..0x2b27] ?
+     * Confirme que le corrélateur FB consomme bien la vraie I/Q écrite par le
+     * BSP, et à quel PC (= le vrai site corrélateur). Cap 60, ~zéro coût hors zone. */
+    if (addr >= 0x2a00 && addr < 0x2b28 && s->data[addr] != 0) {
+        static unsigned iqr = 0;
+        if (iqr < 60) {
+            uint16_t val = s->data[addr];
+            /* A/B (accumulateurs corr complexe, sign-ext 40b) + valeurs aux
+             * AUTRES pointeurs (candidats réf cos/sin) PENDANT la lecture I/Q. */
+            int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+            int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
+            fprintf(stderr, "[c54x] IQ-READ #%u addr=0x%04x val=0x%04x PC=0x%04x A=%lld B=%lld "
+                    "T=%04x | AR3=%04x[%04x] AR4=%04x[%04x] AR5=%04x[%04x] insn=%u\n",
+                    iqr, addr, val, s->pc, (long long)a, (long long)b, s->t,
+                    s->ar[3], s->data[s->ar[3]], s->ar[4], s->data[s->ar[4]],
+                    s->ar[5], s->data[s->ar[5]], s->insn_count);
+            iqr++;
+        }
+    }
     /* MTTCG : protège DARAM access (DSP + ARM-OVLY peuvent racer).
      * Sans MTTCG : mutex non contesté (overhead minimal). */
     qemu_mutex_lock(&calypso_pcb_daram_lock);
@@ -2082,6 +2101,34 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * boot phase. Env-gated CALYPSO_MVPD_TRACE=1. */
     if (g_mvpd_trace_enabled > 0) {
         mvpd_trace_record(addr);
+    }
+    /* ANGLE-WR tracer (2026-05-30) : qui écrit a_sync_demod[ANGLE]=0x08fc
+     * (et TOA=0x08fa, SNR=0x08fd) = la SORTIE du vrai détecteur de fréquence
+     * FCCH. Capture A/B (corr complexe) + réf (AR3/4/5) au store → le vrai
+     * site de corrélation fréquentielle. Cap 40. */
+    /* FBMODE-WR : qui écrit d_fb_mode (0x08f9) et avec quelle valeur (large
+     * vs étroit) ? Si bascule étroit après le rejet boot → plus de cold-acq. */
+    if (addr == 0x08f9) {
+        static unsigned fm = 0;
+        if (fm < 40) {
+            fprintf(stderr, "[c54x] FBMODE-WR #%u d_fb_mode <- 0x%04x PC=0x%04x insn=%u\n",
+                    fm, val, s->pc, s->insn_count);
+            fm++;
+        }
+    }
+    if (addr >= 0x08fa && addr <= 0x08fd) {
+        static unsigned aw = 0;
+        if (aw < 40) {
+            int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+            int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
+            const char *nm = addr==0x08fa?"TOA":addr==0x08fb?"PM":addr==0x08fc?"ANGLE":"SNR";
+            fprintf(stderr, "[c54x] ANGLE-WR #%u %s[0x%04x]<-0x%04x PC=0x%04x A=%lld B=%lld T=%04x | "
+                    "AR2=%04x[%04x] AR3=%04x[%04x] AR4=%04x[%04x] AR5=%04x[%04x] insn=%u\n",
+                    aw, nm, addr, val, s->pc, (long long)a, (long long)b, s->t,
+                    s->ar[2], s->data[s->ar[2]], s->ar[3], s->data[s->ar[3]],
+                    s->ar[4], s->data[s->ar[4]], s->ar[5], s->data[s->ar[5]], s->insn_count);
+            aw++;
+        }
     }
     /* MTTCG lock : voir data_read ci-dessus. */
     qemu_mutex_lock(&calypso_pcb_daram_lock);
@@ -10428,6 +10475,40 @@ int c54x_run(C54xState *s, int n_insns)
             else g_sp_ledger.sp_pops++;
         }
 
+        /* === CORR-ABG probe (2026-05-30, c-web) : la FB-det est FRÉQUENTIELLE
+         * (FCCH = ton pur), pas un pic d'amplitude. Au site corrélateur 0xec07,
+         * capture A & B SÉPARÉS (= I/Q de la corr complexe), l'angle atan2(B,A)
+         * (= la fréquence vue par le détecteur), et les valeurs aux 4 pointeurs
+         * AR (data-I/Q vs table de réf cos/sin — vérifie que la réf est un vrai
+         * sinus, pas du garbage/zéro). Cap 30. */
+        /* DETECTOR-RUN (2026-05-30) : compteur d'exécutions du VRAI détecteur
+         * freq FCCH (0x9ac0). Pourquoi ne tourne-t-il qu'1× au boot ? Loggue
+         * insn + d_fb_mode (0x08f9, large vs étroit) + d_task_md (0x0804/0x0818)
+         * à chaque passage. */
+        if (exec_pc == 0x9ac0) {
+            static unsigned dr = 0;
+            if (dr < 30 || (dr % 200) == 0)
+                fprintf(stderr, "[c54x] DETECTOR-RUN #%u @0x9ac0 d_fb_mode[08f9]=0x%04x "
+                        "d_fb_det[08f8]=0x%04x insn=%u\n",
+                        dr, s->data[0x08f9], s->data[0x08f8], s->insn_count);
+            dr++;
+        }
+        if (exec_pc == 0xec07) {
+            static unsigned cr = 0;
+            if (cr < 30) {
+                int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+                int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
+                /* angle=atan2(B,A) calculé à l'analyse (pas de math.h ici). */
+                fprintf(stderr, "[c54x] CORR-ABG #%u A=%lld B=%lld | "
+                        "AR2=%04x[%04x] AR3=%04x[%04x] AR4=%04x[%04x] AR5=%04x[%04x] insn=%u\n",
+                        cr, (long long)a, (long long)b,
+                        s->ar[2], s->data[s->ar[2]], s->ar[3], s->data[s->ar[3]],
+                        s->ar[4], s->data[s->ar[4]], s->ar[5], s->data[s->ar[5]],
+                        s->insn_count);
+                cr++;
+            }
+        }
+
         /* === CORR-PEAK probe (2026-05-30) : au store du TOA (PC=0x9ac0, STL A
          * dans a_sync_demod) dumper A/B complets + AR + T + la fenêtre d'entrée
          * lue (buffer BSP 0x2a00) → voir comment le corrélateur dérive le TOA
@@ -10888,8 +10969,42 @@ int c54x_run(C54xState *s, int n_insns)
                 fprintf(stderr, "[c54x] CALYPSO_DSP_YIELD = %d insn/yield %s\n",
                         dsp_yield, dsp_yield ? "(variateur ON)" : "(OFF, legacy)");
             }
-            if (dsp_yield > 0 && executed >= dsp_yield && s->delay_slots == 0)
-                break;   /* boundary propre → mainloop sert l'I/O + délivre IT */
+            /* Bien implémenté (fix 2026-05-30) : ne yielder qu'à un point
+             * INTERRUPTIBLE. Le yield rend la main à la mainloop qui délivre
+             * l'IT (INT3) au DSP ; sur vrai C54x une IT n'est prise qu'à INTM=0
+             * (hors section critique). Couper sur un simple compteur d'insns
+             * tombait en pleine séquence de dispatch (INTM=1, DP hérité avant
+             * LDP) → l'IT au resume corrompait DP/ST0 → CALAD vers la LUT
+             * (wedge 0x9207) ou self-CALA. On exige donc :
+             *   - executed >= dsp_yield ET INTM=0 (point sûr), OU
+             *   - executed >= 4×dsp_yield (cap dur : évite la famine mainloop
+             *     si le firmware reste en INTM=1 anormalement longtemps).
+             * delay_slots==0 garde inchangée (jamais mid-branche-différée). */
+            /* 4 gardes = les 4 états non-interruptibles du C54x :
+             *   delay_slots==0  : pas mid-branche-différée (RETD/RCD/CALLD/BD)
+             *   !rpt_active     : pas mid-RPT (single-repeat = NON interruptible
+             *                     sur HW jusqu'à RC épuisé ; RPTB l'est, lui)
+             *   INTM==0         : interruptible (hors section critique/dispatch)
+             *   (+ break après commit pc/delay = pas mid-instruction)
+             * Cap dur 4× : si INTM reste 1 anormalement, force le yield pour
+             * éviter la famine mainloop (cas "illégal" tracé ci-dessous). */
+            if (dsp_yield > 0 && s->delay_slots == 0 && !s->rpt_active &&
+                ((executed >= (unsigned)dsp_yield && !(s->st1 & ST1_INTM)) ||
+                 executed >= (unsigned)dsp_yield * 4u)) {
+                /* Preuve du gate : log les premiers breaks + tout break "cap-forcé"
+                 * (INTM=1 = illégal toléré). Si on ne voit JAMAIS de cap-forcé sur
+                 * N runs ET 0x9207 disparaît → le gate est prouvé, pas juste constaté. */
+                if (calypso_debug_enabled("YIELD-BREAK")) {
+                    static unsigned yb = 0;
+                    int forced = (s->st1 & ST1_INTM) ? 1 : 0;
+                    if (yb < 40 || forced)
+                        fprintf(stderr, "[c54x] YIELD-BREAK #%u INTM=%d delay=%d rpt=%d pc=0x%04x exec=%u %s\n",
+                                yb, forced, s->delay_slots, s->rpt_active, s->pc, executed,
+                                forced ? "*** CAP-FORCED (INTM=1 illegal) ***" : "(safe)");
+                    yb++;
+                }
+                break;   /* boundary propre + interruptible → mainloop sert I/O + IT */
+            }
         }
     }
     return executed;

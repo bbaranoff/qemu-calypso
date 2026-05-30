@@ -125,6 +125,13 @@ static pthread_mutex_t g_bsp_mutex = PTHREAD_MUTEX_INITIALIZER;
  * plusieurs secondes ; pour UL RACH ce lag est fatal (BTS rejette les
  * RACH au FN périmé). LU = autre combat, exige horloges réelles. */
 #define DL_FIFO_SIZE 4096
+/* Coussin de pré-fill (fix 2026-05-30) : on ne sert pas le 1er burst tant que
+ * la FIFO DL n'a pas atteint DL_PREFILL entrées. Établit un buffer qui absorbe
+ * les spikes de jitter entre l'horloge QEMU (clk_listener) et le heartbeat
+ * device (uhdwrap_read) — deux horloges libres. Sans ça, la profondeur ~2 se
+ * vide au moindre spike → "FIFO empty" → osmo-trx RX error → IPC LOST → le BSP
+ * n'est jamais nourri (D_BURST_D vide, snr=0). 32 frames ≈ 148 ms de marge. */
+#define DL_PREFILL 32
 struct dl_fifo_entry {
     bool     is_fcch;  /* for diag log only */
     uint64_t ts;       /* internal osmo-trx ts (for diag) */
@@ -229,6 +236,20 @@ static void *clk_listener(void *arg)
         pthread_mutex_lock(&g_dl_fifo_mutex);
         size_t head = g_dl_fifo_head;
         size_t tail = g_dl_fifo_tail;
+        /* Pré-fill : attendre un coussin DL_PREFILL avant de servir le 1er
+         * burst (puis on sert normalement 1/tick). Le coussin absorbe ensuite
+         * les spikes de jitter sans jamais retomber à 0. */
+        static int s_prefilled = 0;
+        if (!s_prefilled) {
+            if (tail - head < DL_PREFILL) {
+                pthread_mutex_unlock(&g_dl_fifo_mutex);
+                continue;   /* laisse la FIFO se remplir, ne consomme pas le tick */
+            }
+            s_prefilled = 1;
+            LOGP(DDEV, LOGL_NOTICE,
+                 "DL FIFO pre-filled to %d, starting to serve at qfn=%u\n",
+                 DL_PREFILL, fn);
+        }
         if (head == tail) {
             /* Empty FIFO — nothing to serve this tick. */
             pthread_mutex_unlock(&g_dl_fifo_mutex);

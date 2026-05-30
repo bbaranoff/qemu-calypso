@@ -335,7 +335,7 @@ static void bsp_trxd_readable(void *opaque)
     struct sockaddr_in addr;
     socklen_t alen = sizeof(addr);
 
-    ssize_t n = recvfrom(bsp.trxd_fd, buf, sizeof(buf), 0,
+    ssize_t n = recvfrom(bsp.trxd_fd, buf, sizeof(buf), MSG_DONTWAIT,
                          (struct sockaddr *)&addr, &alen);
     if (n < 8) return;
 
@@ -533,6 +533,32 @@ static void bsp_trxd_readable(void *opaque)
 static void bsp_drain_cb(void *opaque)
 {
     static int64_t last_target = 0;
+    /* Drain la socket UDP DL ICI (timer REALTIME fiable, fix 2026-05-30).
+     * Sous icount=auto le DSP (c54x_run) monopolise le thread mainloop →
+     * l'iohandler bsp_trxd_readable n'est jamais servi → les paquets device
+     * s'accumulent non-lus (Recv-Q monte) → BSP-DELIVER=0, D_BURST_D vide,
+     * snr=0. On vide la socket à chaque tick drain (recvfrom MSG_DONTWAIT),
+     * indépendant de la mainloop affamée. 64 = marge (≈1-2 bursts/5ms). */
+    {
+        /* Test décisif : PEEK direct sur bsp.trxd_fd — la data est-elle sur CE
+         * fd ? (errno=EAGAIN/11 = rien ici ; >0 = data présente). */
+        uint8_t tb[16]; struct sockaddr_in sa; socklen_t sl = sizeof(sa);
+        errno = 0;
+        ssize_t pk = (bsp.trxd_fd >= 0)
+            ? recvfrom(bsp.trxd_fd, tb, sizeof(tb), MSG_DONTWAIT | MSG_PEEK,
+                       (struct sockaddr *)&sa, &sl)
+            : -99;
+        int e = errno;
+        uint64_t rx0 = bsp.bursts_seen;
+        for (int i = 0; i < 64 && bsp.trxd_fd >= 0; i++)
+            bsp_trxd_readable(NULL);
+        static uint64_t dc = 0;
+        if (dc < 30 || (dc % 2000) == 0)
+            fprintf(stderr, "[BSP] DRAIN-CB #%llu fd=%d PEEK=%zd errno=%d seen=%llu->%llu\n",
+                    (unsigned long long)dc, bsp.trxd_fd, pk, e,
+                    (unsigned long long)rx0, (unsigned long long)bsp.bursts_seen);
+        dc++;
+    }
     if (bsp.dsp) {
         uint32_t cur_fn = calypso_trx_get_fn();
         calypso_bsp_deliver_buffered(cur_fn);
