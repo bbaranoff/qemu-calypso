@@ -10433,19 +10433,35 @@ int c54x_run(C54xState *s, int n_insns)
          * lue (buffer BSP 0x2a00) → voir comment le corrélateur dérive le TOA
          * (offset peak, wrap, référence) à partir d'une FCCH pourtant correcte.
          * Cap 40, ~zéro coût hors site. */
-        if (exec_pc == 0x9ac0) {
+        if (exec_pc == 0xa0e7 || exec_pc == 0x9ac0) {
             static unsigned cp_log = 0;
-            if (cp_log < 40) {
+            /* Ne fire QUE quand une vraie I/Q est présente (input non-nul),
+             * sinon le cap est gaspillé sur le boot (buffer vide). On teste
+             * 0x2a00 (BSP write) ET 0x2c00 (où AR3 pointe = lecture corr). */
+            /* Gate sur RX buffer 0x2a00 NON-NUL : ne fire que quand une vraie
+             * I/Q est présente (sinon gaspillé au boot/vide). Capture la vraie
+             * corrélation FCCH dès que le BSP livre. */
+            if (cp_log < 40 && (s->data[0x2a00] || s->data[0x2a02] ||
+                                s->data[0x2a04] || s->data[0x2a08] ||
+                                s->data[0x2a10] || s->data[0x2a20])) {
+                uint16_t a3 = s->ar[3];
                 fprintf(stderr,
-                    "[c54x] CORR-PEAK #%u A=%010llx B=%010llx T=%04x "
-                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x | in@0x2a00: "
-                    "%04x %04x %04x %04x %04x %04x %04x %04x insn=%u\n",
-                    cp_log,
+                    "[c54x] CORR-PEAK #%u PC=0x%04x A=%010llx B=%010llx T=%04x "
+                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x\n"
+                    "[c54x]   in@0x2a00: %04x %04x %04x %04x %04x %04x %04x %04x\n"
+                    "[c54x]   in@0x2c00: %04x %04x %04x %04x %04x %04x %04x %04x\n"
+                    "[c54x]   *AR3@0x%04x: %04x %04x %04x %04x %04x %04x %04x %04x insn=%u\n",
+                    cp_log, exec_pc,
                     (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
                     (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
-                    s->t, s->ar[2], s->ar[3], s->ar[4], s->ar[5],
+                    s->t, s->ar[2], a3, s->ar[4], s->ar[5],
                     s->data[0x2a00], s->data[0x2a01], s->data[0x2a02], s->data[0x2a03],
                     s->data[0x2a04], s->data[0x2a05], s->data[0x2a06], s->data[0x2a07],
+                    s->data[0x2c00], s->data[0x2c01], s->data[0x2c02], s->data[0x2c03],
+                    s->data[0x2c04], s->data[0x2c05], s->data[0x2c06], s->data[0x2c07],
+                    a3,
+                    s->data[a3], s->data[(uint16_t)(a3+1)], s->data[(uint16_t)(a3+2)], s->data[(uint16_t)(a3+3)],
+                    s->data[(uint16_t)(a3+4)], s->data[(uint16_t)(a3+5)], s->data[(uint16_t)(a3+6)], s->data[(uint16_t)(a3+7)],
                     s->insn_count);
                 fflush(stderr);
                 cp_log++;

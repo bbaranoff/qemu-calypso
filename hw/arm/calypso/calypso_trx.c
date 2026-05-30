@@ -738,7 +738,16 @@ static pthread_t         g_clk_master_thread;
 static int               g_clk_master_fd = -1;
 static struct sockaddr_in g_clk_master_peer;
 
-#define WALL_TDMA_NS  4615000LL  /* 4.615 ms = 1 GSM frame */
+/* GSM TDMA frame = 1250 samples / 270833.33 sps = 60/13 ms = 4 615 384,6 ns.
+ * Fix 2026-05-30 : était 4615000 (arrondi 384 ns TROP RAPIDE/frame). Ce drain
+ * QEMU plus rapide que le fill device (PERIOD_NS×2=4615384, calypso-ipc-device
+ * qemu_wrap.c) vidait lentement la FIFO DL (profondeur ~2) → underrun ~+30s →
+ * "FIFO empty" → IPC LOST → I/Q figées. Match exact = plus de drift structurel. */
+/* Match EXACT le device osmo-trx (qemu_wrap.c PERIOD_NS=2307692 ×2 = 4615384)
+ * pour biais ZÉRO sur la FIFO DL. NB : osmocom-bb trxcon (sched_trx.c) utilise
+ * l'arrondi 4615000 côté host, mais le feed I/Q est cadencé par osmo-trx = la
+ * radio = 4615384 sample-exact. C'est CETTE valeur qu'il faut matcher. */
+#define WALL_TDMA_NS  4615384LL   /* = device osmo-trx (1250 smpl / 270833,33 sps) */
 
 static void *clk_master_loop(void *arg)
 {
