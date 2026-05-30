@@ -1572,6 +1572,13 @@ static void nop_guard_dump(C54xState *s, uint16_t pc, uint8_t xpc)
 
 static uint16_t data_read_locked(C54xState *s, uint16_t addr);
 
+/* FBWATCH (2026-05-30 soir) : sonde FB-dispatch gatée par une env DÉDIÉE
+ * (CALYPSO_FBWATCH=1), résolue UNE fois en static int → check int cheap, PAS
+ * via calypso_debug_enabled (master-gate reste 0, 127 gates court-circuités →
+ * QEMU temps-réel → mobile vivant). Déclaré ici (avant data_read_locked qui
+ * l'utilise). Filme : page-read / dispatch 0x833b / 0x9ac0 / d_fb_det / canary. */
+static int      g_fbwatch_on = -1;
+
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
     /* Correlator read tracer (env-gated CALYPSO_CORRELATOR_TRACE=1).
@@ -2083,6 +2090,15 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
                     s->pc, s->insn_count, s->sp);
             dsp_page_log++;
         }
+        /* FBWATCH PRODUCTEUR : le DSP re-lit-il d_dsp_page PAR-FRAME ? (env one-shot) */
+        if (g_fbwatch_on < 0) g_fbwatch_on = getenv("CALYPSO_FBWATCH") ? 1 : 0;
+        if (g_fbwatch_on) {
+            static unsigned wpg = 0;
+            if (wpg++ < 60)
+                fprintf(stderr, "[c54x] FBWATCH-PAGE-RD #%u val=0x%04x PC=0x%04x insn=%u\n",
+                        wpg, s->api_ram ? s->api_ram[addr - 0x0800] : s->data[addr],
+                        s->pc, s->insn_count);
+        }
     }
     /* Timer registers (0x0024-0x0026) — read returns current value */
     if (addr == TIM_ADDR) return s->data[TIM_ADDR];
@@ -2172,7 +2188,7 @@ static unsigned g_stkw_idx  = 0;
 static int      g_orphan_on = -1;
 static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 {
-    if (g_orphan_on < 0) g_orphan_on = calypso_debug_enabled("ORPHAN") ? 1 : 0;
+    if (g_orphan_on < 0) g_orphan_on = getenv("CALYPSO_ORPHAN") ? 1 : 0;  /* env dédiée (hors CALYPSO_DEBUG → master reste 0, anti-Heisenbug) */
     if (!g_orphan_on) return;
     if (addr < 0x1000 || addr > 0x6000) return;   /* zone pile (SP dérive 0x1100→0x56xx) */
     StkwEv *e = &g_stkw_ring[g_stkw_idx % STKW_RING_N];
@@ -2221,6 +2237,33 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
             fprintf(stderr, "[c54x] FBMODE-WR #%u d_fb_mode <- 0x%04x PC=0x%04x insn=%u\n",
                     fm, val, s->pc, s->insn_count);
             fm++;
+        }
+    }
+    /* === FBWATCH (env CALYPSO_FBWATCH, one-shot, hors master-gate) === */
+    if (g_fbwatch_on < 0) g_fbwatch_on = getenv("CALYPSO_FBWATCH") ? 1 : 0;
+    if (g_fbwatch_on) {
+        /* (1) qui ÉCRIT le flag dispatch FB (slot data[0x60-0x70] / 0x3dc0-2) ? */
+        if ((addr >= 0x0060 && addr <= 0x0070) || (addr >= 0x3dc0 && addr <= 0x3dc2)) {
+            static unsigned wf = 0;
+            if (wf++ < 80)
+                fprintf(stderr, "[c54x] FBWATCH-FLAG data[0x%04x] <- 0x%04x PC=0x%04x insn=%u%s\n",
+                        addr, val, s->pc, s->insn_count, val ? "  *** NON-ZERO ***" : "");
+        }
+        /* (3) le DSP écrit-il une détection FB (d_fb_det 0x08f8 non-zéro) ? */
+        if (addr == 0x08f8 && val) {
+            static unsigned wd = 0;
+            if (wd++ < 40)
+                fprintf(stderr, "[c54x] FBWATCH-DET d_fb_det <- 0x%04x PC=0x%04x insn=%u\n",
+                        val, s->pc, s->insn_count);
+        }
+        /* (5) LE FLAG PRODUCTEUR : qui écrit data[0x585f] (mot d'état foreground/ISR) ?
+         * bit7 (0x0080) pollé par le foreground @0xf7af, bit8 (0x0100) par les ISR.
+         * Si jamais écrit / bit7 jamais posé = le producteur du flag manque. */
+        if (addr == 0x585f) {
+            static unsigned w5 = 0;
+            if (w5++ < 80)
+                fprintf(stderr, "[c54x] FBWATCH-585F data[0x585f] <- 0x%04x PC=0x%04x insn=%u%s\n",
+                        val, s->pc, s->insn_count, (val & 0x0080) ? "  *** BIT7 SET ***" : "");
         }
     }
     if (addr >= 0x08fa && addr <= 0x08fd) {
@@ -6957,6 +7000,16 @@ static int c54x_exec_one(C54xState *s)
             else                s->st0 &= ~ST0_TC;
             bool tc_after = (s->st0 & ST0_TC) != 0;
             consumed = 2;
+            /* FBWATCH : capture EXACTE au site de poll foreground (0xf7af/0xf7b7)
+             * — addr résolue + valeur data_read + TC. ID le flag jamais vrai. */
+            if (g_fbwatch_on > 0 && (s->pc == 0xf7af || s->pc == 0xf7b7)
+                && s->insn_count > 100000) {   /* post-wire (1er wire @insn 32768) */
+                static unsigned wbf = 0;
+                if (wbf++ < 30)
+                    fprintf(stderr, "[c54x] FBWATCH-BITF pc=0x%04x addr=0x%04x "
+                            "mem=0x%04x mask=0x%04x -> TC=%d insn=%u\n",
+                            s->pc, addr, mem_val, mask, tc_after, s->insn_count);
+            }
             /* BITF instrumentation (2026-05-15 nuit) — pour confirmer si TC
              * est set correctement. Hypothèse : si BITF appelle souvent mais
              * tc_after=1 rarement → masque/mem_val pattern empêche TC=1,
@@ -10674,6 +10727,46 @@ int c54x_run(C54xState *s, int n_insns)
         int consumed;
         uint16_t exec_pc = s->pc;
         uint16_t exec_op = prog_fetch(s, s->pc);
+        /* === FBWATCH-ALIVE (canary) : PROUVE que la sonde est armée + sample PC
+         * foreground. Si CE log sort, g_fbwatch_on=1 et le silence des autres
+         * FBWATCH est RÉEL. S'il ne sort PAS, les probes étaient mortes. Fire
+         * garanti tous les ~20M insns (≈10 lignes sur le run). === */
+        if (g_fbwatch_on > 0 && (s->insn_count % 20000000u) == 0) {
+            fprintf(stderr, "[c54x] FBWATCH-ALIVE insn=%u PC=0x%04x INTM=%d SP=0x%04x\n",
+                    s->insn_count, exec_pc, !!(s->st1 & ST1_INTM), s->sp);
+        }
+        /* === FBWATCH-POLL : le foreground polle un flag via BITF @0xf7af/0xf7b7
+         * (RC NTC = boucle tant que TC=0). Capture l'adresse du flag (AR0..AR2 +
+         * data) + TC pour ID le bit jamais posé = ce qu'il faut câbler (modèle HW). */
+        if (g_fbwatch_on > 0 && (exec_pc == 0xf7af || exec_pc == 0xf7b7)) {
+            static unsigned wpoll = 0;
+            if (wpoll++ < 30) {
+                uint16_t mask = prog_fetch(s, exec_pc + 1);
+                fprintf(stderr, "[c54x] FBWATCH-POLL pc=0x%04x mask=0x%04x | "
+                        "AR0=0x%04x d=0x%04x | AR1=0x%04x d=0x%04x | AR2=0x%04x d=0x%04x | TC=%d insn=%u\n",
+                        exec_pc, mask,
+                        s->ar[0], s->data[s->ar[0]], s->ar[1], s->data[s->ar[1]],
+                        s->ar[2], s->data[s->ar[2]], !!(s->st0 & ST0_TC), s->insn_count);
+            }
+        }
+        /* === FBWATCH (2) : le handler FB 0x9ac0 tourne-t-il ? (env one-shot) === */
+        if (g_fbwatch_on > 0 && exec_pc == 0x9ac0) {
+            static unsigned w9 = 0;
+            if (w9++ < 40)
+                fprintf(stderr, "[c54x] FBWATCH-9AC0 #%u insn=%u SP=0x%04x DP=0x%03x\n",
+                        w9, s->insn_count, s->sp, s->st0 & 0x1FF);
+        }
+        /* === FBWATCH (4) PRODUCTEUR/CONSOMMATEUR : le dispatch CALAD @0x833b
+         * tourne-t-il par-frame, et quelle adresse handler calcule-t-il dans A ?
+         * 0 ligne = dispatcher mort (producteur). A jamais 0x9ac0 = la jump-table/
+         * formule ne produit jamais le handler FB. A=0x9ac0 = FB dispatché mais
+         * ne détecte pas (bug handler). Cap haut pour voir la distribution. */
+        if (g_fbwatch_on > 0 && exec_pc == 0x833b) {
+            static unsigned wdp = 0;
+            if (wdp++ < 120)
+                fprintf(stderr, "[c54x] FBWATCH-DISP #%u insn=%u A_handler=0x%04x DP=0x%03x SP=0x%04x\n",
+                        wdp, s->insn_count, (uint16_t)(s->a & 0xffff), s->st0 & 0x1FF, s->sp);
+        }
         /* CORR-ENTRY tracker (env CALYPSO_CORRELATOR_TRACE=1) : capture
          * transition out→in du range FB-det [0x8d00..0x9000). Cf top of
          * file pour la lazy-init + l'évidence runtime 2026-05-25 night. */
@@ -10767,7 +10860,7 @@ int c54x_run(C54xState *s, int n_insns)
             /* === SHADOW STACK : appariement push/pop (gate ORPHAN) ===
              * Nomme LE return orphelin (over-pop), pas les 15 victimes 0xc8be. */
             if (g_shadow_on < 0) {
-                const char *eo = cdbg_env("ORPHAN");
+                const char *eo = getenv("CALYPSO_ORPHAN");  /* env dédiée (hors CALYPSO_DEBUG) */
                 g_shadow_on = (eo && *eo) ? 1 : 0;
             }
             if (g_shadow_on) {
@@ -11641,6 +11734,24 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
     if (vec < 0 || vec >= 32) return;
     if (imr_bit < 0 || imr_bit >= 16) return;
     s->ifr |= (1 << imr_bit);
+
+    /* === EXPÉRIENCE WIRE585F (env CALYPSO_WIRE585F=1, toggle, unpatch trivial) ===
+     * Le foreground polle data[0x585f] bit7 (0x0080) @0xf7af, les ISR pollent bit8
+     * (0x0100) — JAMAIS posé (FBWATCH-585F=0) = deadlock du producteur. Hypothèse :
+     * c'est un flag "frame ready" que le frame-IRQ (INT3=vec19) doit poser. On le
+     * câble ici pour TESTER si ça débloque le dispatch FB/PM. Débloque → on tient
+     * l'événement producteur manquant. Ne débloque pas → unpatch (env off). */
+    if (vec == 19) {
+        static int wire585f = -1;
+        if (wire585f < 0) wire585f = getenv("CALYPSO_WIRE585F") ? 1 : 0;
+        if (wire585f) {
+            s->data[0x585f] |= 0x0180;
+            static unsigned wlog = 0;
+            if (wlog++ < 20)
+                fprintf(stderr, "[c54x] WIRE585F-FIRED #%u data[0x585f]=0x%04x insn=%u\n",
+                        wlog, s->data[0x585f], s->insn_count);
+        }
+    }
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
 

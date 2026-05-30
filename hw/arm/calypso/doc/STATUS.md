@@ -64,7 +64,50 @@ boot sain → idle 0xcc62 → INT3 → ISR 0xffcc → RC NTC (TC=0) → RETE sec
   → JAMAIS : read d_task_md, test 0x3DC0 bit4, gate data[0x62] → 0x9ac0 → d_fb_det
 ```
 
-## Prochaine campagne — brief CC-web (FB est ARM-commandé, ARM L1 prouvé correct)
+## Architecture FB-dispatch CLARIFIÉE (2026-05-30 soir, post-falsification boot-init)
+
+Expérience CC-web « FB = queue boot-init » **FALSIFIÉE** : 2 modèles de boot
+(redirect 0x7120 vs SP-set natural 0xb410), boot-init 0x7000-0x7025 inatteignable
+par les deux, FB-dispatch échoue **identiquement** → FB-dispatch = steady-state
+SÉPARÉ (pas la queue de c3ec660). Bonus : over-pop = 100% artefact SP=0x1100
+(F@0x76f8 tourne propre depuis 0x5AC8).
+
+**Artefact consolidé (table vecteurs IRQ + IMR + disasm idle) tranche l'archi :**
+- `0x08d4 = &d_dsp_page` CONFIRMÉ (NDB base ARM 0xFFD001A8 → DSP 0x08D4). Pas un fantôme.
+- **Aucun vecteur IRQ (0xff80+vec*4) ne lit 0x08d4.** Les ISR lisent les flags
+  `0x3dc0/1/2` (vec19 frame→0x3dc1, vec23→0x3dc0, vec24→0x3dc2). → le dispatch
+  d_dsp_page est **FOREGROUND-pollé, PAS IRQ-driven**.
+- Frame-IRQ vec19 (imr bit3) **ARMÉ dans 0x52fd + fire** 8339× → **B (masquage) MOOT**.
+  (0x52fd masque bits 1/8/10/11/13/15 = vec 17/24/26/27/29/31.)
+- Idle 0xe9ac = **bloc MAC ×9** (0xb398, pas un wait passif). 0xf7b2 (reprise RETE)
+  = `RC NTC` (épilogue). Le **dispatcher 0xcc62 TOURNE** (polle data[0x60-0x70]).
+
+**Le gap LOCALISÉ (pas résolu), avec mécanisme probable :** le per-frame existe et
+s'exécute (dispatcher 0xcc62 polle data[0x60-0x70] chaque frame) — donc PAS une
+ré-entrée structurellement absente. C'est le **slot FB de data[0x60-0x70] / flag
+0x3dc0-2 qui n'est JAMAIS set**, donc la branche foreground vers le FB-processing
+(0x7700 lecture page → 0x9ac0) n'est jamais prise.
+
+**Candidat #1 = C (flag-gate non posé par l'ISR frame).** L'ISR frame @0xffcc
+(`0x0100 ; RC NTC@0xffcd ; LD 0x3dc1 ; STL…`) early-return sur TC=0 **AVANT** de
+poser le flag (0x3dc0-2 / data[0x60-0x70]) que la branche foreground attend
+(= pourquoi 0x3dc0/1 jamais touché, FBDB-PROBE=0). Dispatch foreground + flag-gate
+posé par l'ISR sont compatibles : l'ISR pose le flag, le foreground le polle. Le
+early-return TC=0 casse le maillon « ISR pose le flag ».
+
+**Prochaine sonde (invasif) — UNE capture causale chaînée, pas 3 passes** (même
+réflexe que vecteurs+IMR) : un seul run qui chaîne `TC à l'entrée ISR 0xffcc` →
+`corps post-RC@0xffcd (écrit-il le flag 0x3dc0-2 / data[0x60-0x70] ? oui/non)` →
+`poll dispatcher 0xcc62 (le slot FB reste-t-il clair ?)`. On voit le maillon cassé
+dans le run, pas en recoupant après coup.
+**Root à prioriser = décoder `0x0100@0xffcc`** : « pourquoi TC=0 » est la
+question-mère ; le poll-foreground et le poseur-de-flag orbitent autour.
+**⚠️ NON-VÉRIFIÉ à établir, pas supposer** : « 0x7700 = entrée FB-processing » est
+ASSERTÉ (0x7700 touché 1× = incident, load AR-indexé du sweep RPTB), PAS établi.
+La sonde doit CONFIRMER où le dispatcher branche réellement pour la FB — sinon on
+watch le mauvais PC.
+
+## Brief antérieur CC-web (FB est ARM-commandé, ARM L1 prouvé correct)
 Le FB est une tâche commandée par l'ARM (`d_task_md`=5). L'ARM L1 est la couche
 prouvée correcte end-to-end (L1CTL MITM, faute isolée au DSP) → la commande FB
 est probablement émise correctement, le mur est en **aval (DSP/API)**. Entrée
