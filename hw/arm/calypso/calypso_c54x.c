@@ -9635,21 +9635,21 @@ int c54x_run(C54xState *s, int n_insns)
          * fois SP=0x5AC8 posé par 0x7120, la condition retombe → les walks
          * séquentiels firmware passant par 0xff80 plus tard NE sont PAS
          * hijackés (cf SOFT-RESET-TRIG ci-dessous, insn>100k). */
-        /* EXPÉRIENCE 2026-05-30 (CC-web) : le redirect → 0x7120 posait SP mais
-         * sautait le boot-init 0x7000-0x7025 + le reset-handler 0xb410 (BACC A=0
-         * → serial-loader direct). Vérifié : 0x7000-0x7025 jamais exécuté, 0xb410
-         * 0 hit → FB-dispatch jamais câblé = queue de c3ec660.
-         * Modèle plus fidèle : le mask-ROM pose SEULEMENT SP=0x5AC8, puis laisse
-         * le firmware booter par son PROPRE reset vector (0xff80 FB→0xb410→
-         * boot-init) AVEC un SP valide. On ne redirige PLUS le PC. */
+        /* EXPÉRIENCE 2026-05-30 (CC-web) testée et CONCLUE : poser SP=0x5AC8 sans
+         * rediriger le PC (laisser 0xff80→0xb410 tourner) → le reset-handler
+         * 0xb410 s'exécute MAIS n'appelle PAS le boot-init 0x7000-0x7025 (reste
+         * 1 hit incident) ; FB-dispatch échoue identiquement. Donc FB-dispatch
+         * n'est PAS la queue du boot-init = issue steady-state SÉPARÉE. Acquis :
+         * l'over-pop était 100% un artefact de SP=0x1100 (F@0x76f8 tourne propre
+         * depuis 0x5AC8, no wedge). On revient au redirect 0x7120 committé. */
         if (s->pc == 0xFF80 && s->sp == 0x1100) {
             static int redirect_log;
             if (redirect_log < 3) {
-                C54_LOG("SILICON-BOOT-SP-INIT PC=0xFF80 SP=0x1100→0x5AC8 "
-                        "(modèle mask-ROM ; firmware boote ensuite via 0xff80→0xb410)");
+                C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x7120 "
+                        "(modèle mask-ROM manquant ; 0x7120 = STM #0x5AC8,SP)");
                 redirect_log++;
             }
-            s->sp = 0x5AC8;
+            s->pc = 0x7120;
         }
         /* === SOFT-RESET-TRIGGER probe (2026-05-28) ===
          * SP-CATASTROPHE trace montre PC=0x7120 (boot init via notre override
