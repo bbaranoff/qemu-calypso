@@ -452,6 +452,18 @@ static uint16_t g_last_st0w_val = 0;        /* valeur ST0 restaurée */
 static uint16_t g_last_st0w_op  = 0;        /* opcode de l'instruction qui écrit ST0 */
 static uint16_t g_last_st0w_xpc = 0;        /* XPC au moment du write (0xf48b dépend de XPC) */
 static uint16_t g_last_st0w_prev = 0;       /* PC prédécesseur du write (comment on y arrive) */
+/* SURGICAL 2026-05-30 : slot LUT lu à l'entrée dispatcher 0x834d (capture
+ * silencieuse, pour épingler le DP coupable du self-CALA 0x70c3 sans le
+ * spam de DISP-TRACE qui décale le timing et masque le bug). */
+static uint16_t g_disp_lut_ea  = 0;
+static uint16_t g_disp_lut_val = 0;
+/* SURGICAL 2026-05-30 : ring des évènements SP (push/pop) au chokepoint
+ * unique de la boucle run. Sur tout changement de SP on enregistre
+ * {pc, op, delta}. Dumpé par BLACKHOLE-CALA → nomme la source récurrente
+ * de drain (push jamais dépoppé). Écritures array only = ~zéro coût. */
+struct sp_evt { uint16_t pc; uint16_t op; int16_t delta; uint16_t sp; };
+static struct sp_evt g_spring[64];
+static uint32_t g_spring_idx = 0;
 
 static void rsbx_intm_check(C54xState *s, uint16_t op)
 {
@@ -1414,9 +1426,10 @@ static const char *classify_xfer_op(uint16_t op)
     if (op == 0xF4E4) return "FRET";
     if (op == 0xF4EB) return "RETE";
     if (op == 0xF6E4 || op == 0xF6E5) return "FRETD";
-    if (op == 0xF073 || op == 0xF273) return "RET";
-    if (op == 0xF074) return "B";
-    if (op == 0xF274) return "CALL";
+    if (op == 0xF073) return "B";
+    if (op == 0xF273) return "BD";
+    if (op == 0xF074) return "CALL";
+    if (op == 0xF274) return "CALLD";
     return "OTHER";
 }
 
@@ -4099,6 +4112,48 @@ static int c54x_exec_one(C54xState *s)
             int is_call = (op & 1) != 0;
             uint16_t tgt = (uint16_t)((is_b ? s->b : s->a) & 0xFFFF);
             uint16_t src_pc = s->pc;
+            /* SURGICAL 2026-05-30 : self-CALA black-hole capture. Fire UNE
+             * fois quand un CALA cible lui-même dans la zone 0x7000-0x70FF
+             * (= le trou noir 0x70c3). Donne le DP hérité + le slot LUT lu
+             * au dispatcher 0x834d (ea/val) + le POPM ST0 et le LDP qui ont
+             * posé ce DP — le coupable complet, sans spam (≠ DISP-TRACE). */
+            if (is_call && tgt == src_pc && tgt >= 0x7000 && tgt <= 0x70FF) {
+                static int bh_logged = 0;
+                if (!bh_logged++) {
+                    fprintf(stderr,
+                        "[c54x] *** BLACKHOLE-CALA *** tgt=0x%04x DP=0x%03x "
+                        "SP=0x%04x prevPC=0x%04x dispLUT{ea=0x%04x val=0x%04x} "
+                        "lastST0w{pc=0x%04x val=0x%04x prev=0x%04x} "
+                        "lastLDP{pc=0x%04x val=0x%03x} insn=%u\n",
+                        tgt, (unsigned)(s->st0 & 0x1FF), s->sp, g_prev_pc,
+                        g_disp_lut_ea, g_disp_lut_val,
+                        g_last_st0w_pc, g_last_st0w_val, g_last_st0w_prev,
+                        g_last_ldp_pc, g_last_ldp_val, s->insn_count);
+                    /* Dump pile autour de SP : montre l'orphelin (0xf487) et
+                     * ses voisins. Si le vrai ST0 (genre 0x0xxx/0x4xxx, DP
+                     * plausible) est à SP±1, c'est un imbalance d'1 mot. Les
+                     * mots PC-shaped (0xf4xx/0x7xxx) empilés = drain cumulatif. */
+                    fprintf(stderr, "[c54x]     STACK around SP=0x%04x :", s->sp);
+                    for (int k = -2; k <= 9; k++) {
+                        uint16_t a = (uint16_t)(s->sp + k);
+                        fprintf(stderr, " %s[%04x]=%04x",
+                                k == 0 ? ">" : "", a, s->data[a]);
+                    }
+                    fprintf(stderr, "\n");
+                    /* SP-event ring : les 28 derniers push/pop (pc:op delta).
+                     * Cherche un push (delta<0) sans pop apparié = la fuite. */
+                    fprintf(stderr, "[c54x]     SP-EVENTS net_words=%lld pushes=%llu pops=%llu (récents, anciens→récents):\n[c54x]    ",
+                            (long long)g_sp_ledger.net_words,
+                            (unsigned long long)g_sp_ledger.sp_pushes,
+                            (unsigned long long)g_sp_ledger.sp_pops);
+                    for (int k = 28; k >= 1; k--) {
+                        struct sp_evt *e = &g_spring[(g_spring_idx - k) & 63];
+                        fprintf(stderr, " %04x:%04x%+d", e->pc, e->op, e->delta);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+            }
             int fb_zone = (tgt >= 0x7730 && tgt <= 0x7990) ||
                           (tgt >= 0x8800 && tgt <= 0x88FF) ||
                           (tgt >= 0xA000 && tgt <= 0xA1FF);
@@ -5197,9 +5252,17 @@ static int c54x_exec_one(C54xState *s)
             return 0;
         }
         if (op == 0xF273) {
-            /* RETD — delayed return (1 word) */
-            uint16_t ra = data_read(s, s->sp); s->sp++;
-            s->pc = ra;
+            /* BD pmad — delayed branch (2 words, 2 delay slots). AUCUNE pile.
+             * Per tic54x-opc.c: bd 0xF273 mask 0xFFFF. Le vrai RETD = 0xFE00
+             * (hi8==0xFE, géré plus bas avec pop + delay_slots).
+             * Fix 2026-05-30 : était traité comme RETD (pop parasite) → SP
+             * désaligné d'1 mot par BD → POPM ST0 0xf48b pop un PC orphelin
+             * → DP=0x087 → dispatcher 0x8341 → CALAD 0x70c3 = trou noir.
+             * Identique au B (F073) ci-dessus : saut direct, pas de pile (ce
+             * decoder approxime les branches différées en sautant immédiat,
+             * cf CALLD F274). */
+            op2 = prog_fetch(s, s->pc + 1);
+            s->pc = op2;
             return 0;
         }
         /* === F2xx dispatch (audit F-class 2026-05-25) =====================
@@ -10343,7 +10406,51 @@ int c54x_run(C54xState *s, int n_insns)
             g_prev_pc = s_last_run_pc;
             s_last_run_pc = s->pc;
         }
+        /* SURGICAL : capture silencieuse du slot LUT lu au 0x834d (LD
+         * (DP<<7|0x07)<<1,A). 1 compare/insn, pas de log → ~zéro impact
+         * timing. Sert le probe BLACKHOLE-CALA (self-CALA 0x70c3). */
+        if (s->pc == 0x834d) {
+            g_disp_lut_ea  = (uint16_t)(((s->st0 & 0x1FF) << 7) | 0x07);
+            g_disp_lut_val = s->data[g_disp_lut_ea];
+        }
+        uint16_t sp_before_exec = s->sp;
         consumed = c54x_exec_one(s);
+        /* SP-event ring : enregistre tout changement de SP (push/pop) avec
+         * le PC/op responsable. Sert le dump BLACKHOLE-CALA. */
+        if (s->sp != sp_before_exec) {
+            struct sp_evt *e = &g_spring[g_spring_idx++ & 63];
+            e->pc = exec_pc;
+            e->op = prog_fetch(s, exec_pc);
+            e->delta = (int16_t)(s->sp - sp_before_exec);
+            e->sp = s->sp;
+            g_sp_ledger.net_words += (int16_t)(sp_before_exec - s->sp);
+            if ((int16_t)(s->sp - sp_before_exec) < 0) g_sp_ledger.sp_pushes++;
+            else g_sp_ledger.sp_pops++;
+        }
+
+        /* === CORR-PEAK probe (2026-05-30) : au store du TOA (PC=0x9ac0, STL A
+         * dans a_sync_demod) dumper A/B complets + AR + T + la fenêtre d'entrée
+         * lue (buffer BSP 0x2a00) → voir comment le corrélateur dérive le TOA
+         * (offset peak, wrap, référence) à partir d'une FCCH pourtant correcte.
+         * Cap 40, ~zéro coût hors site. */
+        if (exec_pc == 0x9ac0) {
+            static unsigned cp_log = 0;
+            if (cp_log < 40) {
+                fprintf(stderr,
+                    "[c54x] CORR-PEAK #%u A=%010llx B=%010llx T=%04x "
+                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x | in@0x2a00: "
+                    "%04x %04x %04x %04x %04x %04x %04x %04x insn=%u\n",
+                    cp_log,
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                    s->t, s->ar[2], s->ar[3], s->ar[4], s->ar[5],
+                    s->data[0x2a00], s->data[0x2a01], s->data[0x2a02], s->data[0x2a03],
+                    s->data[0x2a04], s->data[0x2a05], s->data[0x2a06], s->data[0x2a07],
+                    s->insn_count);
+                fflush(stderr);
+                cp_log++;
+            }
+        }
 
         /* Track A writes (probe 3, post-exec). exec_pc = PC qui vient
          * d'exécuter. Si A a changé, c'est cet opcode qui a écrit A. */
@@ -10610,30 +10717,11 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
-        /* === VARIATEUR DE VITESSE osmocon (gated, CALYPSO_DSP_YIELD=N) ===
-         * Le DSP c54x tourne SYNCHRONE dans tdma_tick sur le thread principal.
-         * Tant que c54x_run mouline, l'ARM TCG + la mainloop (I/O radio/UART/
-         * socket osmocon) sont gelés → osmocon starve → LOST. C'est ce que le
-         * fprintf débloquait par accident (write bloquant = yield).
-         * Ici : version propre et RÉGLABLE. Tous les N insns DSP, on sort de
-         * c54x_run → tdma_tick rend la main → la mainloop pompe l'I/O → osmocon
-         * reçoit ses frames à temps.
-         *   N PETIT  = yield fréquent = osmocon RAPIDE (DSP ralenti)
-         *   N GRAND  = yield rare     = DSP rapide   (osmocon ralenti)
-         *   0/unset  = OFF (legacy, pas de yield) — le DSP garde tout le budget.
-         * C'est le "variateur de vitesse" : dose le partage thread DSP↔I/O. */
-        {
-            static int dsp_yield = -1;
-            if (dsp_yield < 0) {
-                const char *e = getenv("CALYPSO_DSP_YIELD");
-                dsp_yield = (e && *e) ? atoi(e) : 0;
-                if (dsp_yield < 0) dsp_yield = 0;
-                fprintf(stderr, "[c54x] CALYPSO_DSP_YIELD = %d insn/yield %s\n",
-                        dsp_yield, dsp_yield ? "(variateur ON)" : "(OFF, legacy)");
-            }
-            if (dsp_yield > 0 && executed >= dsp_yield)
-                break;   /* sort de c54x_run → mainloop sert l'I/O (osmocon) */
-        }
+        /* === VARIATEUR DE VITESSE osmocon : le break est MAINTENANT en
+         * FIN d'itération (après s->pc += consumed + commit delay-slots),
+         * cf bloc plus bas. Casser ici (avant l'avance du pc) ré-exécutait
+         * l'instruction courante à la ré-entrée → double-pop des RET/RETD/RCD
+         * → over-pop SP → garbage DP → self-CALA 0x70c3. Fix 2026-05-30. */
 
         /* === DUAL-OP-INTERPRET diagnostic ===
          * Compare current decoder's AR field interpretation (3-bit fields)
@@ -10745,6 +10833,48 @@ int c54x_run(C54xState *s, int n_insns)
         s->insn_count++;
 
         executed++;
+
+        /* SP-LEDGER : dump périodique pour valider net_words→0 sur run long
+         * (métrique de balance push/pop post-yield-fix). ~1 compare/insn. */
+        if (s->insn_count - g_sp_ledger.last_dump_insn >= 20000000u) {
+            g_sp_ledger.last_dump_insn = s->insn_count;
+            fprintf(stderr,
+                "[c54x] SP-LEDGER insn=%u SP=0x%04x net_words=%lld pushes=%llu pops=%llu irq=%llu\n",
+                s->insn_count, s->sp, (long long)g_sp_ledger.net_words,
+                (unsigned long long)g_sp_ledger.sp_pushes,
+                (unsigned long long)g_sp_ledger.sp_pops,
+                (unsigned long long)g_sp_ledger.irq_entries);
+            fflush(stderr);
+        }
+
+        /* === VARIATEUR DE VITESSE osmocon (gated, CALYPSO_DSP_YIELD=N) ===
+         * Le DSP c54x tourne SYNCHRONE dans tdma_tick sur le thread principal.
+         * Tous les N insns on sort de c54x_run → la mainloop pompe l'I/O
+         * (osmocon) puis délivre les IT au DSP.
+         *   N PETIT = yield fréquent = osmocon rapide / DSP ralenti
+         *   N GRAND = yield rare / 0 = OFF (legacy, DSP garde tout le budget)
+         * IMPÉRATIF : ne casser qu'à un BOUNDARY PROPRE — ici, après
+         * `s->pc += consumed` ET le commit des delay-slots (delay_slots==0).
+         * Sinon (a) l'instruction courante est ré-exécutée à la ré-entrée
+         * (double-pop) et (b) un IT délivré par la mainloop tomberait au
+         * milieu des delay-slots d'un RETD/RCD → retour différé corrompu.
+         * Les deux mènent à l'over-pop SP → DP garbage → self-CALA 0x70c3.
+         * (Valeur idéale = statique à déterminer ; gardée en env pour l'instant.) */
+        {
+            static int dsp_yield = -1;
+            if (dsp_yield < 0) {
+                const char *e = getenv("CALYPSO_DSP_YIELD");
+                /* Défaut statique 32768 (2^15) : cadence DSP↔osmocon/IT calée
+                 * (valeur trouvée empiriquement, ON par défaut). 0 = OFF legacy
+                 * seulement si CALYPSO_DSP_YIELD=0 explicite. */
+                dsp_yield = (e && *e) ? atoi(e) : 32768;
+                if (dsp_yield < 0) dsp_yield = 0;
+                fprintf(stderr, "[c54x] CALYPSO_DSP_YIELD = %d insn/yield %s\n",
+                        dsp_yield, dsp_yield ? "(variateur ON)" : "(OFF, legacy)");
+            }
+            if (dsp_yield > 0 && executed >= dsp_yield && s->delay_slots == 0)
+                break;   /* boundary propre → mainloop sert l'I/O + délivre IT */
+        }
     }
     return executed;
 }
@@ -11008,6 +11138,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             data_write(s, s->sp, s->xpc);          /* save XPC inconditionnel */
             g_sp_ledger.irq_words_pushed++;
             g_sp_ledger.irq_entries++;
+            g_sp_ledger.net_words += 2;  /* PC+XPC poussés ici (hors ring exec) */
             s->st1 |= ST1_INTM;
             /* DISP-ENTRY : capture contexte préempté (DP foreground inchangé) */
             g_last_intr_insn = s->insn_count; g_last_intr_vec = vec;
@@ -11020,8 +11151,15 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         if (!unmasked) {
             s->pc++;  /* resume at instruction after IDLE */
         }
-    } else if (!(s->st1 & ST1_INTM) && unmasked) {
-        /* Normal (non-IDLE) interrupt servicing */
+    } else if (!(s->st1 & ST1_INTM) && unmasked && s->delay_slots == 0) {
+        /* Normal (non-IDLE) interrupt servicing.
+         * Garde delay_slots==0 (fix 2026-05-30) : faithful C54x — une IT
+         * n'est PAS reconnue entre une branche différée (RETD/RCD/CALLD/BD)
+         * et ses 2 delay-slots. Vectoriser mid-delay laisserait delay_slots
+         * armé → au retour (RETE) le commit delayed_pc se ferait dans le
+         * mauvais contexte → over-pop SP → DP garbage → self-CALA 0x70c3.
+         * IFR reste set (non clearé) → l'IT est servie au prochain appel,
+         * delay_slots étant retombé à 0 (max ~2 insns plus tard). */
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);
@@ -11030,6 +11168,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         data_write(s, s->sp, s->xpc);              /* save XPC inconditionnel */
         g_sp_ledger.irq_words_pushed++;
         g_sp_ledger.irq_entries++;
+        g_sp_ledger.net_words += 2;  /* PC+XPC poussés ici (hors ring exec) */
         s->st1 |= ST1_INTM;
         /* DISP-ENTRY : capture contexte préempté (DP foreground inchangé) */
         g_last_intr_insn = s->insn_count; g_last_intr_vec = vec;

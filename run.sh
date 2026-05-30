@@ -82,7 +82,14 @@ QEMU accel:
 Pipeline:
   CALYPSO_L2_CLIENT=mobile|ccch_scan|cell_log      L2 app
   CALYPSO_SKIP_IPC_DEVICE|TRX_IPC|BTS|L2|GSMTAP|BRIDGE_PY=0|1
-  CALYPSO_DSP_SHUNT=0|1                            canned FB+SB shunt
+  CALYPSO_DSP_SHUNT=0|1                            canned FB+SB shunt (skip DSP)
+  CALYPSO_DSP_L1STUB=0|1                           patch PROM0@0x7120 = publisher
+                                                   L1+L2 (FB+PM+SB+SI3 continus,
+                                                   reste du ROM/blobs intact) →
+                                                   le mobile campe sans I/Q.
+                                                   Gère make_dsp_bin_L1.py + PROM0.
+  CALYPSO_FORCE_TOA=<N>                             force a_sync_TOA lu par l'ARM
+                                                   à N (ex 23) — env gated, rigolo.
   CALYPSO_IRDA_CAPTURE=0|1                         /tmp/fw-irda.log
   CALYPSO_BSP_IQ_PASSTHROUGH=0|1                   BSP DL soft-bits → GMSK IQ
   CALYPSO_NO_ATTACH=0|1                            skip final tmux attach
@@ -1535,6 +1542,25 @@ fi
 [ -z "${CALYPSO_DSP_DROM+x}"  ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"  ] && CALYPSO_DSP_DROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"
 [ -z "${CALYPSO_DSP_PDROM+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin" ] && CALYPSO_DSP_PDROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin"
 unset _DSP_TXT_DIR _DSP_TXT_BASE
+
+# === L1-STUB ROM (opt-in CALYPSO_DSP_L1STUB=1) =========================
+# Patche PROM0 @0x7120 avec un publisher synthétique L1+L2 (FB lock +
+# PM + SB + BCCH SI3 écrits en continu) via scripts/make_dsp_bin_L1.py.
+# Le RESTE du ROM est préservé ; toutes les autres sections/blobs intacts.
+# But : faire camper le mobile (SI) sans dépendre de la corrélation I/Q.
+if [ "${CALYPSO_DSP_L1STUB:-0}" = "1" ]; then
+    _L1STUB_IN="${CALYPSO_DSP_PROM0:-/opt/GSM/calypso_dsp.PROM0.bin}"
+    _L1STUB_OUT="/tmp/calypso_dsp_L1stub.PROM0.bin"
+    _L1STUB_SCRIPT="$(dirname "$0")/scripts/make_dsp_bin_L1.py"
+    [ -r "$_L1STUB_SCRIPT" ] || _L1STUB_SCRIPT="/opt/GSM/qemu-src/scripts/make_dsp_bin_L1.py"
+    echo "[run.sh] CALYPSO_DSP_L1STUB=1 → patch $_L1STUB_IN → $_L1STUB_OUT"
+    python3 "$_L1STUB_SCRIPT" "$_L1STUB_IN" "$_L1STUB_OUT" || {
+        echo "[run.sh] make_dsp_bin_L1.py a échoué" >&2; exit 1; }
+    CALYPSO_DSP_PROM0="$_L1STUB_OUT"
+    echo "[run.sh] PROM0 → $_L1STUB_OUT (publisher L1+L2 actif, reste du ROM intact)"
+    unset _L1STUB_IN _L1STUB_OUT _L1STUB_SCRIPT
+fi
+
 # CALYPSO_DSP_BLOB has NO default — DARAM fixture is opt-in only.
 # Usage examples:
 #   CALYPSO_DSP_PROM2= ./run.sh                          # disable PROM2

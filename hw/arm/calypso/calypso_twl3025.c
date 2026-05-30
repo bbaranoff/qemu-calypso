@@ -35,8 +35,8 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* TWL3025 / Compal E88 vcxocal constants (rf/vcxocal.h osmocom-bb) :
- *   afc_slope = 287 Hz/LSB (= dérivée linéaire VCXO à 900 MHz GSM)
+/* TWL3025 / Compal E88 vcxocal constants (board gta0x/afcparams.c osmocom-bb) :
+ *   afc_slope = 454 (entier OsmocomBB, board E88/Openmoko)
  *   afc_initial_dac_value = -700 (= calibration board E88, compense le
  *                                  trim du quartz physique)
  *   d_afc range : ±4095 (13-bit signed DAC)
@@ -48,7 +48,18 @@
  * DAC=-700 (= calib idéale) → effective=0 → no rotation
  * DAC=0    (= "+700 LSB au-dessus de la calib") → effective=+700 → +200900Hz
  */
-#define TWL3025_AFC_SLOPE_HZ_PER_LSB    287.0
+/* FIX 2026-05-30 (AFC convergence = dernier mur FBSB) : la sensibilité VCXO
+ * physique DOIT être cohérente avec la boucle firmware osmocom afc_correct() :
+ *   delta_LSB = (AFC_NORM_FACTOR_GSM × freq_error_Hz) / afc_slope
+ *   AFC_NORM_FACTOR_GSM = 2^15/947 = 34.6   ;   afc_slope = 454 (board E88)
+ * Boucle stable (gain≈1) ⟺ VCXO = afc_slope / norm_factor = 454/(2^15/947)
+ *   ≈ 13.12 Hz/LSB.
+ * L'ancienne 287.0 donnait un gain de boucle ~22× → sur-correction → le DAC
+ * oscille (-700↔-162) → rotation FCCH énorme (±150 kHz) hors capture DSP
+ * (±20 kHz) → FB jamais détecté/accepté → mur FBSB. */
+#define TWL3025_AFC_NORM_FACTOR_GSM     (32768.0 / 947.0)
+#define TWL3025_AFC_SLOPE               454.0
+#define TWL3025_AFC_SLOPE_HZ_PER_LSB    (TWL3025_AFC_SLOPE / TWL3025_AFC_NORM_FACTOR_GSM)
 /* ⚠️ TESTING 2026-05-29 v2 : baseline -700 + init dac=-700 (cal Compal/Pirelli).
  * osmocom : afc_reset() -> dac=afc_initial_dac_value(-700) PUIS afc_correct
  * CONVERGE. Le modèle DOIT démarrer à -700 (effective=0, pas de rotation) et

@@ -200,6 +200,31 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
               (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
               ((uint8_t *)src)[offset & 1];
     }
+    /* CALYPSO_FORCE_TOA=<N> (env gated, rigolo) : force une détection FB
+     * complète vue par l'ARM, sans toucher le DSP. osmocom prim_fbsb.c
+     * n'atteint read_fb_result (lecture TOA dans ndb->a_sync_demod[D_TOA]
+     * @0x01F4) QU'APRÈS que d_fb_det (@0x01F0) = "FOUND". Donc forcer le TOA
+     * seul ne suffit pas : on force tout le bloc résultat FB sur le read ARM.
+     *   0x01F0 d_fb_det = 1 (FOUND)   0x01F4 a_sync_TOA  = N (23 = on-time)
+     *   0x01F8 a_sync_ANGLE = 0 (AFC ne diverge pas)  0x01FA a_sync_SNR = haut */
+    if (offset >= 0x01F0 && offset <= 0x01FA && size == 2) {
+        static int force_toa = -2;  /* -2 = uninit, -1 = off */
+        if (force_toa == -2) {
+            const char *e = getenv("CALYPSO_FORCE_TOA");
+            force_toa = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
+            if (force_toa >= 0)
+                fprintf(stderr, "[calypso-trx] CALYPSO_FORCE_TOA=%d (bloc FB-result forcé : d_fb_det=1 TOA=%d ANGLE=0 SNR=high)\n", force_toa, force_toa);
+        }
+        if (force_toa >= 0) {
+            switch (offset) {
+            case 0x01F0: val = 1;                       break; /* d_fb_det = FOUND */
+            case 0x01F4: val = (uint16_t)force_toa;      break; /* a_sync_TOA */
+            case 0x01F8: val = 0;                        break; /* a_sync_ANGLE = 0 */
+            case 0x01FA: val = 0x7000;                   break; /* a_sync_SNR high */
+            default: break;                                     /* 0x01F2/0x01F6 inchangés */
+            }
+        }
+    }
     /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
