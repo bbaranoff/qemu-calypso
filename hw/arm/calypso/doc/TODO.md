@@ -4,6 +4,33 @@ description: Per CLAUDE.md rule #1, all env-gated hacks listed here with explici
 type: project
 ---
 
+# Objectif courant (2026-05-30) : FB-dispatch
+
+Le root SP est résolu (cf `STATUS.md` : redirect silicon-boot-ROM restauré,
+wedge 0x70c3 mort, base saine). Blocker restant = le DSP ne dispatche jamais le
+détecteur FB `0x9ac0` :
+- ISR INT3 @0xffcc early-return sur `RC NTC@0xffcd` (TC=0) → n'atteint jamais
+  read d_task_md / test flag `0x3DC0 bit4` / gate `data[0x62]`.
+- À trouver : qui set TC (`0x0100@0xffcc`), qui arme `0x3DC0`/`data[0x62]`,
+  pourquoi le DSP reste en idle minimal sans scheduler L1 complet.
+- Envoyé à CC-web (30/05), réponse attendue.
+
+# Modèles hardware permanents (NE PAS retirer — modélisent du silicon absent du dump)
+
+## Silicon-boot-ROM redirect 0xFF80→0x7120  (réactivé 2026-05-30)
+
+**Site** : `hw/arm/calypso/calypso_c54x.c`, top de `c54x_run` while-loop.
+```c
+if (s->pc == 0xFF80 && s->sp == 0x1100) { s->pc = 0x7120; }
+```
+**Rationale** : le dump PROM ne contient pas le mask-ROM silicon qui, au reset,
+pose SP=0x5AC8 et saute à l'entrée firmware PROM0[0x7120] (= STM #0x5AC8,SP).
+Sans ce modèle, SP reste à 0x1100 (invalide) → over-pop → wedge 0x70c3.
+**Ce n'est PAS un hack rule#1** : modélise du hardware réel absent du dump, ne
+force aucune instruction firmware (route vers l'entrée firmware propre qui fait
+elle-même son init SP). Gate `SP==0x1100` = cold-reset seul.
+**Régression** : avait été retiré par erreur en git `c3ec660` (29/05).
+
 # Active hacks (must be removed once root cause fixed)
 
 ## CALYPSO_BSP_BYPASS_BDLENA (env-gated, default OFF)
