@@ -2265,6 +2265,13 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                 fprintf(stderr, "[c54x] FBWATCH-585F data[0x585f] <- 0x%04x PC=0x%04x insn=%u%s\n",
                         val, s->pc, s->insn_count, (val & 0x0080) ? "  *** BIT7 SET ***" : "");
         }
+        /* la table de dispatch est-elle peuplée ? data[0x4c5b] = cible BACC A @0x7127 */
+        if (addr == 0x4c5b) {
+            static unsigned wt = 0;
+            if (wt++ < 20)
+                fprintf(stderr, "[c54x] FBWATCH-INITTAB-WR data[0x4c5b] <- 0x%04x PC=0x%04x insn=%u\n",
+                        val, s->pc, s->insn_count);
+        }
     }
     if (addr >= 0x08fa && addr <= 0x08fd) {
         static unsigned aw = 0;
@@ -9697,12 +9704,32 @@ int c54x_run(C54xState *s, int n_insns)
          * depuis 0x5AC8, no wedge). On revient au redirect 0x7120 committé. */
         if (s->pc == 0xFF80 && s->sp == 0x1100) {
             static int redirect_log;
+            /* EXPÉRIENCE CALYPSO_REDIR7000 (2026-05-30) : le redirect→0x7120 saute
+             * l'init qui peuple les tables BACC-A (data[0x4c5b]/0x3fe1) → A=0 →
+             * boot stub → dispatch dormant. Test : poser SP=0x5AC8 (mask-ROM) +
+             * rediriger vers 0x7000 (init COMPLÈTE : tables + A) pour que BACC A
+             * atteigne la vraie entrée firmware. cf SESSION_2026-05-29 fix#2. */
+            static int redir7000 = -1;
+            if (redir7000 < 0) redir7000 = getenv("CALYPSO_REDIR7000") ? 1 : 0;
             if (redirect_log < 3) {
-                C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x7120 "
-                        "(modèle mask-ROM manquant ; 0x7120 = STM #0x5AC8,SP)");
+                C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x%04x%s",
+                        redir7000 ? 0x7000 : 0x7120,
+                        redir7000 ? " (REDIR7000: SP=0x5AC8 + init complète A-tables)" : "");
                 redirect_log++;
             }
-            s->pc = 0x7120;
+            /* VALIDATION CALYPSO_INITTAB (env, réversible) : prouve que peupler la
+             * table de dispatch débloque FB. Pose SP, PUSH retour=0x7120, saute à
+             * 0xc704 (table-init) → peuple data[0x4c24-0x4c5d] → RET vers 0x7120 →
+             * boot normal continue AVEC table peuplée → BACC A atteint les vrais
+             * handlers. Débloque FB → root+fix prouvés ; sinon → table pas le seul. */
+            static int inittab = -1;
+            if (inittab < 0) inittab = getenv("CALYPSO_INITTAB") ? 1 : 0;
+            if (inittab) {
+                s->sp = 0x5AC8;
+                s->sp--; s->data[s->sp] = 0x7120;   /* retour = boot normal */
+                s->pc = 0xc704;                       /* run table-init → RET 0x7120 */
+            } else if (redir7000) { s->sp = 0x5AC8; s->pc = 0x7000; }
+            else s->pc = 0x7120;
         }
         /* === SOFT-RESET-TRIGGER probe (2026-05-28) ===
          * SP-CATASTROPHE trace montre PC=0x7120 (boot init via notre override
@@ -10755,6 +10782,15 @@ int c54x_run(C54xState *s, int n_insns)
             if (w9++ < 40)
                 fprintf(stderr, "[c54x] FBWATCH-9AC0 #%u insn=%u SP=0x%04x DP=0x%03x\n",
                         w9, s->insn_count, s->sp, s->st0 & 0x1FF);
+        }
+        /* === FBWATCH-INITTAB : la routine d'init de la table de dispatch
+         * (0xc704, peuple data[0x4c24-0x4c5d] = cibles BACC-A/CALA) tourne-t-elle ?
+         * 0 hit = jamais atteinte = root confirmé (boot saute le setup-pass). */
+        if (g_fbwatch_on > 0 && (exec_pc == 0xc704 || exec_pc == 0xc472)) {
+            static unsigned wit = 0;
+            if (wit++ < 10)
+                fprintf(stderr, "[c54x] FBWATCH-INITTAB pc=0x%04x insn=%u SP=0x%04x\n",
+                        exec_pc, s->insn_count, s->sp);
         }
         /* === FBWATCH (4) PRODUCTEUR/CONSOMMATEUR : le dispatch CALAD @0x833b
          * tourne-t-il par-frame, et quelle adresse handler calcule-t-il dans A ?
