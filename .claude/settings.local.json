@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pdftotext -layout /home/nirvana/qemu-src/hw/arm/calypso/doc/spru172c.pdf /tmp/spru.txt)"
+    ]
+  }
+}

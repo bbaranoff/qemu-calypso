@@ -2986,7 +2986,19 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             sp_abs_track(s, val, 0);  /* site=0 : MMR_SP via STL/STM/STLM */
             s->sp = val;
             return;
-        case MMR_BK:   s->bk = val; return;
+        case MMR_BK:
+            /* PROBE 2026-06-01 : qui écrit BK ? (BK=0 casse l'adressage circulaire
+             * → runaway AR2 0xfa98/0xf17c). Nomme le writer + valeur. À RETIRER. */
+            {
+                static uint32_t bkw_n = 0;
+                if (bkw_n < 40) {
+                    fprintf(stderr, "[c54x] BK-WR (MMR) 0x%04x→0x%04x PC=0x%04x op=0x%04x "
+                            "%s insn=%u\n", s->bk, val, s->pc, prog_fetch(s, s->pc),
+                            (val == 0) ? "<<< BK=0 (casse circular!)" : "", s->insn_count);
+                    bkw_n++;
+                }
+            }
+            s->bk = val; return;
         case MMR_BRC:  s->brc = val; return;
         case MMR_RSA:  s->rsa = val; return;
         case MMR_REA:  s->rea = val; return;
@@ -3460,6 +3472,20 @@ static void __attribute__((unused)) prog_write(C54xState *s, uint32_t addr, uint
  * Addressing mode helpers
  * ================================================================ */
 
+/* MOD-MISMATCH probe helper (2026-06-01) : adressage circulaire canonique
+ * C54x (SPRU172/tic54x-dis.c). step ±1 ou ±AR0, |step| <= BK attendu.
+ * BK=0 → linéaire (règle #6396 : STM #0,BK délibéré, on ne wrappe pas).
+ * NB : pur calcul de référence pour la sonde — N'ALTÈRE PAS l'exécution. */
+static uint16_t c54x_circ_ref(uint16_t ar, int step, uint16_t bk)
+{
+    if (bk == 0) return (uint16_t)(ar + step);
+    uint16_t base = ar - (ar % bk);
+    int idx = (int)(ar % bk) + step;
+    if (idx >= (int)bk) idx -= bk;
+    else if (idx < 0)   idx += bk;
+    return (uint16_t)(base + idx);
+}
+
 /* Resolve Smem operand: direct or indirect addressing.
  * Returns the data memory address. */
 static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
@@ -3480,6 +3506,7 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         int nar = opcode & 0x07;
         int cur_arp = nar;
         uint16_t addr = s->ar[cur_arp];
+        uint16_t ar_before = s->ar[cur_arp];  /* MOD-MISMATCH probe : base avant post-modify */
 
         /* PROBE 2026-05-31 convergence modes : 1er usage de chaque AR comme base
          * d'adresse. Si la valeur == reset (AR0=0xff75/0x5aad, AR6=0/0xbae6,
@@ -3605,6 +3632,49 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
             addr = prog_fetch(s, s->pc + 1);
             s->lk_used = true;
             break;
+        }
+
+        /* PROBE 2026-06-01 MOD-MISMATCH : delta silicium-correct EN PARALLÈLE
+         * (n'altère PAS l'exécution — pur compare). Confirme sur le flux réel
+         * que seuls mods 5/6/9/10/11 divergent ET que la firmware les touche.
+         * Réf : tic54x-dis.c:506-518 (MOD canonique), macros tic54x.h:97-98
+         * identiques à l'extraction QEMU. À RETIRER après validation du patch. */
+        {
+            int16_t  a0  = (int16_t)s->ar[0];
+            uint16_t bk  = s->bk;
+            uint16_t sil;               /* AR attendu côté silicium */
+            switch (mod) {
+            case 0x0: sil = ar_before;                       break; /* *ar      */
+            case 0x1: sil = (uint16_t)(ar_before - 1);       break; /* *ar-     */
+            case 0x2: sil = (uint16_t)(ar_before + 1);       break; /* *ar+     */
+            case 0x3: sil = (uint16_t)(ar_before + 1);       break; /* *+ar     */
+            case 0x4: sil = (uint16_t)(ar_before - a0);      break; /* *ar-0B   */
+            case 0x5: sil = (uint16_t)(ar_before - a0);      break; /* *ar-0    */
+            case 0x6: sil = (uint16_t)(ar_before + a0);      break; /* *ar+0    */
+            case 0x7: sil = (uint16_t)(ar_before + a0);      break; /* *ar+0B   */
+            case 0x8: sil = c54x_circ_ref(ar_before, -1,  bk); break; /* *ar-%  */
+            case 0x9: sil = c54x_circ_ref(ar_before, -a0, bk); break; /* *ar-0% */
+            case 0xA: sil = c54x_circ_ref(ar_before, +1,  bk); break; /* *ar+%  */
+            case 0xB: sil = c54x_circ_ref(ar_before, +a0, bk); break; /* *ar+0% */
+            default:  sil = s->ar[cur_arp];                  break; /* 12-15 lk : skip */
+            }
+            /* quels mods la firmware touche (1er hit chacun) */
+            static uint16_t mod_seen = 0;
+            if (!(mod_seen & (1u << mod))) {
+                mod_seen |= (1u << mod);
+                fprintf(stderr, "[c54x] MOD-FIRSTHIT mod=%2d AR%d PC=0x%04x op=0x%04x insn=%u\n",
+                        mod, cur_arp, s->pc, opcode, s->insn_count);
+            }
+            /* divergence silicium vs QEMU (modes 0..11 seulement) */
+            if (mod <= 0xB && sil != s->ar[cur_arp]) {
+                static uint32_t mm_n[16] = {0};
+                if (mm_n[mod] < 8)
+                    fprintf(stderr, "[c54x] MOD-MISMATCH mod=%2d AR%d ar0=0x%04x bk=0x%04x "
+                            "base=0x%04x qemu=0x%04x silicon=0x%04x PC=0x%04x op=0x%04x insn=%u\n",
+                            mod, cur_arp, (uint16_t)a0, bk, ar_before,
+                            s->ar[cur_arp], sil, s->pc, opcode, s->insn_count);
+                mm_n[mod]++;
+            }
         }
 
         /* Update ARP */
@@ -6392,7 +6462,20 @@ static int c54x_exec_one(C54xState *s)
             case 0xA: /* F7Ax: LD #k8, ARP */
                 s->st0 = (s->st0 & ~ST0_ARP_MASK) | ((k & 7) << ST0_ARP_SHIFT); break;
             case 0xB: s->ar[7] = k; break; /* F7Bx: LD #k8, AR7 */
-            case 0xC: s->bk = k; break;
+            case 0xC: /* F7Cx: LD #k8u, BK */
+                /* PROBE 2026-06-01 : 2e site d'écriture BK (LD #k8,BK). Nomme le
+                 * writer + valeur. BK=0 casse l'adressage circulaire → runaway
+                 * AR2 0xfa98/0xf17c. À RETIRER avec la sonde MMR_BK. */
+                {
+                    static uint32_t bkw2_n = 0;
+                    if (bkw2_n < 40) {
+                        fprintf(stderr, "[c54x] BK-WR (F7Cx LD#k) 0x%04x→0x%04x PC=0x%04x "
+                                "%s insn=%u\n", s->bk, k, s->pc,
+                                (k == 0) ? "<<< BK=0 (casse circular!)" : "", s->insn_count);
+                        bkw2_n++;
+                    }
+                }
+                s->bk = k; break;
             case 0xD: sp_abs_track(s, k, 1); s->sp = k; break;  /* LD #k8u, SP */
             }
             return consumed + s->lk_used;
