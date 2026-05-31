@@ -79,8 +79,6 @@ static uint16_t g_last_d_burst_d;
 /* PROBE 2026-05-31 (review c web) : dernier PC/op ayant écrit chaque slot de
  * pile (zone 0x1000-0x1FFF). Nomme le PSHM qui a posé l'orphelin 0x80fd lu par
  * POPM ST0 @0x94f3 → matching-frame vs frame étranger. À RETIRER. */
-static uint16_t g_stkwr_pc[0x1000];   /* index = addr - 0x1000 */
-static uint16_t g_stkwr_op[0x1000];
 
 /* === Generic watch-write zone helper (2026-05-15 matin) ===
  *
@@ -3356,10 +3354,18 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             C54_LOG("DARAM write count: %d (last: [0x%04x]=0x%04x)", dw_total, addr, val);
     }
 
-    /* PROBE 2026-05-31 (review c web) : enregistre le writer des slots de pile. */
-    if (addr >= 0x1000 && addr < 0x2000) {
-        g_stkwr_pc[addr - 0x1000] = s->pc;
-        g_stkwr_op[addr - 0x1000] = prog_fetch(s, s->pc);
+    /* PROBE 2026-05-31 frame-IT : qui écrit les flags polled par le DSP wedgé
+     * (data[0x006e], data[0x585f]) ? Tranche (a) ISR-relocate vs (b) HW-write.
+     * Si AUCUN write ou valeur jamais "attendue" → flag jamais posé = deadlock.
+     * À RETIRER après diag. */
+    if (addr == 0x006e || addr == 0x585f) {
+        static uint32_t fw_n = 0;
+        if (fw_n < 60) {
+            fprintf(stderr, "[c54x] FLAGWR data[0x%04x] 0x%04x→0x%04x PC=0x%04x "
+                    "INTM=%d insn=%u\n", addr, s->data[addr], val, s->pc,
+                    !!(s->st1 & ST1_INTM), s->insn_count);
+            fw_n++;
+        }
     }
 
     s->data[addr] = val;
@@ -10918,10 +10924,6 @@ int c54x_run(C54xState *s, int n_insns)
         }
         uint16_t sp_before_exec = s->sp;
         uint16_t ds_before = s->delay_slots;  /* delay-slot word-count fix 2026-05-31 */
-        /* op FIABLE capturé AVANT exec (s->pc/xpc encore au bon banc) — review
-         * c web : e->op=prog_fetch ré-lit APRÈS exec et ment ≥0x8000 si FRET/RETE
-         * a changé XPC. exec_op_rel sert la classif CALL/RET du matcher. */
-        uint16_t exec_op_rel = prog_fetch(s, s->pc);
         consumed = c54x_exec_one(s);
         /* SP-event ring : enregistre tout changement de SP (push/pop) avec
          * le PC/op responsable. Sert le dump BLACKHOLE-CALA. */
@@ -10934,161 +10936,6 @@ int c54x_run(C54xState *s, int n_insns)
             g_sp_ledger.net_words += (int16_t)(sp_before_exec - s->sp);
             if ((int16_t)(s->sp - sp_before_exec) < 0) g_sp_ledger.sp_pushes++;
             else g_sp_ledger.sp_pops++;
-
-            /* PROBE 2026-05-31 : chaque NOUVEAU minimum de net_words = un cran
-             * d'over-pop RÉEL (IRQ pushe +2 → net_words monte → ne déclenche
-             * pas ; seuls les pops non-appariés font descendre). Nomme l'opcode
-             * qui draine SP vers le self-CALA 0x70c3. À RETIRER après diag. */
-            {
-                static int64_t netmin = 0;
-                static uint32_t netmin_n = 0;
-                if (g_sp_ledger.net_words < netmin && netmin_n < 80) {
-                    fprintf(stderr,
-                        "[c54x] NET-MIN #%u net_words=%lld pc=0x%04x op=0x%04x "
-                        "delta=%+d SP=0x%04x insn=%u\n",
-                        netmin_n, (long long)g_sp_ledger.net_words,
-                        exec_pc, e->op, e->delta, s->sp, s->insn_count);
-                    netmin = g_sp_ledger.net_words;
-                    netmin_n++;
-                }
-            }
-
-            /* LEDGER PAR CLASSE D'OPCODE (review c web 2026-05-31) : accumule
-             * mots POUSSÉS vs POPÉS par classe. Le drift net_words=-59 = une
-             * classe de RETOUR qui pope plus de mots que sa classe d'APPEL n'en
-             * pousse (largeur near/far désappariée). Classif via exec_op_rel
-             * (FIABLE, pas e->op qui ment ≥0x8000). Au fault 0x94f3 + tous les
-             * 250k, dump le bilan par classe. La classe au pop>>push = coupable.
-             * NB : l'entrée IT (c54x_interrupt_ex) pousse +2 HORS de ce
-             * chokepoint → RETE/RETED/RET_far apparaîtront en pop "non-apparié"
-             * ici = normal (leur push est l'IT). À RETIRER après diag. */
-            {
-                enum { K_CALL, K_RETN, K_RETF, K_RETE, K_RETED,
-                       K_PSHM, K_POPM, K_OTHER, K_NCLS };
-                static const char *knm[K_NCLS] = {
-                    "CALL","RET_near","RET_far","RETE","RETED",
-                    "PSHM","POPM","OTHER" };
-                static uint64_t kpush[K_NCLS], kpop[K_NCLS], kcnt[K_NCLS];
-                uint16_t mop = exec_op_rel;
-                int kc;
-                if (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
-                    ||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
-                    ||(mop&0xFF00)==0xF900||(mop&0xFF00)==0xFB00) kc=K_CALL;
-                else if (mop==0xF4E4||mop==0xF6E4||mop==0xF4E5||mop==0xF6E5) kc=K_RETF;
-                else if (mop==0xF4EB) kc=K_RETE;
-                else if (mop==0xF6EB) kc=K_RETED;
-                else if (mop==0xF49B||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00) kc=K_RETN;
-                else if ((mop&0xFF00)==0x4A00||(mop&0xFF00)==0x4B00) kc=K_PSHM;
-                else if ((mop&0xFF00)==0x8A00||(mop&0xFF00)==0x8B00) kc=K_POPM;
-                else kc=K_OTHER;
-                if (e->delta < 0) kpush[kc] += (uint64_t)(-e->delta);
-                else              kpop[kc]  += (uint64_t)e->delta;
-                kcnt[kc]++;
-
-                static uint32_t lastdmp = 0;
-                int at_fault = (exec_pc == 0x94f3 && exec_op_rel == 0x8a06);
-                if (at_fault || s->insn_count - lastdmp >= 250000u) {
-                    lastdmp = s->insn_count;
-                    fprintf(stderr, "[c54x] CLASS-LEDGER insn=%u net_words=%lld%s\n",
-                            s->insn_count, (long long)g_sp_ledger.net_words,
-                            at_fault ? "  <<< AU FAULT 0x94f3" : "");
-                    for (int i = 0; i < K_NCLS; i++) {
-                        if (!kcnt[i]) continue;
-                        fprintf(stderr,
-                            "[c54x]   %-9s push=%-9llu pop=%-9llu net=%+lld  n=%llu\n",
-                            knm[i], (unsigned long long)kpush[i],
-                            (unsigned long long)kpop[i],
-                            (long long)((int64_t)kpush[i] - (int64_t)kpop[i]),
-                            (unsigned long long)kcnt[i]);
-                    }
-                }
-            }
-
-            /* FULL-TRACE pile (review c web 2026-05-31) : ~226 events SP only
-             * jusqu'au fault → on logge CHAQUE push/pop et on apparie à l'œil.
-             * Le 1er RET/POPM sans push apparié = le bug, zéro spéculation.
-             * Classe lisible + net courant. Ring 1024, dump complet au fault. */
-            {
-                static struct { uint16_t pc, op; int16_t d; uint16_t sp;
-                                int32_t net; char cl[4]; } tr[1024];
-                static int trn = 0;
-                uint16_t mop = exec_op_rel;
-                const char *cl;
-                if (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
-                    ||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
-                    ||(mop&0xFF00)==0xF900||(mop&0xFF00)==0xFB00) cl="CAL";
-                else if (mop==0xF4E4||mop==0xF6E4||mop==0xF4E5||mop==0xF6E5) cl="RTF";
-                else if (mop==0xF4EB) cl="RTE";
-                else if (mop==0xF6EB) cl="RTD";
-                else if (mop==0xF49B||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00) cl="RTN";
-                else if ((mop&0xFF00)==0x4A00||(mop&0xFF00)==0x4B00) cl="PSH";
-                else if ((mop&0xFF00)==0x8A00||(mop&0xFF00)==0x8B00) cl="POP";
-                else cl="OTH";
-                if (trn < 1024) {
-                    tr[trn].pc=exec_pc; tr[trn].op=exec_op_rel; tr[trn].d=e->delta;
-                    tr[trn].sp=s->sp; tr[trn].net=(int32_t)g_sp_ledger.net_words;
-                    tr[trn].cl[0]=cl[0]; tr[trn].cl[1]=cl[1];
-                    tr[trn].cl[2]=cl[2]; tr[trn].cl[3]=0; trn++;
-                }
-                if (exec_pc == 0x94f3 && exec_op_rel == 0x8a06) {
-                    fprintf(stderr, "[c54x] FULL-TRACE pile (%d events, push=- pop=+):\n", trn);
-                    for (int i = 0; i < trn; i++)
-                        fprintf(stderr, "[c54x] %3d %s pc=0x%04x op=0x%04x d=%+d sp=0x%04x net=%+d\n",
-                                i, tr[i].cl, tr[i].pc, tr[i].op, tr[i].d, tr[i].sp, tr[i].net);
-                }
-            }
-
-            /* PROBE 2026-05-31 (review c web) : POPM ST0 @0x94f3 à CHAQUE
-             * passage. Tranche les 3 angles : (a) dérive SP RÉELLE vs artefact
-             * — SP_read = registre lu en dur ; (b) cause vs symptôme — si dSP
-             * croît passage-après-passage et le pop devient 0x80fd quand dSP a
-             * dérivé = drift cause ; si SP stable et 0x80fd surgit = événement
-             * unique ; (c) provenance — voisinage pile brut s->data[]. POPM lit
-             * data[sp] puis sp++ → slot = sp_before_exec. À RETIRER. */
-            if (exec_pc == 0x94f3 && e->op == 0x8a06) {
-                static uint16_t base94 = 0; static int first94 = 1;
-                static uint32_t n94 = 0;
-                uint16_t slot = sp_before_exec;
-                if (first94) { base94 = slot; first94 = 0; }
-                uint16_t wpc = 0, wop = 0;
-                if (slot >= 0x1000 && slot < 0x2000) {
-                    wpc = g_stkwr_pc[slot - 0x1000];
-                    wop = g_stkwr_op[slot - 0x1000];
-                }
-                if (n94 < 80) {
-                    fprintf(stderr,
-                        "[c54x] POPM94F3 #%u insn=%u SP_read=0x%04x dSP=%+d "
-                        "ST0_pop=0x%04x DP=0x%03x stk[-1..+1]=%04x %04x %04x "
-                        "writer{pc=0x%04x op=0x%04x}\n",
-                        n94, s->insn_count, slot, (int)(int16_t)(slot - base94),
-                        s->st0, dp(s),
-                        s->data[(uint16_t)(slot - 1)], s->data[slot],
-                        s->data[(uint16_t)(slot + 1)], wpc, wop);
-                    /* Fenêtre de pile complète + writer de chaque slot : montre
-                     * la structure de frame (RET-addr=CALL vs ST0/ST1=PSHM) et
-                     * OÙ le frame casse (push manquant / pop en trop). */
-                    for (int k = -4; k <= 7; k++) {
-                        uint16_t a = (uint16_t)(slot + k);
-                        uint16_t pc_w = 0, op_w = 0;
-                        if (a >= 0x1000 && a < 0x2000) {
-                            pc_w = g_stkwr_pc[a - 0x1000];
-                            op_w = g_stkwr_op[a - 0x1000];
-                        }
-                        const char *what = ((op_w & 0xFF00) == 0x4A00 ||
-                                            (op_w & 0xFF00) == 0x4B00) ? "PSHM" :
-                                           (op_w == 0xf074 || op_w == 0xf274 ||
-                                            op_w == 0xf4e3 || op_w == 0xf6e3 ||
-                                            (op_w & 0xFF80) == 0xf980 ||
-                                            (op_w & 0xFF80) == 0xfb80) ? "CALL" :
-                                           (op_w == 0xc000 || op_w == 0xc400) ? "PSHD" : "?";
-                        fprintf(stderr,
-                            "[c54x]   stk[0x%04x]=%04x  writer{pc=0x%04x op=0x%04x %s}%s\n",
-                            a, s->data[a], pc_w, op_w, what,
-                            a == slot ? "  <-- POPM ST0 lit ICI" : "");
-                    }
-                    n94++;
-                }
-            }
 
             /* === SHADOW STACK : appariement push/pop (gate ORPHAN) ===
              * Nomme LE return orphelin (over-pop), pas les 15 victimes 0xc8be. */
@@ -11575,31 +11422,6 @@ int c54x_run(C54xState *s, int n_insns)
         s->last_exec_pc = exec_pc;
         s->last_exec_op = exec_op;
 
-        /* PROBE 2026-05-31 : ORIGINE du self-CALA 0x70c3 (=28868).
-         * Capte le moment où A entre dans [0x7000,0x70ff] — c'est le LD du
-         * dispatcher qui lit la LUT à (DP<<7|0x07)<<1 et charge A=garbage.
-         * Loggue le PC dispatcher, le DP utilisé (attendu 0x124, KO si 0x086/87),
-         * l'addr LUT, SP, et le DERNIER setter de DP (= le coupable qui a posé
-         * le mauvais DP, ou l'over-pop qui l'a hérité). À RETIRER après diag. */
-        {
-            static uint16_t acala_prevdp = 0xFFFF, acala_ldp_pc = 0, acala_ldp_val = 0;
-            static uint16_t acala_prevA = 0;
-            static uint32_t acala_n = 0;
-            if (dp(s) != acala_prevdp) {
-                acala_ldp_pc = exec_pc; acala_ldp_val = dp(s); acala_prevdp = dp(s);
-            }
-            uint16_t acala_aLo = (uint16_t)(s->a & 0xFFFF);
-            if (acala_aLo == 0x70c3 &&
-                acala_aLo != acala_prevA && acala_n < 30) {
-                fprintf(stderr, "[c54x] ACALA-ORIG #%u A=0x%04x exec_pc=0x%04x op=0x%04x "
-                        "DP=0x%03x lut=0x%04x SP=0x%04x lastDP{pc=0x%04x val=0x%03x} insn=%u\n",
-                        acala_n, acala_aLo, exec_pc, exec_op, dp(s),
-                        (uint16_t)(((dp(s) << 7) | 0x07) << 1), s->sp,
-                        acala_ldp_pc, acala_ldp_val, s->insn_count);
-                acala_n++;
-            }
-            acala_prevA = acala_aLo;
-        }
 
         /* RPT: after executing an instruction while repeat is active,
          * re-execute the SAME instruction (don't advance PC) until count=0. */
@@ -11660,70 +11482,6 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
 
-        /* DISPATCHER 0x7700 RE-ENTRY PROBE (2026-05-31, tranche (a) vs (b)) :
-         * le drainer = POPM ST0 @0x7737 + RET @0x7738 rejoués sans l'entrée
-         * CALL 0x770a → PSHM ST0 @0x770d. (a) si A!=0 force BC@0x772f→0x7737
-         * chaque tour = compteur faux ; (b) si RET@0x7738 dépile vers le corps
-         * (≈0x771x) au lieu du caller = spin par désalignement. Compteurs +
-         * cible du RET + A au BC. PC final (post-countdown). À RETIRER. */
-        {
-            static uint32_t n770d=0, n770a=0, n7737=0, nbc=0, nret=0;
-            if (exec_pc == 0x770d) n770d++;
-            if (exec_pc == 0x770a) n770a++;
-            if (exec_pc == 0x7737) n7737++;
-            if (exec_pc == 0x772f && nbc < 16) {
-                fprintf(stderr, "[c54x] DISP-BC@772f #%u A=0x%05llx (lo=0x%04x) "
-                        "→PC=0x%04x %s insn=%u\n", nbc,
-                        (unsigned long long)(s->a & 0xFFFFFFFFFFull),
-                        (uint16_t)(s->a & 0xFFFF), s->pc,
-                        s->pc==0x7737?"PRIS(exit)":"fall",
-                        s->insn_count);
-                nbc++;
-            }
-            if (exec_pc == 0x7738 && nret < 16) {
-                fprintf(stderr, "[c54x] DISP-RET@7738 #%u →PC=0x%04x %s "
-                        "SP=0x%04x cnt{770a=%u 770d=%u 7737=%u} insn=%u\n",
-                        nret, s->pc,
-                        (s->pc & 0xFFF0)==0x7710||(s->pc&0xFFF0)==0x7720
-                          ? "RE-ENTRE-CORPS" : "→caller",
-                        s->sp, n770a, n770d, n7737, s->insn_count);
-                nret++;
-            }
-            /* ENTRÉE du dispatcher : transition depuis HORS [0x7700,0x773f]
-             * vers le prologue [0x7700,0x771c]. Montre le PC précédent (qui
-             * saute/appelle) et le point d'atterrissage exact — révèle si on
-             * saute 0x770d PSHM ST0. À RETIRER. */
-            {
-                static uint16_t dprev = 0, dprevop = 0; static uint32_t nent = 0;
-                /* Cible le CORPS [0x7711,0x771c] (pas le top 0x7700 = boucle
-                 * de boot), post-boot (insn>100). Montre QUI saute/appelle le
-                 * corps et avec quel SP — révèle BACC (pas de push) vs CALL. */
-                int in_body = (exec_pc >= 0x7711 && exec_pc <= 0x771c);
-                int prev_out = (dprev < 0x7700 || dprev > 0x773f);
-                if (in_body && prev_out && s->insn_count > 100 && nent < 20) {
-                    /* writer du slot de la continuation qu'on vient de dépiler
-                     * (le RET @prev a lu data[sp-1] puis sp++ → slot=sp-1).
-                     * = QUI a poussé 0x7712. pc=0 → jamais primé (stale). */
-                    uint16_t cslot = (uint16_t)(s->sp - 1);
-                    uint16_t cwpc = 0, cwop = 0;
-                    if (cslot >= 0x1000 && cslot < 0x2000) {
-                        cwpc = g_stkwr_pc[cslot - 0x1000];
-                        cwop = g_stkwr_op[cslot - 0x1000];
-                    }
-                    fprintf(stderr, "[c54x] DISP-ENTER #%u land=0x%04x op=0x%04x "
-                            "from prev=0x%04x (prevop=0x%04x) SP=0x%04x "
-                            "cont=0x%04x writer{pc=0x%04x op=0x%04x} "
-                            "queue[SP..+3]=%04x %04x %04x %04x insn=%u\n",
-                            nent, exec_pc, exec_op, dprev, dprevop, s->sp,
-                            cslot < 0x2000 ? s->data[cslot] : 0, cwpc, cwop,
-                            s->data[s->sp], s->data[(uint16_t)(s->sp+1)],
-                            s->data[(uint16_t)(s->sp+2)], s->data[(uint16_t)(s->sp+3)],
-                            s->insn_count);
-                    nent++;
-                }
-                dprev = exec_pc; dprevop = exec_op;
-            }
-        }
 
         /* === RPTB (block repeat) end-of-body check ===
          * Must run AFTER PC advance and delayed-branch settle so the
@@ -11761,7 +11519,7 @@ int c54x_run(C54xState *s, int n_insns)
 
         /* SP-LEDGER : dump périodique pour valider net_words→0 sur run long
          * (métrique de balance push/pop post-yield-fix). ~1 compare/insn. */
-        if (s->insn_count - g_sp_ledger.last_dump_insn >= 250000u) {
+        if (s->insn_count - g_sp_ledger.last_dump_insn >= 20000000u) {
             g_sp_ledger.last_dump_insn = s->insn_count;
             fprintf(stderr,
                 "[c54x] SP-LEDGER insn=%u SP=0x%04x net_words=%lld pushes=%llu pops=%llu irq=%llu\n",
