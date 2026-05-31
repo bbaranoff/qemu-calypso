@@ -912,6 +912,27 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     }
     bsp.bursts_written++;
 
+    /* PROBE 2026-05-31 fork-1 : dump des bursts I/Q pour FFT offline (cherche
+     * le pic FCCH à +67.7 kHz = 1625/24). Gated CALYPSO_IQDUMP. Dump bursts
+     * 5..28 en raw int16 (un fichier par burst → l'un d'eux = FCCH). À RETIRER. */
+    if (getenv("CALYPSO_IQDUMP")) {
+        static unsigned rx_dump_n;
+        if (rx_dump_n < 24) {
+            char path[80];
+            snprintf(path, sizeof(path), "/tmp/iq_rx_%03u.bin", rx_dump_n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                for (int i = 0; i < n; i++) {
+                    int16_t s = (int16_t)iq[i];
+                    fwrite(&s, sizeof(int16_t), 1, f);
+                }
+                fclose(f);
+                BSP_LOG("IQDUMP rx #%u → %s (%d int16)", rx_dump_n, path, n);
+            }
+            rx_dump_n++;
+        }
+    }
+
     /* Log DARAM content after write for FB bursts (inside lock so values
      * read are consistent with what we just wrote). */
     if (bsp.bursts_written <= 3) {
@@ -1084,6 +1105,28 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         }
         calypso_pcb_daram_lock_release();
         bsp.bursts_written++;
+
+        /* PROBE 2026-05-31 fork-1 : dump I/Q (chemin deliver_buffered, le VIVANT
+         * = samples post-AFC livrés au corrélateur). Gated CALYPSO_IQDUMP,
+         * compteur indépendant, préfixe iq_dlv. À RETIRER. */
+        if (getenv("CALYPSO_IQDUMP")) {
+            static unsigned dlv_dump_n;
+            if (dlv_dump_n < 24) {
+                char path[80];
+                snprintf(path, sizeof(path), "/tmp/iq_dlv_%03u.bin", dlv_dump_n);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    for (int i = 0; i < n; i++) {
+                        int16_t s = (int16_t)sl->iq[i];
+                        fwrite(&s, sizeof(int16_t), 1, f);
+                    }
+                    fclose(f);
+                    BSP_LOG("IQDUMP dlv #%u fn=%u tn=%u → %s (%d int16)",
+                            dlv_dump_n, (unsigned)sl->fn, (unsigned)tn, path, n);
+                }
+                dlv_dump_n++;
+            }
+        }
         sl->valid = false;  /* consumed */
 
         /* === BRINT0 assert (2026-05-28) =====================================

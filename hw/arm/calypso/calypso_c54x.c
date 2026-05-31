@@ -3394,6 +3394,23 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
+    /* PROBE 2026-05-31 : qui écrit d_fb_mode (0x08f9) avec du GARBAGE (>1) ?
+     * Le détecteur tourne mais d_fb_mode=0x435b (≠0/1) → fenêtre/scaling faux.
+     * Hypothèse : runaway AR2/BK=0 le corrompt. Nomme le corrupteur. À RETIRER. */
+    if (addr == 0x08f9 && val > 1) {   /* GARBAGE uniquement (val ≠ 0/1) */
+        static uint32_t fm_n = 0;
+        if (fm_n < 40) {
+            fprintf(stderr, "[c54x] FBMODE-GARBAGE data[0x08f9] 0x%04x→0x%04x PC=0x%04x "
+                    "op=0x%04x SP=0x%04x AR2=%04x AR3=%04x BK=%04x %s insn=%u\n",
+                    s->data[0x08f9], val, s->pc, prog_fetch(s, s->pc),
+                    s->sp, s->ar[2], s->ar[3], s->bk,
+                    (s->sp == 0x08f9) ? "<<< SP-PUSH" :
+                    (s->ar[2] == 0x08f9 || s->ar[2] == 0x08f8) ? "<<< AR2-STORE" : "?",
+                    s->insn_count);
+            fm_n++;
+        }
+    }
+
     s->data[addr] = val;
 }
 
@@ -10975,6 +10992,24 @@ int c54x_run(C54xState *s, int n_insns)
             g_sp_ledger.net_words += (int16_t)(sp_before_exec - s->sp);
             if ((int16_t)(s->sp - sp_before_exec) < 0) g_sp_ledger.sp_pushes++;
             else g_sp_ledger.sp_pops++;
+
+            /* PROBE 2026-05-31 : SP qui PLONGE dans la zone API RAM (0x0700-0x0a00)
+             * = corruption → CALLD push clobber d_fb_det/d_fb_mode (0x08f8/9).
+             * Loggue l'instruction qui y fait entrer SP (transition depuis hors
+             * zone) + delta + voisinage pile. Nomme le setter de SP fautif. */
+            {
+                static uint32_t spdz_n = 0;
+                int in_zone   = (s->sp >= 0x0700 && s->sp <= 0x0a00);
+                int was_out   = (sp_before_exec < 0x0700 || sp_before_exec > 0x0a00);
+                if (in_zone && was_out && spdz_n < 30) {
+                    fprintf(stderr, "[c54x] SP-DANGER SP 0x%04x→0x%04x (delta=%+d) "
+                            "PC=0x%04x op=0x%04x XPC=%u insn=%u\n",
+                            sp_before_exec, s->sp,
+                            (int)(int16_t)(s->sp - sp_before_exec),
+                            exec_pc, prog_fetch(s, exec_pc), s->xpc, s->insn_count);
+                    spdz_n++;
+                }
+            }
 
             /* === SHADOW STACK : appariement push/pop (gate ORPHAN) ===
              * Nomme LE return orphelin (over-pop), pas les 15 victimes 0xc8be. */
