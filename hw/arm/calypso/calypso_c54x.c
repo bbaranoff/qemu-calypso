@@ -6456,10 +6456,17 @@ static int c54x_exec_one(C54xState *s)
              * c54x_cond_true() (cf CC ci-dessus). */
             bool take = c54x_cond_true(s, (uint8_t)(op & 0x7F));
             if (take) {
+                /* FIX 2026-05-31 : CCD est DIFFÉRÉ — arme delay_slots=2 +
+                 * delayed_pc (comme CALLD f274, fixé 2026-05-30), au lieu de
+                 * sauter immédiatement (s->pc=op2; return 0) qui SKIPPAIT les
+                 * 2 delay-slots → push perdu si un slot pousse → over-pop →
+                 * 0x80fd → self-CALA 0x70c3. Retour poussé = pc+4 (past CCD +
+                 * 2 slots). Not-taken : PC avance de consumed (2) = past CCD. */
                 s->sp--;
-                data_write(s, s->sp, (uint16_t)(s->pc + 4)); /* past CCD + 2 delay slots */
-                s->pc = op2;
-                return 0;
+                data_write(s, s->sp, (uint16_t)(s->pc + 4));
+                s->delayed_pc  = op2;
+                s->delay_slots = 2;
+                return consumed + s->lk_used;
             }
             return consumed + s->lk_used;
         }

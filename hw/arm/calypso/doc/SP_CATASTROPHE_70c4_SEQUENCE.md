@@ -129,3 +129,38 @@ reste correct, retour inchangé) et sur 0xb53a (2 PSHM → les deux s'exécutent
 VALIDATION (invariants, run non-déterministe → 2-3 runs) :
   - tgt=0x70c3 → 0 ; BLACKHOLE-CALA → 0 ; osmocon 28868 → disparaît
   - d_fb_det (0x08F8) jamais 0x70c4 ; SP-LEDGER net_words borné
+
+---
+## ✅✅✅ VRAIE ROOT CAUSE CONFIRMÉE + FIX VALIDÉ (2026-05-31 soir)
+
+Le fix delay-slots ci-dessus était nécessaire mais **INSUFFISANT** (28868 persistait
+~2/3 runs). La VRAIE cause, trouvée par sonde différentielle :
+
+**Les handlers `CC` (0xF9xx) et `CCD` (0xFB00-FB7F) décodaient la condition depuis
+`(op>>4)&0xF` = le MAUVAIS champ de bits.** L'encodage autoritaire (binutils
+`tic54x-opc.c condition_codes[]`) met le test dans l'**octet bas** : CC1=0x40 (accu),
+CCB=0x08 (B), test bits[2:0] EQ=5 NEQ=4 LT=3 LEQ=7 GT=6 GEQ=2, AOV=0x70 ANOV=0x60,
+TC=0x30 NTC=0x20, C=0x0C NC=0x08. L'ancien code n'évaluait juste que UNC et AEQ/BEQ
+par coïncidence ; NEQ/LT/LEQ/GT/GEQ/**TC**/C tous FAUX.
+
+Chaîne : `CC[TC]` (f930) dans la power-scan 0xb1xx mal évalué → mauvais call/no-call
+→ push manquants → over-pop → orphelin 0x80fd @0x94f3 → DP=0x0fd → 0x70c3 → 28868.
+Prouvé par sonde CC-MISMATCH (divergences réelles @0xb117/b11c/b126/b12b, CC[TC] TC-set).
+
+FIX : helper `c54x_cond_true(s, cc)` (décode octet bas, identique au RC/RCD correct,
+couvre TC/C/OV/A/B), appelé par CC et CCD. + 2ᵉ bug CCD : `take` sautait immédiatement
+(s->pc=op2; return 0) → delay-slots SKIPPÉS ; corrigé en armant delay_slots=2+delayed_pc
+(miroir CALLD f274).
+
+VALIDÉ cross-run : pré-fix black-hole insn 3.19M → post-fix 628M+ (200×), 28868=0 dans
+2+ runs, mobile boucle PM/FBSB 514 propre >144s. Résidu tardif 3-30× @628-643M (DP=0x000
+via pc=0x7656) = 2ᵉ couche, hors fenêtre FBSB.
+
+⚠️ FAUX-PISTES (ne pas re-chasser) : dispatcher 0x7700 `POPM ST0 @0x7737 + RET @0x7738`
+RE-ENTRE-CORPS au boot = NORMAL (continuation 0x7712 = constante boot-loadée lue via la
+pile, writer pc=0, tourne 600M insns sans rejouer). 0x770d PSHM ST0 "jamais exécuté" =
+chemin d'entrée séparé légit.
+
+Blocker DÉPLACÉ AVAL (plus DSP) : FB-det tourne @0x9ac0 mais d_fb_det=0 (I/Q -138 dBm,
+pas de FCCH) + LOST = FIFO underrun (WALL_TDMA_NS=4615385) ; mode no-dsp : SCH décode
+BSIC=63 garbage = qualité I/Q. Wedge tardif 0xa47x INTM=1 poll 0x8a44 = autre 2ᵉ couche.
