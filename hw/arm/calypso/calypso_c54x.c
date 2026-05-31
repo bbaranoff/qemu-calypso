@@ -2682,6 +2682,33 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
+    /* WR585F (CALYPSO_DEBUG=WR585F) : sonde dédiée écriture data[0x585f], le
+     * flag SARAM que le DSP poll en boucle à PC=0xf2cd (BITF bit7) — 30M+ reads
+     * tous à 0 dans le run 2026-05-31 (set=0 clear=30M) → handshake jamais levé,
+     * c'est le MUR amont du dispatcher de tâches (DISP-ENTRY/DET9AC0=0). Cette
+     * sonde dit QUI écrit le flag (PC+old→new), si le bit7 passe à 1, et quand.
+     *  - aucune ligne → le flag n'est JAMAIS écrit = source morte (ISR frame
+     *    non vectorisée / complétion DMA non signalée → cas 1/2)
+     *  - écrit mais bit7 reste 0 → mauvaise valeur posée (cas 3, bug opcode/route)
+     *  - bit7 1 puis 0 juste après → race/ordre (effacé avant le poll)
+     * Read-only sauf le log. Auto-active sous ALL (token sans tiret). */
+    if (addr == 0x585f && calypso_debug_enabled("WR585F")) {
+        static unsigned w585_n, w585_log;
+        uint16_t oldv = s->data[addr];
+        w585_n++;
+        int bit7_old = !!(oldv & 0x0080), bit7_new = !!(val & 0x0080);
+        if (w585_log < 300 || bit7_new || (bit7_old != bit7_new)) {
+            w585_log++;
+            fprintf(stderr,
+                "[c54x] WR585F #%u data[0x585f] 0x%04x->0x%04x bit7 %d->%d%s "
+                "PC=0x%04x XPC=%u DP=0x%03x INTM=%d insn=%u\n",
+                w585_n, oldv, val, bit7_old, bit7_new,
+                (bit7_new ? "  <-- FLAG LEVE !" : ""),
+                s->pc, s->xpc & 0xFF, (unsigned)(s->st0 & 0x1FF),
+                !!(s->st1 & ST1_INTM), (unsigned)s->insn_count);
+        }
+    }
+
     /* WATCH-WRITE on the same mailbox slots tracked in data_read.
      * Whoever writes them — DSP or ARM via api_ram alias — gets logged
      * so we can attribute the source of the value the firmware polls. */
@@ -3708,6 +3735,28 @@ static int c54x_exec_one(C54xState *s)
                 }
                 fprintf(stderr, "\n");
             }
+        }
+    }
+
+    /* DET9AC0 (CALYPSO_DEBUG=DET9AC0) : compteur du détecteur FCCH 0x9ac0,
+     * le trou non couvert par DISP-ENTRY (0x8341) ni CORRELATOR-TRACE
+     * ([0x8d00..0x9000)). Mémoire (project_session_..._detector_bootonly) :
+     * 0x9ac0 serait BOOT-ONLY (~42× au boot, jamais re-cadencé sur la vraie
+     * I/Q à +3s). Ce probe le TRANCHE structurellement : compte les hits,
+     * bucket boot (<5M insn) vs steady, logge AR3/AR4 (ptr buffer I/Q) +
+     * d_fb_mode (0x08f9, large=0/étroit=1) à chaque hit. Read-only, 1 PC,
+     * token sans tiret (parser-safe). */
+    if (s->pc == 0x9ac0 && calypso_debug_enabled("DET9AC0")) {
+        static unsigned n9, n9_boot, n9_steady, log9;
+        n9++;
+        if (s->insn_count < 5000000) n9_boot++; else n9_steady++;
+        if (log9 < 200 || (n9 % 1000) == 0) {
+            log9++;
+            fprintf(stderr,
+                "[c54x] DET9AC0 hit #%u (boot=%u steady=%u) AR3=0x%04x "
+                "AR4=0x%04x d_fb_mode=0x%04x DP=0x%03x insn=%u\n",
+                n9, n9_boot, n9_steady, s->ar[3], s->ar[4],
+                s->data[0x08f9], (unsigned)(s->st0 & 0x1FF), s->insn_count);
         }
     }
 
@@ -11644,38 +11693,47 @@ void c54x_reset(C54xState *s)
 {
     g_boot_trace = 50;
     s->blob_loaded = false;  /* explicit reset exits dsp-blob fixture mode */
-    s->a = 0; s->b = 0;
-    /* ── Anti-drift audit : reset MMRs hardcodés vs calypso_dsp.Registers.bin ──
-     * (2026-05-31) Les valeurs ci-dessous sont le FALLBACK. Quand le snapshot
-     * registres est chargé (`-M calypso,dsp-registers=<path>`, câblé par défaut
-     * dans run.sh via .Registers.bin), c54x_reset l'applique APRÈS ce hardcode
-     * (bloc `if (s->reg_init_valid)` plus bas) → le .bin est alors la source de
-     * vérité du reset. Ce .bin est un SNAPSHOT mi-exécution (post-handshake
-     * bootloader), cohérent avec le modèle "entrée firmware". Table ci-dessous =
-     * comparaison hardcode (fallback) vs .bin (override) ; garder cohérent à la
-     * main pour le cas no-file.
+    s->a = 0; s->b = 0;   /* mode c54x = reset datasheet propre : A=B=0
+                           * (le snapshot a BL=0x60, appliqué seulement en mode bin) */
+    /* ── REVIEW registres : hardcode C ↔ calypso_dsp.Registers.bin (2026-05-31) ──
+     * Le hardcode ci-dessous = mode "c54x" = RESET DATASHEET PROPRE (champs
+     * critiques alignés au snapshot, champs bénins/garbage à 0). Les 3 modes
+     * sont ainsi orthogonaux (sélecteur plus bas) :
+     *   c54x   = ce hardcode propre, indépendant du fichier
+     *   bin    = override depuis .Registers.bin VERBATIM (snapshot exact, défaut)
+     *   hybrid = bin pour l'opérationnel + champs critiques forcés propres
+     *            (IFR=0, AR0=0xFF75, BRC/RSA/REA=0) → ≈ c54x sur ces champs
      *
-     *   MMR        hardcode  .bin     verdict
-     *   IMR  0x00  0x52FD    0x52FD   accord
-     *   IFR  0x01  0x0000    0x0008   DIVERGE — hardcode CORRECT (IFR=0 au reset ;
-     *                                  0x0008 = IRQ pending capturé en cours d'exec,
-     *                                  NE PAS copier le .bin)
-     *   ST0  0x06  0x181F    0x181F   accord
-     *   ST1  0x07  0x2900    0x2900   accord
-     *   TRN  0x0F  0x0000    0xFF75   diverge (TRN non critique au reset)
-     *   AR0  0x10  0xFF75    0x5AAD   ⚠ SUSPECT : 0xFF75 = la valeur TRN(.bin) à
-     *                                  l'index voisin → possible off-by-one MMR à
-     *                                  la dérivation d'origine. BK(0x19) est correct
-     *                                  donc PAS un décalage global. À TRANCHER vs
-     *                                  dumps 3311/3416/3606 avant de toucher (c web).
-     *                                  Non bloquant : firmware recharge AR0 (STM/LD
-     *                                  @0x7120) avant usage.
-     *   AR1-5 0x11-15  = .bin = .bin  accord (invariant cross-dump)
-     *   AR6  0x16  0x0000    0xBAE6   diverge (non doc invariant → garde 0)
-     *   AR7  0x17  0x0000    0x1E44   diverge (idem)
-     *   SP   0x18  0x1100    0x1100   accord
-     *   BK   0x19  0xFFF6    0xFFF6   accord
-     *   PMST 0x1D  0xFFA8    0xFFA8   accord
+     * Le .bin est un SNAPSHOT mi-exécution (post-handshake bootloader). Review
+     * champ par champ (verdict = pertinence de la valeur AU RESET) :
+     *
+     *   MMR        valeur(bin=hardcode)  classe        commentaire
+     *   IMR  0x00  0x52FD                CRITIQUE-OK   masque IRQ, identique 3 dumps
+     *   IFR  0x01  0x0008                BÉNIN         bit3 INT3 pending ; INTM=1 masque
+     *                                                  → hybrid le met à 0 (datasheet pur)
+     *   ST0  0x06  0x181F                CRITIQUE-OK   DP=0x1F
+     *   ST1  0x07  0x2900                CRITIQUE-OK   INTM/SXM/XF
+     *   A    08-0a  0x000000             OK            accumulateur A = 0
+     *   B    0b-0d  0x000060             BÉNIN         BL=0x60 (rechargé avant usage)
+     *   T    0x0E  0x0000                OK
+     *   TRN  0x0F  0xFF75                BÉNIN         Viterbi, neutre au reset
+     *   AR0  0x10  0x5AAD                BÉNIN         rechargé (LD @0x7120) ; hybrid=0xFF75
+     *   AR1-5 11-15 invariants           CRITIQUE-OK   identiques 3 dumps (API_RAM, etc.)
+     *   AR6  0x16  0xBAE6                BÉNIN         rechargé avant usage
+     *   AR7  0x17  0x1E44                BÉNIN         idem
+     *   SP   0x18  0x1100                CRITIQUE-OK   pile post-handshake
+     *   BK   0x19  0xFFF6                CRITIQUE-OK   circular buffer
+     *   BRC  0x1A  0x8FD7                GARBAGE       reste RPTB mi-vol ; neutre
+     *   RSA  0x1B  0xD9EC                GARBAGE       (rptb_active=false au reset)
+     *   REA  0x1C  0xBBEF                GARBAGE       → hybrid les met à 0
+     *   PMST 0x1D  0xFFA8                CRITIQUE-OK   IPTR=0x1FF, MP_MC, OVLY, DROM
+     *   XPC  0x1E  0x0000                — jamais overridé (page runtime, fetch vec)
+     *
+     * CONCLUSION review : les champs CRITIQUE-OK (SP/ST0/ST1/PMST/IMR/AR1-5/BK)
+     * sont identiques bin↔hardcode et pilotent le reset. Les divergences (IFR,
+     * AR0/6/7, TRN, B, BRC/RSA/REA) sont toutes BÉNIGNES ou GARBAGE et neutres
+     * au reset (IT masquée par INTM=1 ; AR rechargés ; rptb_active=false). Donc
+     * aucune n'explique le stuck FB (boucle BITF @0xf2cd sur data[0x585f]).
      */
     /* AR registers aligned with silicon spec (doc/datasheets/README.md §3,
      * 2026-05-25). Cross-checked 3 ROM dumps (3311/3416/3606) + local osmocom :
@@ -11686,14 +11744,19 @@ void c54x_reset(C54xState *s)
      * Précédent : memset 0 = init shortcut, même problème que SP/IMR.
      * Symptôme : STL A,*AR2 à PC=0x9ac0 avec AR2=0 écrivait à mem[0x00]=IMR
      * → IMR cleared → toutes IRQ FRAME/BRINT0 masquées → DSP bloqué en df9x. */
+    /* AR registers — mode c54x = reset datasheet propre.
+     * AR1-5 = invariants cross-dump (3311/3416/3606) = identiques au snapshot,
+     * gardés ici car CRITIQUES. AR0/AR6/AR7 = 0 (neutres : le firmware les
+     * recharge avant usage, ex. LD @0x7120). Le snapshot a AR0=0x5aad,
+     * AR6=0xbae6, AR7=0x1e44 → appliqués seulement en mode bin. */
     memset(s->ar, 0, sizeof(s->ar));
-    s->ar[0] = 0xFF75;  /* local osmocom */
+    s->ar[0] = 0xFF75;  /* dump local historique (neutre, rechargé avant usage) */
     s->ar[1] = 0x005F;
     s->ar[2] = 0x0813;  /* API_RAM-related — clobber IMR si =0 (cf 2026-05-25) */
     s->ar[3] = 0x0014;
     s->ar[4] = 0x0003;
     s->ar[5] = 0x0014;
-    s->t = 0; s->trn = 0;
+    s->t = 0; s->trn = 0;   /* TRN=0 (snapshot 0xff75, neutre au reset) */
     s->sp = 0x1100; s->bk = 0xFFF6;  /* SP+BK init aligned with silicon (2026-05-25).
                                  * 3 ROM dumps (3311/3416/3606) + local : SP=0x1100
                                  * post-bootloader-handshake. Let firmware repoint
@@ -11703,6 +11766,10 @@ void c54x_reset(C54xState *s)
                                  * la re-init firmware. Suspect d'être la racine
                                  * du clobber AR5↔SP overlap à mem[0x3fbe].
                                  * Voir doc/datasheets/README.md §3-4. */
+    /* BRC/RSA/REA = 0 (reset datasheet propre). Le snapshot capture des restes
+     * de RPTB mi-vol (BRC=0x8fd7 RSA=0xd9ec REA=0xbbef) = GARBAGE sans sens au
+     * reset ; appliqués seulement en mode bin. rptb_active=false (posé plus bas)
+     * → ces registres ne sont consultés qu'après qu'un RPTB les recharge. */
     s->brc = 0; s->rsa = 0; s->rea = 0;
     /* MMR reset values aligned with Calypso silicon (3 FreeCalypso ROM dumps + local).
      * Empirically validated 2026-04-28. See doc/datasheets/README.md §3.
@@ -11719,40 +11786,81 @@ void c54x_reset(C54xState *s)
                                                     * → flags dispatcher pas écrits → DSP
                                                     * boucle indéfiniment en df9x (= bloqueur
                                                     * #2 chain FBSB). Fix 2026-05-25. */
-    s->ifr = 0;
+    s->ifr = 0;        /* IFR=0 (reset datasheet propre). Le snapshot a 0x0008
+                        * (bit3 INT3 pending) ; appliqué seulement en mode bin.
+                        * Neutre de toute façon : INTM=1 (ST1=0x2900) masque l'IT. */
     s->xpc = 0;
-    /* dsp-registers override : when calypso_dsp.Registers.bin was loaded
-     * (default via run.sh), apply its MMR snapshot on top of the silicon
-     * hardcode above so the .bin is the authoritative reset state. This is
-     * the "load the registers like the other ROM blobs" path. Applied BEFORE
-     * the PC = IPTR*0x80 computation below so PMST/IPTR from the .bin drive
-     * the reset vector too. See the anti-drift audit table above. */
-    if (s->reg_init_valid) {
-        const uint16_t *r = s->reg_init;
-        s->imr  = r[0x00];
-        s->ifr  = r[0x01];
-        s->st0  = r[0x06];
-        s->st1  = r[0x07];
-        s->a    = ((int64_t)(r[0x0a] & 0xFF) << 32) |
-                  ((uint32_t)r[0x09] << 16) | r[0x08];
-        s->b    = ((int64_t)(r[0x0d] & 0xFF) << 32) |
-                  ((uint32_t)r[0x0c] << 16) | r[0x0b];
-        s->t    = r[0x0e];
-        s->trn  = r[0x0f];
-        for (int i = 0; i < 8; i++)
-            s->ar[i] = r[0x10 + i];
-        s->sp   = r[0x18];
-        s->bk   = r[0x19];
-        s->brc  = r[0x1a];
-        s->rsa  = r[0x1b];
-        s->rea  = r[0x1c];
-        s->pmst = r[0x1d];
-        /* XPC NOT overridden from the snapshot: it's a runtime program-page
-         * register. The post-reset vector fetch at IPTR*0x80 must come from
-         * page 0, so XPC stays at its silicon reset value (0, set above). */
-        C54_LOG("reset: dsp-registers override applied (SP=0x%04x PMST=0x%04x "
-                "ST0=0x%04x ST1=0x%04x IMR=0x%04x IFR=0x%04x AR0=0x%04x)",
-                s->sp, s->pmst, s->st0, s->st1, s->imr, s->ifr, s->ar[0]);
+    /* ===================== Sélecteur d'état reset registres =====================
+     * Trois modes, choisis par env CALYPSO_DSP_REG_MODE :
+     *   "c54x"   → hardcode C ci-dessus UNIQUEMENT (le .bin chargé est ignoré).
+     *   "bin"    → snapshot calypso_dsp.Registers.bin override TOUT (verbatim).
+     *   "hybrid" → snapshot bin POUR les registres opérationnels validés, MAIS
+     *              garde le hardcode pour les champs où le .bin est jugé faux
+     *              par l'audit anti-drift (cf table plus haut) :
+     *                IFR  : bin=0x0008 (IRQ pending résiduel) → hardcode 0
+     *                AR0  : bin=0x5aad (non validé)           → hardcode 0xFF75
+     *                BRC/RSA/REA : bin=garbage RPTB mi-vol     → hardcode 0
+     * Défaut : "bin" si un .bin est chargé (continuité avec le comportement
+     * câblé par run.sh), sinon forcément le hardcode (rien à overrider).
+     * Tous lus une fois (reset appelé 2× : boot + DSP_DL_STATUS_READY). */
+    {
+        static int reg_mode = -1;  /* 0=c54x 1=bin 2=hybrid */
+        if (reg_mode < 0) {
+            const char *e = getenv("CALYPSO_DSP_REG_MODE");
+            if      (e && !strcasecmp(e, "c54x"))   reg_mode = 0;
+            else if (e && !strcasecmp(e, "hybrid")) reg_mode = 2;
+            else                                    reg_mode = 1; /* "bin"/défaut */
+            C54_LOG("reset: CALYPSO_DSP_REG_MODE=%s → mode=%s",
+                    e ? e : "(unset)",
+                    reg_mode == 0 ? "c54x(hardcode)" :
+                    reg_mode == 2 ? "hybrid" : "bin");
+        }
+        if (s->reg_init_valid && reg_mode != 0) {
+            const uint16_t *r = s->reg_init;
+            /* Registres opérationnels — communs bin + hybrid */
+            s->imr  = r[0x00];
+            s->st0  = r[0x06];
+            s->st1  = r[0x07];
+            s->a    = ((int64_t)(r[0x0a] & 0xFF) << 32) |
+                      ((uint32_t)r[0x09] << 16) | r[0x08];
+            s->b    = ((int64_t)(r[0x0d] & 0xFF) << 32) |
+                      ((uint32_t)r[0x0c] << 16) | r[0x0b];
+            s->t    = r[0x0e];
+            s->trn  = r[0x0f];
+            for (int i = 1; i < 8; i++)   /* AR1..AR7 ; AR0 traité plus bas */
+                s->ar[i] = r[0x10 + i];
+            s->sp   = r[0x18];
+            s->bk   = r[0x19];
+            s->pmst = r[0x1d];
+            if (reg_mode == 1) {
+                /* bin pur : avale aussi les champs douteux/garbage du snapshot */
+                s->ifr   = r[0x01];   /* 0x0008 = INT3 pending résiduel */
+                s->ar[0] = r[0x10];   /* 0x5aad */
+                s->brc   = r[0x1a];   /* garbage RPTB */
+                s->rsa   = r[0x1b];
+                s->rea   = r[0x1c];
+            } else { /* reg_mode == 2 : hybrid → registres opérationnels du bin,
+                      * MAIS champs critiques forcés aux valeurs datasheet pures
+                      * (cf audit anti-drift) pour un reset propre. */
+                s->ifr   = 0x0000;   /* pas d'IRQ pending au reset */
+                s->ar[0] = 0xFF75;   /* ancienne valeur dump (AR0 rechargé avant usage) */
+                s->brc   = 0x0000;
+                s->rsa   = 0x0000;
+                s->rea   = 0x0000;
+            }
+            /* XPC jamais overridé (registre de page runtime ; le fetch vecteur
+             * reset à IPTR*0x80 doit venir de la page 0 → XPC=0 conservé). */
+            C54_LOG("reset: dsp-registers %s applied (SP=0x%04x PMST=0x%04x "
+                    "ST0=0x%04x ST1=0x%04x IMR=0x%04x IFR=0x%04x AR0=0x%04x "
+                    "BRC=0x%04x RSA=0x%04x REA=0x%04x)",
+                    reg_mode == 2 ? "HYBRID" : "BIN",
+                    s->sp, s->pmst, s->st0, s->st1, s->imr, s->ifr, s->ar[0],
+                    s->brc, s->rsa, s->rea);
+        } else {
+            C54_LOG("reset: registres = hardcode C (mode c54x ou pas de .bin) "
+                    "SP=0x%04x PMST=0x%04x IMR=0x%04x IFR=0x%04x AR0=0x%04x",
+                    s->sp, s->pmst, s->imr, s->ifr, s->ar[0]);
+        }
     }
     s->timer_psc = 0;
     s->data[TCR_ADDR] = TCR_TSS;  /* Timer stopped at reset (TSS=1) per HW spec */
