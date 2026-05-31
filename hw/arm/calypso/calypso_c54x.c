@@ -1623,6 +1623,32 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
+    /* PROBE 2026-05-31 frame-IT : valeur FIGÉE des flags polled + qui polle.
+     * La valeur lue (jamais changée) = ce que le BSP doit produire/toggler. */
+    if (addr == 0x006e || addr == 0x585f || addr == 0x8a44) {
+        static uint32_t fr_n = 0;
+        if (fr_n < 24) {
+            fprintf(stderr, "[c54x] FLAGRD data[0x%04x]=0x%04x PC=0x%04x A=0x%04x "
+                    "TC=%d insn=%u\n", addr, s->data[addr], s->pc,
+                    (uint16_t)(s->a & 0xFFFF), !!(s->st0 & ST0_TC), s->insn_count);
+            fr_n++;
+        }
+        /* one-shot : dump overlay de la loop 0x010b (hors dump ROM) + état IT
+         * (IFR/IMR/INTM) pendant le spin → tranche source-dead vs IMR-masqué
+         * vs INTM-collé (review c web). */
+        static int dumped_010b = 0;
+        if (addr == 0x006e && s->pc == 0x010b && !dumped_010b) {
+            dumped_010b = 1;
+            fprintf(stderr, "[c54x] SPIN-IT @0x010b IFR=0x%04x IMR=0x%04x INTM=%d "
+                    "(INT3 bit3 IFR=%d IMR=%d ; BRINT0 bit5 IFR=%d IMR=%d) insn=%u\n",
+                    s->ifr, s->imr, !!(s->st1 & ST1_INTM),
+                    !!(s->ifr&(1<<3)), !!(s->imr&(1<<3)),
+                    !!(s->ifr&(1<<5)), !!(s->imr&(1<<5)), s->insn_count);
+            fprintf(stderr, "[c54x] OVERLAY-DUMP prog[0x0100..0x0118] (loop poll 0x006e):\n");
+            for (uint16_t a = 0x0100; a <= 0x0118; a++)
+                fprintf(stderr, "[c54x]   prog[0x%04x]=0x%04x\n", a, prog_fetch(s, a));
+        }
+    }
     /* D_TASK_MD-RD probe : trace DSP reads of d_task_md (write page 0
      * @ data[0x0804], write page 1 @ data[0x0818]). The DSP dispatcher
      * reads task_md then branches to FB / SB / ALLC / etc. routines.
@@ -3358,9 +3384,9 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * (data[0x006e], data[0x585f]) ? Tranche (a) ISR-relocate vs (b) HW-write.
      * Si AUCUN write ou valeur jamais "attendue" → flag jamais posé = deadlock.
      * À RETIRER après diag. */
-    if (addr == 0x006e || addr == 0x585f) {
+    if (addr == 0x006e || addr == 0x585f || addr == 0x8a44) {
         static uint32_t fw_n = 0;
-        if (fw_n < 60) {
+        if (fw_n < 80) {
             fprintf(stderr, "[c54x] FLAGWR data[0x%04x] 0x%04x→0x%04x PC=0x%04x "
                     "INTM=%d insn=%u\n", addr, s->data[addr], val, s->pc,
                     !!(s->st1 & ST1_INTM), s->insn_count);
@@ -3437,6 +3463,19 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
         int nar = opcode & 0x07;
         int cur_arp = nar;
         uint16_t addr = s->ar[cur_arp];
+
+        /* PROBE 2026-05-31 convergence modes : 1er usage de chaque AR comme base
+         * d'adresse. Si la valeur == reset (AR0=0xff75/0x5aad, AR6=0/0xbae6,
+         * AR7=0/0x1e44) → read-before-write → reset load-bearing = driver de la
+         * divergence bin/c54x. À RETIRER. */
+        {
+            static uint8_t ar_used = 0;
+            if (!(ar_used & (1 << cur_arp))) {
+                ar_used |= (1 << cur_arp);
+                fprintf(stderr, "[c54x] AR-FIRSTUSE AR%d=0x%04x PC=0x%04x insn=%u\n",
+                        cur_arp, addr, s->pc, s->insn_count);
+            }
+        }
 
         /* AR2-FLOOR guard : le pointeur d'écriture corrélateur (AR2) peut
          * sous-déborder le buffer DARAM (0x0800) jusqu'à l'espace MMR
@@ -11768,7 +11807,12 @@ void c54x_reset(C54xState *s)
      * recharge avant usage, ex. LD @0x7120). Le snapshot a AR0=0x5aad,
      * AR6=0xbae6, AR7=0x1e44 → appliqués seulement en mode bin. */
     memset(s->ar, 0, sizeof(s->ar));
-    s->ar[0] = 0xFF75;  /* dump local historique (neutre, rechargé avant usage) */
+    s->ar[0] = 0x5AAD;  /* FIX 2026-05-31 : AR0 = valeur silicium (snapshot bin).
+                         * PROUVÉ read-before-write à insn=1 (PC=0xb410 ORM
+                         * data[*AR0]) via sonde AR-FIRSTUSE → AR0 reset est
+                         * load-bearing, l'ancien 0xFF75 (dump local, "neutre")
+                         * faisait diverger c54x vs bin dès la 1ʳᵉ instruction du
+                         * boot. Aligné sur le silicium → convergence des modes. */
     s->ar[1] = 0x005F;
     s->ar[2] = 0x0813;  /* API_RAM-related — clobber IMR si =0 (cf 2026-05-25) */
     s->ar[3] = 0x0014;
@@ -11851,17 +11895,24 @@ void c54x_reset(C54xState *s)
             s->bk   = r[0x19];
             s->pmst = r[0x1d];
             if (reg_mode == 1) {
-                /* bin pur : avale aussi les champs douteux/garbage du snapshot */
-                s->ifr   = r[0x01];   /* 0x0008 = INT3 pending résiduel */
-                s->ar[0] = r[0x10];   /* 0x5aad */
-                s->brc   = r[0x1a];   /* garbage RPTB */
-                s->rsa   = r[0x1b];
-                s->rea   = r[0x1c];
+                /* FIX 2026-05-31 : bin ne doit PLUS avaler le garbage RPTB du
+                 * snapshot. BRC/RSA/REA = restes d'une boucle RPTB capturée
+                 * mi-vol → invalides au reset → RPTB fantôme au boot → wedge
+                 * précoce 0x010b. Avec clean (=0), bin CONVERGE avec c54x
+                 * (progresse à 0xf17c, INTM=0). IFR aussi forcé 0 (cohérent).
+                 * Prouvé : c54x (RPTB propre) progresse, bin (garbage) wedge. */
+                s->ifr   = 0x0000;
+                s->ar[0] = r[0x10];   /* 0x5aad (silicium) */
+                s->brc   = 0x0000;
+                s->rsa   = 0x0000;
+                s->rea   = 0x0000;
             } else { /* reg_mode == 2 : hybrid → registres opérationnels du bin,
                       * MAIS champs critiques forcés aux valeurs datasheet pures
                       * (cf audit anti-drift) pour un reset propre. */
                 s->ifr   = 0x0000;   /* pas d'IRQ pending au reset */
-                s->ar[0] = 0xFF75;   /* ancienne valeur dump (AR0 rechargé avant usage) */
+                s->ar[0] = r[0x10];  /* FIX 2026-05-31 : AR0 = snapshot silicium
+                                      * (0x5aad), pas le hardcode 0xFF75 : prouvé
+                                      * read-before-write insn=1 → load-bearing. */
                 s->brc   = 0x0000;
                 s->rsa   = 0x0000;
                 s->rea   = 0x0000;
