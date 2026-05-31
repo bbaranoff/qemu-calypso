@@ -3611,6 +3611,42 @@ static uint16_t resolve_xmem(C54xState *s, uint16_t op)
 static uint16_t pc_ring[256];
 static int pc_ring_idx = 0;
 
+/* Évalue une condition C54x depuis l'octet bas de l'opcode, per binutils
+ * condition_codes[] (opcodes/tic54x-opc.c) : CC1=0x40 (test accu), CCB=0x08
+ * (accu B sinon A), test bits[2:0] = EQ=5 NEQ=4 LT=3 LEQ=7 GT=6 GEQ=2 ;
+ * AOV=0x70 ANOV=0x60 ; TC=0x30 NTC=0x20 ; C=0x0C NC=0x08 ; UNC=0x00.
+ * Identique à l'évaluation du handler RC/RCD (correcte). Remplace l'ancien
+ * décode (op>>4)&0xF des handlers CC/CCD qui lisait le MAUVAIS champ (seuls
+ * UNC/AEQ justes par coïncidence ; NEQ/LT/LEQ/GT/GEQ/TC/C faux) → mauvais
+ * call/no-call dans la power-scan 0xb1xx (CC[TC] f930) → push manquants →
+ * over-pop SP → orphelin 0x80fd @0x94f3 → self-CALA 0x70c3 (=28868).
+ * cf doc/SP_CATASTROPHE_70c4_SEQUENCE.md, vérifié sonde CC-MISMATCH. */
+static bool c54x_cond_true(C54xState *s, uint8_t cc)
+{
+    if (cc == 0x00) return true;                       /* UNC */
+    if (cc & 0x40) {                                   /* CC1 : test accu */
+        int64_t acc = (cc & 0x08) ? sext40(s->b) : sext40(s->a);
+        bool ov = (cc & 0x08) ? !!(s->st0 & (1 << 9))  /* OVB */
+                              : !!(s->st0 & (1 << 8));  /* OVA */
+        if ((cc & 0x70) == 0x70) return ov;            /* AOV/BOV  */
+        if ((cc & 0x70) == 0x60) return !ov;           /* ANOV/BNOV */
+        switch (cc & 0x07) {
+        case 0x05: return acc == 0;                    /* EQ  */
+        case 0x04: return acc != 0;                    /* NEQ */
+        case 0x03: return acc <  0;                    /* LT  */
+        case 0x07: return acc <= 0;                    /* LEQ */
+        case 0x06: return acc >  0;                    /* GT  */
+        case 0x02: return acc >= 0;                    /* GEQ */
+        default:   return true;
+        }
+    }
+    if ((cc & 0x30) == 0x30) return !!(s->st0 & ST0_TC);
+    if ((cc & 0x30) == 0x20) return  !(s->st0 & ST0_TC);
+    if ((cc & 0x0C) == 0x0C) return !!(s->st0 & ST0_C);
+    if ((cc & 0x0C) == 0x08) return  !(s->st0 & ST0_C);
+    return true;
+}
+
 static int c54x_exec_one(C54xState *s)
 {
     uint16_t op = prog_fetch(s, s->pc);
@@ -6329,24 +6365,11 @@ static int c54x_exec_one(C54xState *s)
                 s->pc  = op2;
                 return 0;
             }
-            uint8_t cond_code = (op >> 4) & 0xF;
-            uint8_t qual = op & 0xF;
-            bool take = false;
-            int64_t acc = (qual & 0x8) ? s->b : s->a;
-            switch (cond_code) {
-            case 0x0: take = true; break;
-            case 0x1: take = (acc < 0); break;
-            case 0x2: take = (acc <= 0); break;
-            case 0x3: take = (acc != 0); break;
-            case 0x4: take = (acc == 0); break;
-            case 0x5: take = (acc >= 0); break;
-            case 0x6: take = (acc > 0); break;
-            case 0x8: take = !!(s->st0 & ST0_TC); break;
-            case 0x9: take = !(s->st0 & ST0_TC); break;
-            case 0xA: take = !!(s->st0 & ST0_C); break;
-            case 0xB: take = !(s->st0 & ST0_C); break;
-            default: take = true; break;
-            }
+            /* FIX 2026-05-31 : cond décodée depuis l'octet bas (binutils
+             * condition_codes[]) via c54x_cond_true(). L'ancien (op>>4)&0xF
+             * lisait le mauvais champ → CC[TC/NEQ/LT/...] faux → push manquants
+             * power-scan 0xb1xx → over-pop → 0x80fd → self-CALA 0x70c3. */
+            bool take = c54x_cond_true(s, (uint8_t)(op & 0x7F));
             if (take) {
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 2));
@@ -6429,24 +6452,9 @@ static int c54x_exec_one(C54xState *s)
                 s->delay_slots = 2;
                 return consumed + s->lk_used;
             }
-            uint8_t cond_code = (op >> 4) & 0xF;
-            uint8_t qual = op & 0xF;
-            bool take = false;
-            int64_t acc = (qual & 0x8) ? s->b : s->a;
-            switch (cond_code) {
-            case 0x0: take = true; break;
-            case 0x1: take = (acc < 0); break;
-            case 0x2: take = (acc <= 0); break;
-            case 0x3: take = (acc != 0); break;
-            case 0x4: take = (acc == 0); break;
-            case 0x5: take = (acc >= 0); break;
-            case 0x6: take = (acc > 0); break;
-            case 0x8: take = !!(s->st0 & ST0_TC); break;
-            case 0x9: take = !(s->st0 & ST0_TC); break;
-            case 0xA: take = !!(s->st0 & ST0_C); break;
-            case 0xB: take = !(s->st0 & ST0_C); break;
-            default: take = true; break;
-            }
+            /* FIX 2026-05-31 : cond décodée depuis l'octet bas via
+             * c54x_cond_true() (cf CC ci-dessus). */
+            bool take = c54x_cond_true(s, (uint8_t)(op & 0x7F));
             if (take) {
                 s->sp--;
                 data_write(s, s->sp, (uint16_t)(s->pc + 4)); /* past CCD + 2 delay slots */
@@ -10989,6 +10997,40 @@ int c54x_run(C54xState *s, int n_insns)
                 }
             }
 
+            /* FULL-TRACE pile (review c web 2026-05-31) : ~226 events SP only
+             * jusqu'au fault → on logge CHAQUE push/pop et on apparie à l'œil.
+             * Le 1er RET/POPM sans push apparié = le bug, zéro spéculation.
+             * Classe lisible + net courant. Ring 1024, dump complet au fault. */
+            {
+                static struct { uint16_t pc, op; int16_t d; uint16_t sp;
+                                int32_t net; char cl[4]; } tr[1024];
+                static int trn = 0;
+                uint16_t mop = exec_op_rel;
+                const char *cl;
+                if (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
+                    ||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
+                    ||(mop&0xFF00)==0xF900||(mop&0xFF00)==0xFB00) cl="CAL";
+                else if (mop==0xF4E4||mop==0xF6E4||mop==0xF4E5||mop==0xF6E5) cl="RTF";
+                else if (mop==0xF4EB) cl="RTE";
+                else if (mop==0xF6EB) cl="RTD";
+                else if (mop==0xF49B||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00) cl="RTN";
+                else if ((mop&0xFF00)==0x4A00||(mop&0xFF00)==0x4B00) cl="PSH";
+                else if ((mop&0xFF00)==0x8A00||(mop&0xFF00)==0x8B00) cl="POP";
+                else cl="OTH";
+                if (trn < 1024) {
+                    tr[trn].pc=exec_pc; tr[trn].op=exec_op_rel; tr[trn].d=e->delta;
+                    tr[trn].sp=s->sp; tr[trn].net=(int32_t)g_sp_ledger.net_words;
+                    tr[trn].cl[0]=cl[0]; tr[trn].cl[1]=cl[1];
+                    tr[trn].cl[2]=cl[2]; tr[trn].cl[3]=0; trn++;
+                }
+                if (exec_pc == 0x94f3 && exec_op_rel == 0x8a06) {
+                    fprintf(stderr, "[c54x] FULL-TRACE pile (%d events, push=- pop=+):\n", trn);
+                    for (int i = 0; i < trn; i++)
+                        fprintf(stderr, "[c54x] %3d %s pc=0x%04x op=0x%04x d=%+d sp=0x%04x net=%+d\n",
+                                i, tr[i].cl, tr[i].pc, tr[i].op, tr[i].d, tr[i].sp, tr[i].net);
+                }
+            }
+
             /* PROBE 2026-05-31 (review c web) : POPM ST0 @0x94f3 à CHAQUE
              * passage. Tranche les 3 angles : (a) dérive SP RÉELLE vs artefact
              * — SP_read = registre lu en dur ; (b) cause vs symptôme — si dSP
@@ -11608,6 +11650,71 @@ int c54x_run(C54xState *s, int n_insns)
                 else                        s->delay_slots = 0;
                 if (s->delay_slots == 0)
                     s->pc = s->delayed_pc;
+            }
+        }
+
+        /* DISPATCHER 0x7700 RE-ENTRY PROBE (2026-05-31, tranche (a) vs (b)) :
+         * le drainer = POPM ST0 @0x7737 + RET @0x7738 rejoués sans l'entrée
+         * CALL 0x770a → PSHM ST0 @0x770d. (a) si A!=0 force BC@0x772f→0x7737
+         * chaque tour = compteur faux ; (b) si RET@0x7738 dépile vers le corps
+         * (≈0x771x) au lieu du caller = spin par désalignement. Compteurs +
+         * cible du RET + A au BC. PC final (post-countdown). À RETIRER. */
+        {
+            static uint32_t n770d=0, n770a=0, n7737=0, nbc=0, nret=0;
+            if (exec_pc == 0x770d) n770d++;
+            if (exec_pc == 0x770a) n770a++;
+            if (exec_pc == 0x7737) n7737++;
+            if (exec_pc == 0x772f && nbc < 16) {
+                fprintf(stderr, "[c54x] DISP-BC@772f #%u A=0x%05llx (lo=0x%04x) "
+                        "→PC=0x%04x %s insn=%u\n", nbc,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFull),
+                        (uint16_t)(s->a & 0xFFFF), s->pc,
+                        s->pc==0x7737?"PRIS(exit)":"fall",
+                        s->insn_count);
+                nbc++;
+            }
+            if (exec_pc == 0x7738 && nret < 16) {
+                fprintf(stderr, "[c54x] DISP-RET@7738 #%u →PC=0x%04x %s "
+                        "SP=0x%04x cnt{770a=%u 770d=%u 7737=%u} insn=%u\n",
+                        nret, s->pc,
+                        (s->pc & 0xFFF0)==0x7710||(s->pc&0xFFF0)==0x7720
+                          ? "RE-ENTRE-CORPS" : "→caller",
+                        s->sp, n770a, n770d, n7737, s->insn_count);
+                nret++;
+            }
+            /* ENTRÉE du dispatcher : transition depuis HORS [0x7700,0x773f]
+             * vers le prologue [0x7700,0x771c]. Montre le PC précédent (qui
+             * saute/appelle) et le point d'atterrissage exact — révèle si on
+             * saute 0x770d PSHM ST0. À RETIRER. */
+            {
+                static uint16_t dprev = 0, dprevop = 0; static uint32_t nent = 0;
+                /* Cible le CORPS [0x7711,0x771c] (pas le top 0x7700 = boucle
+                 * de boot), post-boot (insn>100). Montre QUI saute/appelle le
+                 * corps et avec quel SP — révèle BACC (pas de push) vs CALL. */
+                int in_body = (exec_pc >= 0x7711 && exec_pc <= 0x771c);
+                int prev_out = (dprev < 0x7700 || dprev > 0x773f);
+                if (in_body && prev_out && s->insn_count > 100 && nent < 20) {
+                    /* writer du slot de la continuation qu'on vient de dépiler
+                     * (le RET @prev a lu data[sp-1] puis sp++ → slot=sp-1).
+                     * = QUI a poussé 0x7712. pc=0 → jamais primé (stale). */
+                    uint16_t cslot = (uint16_t)(s->sp - 1);
+                    uint16_t cwpc = 0, cwop = 0;
+                    if (cslot >= 0x1000 && cslot < 0x2000) {
+                        cwpc = g_stkwr_pc[cslot - 0x1000];
+                        cwop = g_stkwr_op[cslot - 0x1000];
+                    }
+                    fprintf(stderr, "[c54x] DISP-ENTER #%u land=0x%04x op=0x%04x "
+                            "from prev=0x%04x (prevop=0x%04x) SP=0x%04x "
+                            "cont=0x%04x writer{pc=0x%04x op=0x%04x} "
+                            "queue[SP..+3]=%04x %04x %04x %04x insn=%u\n",
+                            nent, exec_pc, exec_op, dprev, dprevop, s->sp,
+                            cslot < 0x2000 ? s->data[cslot] : 0, cwpc, cwop,
+                            s->data[s->sp], s->data[(uint16_t)(s->sp+1)],
+                            s->data[(uint16_t)(s->sp+2)], s->data[(uint16_t)(s->sp+3)],
+                            s->insn_count);
+                    nent++;
+                }
+                dprev = exec_pc; dprevop = exec_op;
             }
         }
 
