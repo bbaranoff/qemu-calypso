@@ -1,4 +1,4 @@
-docker exec -i trying bash -c "cat > /tmp/efgh.gdb" <<'EOF'
+docker exec -i osmo-operator-1 bash -c "cat > /tmp/efgh.gdb" <<'EOF'
 set $n_q=0
 set $n_create=0
 set $n_nb=0

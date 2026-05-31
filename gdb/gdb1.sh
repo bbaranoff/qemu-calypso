@@ -1,4 +1,4 @@
-docker exec -i trying bash -c "cat > /tmp/mutate.gdb" <<'EOF'
+docker exec -i osmo-operator-1 bash -c "cat > /tmp/mutate.gdb" <<'EOF'
 set $rotate = 0
 
 # Rotation SI3 -> SI4 -> SI1 -> SI2 -> SI13 -> SI3 ...

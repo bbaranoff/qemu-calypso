@@ -76,6 +76,12 @@ static uint16_t prog_fetch(C54xState *s, uint16_t pc);
 /* Propagated by D_BURST_D probe, consumed by A_CD-BY-BURST correlation. */
 static uint16_t g_last_d_burst_d;
 
+/* PROBE 2026-05-31 (review c web) : dernier PC/op ayant écrit chaque slot de
+ * pile (zone 0x1000-0x1FFF). Nomme le PSHM qui a posé l'orphelin 0x80fd lu par
+ * POPM ST0 @0x94f3 → matching-frame vs frame étranger. À RETIRER. */
+static uint16_t g_stkwr_pc[0x1000];   /* index = addr - 0x1000 */
+static uint16_t g_stkwr_op[0x1000];
+
 /* === Generic watch-write zone helper (2026-05-15 matin) ===
  *
  * Factorisation du pattern COEFFS-WR / A_CD-WR / ... : pour chaque zone
@@ -2682,33 +2688,6 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
 
-    /* WR585F (CALYPSO_DEBUG=WR585F) : sonde dédiée écriture data[0x585f], le
-     * flag SARAM que le DSP poll en boucle à PC=0xf2cd (BITF bit7) — 30M+ reads
-     * tous à 0 dans le run 2026-05-31 (set=0 clear=30M) → handshake jamais levé,
-     * c'est le MUR amont du dispatcher de tâches (DISP-ENTRY/DET9AC0=0). Cette
-     * sonde dit QUI écrit le flag (PC+old→new), si le bit7 passe à 1, et quand.
-     *  - aucune ligne → le flag n'est JAMAIS écrit = source morte (ISR frame
-     *    non vectorisée / complétion DMA non signalée → cas 1/2)
-     *  - écrit mais bit7 reste 0 → mauvaise valeur posée (cas 3, bug opcode/route)
-     *  - bit7 1 puis 0 juste après → race/ordre (effacé avant le poll)
-     * Read-only sauf le log. Auto-active sous ALL (token sans tiret). */
-    if (addr == 0x585f && calypso_debug_enabled("WR585F")) {
-        static unsigned w585_n, w585_log;
-        uint16_t oldv = s->data[addr];
-        w585_n++;
-        int bit7_old = !!(oldv & 0x0080), bit7_new = !!(val & 0x0080);
-        if (w585_log < 300 || bit7_new || (bit7_old != bit7_new)) {
-            w585_log++;
-            fprintf(stderr,
-                "[c54x] WR585F #%u data[0x585f] 0x%04x->0x%04x bit7 %d->%d%s "
-                "PC=0x%04x XPC=%u DP=0x%03x INTM=%d insn=%u\n",
-                w585_n, oldv, val, bit7_old, bit7_new,
-                (bit7_new ? "  <-- FLAG LEVE !" : ""),
-                s->pc, s->xpc & 0xFF, (unsigned)(s->st0 & 0x1FF),
-                !!(s->st1 & ST1_INTM), (unsigned)s->insn_count);
-        }
-    }
-
     /* WATCH-WRITE on the same mailbox slots tracked in data_read.
      * Whoever writes them — DSP or ARM via api_ram alias — gets logged
      * so we can attribute the source of the value the firmware polls. */
@@ -3377,6 +3356,12 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             C54_LOG("DARAM write count: %d (last: [0x%04x]=0x%04x)", dw_total, addr, val);
     }
 
+    /* PROBE 2026-05-31 (review c web) : enregistre le writer des slots de pile. */
+    if (addr >= 0x1000 && addr < 0x2000) {
+        g_stkwr_pc[addr - 0x1000] = s->pc;
+        g_stkwr_op[addr - 0x1000] = prog_fetch(s, s->pc);
+    }
+
     s->data[addr] = val;
 }
 
@@ -3735,28 +3720,6 @@ static int c54x_exec_one(C54xState *s)
                 }
                 fprintf(stderr, "\n");
             }
-        }
-    }
-
-    /* DET9AC0 (CALYPSO_DEBUG=DET9AC0) : compteur du détecteur FCCH 0x9ac0,
-     * le trou non couvert par DISP-ENTRY (0x8341) ni CORRELATOR-TRACE
-     * ([0x8d00..0x9000)). Mémoire (project_session_..._detector_bootonly) :
-     * 0x9ac0 serait BOOT-ONLY (~42× au boot, jamais re-cadencé sur la vraie
-     * I/Q à +3s). Ce probe le TRANCHE structurellement : compte les hits,
-     * bucket boot (<5M insn) vs steady, logge AR3/AR4 (ptr buffer I/Q) +
-     * d_fb_mode (0x08f9, large=0/étroit=1) à chaque hit. Read-only, 1 PC,
-     * token sans tiret (parser-safe). */
-    if (s->pc == 0x9ac0 && calypso_debug_enabled("DET9AC0")) {
-        static unsigned n9, n9_boot, n9_steady, log9;
-        n9++;
-        if (s->insn_count < 5000000) n9_boot++; else n9_steady++;
-        if (log9 < 200 || (n9 % 1000) == 0) {
-            log9++;
-            fprintf(stderr,
-                "[c54x] DET9AC0 hit #%u (boot=%u steady=%u) AR3=0x%04x "
-                "AR4=0x%04x d_fb_mode=0x%04x DP=0x%03x insn=%u\n",
-                n9, n9_boot, n9_steady, s->ar[3], s->ar[4],
-                s->data[0x08f9], (unsigned)(s->st0 & 0x1FF), s->insn_count);
         }
     }
 
@@ -6844,26 +6807,24 @@ static int c54x_exec_one(C54xState *s)
             return consumed + s->lk_used;
         }
         if (hi8 == 0xEE) {
-            /* EExx: BCD pmad, cond (conditional delayed branch, 2 words) */
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint8_t cond = op & 0xFF;
-            bool take = false;
-            if (cond == 0x03) take = (s->a == 0);
-            else if (cond == 0x0B) take = (s->b == 0);
-            else if (cond == 0x02) take = (s->a != 0);
-            else if (cond == 0x0A) take = (s->b != 0);
-            else if (cond == 0x00) take = true;  /* UNC */
-            else if (cond == 0x08) take = (s->b < 0);
-            else if (cond == 0x04) take = (s->a > 0);
-            else if (cond == 0x0C) take = (s->b > 0);
-            else if (cond == 0x40) take = (s->st0 & ST0_TC) != 0;
-            else if (cond == 0x41) take = !(s->st0 & ST0_TC);
-            else if (cond == 0x20) take = (s->st0 & ST0_C) != 0;
-            else if (cond == 0x21) take = !(s->st0 & ST0_C);
-            else if ((cond & 0x3A) == 0x3A) take = true; /* unconditional-ish */
-            else take = true;
-            if (take) { s->pc = op2; return 0; }
+            /* FRAME #k8 — stack-frame pointer adjust : SP = SP + sign_ext(k8).
+             * Per tic54x-opc.c { "frame", 1,1,1, 0xEE00, 0xFF00, {OP_k8} }
+             * = 1 MOT, et SPRU172C §4 (FRAME adjusts SP by a signed 8-bit imm).
+             * FRAME -N alloue le cadre (SP descend) ; FRAME +N le libère.
+             *
+             * BUG FIX 2026-05-31 : ce handler décodait 0xEExx en "BCD pmad,cond"
+             * (branche conditionnelle différée 2-MOTS) — FAUX sur les 2 plans :
+             *   (1) longueur : 1 mot, pas 2 → désync de tout l'aval
+             *   (2) sémantique : SP+=k8, pas une branche
+             * BCD n'existe même pas en 0xEE (le vrai bc=0xF8, cc=0xF9, bcd=0xFA).
+             * 124 sites 0xEExx en PROM0, dont le chemin de boot (paires
+             * FRAME #-1/#+1 = prologue/épilogue). Le SP jamais ajusté → over-pop
+             * (SP-EVENTS pops>pushes) → POPM ST0 @0x94f3 ramasse l'orphelin
+             * 0x80fd → DP=0x0fd → dispatcher LUT garbage → self-CALA 0x70c3 →
+             * écrit 0x70c4 (=28868) dans d_fb_det/a_pm → rxlev/TOA poison.
+             * cf doc/SP_CATASTROPHE_70c4_SEQUENCE.md. */
+            int8_t k = (int8_t)(op & 0xFF);
+            s->sp = (uint16_t)(s->sp + k);
             return consumed + s->lk_used;
         }
         if ((op & 0xFFE0) == 0xED00) {
@@ -9751,7 +9712,19 @@ int c54x_run(C54xState *s, int n_insns)
          * n'est PAS la queue du boot-init = issue steady-state SÉPARÉE. Acquis :
          * l'over-pop était 100% un artefact de SP=0x1100 (F@0x76f8 tourne propre
          * depuis 0x5AC8, no wedge). On revient au redirect 0x7120 committé. */
-        if (s->pc == 0xFF80 && s->sp == 0x1100) {
+        /* === REDIRECT NEUTRALISÉ PAR DÉFAUT (2026-05-31) ===================
+         * Ce bloc MODÉLISE un mask-ROM TI absent du dump = un HACK (simulation).
+         * Méthode user : NE RIEN simuler. On laisse le vrai reset vector jouer
+         * (0xff80 = FB 0xb410 = vrai reset handler firmware) et on débugge
+         * CHAQUE bug réel de la chaîne de boot avec les valeurs qu'elle produit.
+         * Le redirect est conservé derrière CALYPSO_REDIR_LEGACY=1 UNIQUEMENT
+         * pour comparaison A/B ; OFF par défaut. Premier bug réel attendu sans
+         * lui (cf ancien commentaire) : à 0xb410 le CC saute le STM #0x5AC8,SP
+         * → SP reste 0x1100 → over-pop. C'est CE bug qu'on trace, pas qu'on
+         * contourne. */
+        static int redir_legacy = -1;
+        if (redir_legacy < 0) redir_legacy = getenv("CALYPSO_REDIR_LEGACY") ? 1 : 0;
+        if (redir_legacy && s->pc == 0xFF80 && s->sp == 0x1100) {
             static int redirect_log;
             /* EXPÉRIENCE CALYPSO_REDIR7000 (2026-05-30) : le redirect→0x7120 saute
              * l'init qui peuple les tables BACC-A (data[0x4c5b]/0x3fe1) → A=0 →
@@ -10929,6 +10902,11 @@ int c54x_run(C54xState *s, int n_insns)
             g_disp_lut_val = s->data[g_disp_lut_ea];
         }
         uint16_t sp_before_exec = s->sp;
+        uint16_t ds_before = s->delay_slots;  /* delay-slot word-count fix 2026-05-31 */
+        /* op FIABLE capturé AVANT exec (s->pc/xpc encore au bon banc) — review
+         * c web : e->op=prog_fetch ré-lit APRÈS exec et ment ≥0x8000 si FRET/RETE
+         * a changé XPC. exec_op_rel sert la classif CALL/RET du matcher. */
+        uint16_t exec_op_rel = prog_fetch(s, s->pc);
         consumed = c54x_exec_one(s);
         /* SP-event ring : enregistre tout changement de SP (push/pop) avec
          * le PC/op responsable. Sert le dump BLACKHOLE-CALA. */
@@ -10941,6 +10919,110 @@ int c54x_run(C54xState *s, int n_insns)
             g_sp_ledger.net_words += (int16_t)(sp_before_exec - s->sp);
             if ((int16_t)(s->sp - sp_before_exec) < 0) g_sp_ledger.sp_pushes++;
             else g_sp_ledger.sp_pops++;
+
+            /* PROBE 2026-05-31 : chaque NOUVEAU minimum de net_words = un cran
+             * d'over-pop RÉEL (IRQ pushe +2 → net_words monte → ne déclenche
+             * pas ; seuls les pops non-appariés font descendre). Nomme l'opcode
+             * qui draine SP vers le self-CALA 0x70c3. À RETIRER après diag. */
+            {
+                static int64_t netmin = 0;
+                static uint32_t netmin_n = 0;
+                if (g_sp_ledger.net_words < netmin && netmin_n < 80) {
+                    fprintf(stderr,
+                        "[c54x] NET-MIN #%u net_words=%lld pc=0x%04x op=0x%04x "
+                        "delta=%+d SP=0x%04x insn=%u\n",
+                        netmin_n, (long long)g_sp_ledger.net_words,
+                        exec_pc, e->op, e->delta, s->sp, s->insn_count);
+                    netmin = g_sp_ledger.net_words;
+                    netmin_n++;
+                }
+            }
+
+            /* MATCHER call/return (review c web 2026-05-31) : apparie
+             * CALL-family ↔ RET-family (returns uniquement, hors PSHM/POPM).
+             * Classif via exec_op_rel (FIABLE, pas e->op qui ment ≥0x8000).
+             * Au fault 0x94f3, dump les CALL non-retournés = frames orphelines.
+             * Le 1er orphan ≥0x8000 = le RET mal émulé au banc XPC. À RETIRER. */
+            {
+                static struct { uint16_t ret, pc, sp; uint8_t xpc; } cm[512];
+                static int cmtop = 0;
+                uint16_t mop = exec_op_rel;
+                int is_call = (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
+                               ||mop==0xF4E7||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
+                               ||(mop&0xFF00)==0xF900);
+                int is_ret  = (mop==0xFC00||mop==0xFE00||mop==0xF4EB||mop==0xF4E4
+                               ||mop==0xF6EB||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00);
+                if (e->delta < 0 && is_call) {
+                    if (cmtop < 512) {
+                        cm[cmtop].ret = s->data[s->sp]; cm[cmtop].pc = exec_pc;
+                        cm[cmtop].sp = s->sp; cm[cmtop].xpc = (uint8_t)s->xpc; cmtop++;
+                    }
+                } else if (e->delta > 0 && is_ret) {
+                    if (cmtop > 0) cmtop--;
+                }
+                if (exec_pc == 0x94f3 && exec_op_rel == 0x8a06) {
+                    fprintf(stderr, "[c54x] CALLMATCH fault insn=%u profondeur=%d "
+                            "(CALL non-retournés, récents→anciens):\n",
+                            s->insn_count, cmtop);
+                    for (int k = cmtop - 1; k >= 0 && k >= cmtop - 16; k--)
+                        fprintf(stderr, "[c54x]   orphan[%d] call_pc=0x%04x ret=0x%04x "
+                                "sp=0x%04x xpc=%u%s\n", k, cm[k].pc, cm[k].ret,
+                                cm[k].sp, cm[k].xpc,
+                                cm[k].pc >= 0x8000 ? "  <<< banc HAUT" : "");
+                }
+            }
+
+            /* PROBE 2026-05-31 (review c web) : POPM ST0 @0x94f3 à CHAQUE
+             * passage. Tranche les 3 angles : (a) dérive SP RÉELLE vs artefact
+             * — SP_read = registre lu en dur ; (b) cause vs symptôme — si dSP
+             * croît passage-après-passage et le pop devient 0x80fd quand dSP a
+             * dérivé = drift cause ; si SP stable et 0x80fd surgit = événement
+             * unique ; (c) provenance — voisinage pile brut s->data[]. POPM lit
+             * data[sp] puis sp++ → slot = sp_before_exec. À RETIRER. */
+            if (exec_pc == 0x94f3 && e->op == 0x8a06) {
+                static uint16_t base94 = 0; static int first94 = 1;
+                static uint32_t n94 = 0;
+                uint16_t slot = sp_before_exec;
+                if (first94) { base94 = slot; first94 = 0; }
+                uint16_t wpc = 0, wop = 0;
+                if (slot >= 0x1000 && slot < 0x2000) {
+                    wpc = g_stkwr_pc[slot - 0x1000];
+                    wop = g_stkwr_op[slot - 0x1000];
+                }
+                if (n94 < 80) {
+                    fprintf(stderr,
+                        "[c54x] POPM94F3 #%u insn=%u SP_read=0x%04x dSP=%+d "
+                        "ST0_pop=0x%04x DP=0x%03x stk[-1..+1]=%04x %04x %04x "
+                        "writer{pc=0x%04x op=0x%04x}\n",
+                        n94, s->insn_count, slot, (int)(int16_t)(slot - base94),
+                        s->st0, dp(s),
+                        s->data[(uint16_t)(slot - 1)], s->data[slot],
+                        s->data[(uint16_t)(slot + 1)], wpc, wop);
+                    /* Fenêtre de pile complète + writer de chaque slot : montre
+                     * la structure de frame (RET-addr=CALL vs ST0/ST1=PSHM) et
+                     * OÙ le frame casse (push manquant / pop en trop). */
+                    for (int k = -4; k <= 7; k++) {
+                        uint16_t a = (uint16_t)(slot + k);
+                        uint16_t pc_w = 0, op_w = 0;
+                        if (a >= 0x1000 && a < 0x2000) {
+                            pc_w = g_stkwr_pc[a - 0x1000];
+                            op_w = g_stkwr_op[a - 0x1000];
+                        }
+                        const char *what = ((op_w & 0xFF00) == 0x4A00 ||
+                                            (op_w & 0xFF00) == 0x4B00) ? "PSHM" :
+                                           (op_w == 0xf074 || op_w == 0xf274 ||
+                                            op_w == 0xf4e3 || op_w == 0xf6e3 ||
+                                            (op_w & 0xFF80) == 0xf980 ||
+                                            (op_w & 0xFF80) == 0xfb80) ? "CALL" :
+                                           (op_w == 0xc000 || op_w == 0xc400) ? "PSHD" : "?";
+                        fprintf(stderr,
+                            "[c54x]   stk[0x%04x]=%04x  writer{pc=0x%04x op=0x%04x %s}%s\n",
+                            a, s->data[a], pc_w, op_w, what,
+                            a == slot ? "  <-- POPM ST0 lit ICI" : "");
+                    }
+                    n94++;
+                }
+            }
 
             /* === SHADOW STACK : appariement push/pop (gate ORPHAN) ===
              * Nomme LE return orphelin (over-pop), pas les 15 victimes 0xc8be. */
@@ -11427,6 +11509,32 @@ int c54x_run(C54xState *s, int n_insns)
         s->last_exec_pc = exec_pc;
         s->last_exec_op = exec_op;
 
+        /* PROBE 2026-05-31 : ORIGINE du self-CALA 0x70c3 (=28868).
+         * Capte le moment où A entre dans [0x7000,0x70ff] — c'est le LD du
+         * dispatcher qui lit la LUT à (DP<<7|0x07)<<1 et charge A=garbage.
+         * Loggue le PC dispatcher, le DP utilisé (attendu 0x124, KO si 0x086/87),
+         * l'addr LUT, SP, et le DERNIER setter de DP (= le coupable qui a posé
+         * le mauvais DP, ou l'over-pop qui l'a hérité). À RETIRER après diag. */
+        {
+            static uint16_t acala_prevdp = 0xFFFF, acala_ldp_pc = 0, acala_ldp_val = 0;
+            static uint16_t acala_prevA = 0;
+            static uint32_t acala_n = 0;
+            if (dp(s) != acala_prevdp) {
+                acala_ldp_pc = exec_pc; acala_ldp_val = dp(s); acala_prevdp = dp(s);
+            }
+            uint16_t acala_aLo = (uint16_t)(s->a & 0xFFFF);
+            if (acala_aLo == 0x70c3 &&
+                acala_aLo != acala_prevA && acala_n < 30) {
+                fprintf(stderr, "[c54x] ACALA-ORIG #%u A=0x%04x exec_pc=0x%04x op=0x%04x "
+                        "DP=0x%03x lut=0x%04x SP=0x%04x lastDP{pc=0x%04x val=0x%03x} insn=%u\n",
+                        acala_n, acala_aLo, exec_pc, exec_op, dp(s),
+                        (uint16_t)(((dp(s) << 7) | 0x07) << 1), s->sp,
+                        acala_ldp_pc, acala_ldp_val, s->insn_count);
+                acala_n++;
+            }
+            acala_prevA = acala_aLo;
+        }
+
         /* RPT: after executing an instruction while repeat is active,
          * re-execute the SAME instruction (don't advance PC) until count=0. */
         if (s->rpt_active && !s->idle) {
@@ -11458,10 +11566,31 @@ int c54x_run(C54xState *s, int n_insns)
          * delay_slots = 2. The two instructions following the RCD execute
          * as normal pipeline slots; once both have completed the branch
          * commits by forcing PC to delayed_pc. */
+        /* Delay-slot countdown — compté en MOTS, pas en instructions.
+         * BUG FIX 2026-05-31 : l'ancien code décrémentait dès l'itération qui
+         * arme delay_slots=2, PUIS d'1 par instruction → une SEULE instruction
+         * de delay-slot exécutée. OK pour un slot = 1 insn 2-mots (STM #k), mais
+         * pour un slot = DEUX insns 1-mot, la 2e était SAUTÉE. Quand cette 2e
+         * insn est un PSHM/PSHD (sites PROM0 0xb53a/0xc9a2/0xcaab = code
+         * power-scan que le mobile exécute en cell-search), le push est perdu →
+         * over-pop cumulé (~58 mots) → POPM ST0 @0x94f3 ramasse l'orphelin
+         * 0x80fd → DP=0x0fd → dispatcher 0x8341 lit la LUT garbage → CALAD
+         * 0x70c3 = self-CALA → écrit 0x70c4 (=28868) dans d_fb_det/a_pm →
+         * rxlev/TOA poison → NO_CELL_FOUND. cf doc/SP_CATASTROPHE_70c4_SEQUENCE.
+         * Le C54x a TOUJOURS 2 mots de delay (SPRU172C) : 1 insn 2-mots OU 2
+         * insns 1-mot. On décrémente du nombre de MOTS exécutés (= consumed), et
+         * on NE compte PAS l'itération qui arme (ds_before==0 = la branche
+         * elle-même ; le delay commence à l'instruction suivante). */
         if (s->delay_slots > 0) {
-            s->delay_slots--;
-            if (s->delay_slots == 0) {
-                s->pc = s->delayed_pc;
+            if (ds_before == 0) {
+                /* itération de la branche différée elle-même : ne rien
+                 * décrémenter ; delay_slots (=2) est un compteur de MOTS. */
+            } else {
+                int wexec = (consumed > 0) ? consumed : 1;
+                if (s->delay_slots > wexec) s->delay_slots -= wexec;
+                else                        s->delay_slots = 0;
+                if (s->delay_slots == 0)
+                    s->pc = s->delayed_pc;
             }
         }
 
@@ -11501,7 +11630,7 @@ int c54x_run(C54xState *s, int n_insns)
 
         /* SP-LEDGER : dump périodique pour valider net_words→0 sur run long
          * (métrique de balance push/pop post-yield-fix). ~1 compare/insn. */
-        if (s->insn_count - g_sp_ledger.last_dump_insn >= 20000000u) {
+        if (s->insn_count - g_sp_ledger.last_dump_insn >= 250000u) {
             g_sp_ledger.last_dump_insn = s->insn_count;
             fprintf(stderr,
                 "[c54x] SP-LEDGER insn=%u SP=0x%04x net_words=%lld pushes=%llu pops=%llu irq=%llu\n",

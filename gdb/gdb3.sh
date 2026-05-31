@@ -1,4 +1,4 @@
-docker exec -i trying bash -c "cat > /tmp/mutate_agch.gdb" <<'EOF'
+docker exec -i osmo-operator-1 bash -c "cat > /tmp/mutate_agch.gdb" <<'EOF'
 set $rotate = 0
 
 # Payload IMMEDIATE ASSIGNMENT minimal (23 octets) :
