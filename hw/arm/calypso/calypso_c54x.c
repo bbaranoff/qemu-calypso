@@ -10938,37 +10938,54 @@ int c54x_run(C54xState *s, int n_insns)
                 }
             }
 
-            /* MATCHER call/return (review c web 2026-05-31) : apparie
-             * CALL-family ↔ RET-family (returns uniquement, hors PSHM/POPM).
-             * Classif via exec_op_rel (FIABLE, pas e->op qui ment ≥0x8000).
-             * Au fault 0x94f3, dump les CALL non-retournés = frames orphelines.
-             * Le 1er orphan ≥0x8000 = le RET mal émulé au banc XPC. À RETIRER. */
+            /* LEDGER PAR CLASSE D'OPCODE (review c web 2026-05-31) : accumule
+             * mots POUSSÉS vs POPÉS par classe. Le drift net_words=-59 = une
+             * classe de RETOUR qui pope plus de mots que sa classe d'APPEL n'en
+             * pousse (largeur near/far désappariée). Classif via exec_op_rel
+             * (FIABLE, pas e->op qui ment ≥0x8000). Au fault 0x94f3 + tous les
+             * 250k, dump le bilan par classe. La classe au pop>>push = coupable.
+             * NB : l'entrée IT (c54x_interrupt_ex) pousse +2 HORS de ce
+             * chokepoint → RETE/RETED/RET_far apparaîtront en pop "non-apparié"
+             * ici = normal (leur push est l'IT). À RETIRER après diag. */
             {
-                static struct { uint16_t ret, pc, sp; uint8_t xpc; } cm[512];
-                static int cmtop = 0;
+                enum { K_CALL, K_RETN, K_RETF, K_RETE, K_RETED,
+                       K_PSHM, K_POPM, K_OTHER, K_NCLS };
+                static const char *knm[K_NCLS] = {
+                    "CALL","RET_near","RET_far","RETE","RETED",
+                    "PSHM","POPM","OTHER" };
+                static uint64_t kpush[K_NCLS], kpop[K_NCLS], kcnt[K_NCLS];
                 uint16_t mop = exec_op_rel;
-                int is_call = (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
-                               ||mop==0xF4E7||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
-                               ||(mop&0xFF00)==0xF900);
-                int is_ret  = (mop==0xFC00||mop==0xFE00||mop==0xF4EB||mop==0xF4E4
-                               ||mop==0xF6EB||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00);
-                if (e->delta < 0 && is_call) {
-                    if (cmtop < 512) {
-                        cm[cmtop].ret = s->data[s->sp]; cm[cmtop].pc = exec_pc;
-                        cm[cmtop].sp = s->sp; cm[cmtop].xpc = (uint8_t)s->xpc; cmtop++;
+                int kc;
+                if (mop==0xF074||mop==0xF274||mop==0xF4E3||mop==0xF6E3
+                    ||(mop&0xFF80)==0xF980||(mop&0xFF80)==0xFB80
+                    ||(mop&0xFF00)==0xF900||(mop&0xFF00)==0xFB00) kc=K_CALL;
+                else if (mop==0xF4E4||mop==0xF6E4||mop==0xF4E5||mop==0xF6E5) kc=K_RETF;
+                else if (mop==0xF4EB) kc=K_RETE;
+                else if (mop==0xF6EB) kc=K_RETED;
+                else if (mop==0xF49B||(mop&0xFF00)==0xFC00||(mop&0xFF00)==0xFE00) kc=K_RETN;
+                else if ((mop&0xFF00)==0x4A00||(mop&0xFF00)==0x4B00) kc=K_PSHM;
+                else if ((mop&0xFF00)==0x8A00||(mop&0xFF00)==0x8B00) kc=K_POPM;
+                else kc=K_OTHER;
+                if (e->delta < 0) kpush[kc] += (uint64_t)(-e->delta);
+                else              kpop[kc]  += (uint64_t)e->delta;
+                kcnt[kc]++;
+
+                static uint32_t lastdmp = 0;
+                int at_fault = (exec_pc == 0x94f3 && exec_op_rel == 0x8a06);
+                if (at_fault || s->insn_count - lastdmp >= 250000u) {
+                    lastdmp = s->insn_count;
+                    fprintf(stderr, "[c54x] CLASS-LEDGER insn=%u net_words=%lld%s\n",
+                            s->insn_count, (long long)g_sp_ledger.net_words,
+                            at_fault ? "  <<< AU FAULT 0x94f3" : "");
+                    for (int i = 0; i < K_NCLS; i++) {
+                        if (!kcnt[i]) continue;
+                        fprintf(stderr,
+                            "[c54x]   %-9s push=%-9llu pop=%-9llu net=%+lld  n=%llu\n",
+                            knm[i], (unsigned long long)kpush[i],
+                            (unsigned long long)kpop[i],
+                            (long long)((int64_t)kpush[i] - (int64_t)kpop[i]),
+                            (unsigned long long)kcnt[i]);
                     }
-                } else if (e->delta > 0 && is_ret) {
-                    if (cmtop > 0) cmtop--;
-                }
-                if (exec_pc == 0x94f3 && exec_op_rel == 0x8a06) {
-                    fprintf(stderr, "[c54x] CALLMATCH fault insn=%u profondeur=%d "
-                            "(CALL non-retournés, récents→anciens):\n",
-                            s->insn_count, cmtop);
-                    for (int k = cmtop - 1; k >= 0 && k >= cmtop - 16; k--)
-                        fprintf(stderr, "[c54x]   orphan[%d] call_pc=0x%04x ret=0x%04x "
-                                "sp=0x%04x xpc=%u%s\n", k, cm[k].pc, cm[k].ret,
-                                cm[k].sp, cm[k].xpc,
-                                cm[k].pc >= 0x8000 ? "  <<< banc HAUT" : "");
                 }
             }
 
