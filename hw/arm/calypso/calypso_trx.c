@@ -1529,6 +1529,7 @@ static const char *g_section_prom2;
 static const char *g_section_prom3;
 static const char *g_section_drom;
 static const char *g_section_pdrom;
+static const char *g_section_registers;
 
 void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
                                    const char *prom2, const char *prom3,
@@ -1540,6 +1541,11 @@ void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
     g_section_prom3 = prom3;
     g_section_drom  = drom;
     g_section_pdrom = pdrom;
+}
+
+void calypso_trx_set_registers_path(const char *registers)
+{
+    g_section_registers = registers;
 }
 
 /* ---- Init ---- */
@@ -1651,6 +1657,11 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
                     "prog[0x1ffcc]=0x%04x prog[0x2ffcc]=0x%04x\n",
                     s->dsp->data[0x0ffcc], s->dsp->prog[0x0ffcc],
                     s->dsp->prog[0x1ffcc], s->dsp->prog[0x2ffcc]);
+            /* Register snapshot: load into reg_init[] BEFORE reset so
+             * c54x_reset() applies it as the authoritative MMR reset state
+             * (like the ROM sections above, but for the register file). */
+            if (g_section_registers)
+                c54x_load_registers(s->dsp, g_section_registers);
             c54x_reset(s->dsp);
             calypso_bsp_init(s->dsp);
         }

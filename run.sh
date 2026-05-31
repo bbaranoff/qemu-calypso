@@ -1467,6 +1467,10 @@ fi
 #   CALYPSO_DSP_PROM3=path  → prog[0x38000..] (8K)
 #   CALYPSO_DSP_DROM=path   → data[0x09000..] (20K)
 #   CALYPSO_DSP_PDROM=path  → data[0x0E000..] (8K)
+#   CALYPSO_DSP_REGISTERS=path → MMR reset snapshot (words 0x00..0x1F): IMR,
+#                                IFR, ST0/ST1, T, TRN, AR0-7, SP, BK, BRC,
+#                                RSA, REA, PMST. Auto-detected as
+#                                <base>.Registers.bin. Empty = use C hardcode.
 #
 # Per-section bins are produced by dsp_txt2bin.py from a legacy calypso_dsp.txt :
 #   python3 dsp_txt2bin.py calypso_dsp.txt calypso_dsp.bin
@@ -1501,7 +1505,8 @@ if [ -n "${CALYPSO_DSP_BLOB:-}" ]; then
     CALYPSO_DSP_PROM3=""
     CALYPSO_DSP_DROM=""
     CALYPSO_DSP_PDROM=""
-    echo "[run.sh] CALYPSO_DSP_BLOB=$CALYPSO_DSP_BLOB → all dsp-prom*/drom/pdrom force-disabled (blob is sole DSP code source)"
+    CALYPSO_DSP_REGISTERS=""
+    echo "[run.sh] CALYPSO_DSP_BLOB=$CALYPSO_DSP_BLOB → all dsp-prom*/drom/pdrom/registers force-disabled (blob is sole DSP code source)"
 fi
 
 # DSP txt source → auto-split to per-section .bins on demand.
@@ -1541,6 +1546,9 @@ fi
 [ -z "${CALYPSO_DSP_PROM3+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM3.bin" ] && CALYPSO_DSP_PROM3="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PROM3.bin"
 [ -z "${CALYPSO_DSP_DROM+x}"  ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"  ] && CALYPSO_DSP_DROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.DROM.bin"
 [ -z "${CALYPSO_DSP_PDROM+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin" ] && CALYPSO_DSP_PDROM="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.PDROM.bin"
+# Register snapshot (MMR reset state). Note the mixed-case ".Registers.bin"
+# filename produced by dsp_txt2bin.py (the section loop above uses uppercase).
+[ -z "${CALYPSO_DSP_REGISTERS+x}" ] && [ -r "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.Registers.bin" ] && CALYPSO_DSP_REGISTERS="${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.Registers.bin"
 unset _DSP_TXT_DIR _DSP_TXT_BASE
 
 # === L1-STUB ROM (opt-in CALYPSO_DSP_L1STUB=1) =========================
@@ -1597,7 +1605,7 @@ if [ -n "${CALYPSO_DSP_BLOB:-}" ]; then
     MACHINE_ARG="${MACHINE_ARG},dsp-blob=${CALYPSO_DSP_BLOB}"
     echo "[run.sh] CALYPSO_DSP_BLOB=$CALYPSO_DSP_BLOB (DARAM fixture)"
 fi
-for _sec in PROM0 PROM1 PROM2 PROM3 DROM PDROM; do
+for _sec in PROM0 PROM1 PROM2 PROM3 DROM PDROM REGISTERS; do
     _var="CALYPSO_DSP_${_sec}"
     _val="${!_var:-}"
     if [ -n "$_val" ]; then

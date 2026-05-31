@@ -107,6 +107,11 @@ C54xState *calypso_trx_get_dsp(void);
  * so trx_init can load each section at its silicon-correct DSP address
  * before c54x_reset() (PROM→DARAM auto-copy depends on prog[] populated).
  * Pass NULL for sections that should be left empty. */
+/* Set the optional DSP register-snapshot path (calypso_dsp.Registers.bin).
+ * Loaded into the C54x reg_init[] before c54x_reset() so the snapshot is the
+ * authoritative reset MMR state. NULL = no override (silicon hardcode used). */
+void calypso_trx_set_registers_path(const char *registers);
+
 void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
                                    const char *prom2, const char *prom3,
                                    const char *drom,  const char *pdrom);

@@ -153,6 +153,14 @@ typedef struct C54xState {
     uint16_t imr;
     uint16_t ifr;
 
+    /* Optional reset-state override loaded from calypso_dsp.Registers.bin via
+     * `-M calypso,dsp-registers=<path>` (default-wired by run.sh, like the
+     * other ROM sections). reg_init[i] = value for MMR index i (0x00..0x1F).
+     * When reg_init_valid, c54x_reset() applies these AFTER its silicon
+     * hardcode defaults, so the .bin snapshot is authoritative. */
+    uint16_t reg_init[0x20];
+    bool     reg_init_valid;
+
     /* Program counter */
     uint32_t pc;     /* 16-bit (or 23-bit with XPC) */
     uint16_t xpc;
@@ -283,5 +291,12 @@ int  c54x_load_blob_daram(C54xState *s, const char *path, uint16_t daram_addr);
  * Returns number of words loaded, or -1 on error. */
 int  c54x_load_section(C54xState *s, const char *path,
                        uint32_t start_addr, bool is_program);
+
+/* Load the DSP register snapshot (calypso_dsp.Registers.bin: raw LE 16-bit
+ * words, MMR page 0x00..0x1F first) into reg_init[] so c54x_reset() applies
+ * it as the reset state. Words >= 0x20 are written into data[] (low scratch).
+ * Used by the `-M calypso,dsp-registers=<path>` machine property.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_registers(C54xState *s, const char *path);
 
 #endif /* CALYPSO_C54X_H */

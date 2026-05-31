@@ -50,6 +50,7 @@ typedef struct CalypsoMachineState {
     char *dsp_prom3;         /* `-M calypso,dsp-prom3=<path>` → prog[0x38000+] */
     char *dsp_drom;          /* `-M calypso,dsp-drom=<path>`  → data[0x09000+] */
     char *dsp_pdrom;         /* `-M calypso,dsp-pdrom=<path>` → data[0x0E000+] */
+    char *dsp_registers;     /* `-M calypso,dsp-registers=<path>` → MMR reset snapshot */
 } CalypsoMachineState;
 
 #define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
@@ -95,6 +96,7 @@ static void calypso_machine_init(MachineState *machine)
     calypso_trx_set_section_paths(s->dsp_prom0, s->dsp_prom1,
                                   s->dsp_prom2, s->dsp_prom3,
                                   s->dsp_drom,  s->dsp_pdrom);
+    calypso_trx_set_registers_path(s->dsp_registers);
 
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_CALYPSO_SOC);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->soc), &err)) {
@@ -287,6 +289,7 @@ DEFINE_DSP_STR_PROP(dsp_prom2)
 DEFINE_DSP_STR_PROP(dsp_prom3)
 DEFINE_DSP_STR_PROP(dsp_drom)
 DEFINE_DSP_STR_PROP(dsp_pdrom)
+DEFINE_DSP_STR_PROP(dsp_registers)
 
 static void calypso_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -326,6 +329,9 @@ static void calypso_machine_class_init(ObjectClass *oc, void *data)
         "Path to DROM .bin → data[0x09000..0x0DFFF] (20K words max)");
     REG_DSP_SECTION("dsp-pdrom", dsp_pdrom,
         "Path to PDROM .bin → data[0x0E000..0x0FFFF] (8K words max)");
+    REG_DSP_SECTION("dsp-registers", dsp_registers,
+        "Path to Registers .bin (MMR snapshot, words 0x00..0x1F) → applied as "
+        "the DSP reset state (IMR/IFR/ST0/ST1/T/TRN/AR0-7/SP/BK/BRC/RSA/REA/PMST)");
 #undef REG_DSP_SECTION
 }
 

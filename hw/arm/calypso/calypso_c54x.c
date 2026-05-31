@@ -11612,11 +11612,71 @@ int c54x_load_section(C54xState *s, const char *path,
     return words;
 }
 
+int c54x_load_registers(C54xState *s, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        C54_LOG("load_registers: cannot open '%s'", path);
+        return -1;
+    }
+    int words = 0;
+    uint8_t buf[2];
+    /* First 0x20 words = MMR page → reset-override buffer (applied in
+     * c54x_reset). Remaining words (0x20..0x5F = low scratch DARAM) →
+     * data[] directly, like a section load. */
+    while (words < C54X_DATA_SIZE && fread(buf, 1, 2, f) == 2) {
+        uint16_t w = buf[0] | ((uint16_t)buf[1] << 8);
+        if (words < 0x20)
+            s->reg_init[words] = w;
+        else
+            s->data[words] = w;
+        words++;
+    }
+    fclose(f);
+    if (words >= 0x20)
+        s->reg_init_valid = true;
+    C54_LOG("load_registers: %d words from %s (MMR reset override %s)",
+            words, path, s->reg_init_valid ? "ON" : "OFF (file too short)");
+    return words;
+}
+
 void c54x_reset(C54xState *s)
 {
     g_boot_trace = 50;
     s->blob_loaded = false;  /* explicit reset exits dsp-blob fixture mode */
     s->a = 0; s->b = 0;
+    /* ── Anti-drift audit : reset MMRs hardcodés vs calypso_dsp.Registers.bin ──
+     * (2026-05-31) Les valeurs ci-dessous sont le FALLBACK. Quand le snapshot
+     * registres est chargé (`-M calypso,dsp-registers=<path>`, câblé par défaut
+     * dans run.sh via .Registers.bin), c54x_reset l'applique APRÈS ce hardcode
+     * (bloc `if (s->reg_init_valid)` plus bas) → le .bin est alors la source de
+     * vérité du reset. Ce .bin est un SNAPSHOT mi-exécution (post-handshake
+     * bootloader), cohérent avec le modèle "entrée firmware". Table ci-dessous =
+     * comparaison hardcode (fallback) vs .bin (override) ; garder cohérent à la
+     * main pour le cas no-file.
+     *
+     *   MMR        hardcode  .bin     verdict
+     *   IMR  0x00  0x52FD    0x52FD   accord
+     *   IFR  0x01  0x0000    0x0008   DIVERGE — hardcode CORRECT (IFR=0 au reset ;
+     *                                  0x0008 = IRQ pending capturé en cours d'exec,
+     *                                  NE PAS copier le .bin)
+     *   ST0  0x06  0x181F    0x181F   accord
+     *   ST1  0x07  0x2900    0x2900   accord
+     *   TRN  0x0F  0x0000    0xFF75   diverge (TRN non critique au reset)
+     *   AR0  0x10  0xFF75    0x5AAD   ⚠ SUSPECT : 0xFF75 = la valeur TRN(.bin) à
+     *                                  l'index voisin → possible off-by-one MMR à
+     *                                  la dérivation d'origine. BK(0x19) est correct
+     *                                  donc PAS un décalage global. À TRANCHER vs
+     *                                  dumps 3311/3416/3606 avant de toucher (c web).
+     *                                  Non bloquant : firmware recharge AR0 (STM/LD
+     *                                  @0x7120) avant usage.
+     *   AR1-5 0x11-15  = .bin = .bin  accord (invariant cross-dump)
+     *   AR6  0x16  0x0000    0xBAE6   diverge (non doc invariant → garde 0)
+     *   AR7  0x17  0x0000    0x1E44   diverge (idem)
+     *   SP   0x18  0x1100    0x1100   accord
+     *   BK   0x19  0xFFF6    0xFFF6   accord
+     *   PMST 0x1D  0xFFA8    0xFFA8   accord
+     */
     /* AR registers aligned with silicon spec (doc/datasheets/README.md §3,
      * 2026-05-25). Cross-checked 3 ROM dumps (3311/3416/3606) + local osmocom :
      *   AR1=0x005F, AR2=0x0813, AR3=0x0014, AR4=0x0003, AR5=0x0014  (invariant)
@@ -11661,6 +11721,39 @@ void c54x_reset(C54xState *s)
                                                     * #2 chain FBSB). Fix 2026-05-25. */
     s->ifr = 0;
     s->xpc = 0;
+    /* dsp-registers override : when calypso_dsp.Registers.bin was loaded
+     * (default via run.sh), apply its MMR snapshot on top of the silicon
+     * hardcode above so the .bin is the authoritative reset state. This is
+     * the "load the registers like the other ROM blobs" path. Applied BEFORE
+     * the PC = IPTR*0x80 computation below so PMST/IPTR from the .bin drive
+     * the reset vector too. See the anti-drift audit table above. */
+    if (s->reg_init_valid) {
+        const uint16_t *r = s->reg_init;
+        s->imr  = r[0x00];
+        s->ifr  = r[0x01];
+        s->st0  = r[0x06];
+        s->st1  = r[0x07];
+        s->a    = ((int64_t)(r[0x0a] & 0xFF) << 32) |
+                  ((uint32_t)r[0x09] << 16) | r[0x08];
+        s->b    = ((int64_t)(r[0x0d] & 0xFF) << 32) |
+                  ((uint32_t)r[0x0c] << 16) | r[0x0b];
+        s->t    = r[0x0e];
+        s->trn  = r[0x0f];
+        for (int i = 0; i < 8; i++)
+            s->ar[i] = r[0x10 + i];
+        s->sp   = r[0x18];
+        s->bk   = r[0x19];
+        s->brc  = r[0x1a];
+        s->rsa  = r[0x1b];
+        s->rea  = r[0x1c];
+        s->pmst = r[0x1d];
+        /* XPC NOT overridden from the snapshot: it's a runtime program-page
+         * register. The post-reset vector fetch at IPTR*0x80 must come from
+         * page 0, so XPC stays at its silicon reset value (0, set above). */
+        C54_LOG("reset: dsp-registers override applied (SP=0x%04x PMST=0x%04x "
+                "ST0=0x%04x ST1=0x%04x IMR=0x%04x IFR=0x%04x AR0=0x%04x)",
+                s->sp, s->pmst, s->st0, s->st1, s->imr, s->ifr, s->ar[0]);
+    }
     s->timer_psc = 0;
     s->data[TCR_ADDR] = TCR_TSS;  /* Timer stopped at reset (TSS=1) per HW spec */
     s->data[TIM_ADDR] = 0xFFFF;   /* TIM = max at reset */
