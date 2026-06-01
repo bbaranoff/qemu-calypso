@@ -1411,7 +1411,7 @@ rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$IPC_MSOCK_PATH" "${IPC_MSOCK_PATH}_0"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc >/dev/null 2>&1 || true
+killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc python3 >/dev/null 2>&1 || true
 pkill -9 -f calypso-ipc-device 2>/dev/null || true
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
