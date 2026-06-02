@@ -904,6 +904,66 @@ static const MemoryRegionOps calypso_sim_ops = {
     .impl  = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/* ---- vCPU idle governor (host CPU-leak / thermal fix) -------------------
+ * The osmocom-bb L1 firmware (apps/layer1/main.c) runs a side-effect-free
+ * super-loop with NO WFI:
+ *     while (1) { l1a_compl_execute(); osmo_timers_update();
+ *                 sim_handler(); l1a_l23_handler(); }
+ * On silicon a dedicated baseband core spinning is free. Under -icount auto
+ * QEMU must emulate that spin at ~real-time and therefore pins one host core
+ * at 99.9% forever (observed: the vCPU/TCG thread, PC bouncing across
+ * l1a_compl_execute/l1a_l23_handler — the empty poll, not real work).
+ *
+ * Fix: we are called from the frame-IRQ *lower* callback (~1 ms after the
+ * raise), i.e. once the per-frame work for this TDMA tick is done. If the
+ * guest PC is back inside the L1 idle super-loop, park the vCPU
+ * (cs->halted = 1). The next TPU-frame / UART (L1CTL) / SIM interrupt clears
+ * halted and resumes execution exactly where it left off — invisible to the
+ * guest because the loop is a pure poll. Under icount the halt lets QEMU
+ * warp virtual time to the next timer and the host core sleeps.
+ *
+ * Safety:
+ *  - cpu_handle_halt() refuses to halt while an IRQ is pending
+ *    (cpu_has_work) → never stalls active interrupt servicing.
+ *  - PC-gating to [lo,hi] → we only park while genuinely in the L1
+ *    super-loop, never mid-DSP / mid-handler real work. Outside the window
+ *    we do nothing, so other code paths cannot regress.
+ *  - Opt-out: CALYPSO_CPU_IDLE=0. Window override (hex):
+ *    CALYPSO_IDLE_PC_LO / CALYPSO_IDLE_PC_HI. Window 0 = halt whenever no
+ *    IRQ is pending (rely on cpu_has_work only).
+ */
+static void calypso_cpu_idle_park(void)
+{
+    static int      enabled = -1;
+    static uint64_t lo, hi, parked_n;
+    if (enabled < 0) {
+        const char *e = getenv("CALYPSO_CPU_IDLE");
+        const char *l = getenv("CALYPSO_IDLE_PC_LO");
+        const char *h = getenv("CALYPSO_IDLE_PC_HI");
+        enabled = (e && *e == '0') ? 0 : 1;
+        lo = l ? strtoull(l, NULL, 0) : 0x00823000ULL; /* l1a_l23_handler .. */
+        hi = h ? strtoull(h, NULL, 0) : 0x00826000ULL; /* .. l1a_compl_execute */
+        fprintf(stderr, "[cpu-idle] governor %s window=[0x%llx,0x%llx]\n",
+                enabled ? "ON (opt-out CALYPSO_CPU_IDLE=0)" : "OFF",
+                (unsigned long long)lo, (unsigned long long)hi);
+    }
+    if (!enabled) return;
+
+    CPUState *cs = first_cpu;
+    if (!cs) return;
+
+    uint64_t pc = (cs->cc && cs->cc->get_pc) ? cs->cc->get_pc(cs) : 0;
+    if (lo && hi && (pc < lo || pc >= hi))
+        return;                 /* not in the L1 idle loop — leave it running */
+
+    cs->halted = 1;
+    cpu_exit(cs);               /* break the current TB so the halt takes now */
+
+    if ((++parked_n % 5000) == 0 && calypso_timer_log())
+        fprintf(stderr, "[cpu-idle] parked #%llu pc=0x%llx\n",
+                (unsigned long long)parked_n, (unsigned long long)pc);
+}
+
 /* ---- TDMA ---- */
 static void calypso_frame_irq_lower(void *o){
     /* Frame IRQ lower counter — log thinned 1/1000 pour drift detection. */
@@ -919,6 +979,11 @@ static void calypso_frame_irq_lower(void *o){
     /* DSP shunt service hook (no-op si shunt off). Servir APRÈS le lower
      * pour que le mock écrive ses résultats entre deux ticks ARM. */
     calypso_dsp_shunt_on_frame_tick();
+
+    /* Per-frame work for this tick is done — park the vCPU if the guest is
+     * back in its idle super-loop, so the host core sleeps until the next
+     * interrupt instead of spinning at 100%. See calypso_cpu_idle_park(). */
+    calypso_cpu_idle_park();
 }
 
 /* CALYPSO_TDMA_REALTIME=1 : pin tdma_timer to QEMU_CLOCK_REALTIME so
