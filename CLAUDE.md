@@ -342,3 +342,53 @@ docker exec CONTAINER bash -c "cd /opt/GSM/qemu-src/build && ninja qemu-system-a
 - `hw/char/calypso_uart.c` — UART with RX FIFO + sercomm
 - `calypso-ipc-device` — BTS UDP bridge (clock-slave)
 - `run.sh` — Orchestrated launch (QEMU → bridge → BTS → mobile)
+
+## DIAG 2026-06-02 (pour Claude web) — Bug #3 décodeur : 0x86/0x87 MVDM→STH
+
+### Ce que le diag `run_diag_debug_all.sh` a prouvé (combo full/mobile/c54x)
+- **Localisation = 100% dans le décodeur c54x du corrélateur** (gagnée par
+  élimination, pas raccourci) : cohérence ARM↔DSP prouvée (sentinelle 0xDEAD),
+  consommation ARM OK, livraison BSP byte-identique, AFC `hz=0.0` stable.
+  `I/Q VARIE` (|max|=23340, 6 val/61 addr = vraie forme d'onde) → corrélateur
+  aval suspecté, PAS l'input. `rxlev<=-110` est un leurre (reporting PM = aval
+  du corrélateur cassé).
+- **Symptôme dominant = runaway SP** : SP-LEDGER passe **0x0097 → 0xcade** entre
+  insn 262.8M et 282.8M puis **gèle** (pushes/pops/irq figés 379/2681/1048).
+  pops>pushes mais net_words explose → **une instruction écrit SP=0xcade**
+  (pas un déséquilibre push/pop) = désync de flux, pas une fuite.
+- **AR3=0000 figé** dans IQ-READ (`PC=0x7e6f`, op voisin `0x8693 @0x7e71`).
+- Contexte : le wedge arrive **juste après** dispatch FB (`task_md=5`,
+  `on_dsp_task_change task=5`) → le pipeline FB est enfin armé, mais wedge avant
+  d'écrire `d_fb_det` (ARM lit `d_fb_det=0x0000` en boucle).
+
+### Root cause (vérifié ISA, règle #1)
+`0x8693 @0x7e71` = **`STH A, ASM, *AR3+`** (1 mot, AR3 post-incr) per
+`doc/opcodes/tic54x_hi8_map.md` L95 (`sth 0x8600/0xFE00`). L'ému le décodait en
+**MVDM/MVMD 2-mots** (`hi8==0x86/0x87`, marqué « TODO swap » par l'auteur) :
+1. **longueur 2 au lieu de 1** → bouffe l'opcode suivant → **désync cascade**
+   (= SP→0xcade) ;
+2. n'incrémente jamais l'AR du Smem → **AR3 figé/0** dans la boucle FB.
+Le « op=0000 » qu'on cherchait avant était une trace **pré-fix** (XPC=3 fetchait
+prog[0x3ee00] vide) — clos par le fix `c54x_prog_xlate` (0xE000+ ignore XPC) +
+PDROM chargé. Pas un bug de sonde : `op=prog_fetch(s,s->pc)` disait vrai.
+
+### Fix (commit en cours)
+`c54x_exec_one` : `0x86/0x87` → `STH src,ASM,Smem` 1-mot, mirror exact du
+handler `0x84` (STL A,ASM,Smem) déjà validé, store HIGH word, `src=hi8&1`.
+**Orthogonal au revert 0x72/0x73** (`REVERT_MVMD_KNOWLEDGE.md`) : l'assembleur
+TI encode MVDM=0x72/MVMD=0x73, JAMAIS à 0x86/0x87 → aucun 0x86xx ROM n'est une
+vraie MVDM.
+
+### Proof-gate (à mesurer cross-run, runtime non-déterministe)
+1. **AR3 BALAYE** le buffer I/Q dans IQ-READ (0x2a00→0x2a.. incrémente, plus figé/0).
+2. SP-LEDGER ne slamme plus à 0xcade (pas de gel post-262M).
+3. corrélateur complète une passe → **`d_fb_det` bit15 armé sur input réel**
+   (PAS forcé), propagé à l'ARM → `Channel synched` BSIC/SNR réels.
+
+### Prochain étage = audit différentiel décodeur (au lieu de peler bug par bug)
+Même classe que SACCD / XPC-paging / AR3-zero : trous **longueur/mode/mnémo**.
+TODO connus dans `tic54x_hi8_map.md` (col. misclassification) : 0x85 (MVPD→STL B),
+0x8B (POPD), 0xDD/0xDE/0xCD/0xC5/0xCE (parallel-store mal décodés), 0xAA-AB.
+Pas de désassembleur `tic54x` dispo (binutils host sans la cible) → audit
+table-driven : logger `(PC, op, consumed)` sur l'overlay 0x8000-0x9fff,
+diff la colonne **longueur** vs map authoritative. Priorité longueur (cascade).

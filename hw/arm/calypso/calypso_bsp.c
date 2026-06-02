@@ -549,14 +549,24 @@ static void bsp_drain_cb(void *opaque)
                        (struct sockaddr *)&sa, &sl)
             : -99;
         int e = errno;
-        uint64_t rx0 = bsp.bursts_seen;
         for (int i = 0; i < 64 && bsp.trxd_fd >= 0; i++)
             bsp_trxd_readable(NULL);
         static uint64_t dc = 0;
         if (dc < 30 || (dc % 2000) == 0)
-            fprintf(stderr, "[BSP] DRAIN-CB #%llu fd=%d PEEK=%zd errno=%d seen=%llu->%llu\n",
+            /* FIX 2026-06-02 : reporte le VRAI compteur de livraison
+             * `bursts_written` (incr. dans deliver_buffered ligne 1107 = burst
+             * réellement écrit en DARAM `dsp->data[a]`) au lieu du `bursts_seen`
+             * MORT. bursts_seen vit dans calypso_bsp_rx_burst, que le refactor
+             * 2026-05-29 a bypassé (deliver écrit inline) → seen=0 à vie = sonde
+             * menteuse qui a coûté des heures de fausse piste "feed mort".
+             * delivered>0 et qui monte = signal réellement livré au DSP. */
+            fprintf(stderr, "[BSP] DRAIN-CB #%llu fd=%d PEEK=%zd errno=%d "
+                    "delivered=%llu enq_drops(stale=%llu,full=%llu) seen_DEAD=%llu\n",
                     (unsigned long long)dc, bsp.trxd_fd, pk, e,
-                    (unsigned long long)rx0, (unsigned long long)bsp.bursts_seen);
+                    (unsigned long long)bsp.bursts_written,
+                    (unsigned long long)bsp.bursts_dropped_stale,
+                    (unsigned long long)bsp.bursts_dropped_queue_full,
+                    (unsigned long long)bsp.bursts_seen);
         dc++;
     }
     if (bsp.dsp) {

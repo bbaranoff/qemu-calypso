@@ -3344,7 +3344,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             if (val == 0) {
                 static unsigned zero_log = 0;
                 if (zero_log < 200) {
-                    C54_LOG("D_FB_DET ZERO-WR #%u PC=0x%04x op=0x%04x prev=0x%04x "
+                    C54_DBG("FBDET", "D_FB_DET ZERO-WR #%u PC=0x%04x op=0x%04x prev=0x%04x "
                             "A=%010llx B=%010llx T=0x%04x ST0=0x%04x ST1=0x%04x insn=%u",
                             zero_log + 1,
                             s->pc, s->prog[s->pc],
@@ -3361,7 +3361,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             if (val == 0 && s->data[0x08F8] != 0) {
                 static unsigned override_log = 0;
                 if (override_log < 100) {
-                    C54_LOG("D_FB_DET OVERRIDE #%u prev=0x%04x → 0 PC=0x%04x op=0x%04x "
+                    C54_DBG("FBDET", "D_FB_DET OVERRIDE #%u prev=0x%04x → 0 PC=0x%04x op=0x%04x "
                             "A=%010llx ST0=0x%04x insn=%u",
                             override_log + 1,
                             s->data[0x08F8], s->pc, s->prog[s->pc],
@@ -3389,7 +3389,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                 if (val != 0) {
                     /* SET event */
                     if (set_log_n < 500) {
-                        C54_LOG("D_FB_DET SET #%u val=0x%04x PC=0x%04x op=0x%04x "
+                        C54_DBG("FBDET", "D_FB_DET SET #%u val=0x%04x PC=0x%04x op=0x%04x "
                                 "prev=0x%04x A=%010llx insn=%u",
                                 set_log_n + 1,
                                 val, s->pc, s->prog[s->pc],
@@ -8030,15 +8030,45 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, addr, s->t);
             return consumed + s->lk_used;
         }
-        if (hi8 == 0x8E) {
-            /* MVDP Smem, pmad (data→prog) */
+        /* 0x8E/0x8F : CMPS src, Smem — Compare, Select & Store Maximum
+         * (SPRU172C p.4-35). Opcode 1000 111 S I AAAAAAA = 0x8E00/0xFE00,
+         * bit8 = src (0=A, 1=B). 1 MOT (+1 si long-offset/absolu → lk_used).
+         *   if src(31–16) > src(15–0):  src(31–16)→Smem ; TRN<<=1,TRN(0)=0 ; TC=0
+         *   else:                       src(15–0)→Smem  ; TRN<<=1,TRN(0)=1 ; TC=1
+         * = compare les 2 moitiés 16-bit 2s-comp de l'accu, stocke la MAX, TRN/TC
+         * tracent le gagnant. Cœur de la recherche de pic FCCH (Viterbi).
+         *
+         * FIX 2026-06-02 (audit décodeur DECODE-AUDIT) : 0x8E était décodé MVDP
+         * 2-mots et 0x8F PORTR 2-mots → chaque paire CMPS A/CMPS B consécutive
+         * (op=8e94 op2=8f93 dans la zone FB-det 0xa0xx) voyait le 2e CMPS BOUFFÉ
+         * comme phantom-pmad → désync corrélateur, d_fb_det jamais armé. SÛR :
+         * l'assembleur TI encode MVDP=0x7D, PORTR=0x74 — jamais 0x8E/0x8F ; et
+         * l'I/Q arrive par DMA DARAM (data[0x2a00]), pas par opcode PORTR (audit
+         * 0x8F=0 exécution). Le vieux handler 0x8F=PORTR est neutralisé plus bas. */
+        if (hi8 == 0x8E || hi8 == 0x8F) {
             addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            prog_write(s, op2, data_read(s, addr));
+            int src = (op >> 8) & 1;
+            int64_t acc = src ? s->b : s->a;
+            int16_t hi = (int16_t)((acc >> 16) & 0xFFFF);
+            int16_t lo = (int16_t)(acc & 0xFFFF);
+            s->trn = (uint16_t)(s->trn << 1);
+            if (hi > lo) {
+                data_write(s, addr, (uint16_t)hi);
+                s->trn &= ~0x0001u;
+                s->st0 &= ~ST0_TC;
+            } else {
+                data_write(s, addr, (uint16_t)lo);
+                s->trn |= 0x0001u;
+                s->st0 |= ST0_TC;
+            }
             return consumed + s->lk_used;
         }
-        if (hi8 == 0x8F) {
+        /* SUPERSEDED 2026-06-02 : 0x8F = CMPS B (traité par le handler CMPS
+         * 0x8E/0x8F ci-dessus, qui return avant d'arriver ici). Ce bloc PORTR
+         * est ISA-faux (vrai PORTR=0x74) et jamais atteint (audit 0x8F=0 exec ;
+         * I/Q via DMA DARAM). Gardé en dead-code (if(0)) pour réf si on relocalise
+         * PORTR vers 0x74 un jour. */
+        if (0 && hi8 == 0x8F) {
             /* PORTR PA, Smem — read I/O port */
             addr = resolve_smem(s, op, &ind);
             op2 = prog_fetch(s, s->pc + 1);
@@ -8148,22 +8178,33 @@ static int c54x_exec_one(C54xState *s)
          * restent comme avant (DUPLICATE MVDM/MVMD au lieu de STH A/B ASM
          * vrai — non swappés). */
 
-        /* 86xx: MVDM dmad, MMR — DUPLICATE per current emulation
-         * (vrai 0x86 per binutils = STH A, ASM, Smem — TODO swap) */
-        if (hi8 == 0x86) {
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t mmr = op & 0x7F;
-            data_write(s, mmr, data_read(s, op2));
-            return consumed + s->lk_used;
-        }
-        /* 87xx: MVMD MMR, dmad — DUPLICATE per current emulation
-         * (vrai 0x87 per binutils = STH B, ASM, Smem — TODO swap) */
-        if (hi8 == 0x87) {
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            uint16_t mmr = op & 0x7F;
-            data_write(s, op2, data_read(s, mmr));
+        /* 0x86/0x87 : STH src, ASM, Smem — store HIGH (acc>>16) shifted by ASM,
+         * to Smem (1-WORD). bit8 = src (0=A, 1=B). Per tic54x_hi8_map.md L95 :
+         *   { "sth", 0x8600, 0xFE00, ASM variant }  ← 1 mot, mask 0xFE00.
+         *
+         * FIX 2026-06-02 (bug #3, ROOT CAUSE AR3-zero) : l'ancien décode était
+         * MVDM dmad,MMR (0x86) / MVMD MMR,dmad (0x87) en 2 MOTS — faux sur deux
+         * axes : (1) longueur (2 au lieu de 1) → consommait l'opcode suivant
+         * → désync du flux de décode en cascade (= SP→0xcade observé) ; (2) ne
+         * touchait jamais l'AR du Smem → AR3 figé/0 dans la boucle corrélateur
+         * FB (IQ-READ @0x7e6f montrait AR3=0000 sur op=0x8693 @0x7e71 = STH A,
+         * ASM, *AR3+ : AR3 doit post-incrémenter pour balayer le buffer I/Q
+         * 0x2a00+). Mirror EXACT du handler 0x84 (STL A,ASM,Smem) déjà validé,
+         * mais store HIGH word au lieu de LOW. resolve_smem applique le
+         * post-incrément du Smem indirect → ne PAS re-modifier l'AR ici.
+         *
+         * SÛR vs le revert 0x72/0x73 (REVERT_MVMD_KNOWLEDGE.md) : ORTHOGONAL.
+         * L'assembleur TI encode MVDM=0x72, MVMD=0x73 — JAMAIS à 0x86/0x87.
+         * Donc aucun 0x86xx/0x87xx de la ROM n'est une vraie MVDM/MVMD : c'est
+         * toujours un STH. Le side-effect dont dépend le firmware est sur 0x73
+         * (site 0x8208 op=0x7317), inchangé par ce fix. */
+        if (hi8 == 0x86 || hi8 == 0x87) {
+            addr = resolve_smem(s, op, &ind);
+            int shift = asm_shift(s);
+            int src = hi8 & 1;            /* 0x86→A, 0x87→B */
+            int64_t v = src ? s->b : s->a;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, addr, (uint16_t)((v >> 16) & 0xFFFF));  /* STH = high word */
             return consumed + s->lk_used;
         }
         /* AUDIT FIX 2026-05-15 fin journée : 0x81/0x82/0x83 mal décodés.
@@ -11150,6 +11191,46 @@ int c54x_run(C54xState *s, int n_insns)
         uint16_t sp_before_exec = s->sp;
         uint16_t ds_before = s->delay_slots;  /* delay-slot word-count fix 2026-05-31 */
         consumed = c54x_exec_one(s);
+
+        /* === DECODE-AUDIT (2026-06-02, brief CC-web : audit différentiel) ===
+         * Inventaire du décodeur sur l'overlay corrélateur 0x8000-0x9FFF :
+         * logge UNE fois par (PC,op) distinct l'opcode brut, le mot suivant, et
+         * la LONGUEUR consommée (= consumed, inclut lk_used). À diff contre
+         * doc/opcodes/tic54x_hi8_map.md — colonne longueur d'abord (un mauvais
+         * len désync tout le flux suivant, cf bug 0x86/0x87→SP runaway). Vise à
+         * vider la classe « décode/longueur/mode » d'un coup au lieu de peler
+         * bug par bug. dedup par (PC,op) → capture aussi les variantes XPC d'un
+         * même Pag. Gate CALYPSO_DEBUG=DECODE-AUDIT, coût ~nul après couverture. */
+        static int da_lo = -1, da_hi = -1;
+        static long long da_insn = -1;
+        if (da_lo < 0) {
+            const char *l = getenv("CALYPSO_DA_LO"); const char *h = getenv("CALYPSO_DA_HI");
+            const char *n = getenv("CALYPSO_DA_INSN");
+            da_lo = l ? (int)strtol(l, NULL, 0) : 0x8000;   /* overlay corrélateur par défaut */
+            da_hi = h ? (int)strtol(h, NULL, 0) : 0x9FFF;   /* CALYPSO_DA_LO/HI pour élargir (ex. 0x7000..0xFFFF) */
+            da_insn = n ? strtoll(n, NULL, 0) : 0;          /* CALYPSO_DA_INSN : skip le boot, viser la fenêtre détection (ex. 250000000) */
+        }
+        if (exec_pc >= (uint16_t)da_lo && exec_pc <= (uint16_t)da_hi
+            && s->insn_count >= (uint64_t)da_insn
+            && calypso_debug_enabled("DECODE-AUDIT")) {
+            static uint16_t da_op_seen[0x10000];
+            static uint8_t  da_has[0x10000];
+            static unsigned da_n = 0;
+            uint16_t da_op = prog_fetch(s, exec_pc);
+            /* skip op=0x0000 : trous PROM vide (runaway control-flow, pas un bug
+             * de DÉCODE) — ils empoisonnaient le cap au boot (sweep 0xCB00-0xD3FF). */
+            if (da_op != 0x0000 && da_n < 4000
+                && (!da_has[exec_pc] || da_op_seen[exec_pc] != da_op)) {
+                da_has[exec_pc] = 1;
+                da_op_seen[exec_pc] = da_op;
+                da_n++;
+                fprintf(stderr, "[c54x] DECODE-AUDIT PC=0x%04x op=%04x op2=%04x "
+                        "hi8=%02x len=%d XPC=%u insn=%u\n",
+                        exec_pc, da_op, prog_fetch(s, exec_pc + 1),
+                        (da_op >> 8) & 0xFF, consumed, s->xpc & 0xFF,
+                        s->insn_count);
+            }
+        }
         /* SP-event ring : enregistre tout changement de SP (push/pop) avec
          * le PC/op responsable. Sert le dump BLACKHOLE-CALA. */
         if (s->sp != sp_before_exec) {
