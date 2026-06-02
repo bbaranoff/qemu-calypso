@@ -225,19 +225,23 @@ sample_combo(){
         tot=$((tot+1)); [ "$a" -gt 0 ] && nz=$((nz+1)); [ "$a" -gt "$mx" ] && mx=$a
       done
       distinct=$(printf '%s\n' $iqv | sort -u | wc -l | tr -d ' ')
+      local addrs; addrs=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'addr=0x[0-9a-f]+' | sort -u | wc -l | tr -d ' ')
       # fenêtre insn des samples (boot ~3M vs détection ~70M+)
       fi=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'insn=[0-9]+' | head -1 | sed 's/insn=//')
       la=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'insn=[0-9]+' | tail -1 | sed 's/insn=//')
-      log "    >> INTERPRÉTATION I/Q : n=$tot non-nuls=$nz |max|=$mx valeurs_distinctes=$distinct (insn ${fi:-?}..${la:-?}, int16 ±32767)"
+      log "    >> INTERPRÉTATION I/Q : n=$tot non-nuls=$nz |max|=$mx valeurs_distinctes=$distinct adresses_distinctes=$addrs (insn ${fi:-?}..${la:-?}, int16 ±32767)"
+      if [ "${addrs:-0}" -le 2 ]; then
+        log "       ⚠ sondes concentrées sur $addrs adresse(s) → le DSP relit le même cell (début de passe, AR3 figé) ; on ne peut PAS juger la forme d'onde sur la variance des valeurs ici. Regarder data[] sur une plage d'adresses (0x2a00..0x2a52)."
+      fi
       if   [ "$mx" -lt 16 ];  then
         log "       VERDICT: I/Q PLAT (~0) → AUCUNE puissance au DSP → perte device→BSP→DSP (livraison/c54x_bsp_load)"
-      elif [ "${distinct:-0}" -le 3 ]; then
-        log "       VERDICT: I/Q CONSTANT (|max|=$mx mais $distinct valeur(s) distincte(s)) → DC, AUCUNE forme d'onde"
-        log "                → bug CONTENU I/Q (modulateur osmo-trx-ipc/bridge OU conversion BSP), PAS le PM."
+      elif [ "${addrs:-0}" -ge 3 ] && [ "${distinct:-0}" -ge 3 ]; then
+        log "       VERDICT: I/Q VARIE selon l'adresse ($distinct val / $addrs addr, |max|=$mx) → vraie forme d'onde dans data[] → livraison OK → suspecter CORRÉLATEUR/PM/seuil (aval)"
       else
-        log "       VERDICT: I/Q VARIE ($distinct distinctes, |max|=$mx) → vraie forme d'onde livrée → suspecter le CALCUL PM (renvoie 0 malgré I/Q réel)"
+        log "       VERDICT: non concluant ($distinct val / $addrs addr) — étendre la couverture d'adresses (la valeur seule ne suffit pas si AR3 figé)"
       fi
-      [ -n "$fi" ] && [ "$fi" -lt 10000000 ] && log "       ⚠ samples capturés au BOOT (insn=$fi <10M) = buffer potentiellement STALE ; la sonde IQ-READ doit aussi tirer à l'instant détection (insn~70M) pour conclure sur le steady-state."
+      [ -n "$fi" ] && [ "$la" -gt 50000000 ] 2>/dev/null && log "       ✓ couverture inclut l'instant détection (insn jusqu'à $la)"
+      [ -n "$fi" ] && [ "$fi" -lt 10000000 ] && [ "${la:-0}" -lt 50000000 ] && log "       ⚠ samples seulement au BOOT (insn<50M) = stale ; relancer pour atteindre la détection."
     fi
   }
   log "--- AFC AMONT (convergence ?) — needs DEBUG_TOKENS=TRX,AFC-APPLY ---"

@@ -1615,6 +1615,21 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
                     s->ar[5], s->data[s->ar[5]], s->insn_count);
             iqr++;
         }
+        /* SPAN write-vs-read (2026-06-02, spec CC-web) : à l'instant détection,
+         * dumpe UNE fois le span contigu data[0x2a00..0x2a1f] (ce que le
+         * corrélateur PEUT lire) ET bsp_buf[0..31] (ce que le BSP a écrit).
+         *   data span = waveform & bsp_buf = waveform  -> buffer OK -> bug = AR3/corrélateur (lit que [0]).
+         *   data span = [0] puis DC, bsp_buf = waveform -> livraison PORTR ne copie que [0] (stride/len).
+         *   bsp_buf = DC                                -> conversion cs16 BSP tronque. */
+        static int span_done = 0;
+        if (!span_done && s->insn_count > 60000000u) {
+            span_done = 1;
+            fprintf(stderr, "[c54x] SPAN-READ  data[0x2a00..0x2a1f] insn=%u:", s->insn_count);
+            for (int _i = 0; _i < 32; _i++) fprintf(stderr, " %04x", s->data[0x2a00 + _i]);
+            fprintf(stderr, "\n[c54x] SPAN-WRITE bsp_buf[0..31] (bsp_len=%d):", s->bsp_len);
+            for (int _i = 0; _i < 32 && _i < s->bsp_len; _i++) fprintf(stderr, " %04x", s->bsp_buf[_i]);
+            fprintf(stderr, "\n");
+        }
     }
     /* MTTCG : protège DARAM access (DSP + ARM-OVLY peuvent racer).
      * Sans MTTCG : mutex non contesté (overhead minimal). */
@@ -2245,6 +2260,27 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* === SENTINELLE cohérence ARM<->DSP (CALYPSO_FBDET_SENTINEL=1) ===
+     * Force toute écriture DSP de d_fb_det (0x08f8) à 0xDEAD. L'ARM lit ce mot
+     * via arm=0x01f0 -> s->dsp->data[0x08f8] (calypso_trx.c). La sonde "ARM RD
+     * d_fb_det" (token TRX) montre alors :
+     *   ARM lit 0xDEAD  -> mémoire COHÉRENTE (même cellule) -> H1 mort, c'est H3 (PM/seuil).
+     *   ARM lit 0x0000  -> DÉSYNC ARM<->DSP -> H1 confirmé.
+     * NE PAS combiner avec CALYPSO_FORCE_TOA (qui override la lecture 0x01f0). */
+    {
+        static int sent = -1;
+        if (sent < 0) { const char *e = getenv("CALYPSO_FBDET_SENTINEL"); sent = e ? atoi(e) : 0;
+            if (sent==1) fprintf(stderr, "[c54x] FBDET-SENTINEL=1 FORCE : data[0x08f8] forcé à 0xDEAD\n");
+            else if (sent==2) fprintf(stderr, "[c54x] FBDET-SENTINEL=2 MONITOR : logge la vraie valeur écrite à 0x08f8 (pas de force)\n"); }
+        if (sent && addr == 0x08f8) {
+            uint16_t orig = val;
+            if (sent == 1) val = 0xDEAD;   /* mode FORCE (test cohérence) */
+            static unsigned sn = 0;
+            if (sn++ < 40 || (sn % 2000) == 0)
+                fprintf(stderr, "[c54x] FBDET-SENTINEL #%u DSP write d_fb_det[0x08f8] orig=0x%04x%s PC=0x%04x insn=%u\n",
+                        sn, orig, (sent==1) ? " ->0xDEAD" : " (monitor)", s->pc, s->insn_count);
+        }
+    }
     stkw_rec(s, addr, val);   /* ORPHAN : ring écritures pile */
     /* ORPHAN : tracker stores directs zone [0x1100..0x1140] (vecteur légit vs
      * vierge). Slots au-dessus de SP_base → jamais touchés par un push. */
