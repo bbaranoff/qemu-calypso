@@ -7193,41 +7193,27 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, mmr, op2);
             return consumed + s->lk_used;
         }
-        /* RE-APPLIQUÉ 2026-06-02 : MVDM/MVMD (0x72/0x73) en 2 MOTS, ISA-correct
-         * (tic54x-opc.c : mvdm 0x7200/0xFF00, mvmd 0x7300/0xFF00). Le revert
-         * 2026-05-15 (REVERT_MVMD_KNOWLEDGE.md) les avait retirés car le fix
-         * régressait — MAIS c'était AVANT les fix SACCD / XPC-paging / 0x86-87 /
-         * CMPS, qui satisfont précisément le critère #3 de ré-application du
-         * revert (« opcode upstream identifié et fixé »). La régression d'alors
-         * était un symptôme de ces bugs, maintenant corrigés.
+        /* 0x72/0x73 (MVDM/MVMD) : RESTENT REVERTÉS (fallthrough STL générique).
          *
-         * PREUVE MESURÉE (DECODE-AUDIT gaté insn>250M, 2026-06-02) : à
-         * PC=0xf564, op=0x7215 = MVDM data[0x0014]→AR5, AU CŒUR de la boucle
-         * dispatch FB (0xf561-0xf588). Décodé 1-mot (fallthrough STL), l'ému
-         * ne consommait pas l'opérande 0x0014 → l'exécutait comme un opcode
-         * (PC=0xf565 op=0014 hi8=00) → desync À CHAQUE itération → AR5 (pointeur
-         * du handler de tâche) jamais chargé → tâche FB (task_md=5) jamais
-         * dispatchée → 0x9ac0 jamais ré-atteint past-boot → d_fb_det jamais armé.
-         * = la cause (c) « décision jamais atteinte ».
+         * FINDING 2026-06-02 (cause (c) localisée + prouvée, mais fix bloqué) :
+         * DECODE-AUDIT gaté insn>250M a prouvé qu'à PC=0xf564 op=0x7215 = MVDM
+         * data[0x0014]→AR5, AU CŒUR de la boucle dispatch FB (0xf561-0xf588),
+         * était décodé 1-mot → l'opérande 0x0014 exécutée comme opcode (0xf565
+         * hi8=00) → desync chaque itération → AR5 (ptr handler tâche) jamais
+         * chargé → tâche FB jamais dispatchée → 0x9ac0 jamais ré-atteint
+         * past-boot → d_fb_det jamais armé. = cause (c) « décision jamais
+         * atteinte ». LE MIS-DÉCODE EST RÉEL.
          *
-         * MVDM dmad, MMR : data[MMR] = data[dmad]  (MMR=op&0x7F, dmad=op2). */
-        if (hi8 == 0x72) {
-            uint8_t mmr = op & 0x7F;
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, mmr, data_read(s, op2));
-            return consumed + s->lk_used;
-        }
-        /* MVMD MMR, dmad : data[dmad] = data[MMR]  (MMR=op&0x7F, dmad=op2).
-         * Site historique PC=0x8208 op=0x7317 = MVMD AR7,BRC → BRC=AR7 (= le
-         * RPTB compute-loop count que le firmware arme avant la corrélation). */
-        if (hi8 == 0x73) {
-            uint8_t mmr = op & 0x7F;
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, op2, data_read(s, mmr));
-            return consumed + s->lk_used;
-        }
+         * MAIS appliquer MVDM 2-mots (ISA-correct : data[MMR]=data[dmad]) — même
+         * 0x72 SEUL — RÉGRESSE en deadlock pire : le dispatch avance bien à
+         * PC=0xee38 (task_md=5 lu sur les 2 pages = progrès), mais AR3 y pointe
+         * HORS du buffer I/Q (0x2b97 > 0x2b28) → corrèle des zéros (A=0) → BSP ne
+         * livre plus (delivered=0) → INT3 ne fire plus (irq 3860→4) → deadlock.
+         * = le « bug compensateur upstream » du revert (REVERT_MVMD_KNOWLEDGE.md) :
+         * le setup d'AR3/pointeurs en amont de 0xee38 est aussi mal émulé, et le
+         * STL mis-décodé compensait. Critère de ré-application : fixer d'abord le
+         * deadlock 0xee38 (AR3 hors-buffer) — passe séparée. Voir
+         * project_state_20260602 mémoire. */
         /* LD / ST operations */
         if ((op & 0xF800) == 0x7000) {
             /* 70xx: STL src, Smem */

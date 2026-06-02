@@ -44,6 +44,25 @@
 #define L1CTL_LOG(fmt, ...) \
     fprintf(stderr, "[l1ctl-sock] " fmt "\n", ##__VA_ARGS__)
 
+/* Nom lisible des types L1CTL (l1ctl_proto.h) — pour suivre la conversation
+ * firmware↔mobile à l'œil, surtout post-FORCE_FBSB : l'attendu après
+ * FBSB_CONF=success est CCCH_MODE_REQ/DM_EST_REQ puis DATA_IND. Si DATA_IND
+ * n'apparaît JAMAIS → le block est le demod NB DSP en aval (= l'autre bout). */
+static inline const char *l1ctl_tname(uint8_t t)
+{
+    switch (t) {
+    case 0x01: return "FBSB_REQ";       case 0x02: return "FBSB_CONF";
+    case 0x03: return "DATA_IND";       case 0x04: return "RACH_REQ";
+    case 0x05: return "DM_EST_REQ";     case 0x06: return "DATA_REQ";
+    case 0x07: return "RESET_IND";      case 0x08: return "PM_REQ";
+    case 0x09: return "PM_CONF";        case 0x0c: return "RACH_CONF";
+    case 0x0d: return "RESET_REQ";      case 0x0e: return "RESET_CONF";
+    case 0x0f: return "DATA_CONF";      case 0x10: return "CCCH_MODE_REQ";
+    case 0x11: return "CCCH_MODE_CONF"; case 0x12: return "DM_REL_REQ";
+    case 0x13: return "PARAM_REQ";      default:   return "?";
+    }
+}
+
 /* ---- Sercomm TX parser (firmware → mobile) ---- */
 
 typedef enum {
@@ -147,7 +166,27 @@ static void sercomm_frame_complete(L1CTLSock *s)
     int plen = s->sc_len - 2;
 
     if (dlci == SERCOMM_DLCI_L1CTL && plen > 0) {
-        L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x", dlci, plen, payload[0]);
+        /* CALYPSO_FORCE_FBSB=1 (oracle FORCE_TOA, 2026-06-02) : réécrit le
+         * résultat du L1CTL_FBSB_CONF (type 0x02) → 0=SUCCESS avant TX au
+         * mobile. Le DSP ne détecte jamais la FB → firmware envoie result=255
+         * (échec) → mobile boucle FBSB sans jamais camper. En forçant 0 on
+         * teste PROPREMENT (zéro GDB → zéro LOST/throttle, zéro pollution PM)
+         * jusqu'où la chaîne aval (sync→BCCH→camp) débloque quand FBSB confirme.
+         * Layout payload : l1ctl_hdr(4) + l1ctl_info_dl(12) + l1ctl_fbsb_conf ;
+         * result = offset 18 (après int16 initial_freq_err). Vérifié empirique
+         * (msg 20o, band_arfcn=0x0202=514 @[6..7]). */
+        static int force_fbsb = -1;
+        if (force_fbsb < 0) {
+            const char *e = getenv("CALYPSO_FORCE_FBSB");
+            force_fbsb = (e && *e == '1') ? 1 : 0;
+        }
+        if (force_fbsb && payload[0] == 0x02 /* L1CTL_FBSB_CONF */ && plen >= 19
+            && payload[18] != 0) {
+            L1CTL_LOG("FORCE-FBSB: result 0x%02x → 0 (success forcé)", payload[18]);
+            payload[18] = 0;
+        }
+        L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
+                  l1ctl_tname(payload[0]));
         l1ctl_send_to_mobile(s, payload, plen);
     }
     /* Ignore other DLCIs (debug console, loader, etc.) */
@@ -238,8 +277,8 @@ static void l1ctl_client_readable(void *opaque)
         int flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen,
                                 frame, sizeof(frame));
         if (flen > 0 && s->uart) {
-            L1CTL_LOG("RX←mobile: len=%d type=0x%02x → sercomm %d bytes",
-                      msglen, payload[0], flen);
+            L1CTL_LOG("RX←mobile: len=%d type=0x%02x %s → sercomm %d bytes",
+                      msglen, payload[0], l1ctl_tname(payload[0]), flen);
             /* Hex dump of sercomm frame being injected */
             {
                 fprintf(stderr, "[l1ctl-sock] INJECT %d bytes:", flen);

@@ -392,3 +392,27 @@ TODO connus dans `tic54x_hi8_map.md` (col. misclassification) : 0x85 (MVPD→STL
 Pas de désassembleur `tic54x` dispo (binutils host sans la cible) → audit
 table-driven : logger `(PC, op, consumed)` sur l'overlay 0x8000-0x9fff,
 diff la colonne **longueur** vs map authoritative. Priorité longueur (cascade).
+
+## DIAG 2026-06-02 SOIR (bilan session) — cause (c) localisée, MVDM bloqué
+
+Chaîne **mesurée saine boundary-par-boundary** (BTS→ipc→bridge→BSP→DARAM→DSP→ARM→L2).
+Le mur n'est PAS une intersection — c'est UNE boîte : la décision FB-det dans le DSP.
+
+**Fixes validés gardés :** 0x86/0x87=STH (SP wedge mort, AR3 balaie), 0x8E/0x8F=CMPS
+(nécessaire pas suffisant), sonde `DRAIN-CB delivered=` (vrai compteur `bursts_written`
+vs `bursts_seen` MORT = red herring). Outils : DECODE-AUDIT (CALYPSO_DA_LO/HI/INSN),
+token FBDET.
+
+**Cause (c) prouvée :** DECODE-AUDIT gaté insn>250M → `PC=0xf564 op=0x7215 MVDM`
+dans la boucle dispatch FB décodé 1-mot (0x72/0x73 retirés par revert) → opérande
+exécutée comme opcode → desync → AR5 (ptr handler) jamais chargé → tâche FB jamais
+dispatchée → `0x9ac0` jamais ré-atteint past-boot (DETECTOR-RUN 5× boot) → ANGLE-WR=0
+(SNR/PM jamais écrits) → d_fb_det jamais armé.
+
+**MVDM 2-mots ISA-correct RÉGRESSE (gardé reverté) :** avance dispatch à PC=0xee38
+(task=5 sur 2 pages) mais **AR3 hors-buffer 0x2b97>0x2b28** → A=0 → delivered=0 →
+INT3 mort (irq 3860→4) = deadlock (bug compensateur upstream, REVERT_MVMD_KNOWLEDGE.md).
+
+**NEXT LEAD :** d'où vient AR3=0x2b97 (hors-buffer) à 0xee38 ? Le fixer débloque le
+MVDM ISA → (c) résolu. Garder 0x86/87+CMPS, ré-appliquer 0x72/0x73, tracer le setup AR3.
+**AFC figée = esclave de la FB-det, PAS la cause** (FB établit la réf fréquence).
