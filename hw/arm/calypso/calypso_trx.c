@@ -207,21 +207,60 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * seul ne suffit pas : on force tout le bloc résultat FB sur le read ARM.
      *   0x01F0 d_fb_det = 1 (FOUND)   0x01F4 a_sync_TOA  = N (23 = on-time)
      *   0x01F8 a_sync_ANGLE = 0 (AFC ne diverge pas)  0x01FA a_sync_SNR = haut */
-    if (offset >= 0x01F0 && offset <= 0x01FA && size == 2) {
+    /* Étendu 2026-06-02 : FORCE_TOA force le bloc FB (a_sync_demod @0x01F0-FA,
+     * NDB) ET le bloc SB (a_serv_demod[D_TOA], db_r). Sinon le SB lit du garbage
+     * → l1s_sbdet_resp calcule "SB N bits in the future?!?" → sync rejeté →
+     * BSIC=0, pas de sysinfo. Forcer a_serv_demod[D_TOA]=force_toa (=23) fait
+     * `toa-=23 → 0` → passe le check `toa > bits_delta`. db_r page0=0xFFD00050
+     * (off 0x50) / page1=0xFFD00078 (off 0x78), struct DSP33-36 a_serv_demod
+     * @word8 → D_TOA = off 0x60 (p0) / 0x88 (p1). */
+    if (size == 2) {
         static int force_toa = -2;  /* -2 = uninit, -1 = off */
         if (force_toa == -2) {
             const char *e = getenv("CALYPSO_FORCE_TOA");
             force_toa = (e && *e) ? (int)strtol(e, NULL, 0) : -1;
             if (force_toa >= 0)
-                fprintf(stderr, "[calypso-trx] CALYPSO_FORCE_TOA=%d (bloc FB-result forcé : d_fb_det=1 TOA=%d ANGLE=0 SNR=high)\n", force_toa, force_toa);
+                fprintf(stderr, "[calypso-trx] CALYPSO_FORCE_TOA=%d (FB a_sync_demod + SB a_serv_demod[D_TOA] forcés)\n", force_toa);
         }
         if (force_toa >= 0) {
             switch (offset) {
+            /* --- bloc FB (a_sync_demod, NDB @0x01F0) --- */
             case 0x01F0: val = 1;                       break; /* d_fb_det = FOUND */
             case 0x01F4: val = (uint16_t)force_toa;      break; /* a_sync_TOA */
             case 0x01F8: val = 0;                        break; /* a_sync_ANGLE = 0 */
             case 0x01FA: val = 0x7000;                   break; /* a_sync_SNR high */
-            default: break;                                     /* 0x01F2/0x01F6 inchangés */
+            /* --- bloc SB (a_serv_demod[D_TOA], db_r page 0 et 1) --- */
+            case 0x0060: case 0x0088:
+                val = (uint16_t)force_toa;               break; /* SB TOA → 23 : passe le check "future" */
+            default: break;                                     /* 0x01F2/0x01F6 + reste inchangés */
+            }
+        }
+    }
+    /* CALYPSO_FORCE_NB=1 (gate NB demod, 2026-06-02) : l1s_nb_resp bail "EMPTY"
+     * si db_r->d_task_d==0 (le DSP NB demod ne tourne pas) → jamais de DATA_IND
+     * BCCH → pas de SI. Force d_task_d≠0 (word 0 du db_r : page0 off 0x50 /
+     * page1 off 0x78) pour passer "EMPTY" → le firmware émet le DATA_IND (que
+     * CALYPSO_FORCE_AGCH remplit ensuite avec un SI/IMM-ASS). Révèle ensuite le
+     * check d_burst_d (offset 0x52/0x7A). */
+    if (size == 2 && (offset == 0x0050 || offset == 0x0078 ||
+                      offset == 0x0052 || offset == 0x007A)) {
+        static int force_nb = -1;
+        if (force_nb < 0) {
+            const char *e = getenv("CALYPSO_FORCE_NB");
+            force_nb = (e && *e == '1') ? 1 : 0;
+        }
+        if (force_nb) {
+            if ((offset == 0x0050 || offset == 0x0078) && val == 0) {
+                val = 1;   /* d_task_d → non-zéro : passe le "EMPTY" */
+            } else if (offset == 0x0052 || offset == 0x007A) {
+                /* d_burst_d ← db_w->d_burst_d (= le burst_id que le firmware a
+                 * commandé via dsp_load_rx_task) → passe le check
+                 * d_burst_d != burst_id. db_w d_burst_d : p0 DSP word 0x801,
+                 * p1 0x815 (db_w p0=0xFFD00000 off0x02, p1=0xFFD00028 off0x2A). */
+                if (s->dsp && s->dsp->data)
+                    val = s->dsp->data[(offset == 0x0052) ? 0x801 : 0x815];
+                else
+                    val = s->dsp_ram[(offset == 0x0052) ? 0x01 : 0x15];
             }
         }
     }

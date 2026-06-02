@@ -44,10 +44,10 @@
 #define L1CTL_LOG(fmt, ...) \
     fprintf(stderr, "[l1ctl-sock] " fmt "\n", ##__VA_ARGS__)
 
-/* Nom lisible des types L1CTL (l1ctl_proto.h) — pour suivre la conversation
- * firmware↔mobile à l'œil, surtout post-FORCE_FBSB : l'attendu après
- * FBSB_CONF=success est CCCH_MODE_REQ/DM_EST_REQ puis DATA_IND. Si DATA_IND
- * n'apparaît JAMAIS → le block est le demod NB DSP en aval (= l'autre bout). */
+/* Nom lisible des types L1CTL (l1ctl_proto.h) — diagnostic pur pour suivre la
+ * conversation firmware↔mobile à l'œil. NB : ce mobile cause par osmocon/hdlc
+ * (serial), pas par ce socket unix ; ce log ne voit que le sens firmware→mobile
+ * via sercomm. Le vrai flux mobile↔firmware se lit dans osmocon.log (hdlc). */
 static inline const char *l1ctl_tname(uint8_t t)
 {
     switch (t) {
@@ -166,24 +166,46 @@ static void sercomm_frame_complete(L1CTLSock *s)
     int plen = s->sc_len - 2;
 
     if (dlci == SERCOMM_DLCI_L1CTL && plen > 0) {
-        /* CALYPSO_FORCE_FBSB=1 (oracle FORCE_TOA, 2026-06-02) : réécrit le
-         * résultat du L1CTL_FBSB_CONF (type 0x02) → 0=SUCCESS avant TX au
-         * mobile. Le DSP ne détecte jamais la FB → firmware envoie result=255
-         * (échec) → mobile boucle FBSB sans jamais camper. En forçant 0 on
-         * teste PROPREMENT (zéro GDB → zéro LOST/throttle, zéro pollution PM)
-         * jusqu'où la chaîne aval (sync→BCCH→camp) débloque quand FBSB confirme.
-         * Layout payload : l1ctl_hdr(4) + l1ctl_info_dl(12) + l1ctl_fbsb_conf ;
-         * result = offset 18 (après int16 initial_freq_err). Vérifié empirique
-         * (msg 20o, band_arfcn=0x0202=514 @[6..7]). */
-        static int force_fbsb = -1;
-        if (force_fbsb < 0) {
-            const char *e = getenv("CALYPSO_FORCE_FBSB");
-            force_fbsb = (e && *e == '1') ? 1 : 0;
+        /* ===== GATES de déblocage (oracle FORCE_TOA, gate-par-gate) =====
+         * Le mobile reçoit par CE socket (mobile.cfg: layer2-socket
+         * /tmp/osmocom_l2). Deux gates bridgent les trous du demod DSP, pour
+         * prouver que tout l'aval (camp/SI/IMM-ASS) marche quand le DSP fournit
+         * son résultat. Purement oracle — à retirer quand le DSP demod marche.
+         *   CALYPSO_FORCE_FBSB=1 : bridge blocker #1 (Channel sync error) =
+         *                          FBSB_CONF(0x02) result@[18] → 0=SUCCESS.
+         *   CALYPSO_FORCE_AGCH=1 : bridge blocker #2 (pas de sysinfo) sur les
+         *                          DATA_IND(0x03) : BCCH(chan 0x80) rote le type
+         *                          SI ; AGCH/PCH(chan 0x90) injecte IMM ASS.
+         *                          Port exact du GDB mutate_agch.
+         * Layout payload : l1ctl_hdr(4) + l1ctl_info_dl(12) + corps ;
+         * → FBSB result @18 ; DATA_IND chan_nr @4, L3 @16. */
+        static int g_fbsb = -1, g_agch = -1;
+        if (g_fbsb < 0) {
+            const char *a = getenv("CALYPSO_FORCE_FBSB");
+            const char *b = getenv("CALYPSO_FORCE_AGCH");
+            g_fbsb = (a && *a == '1') ? 1 : 0;
+            g_agch = (b && *b == '1') ? 1 : 0;
         }
-        if (force_fbsb && payload[0] == 0x02 /* L1CTL_FBSB_CONF */ && plen >= 19
-            && payload[18] != 0) {
-            L1CTL_LOG("FORCE-FBSB: result 0x%02x → 0 (success forcé)", payload[18]);
+        if (g_fbsb && payload[0] == 0x02 && plen >= 19 && payload[18] != 0) {
+            L1CTL_LOG("GATE-FBSB #1: FBSB_CONF result 0x%02x → 0", payload[18]);
             payload[18] = 0;
+        }
+        if (g_agch && payload[0] == 0x03 && plen >= 16 + 3) {
+            uint8_t chan_nr = payload[4];
+            uint8_t *l3 = &payload[16];
+            if (chan_nr == 0x80) {
+                static const uint8_t si[4] = { 0x19, 0x1a, 0x1b, 0x1c };
+                static int r = 0;
+                l3[2] = si[r]; r = (r + 1) & 3;
+                L1CTL_LOG("GATE-AGCH #2 bcch: SI type → 0x%02x", l3[2]);
+            } else if (chan_nr == 0x90 && plen >= 16 + 23) {
+                static const uint8_t imm[23] = {
+                    0x2d, 0x06, 0x3f, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+                    0x2b, 0x2b, 0x2b };
+                memcpy(l3, imm, sizeof(imm));
+                L1CTL_LOG("GATE-AGCH #2 pch: IMM ASSIGNMENT injecté");
+            }
         }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
