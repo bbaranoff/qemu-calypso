@@ -7871,8 +7871,15 @@ static int c54x_exec_one(C54xState *s)
         if ((op & 0xFC00) == 0x9C00) {
             int src_s = (op >> 9) & 1;
             int64_t acc = src_s ? s->b : s->a;
-            int xar_s = (op >> 4) & 0x07;
-            uint16_t xaddr = s->ar[xar_s];
+            /* FIX 2026-06-02 (ROOT CAUSE FB-det) : opérande Xmem décodé via
+             * resolve_xmem (xar=((op>>4)&3)+2 = AR2-5, + xmod post-modify),
+             * exactement comme STL/STH 0x98-0x9B. L'ancien `(op>>4)&0x07` lisait
+             * le MAUVAIS AR (AR1 au lieu de AR3 pour op=0x9e9b) et `(op>>7)&1` un
+             * faux sens → AR3 jamais incrémenté → la boucle de recherche de pic
+             * FCCH (@0x8576 RPTB) relisait sample[0] 15× → corrélation figée,
+             * d_fb_det garbage, rxlev plancher, FBSB jamais fermé. resolve_xmem
+             * applique le post-incrément ; ne PAS re-modifier en fin de handler. */
+            uint16_t xaddr = resolve_xmem(s, op);
             int cond = op & 0x0F;
             /* Evaluate condition */
             int take = 0;
@@ -7899,8 +7906,7 @@ static int c54x_exec_one(C54xState *s)
                 uint16_t val = data_read(s, xaddr);
                 data_write(s, xaddr, val);
             }
-            /* Xmem post-modify */
-            if ((op >> 7) & 1) s->ar[xar_s]--; else s->ar[xar_s]++;
+            /* post-modify Xmem déjà appliqué par resolve_xmem (cf FIX ci-dessus) */
             return consumed + s->lk_used;
         }
         /* POPM MMR — pop top-of-stack into MMR (1-word).
