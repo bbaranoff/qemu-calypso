@@ -188,6 +188,11 @@ sample_combo(){
   # ---- CC-web probe captures (only populated when DEBUG_TOKENS / FORCE_TOA set) ----
   log "--- SP-LEDGER trend (net_words vs insn — linear=real leak, flat=artifact) ---"
   grep -E 'SP-LEDGER' "$QLOG" 2>/dev/null | tail -8 | sed 's/^/    /' | tee -a "$OUT"
+  log "--- ARM->DSP task handoff (manip#1: real DSP latch la tâche FB ?) ---"
+  log "    [needs DEBUG_TOKENS=D_TASK_MD-RD,D_TASK_MD_ALL ; sinon vide]"
+  log "    ARM writes (d_task_md):"; grep -hE 'ARM TASK WR|D_TASK_MD_ALL|DMA proof.*task_md' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
+  log "    DSP reads (d_task_md @0x0804/0x0818):"; grep -hE 'D_TASK_MD-RD' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
+  log "    task-change (fbsb orchestration):"; grep -hE 'on_dsp_task_change' "$QLOG" 2>/dev/null | tail -3 | sed 's/^/      /' | tee -a "$OUT"
   log "--- d_fb_det ARM/DSP reads + writes (shunt-ipc handshake) ---"
   grep -hE 'WATCH-READ d_fb_det|FBDET RD|FBWATCH-DET|d_fb_det' "$QLOG" 2>/dev/null | tail -6 | sed 's/^/    /' | tee -a "$OUT"
   log "--- shunt LATCH page read/write (page aliasing check) ---"
