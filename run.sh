@@ -1484,6 +1484,7 @@ fi
 # section loads), per code path in calypso_trx.c.
 
 MACHINE_ARG="calypso"
+: "${CALYPSO_DSP_REG_MODE:=c54x}"; export CALYPSO_DSP_REG_MODE  # diag 2026-06-02 : c54x=vrai FB (task_md=5,d_fb_det=0x9041) ; bin=self-CALA. opt-out CALYPSO_DSP_REG_MODE=bin
 
 _dsp_check_file() {
     local var="$1"; local path="$2"

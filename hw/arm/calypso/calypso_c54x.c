@@ -1597,8 +1597,12 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
      * Confirme que le corrélateur FB consomme bien la vraie I/Q écrite par le
      * BSP, et à quel PC (= le vrai site corrélateur). Cap 60, ~zéro coût hors zone. */
     if (addr >= 0x2a00 && addr < 0x2b28 && s->data[addr] != 0) {
-        static unsigned iqr = 0;
-        if (iqr < 60) {
+        static unsigned iqr = 0, iqseen = 0;
+        iqseen++;
+        /* boot (first 60) + DÉTECTION : tire aussi 1/8000 après insn>50M pour
+         * voir ce que le corrélateur lit VRAIMENT à l'instant FB-det (insn~71M),
+         * pas seulement le buffer stale du boot (2026-06-02). */
+        if (iqr < 60 || (s->insn_count > 50000000u && (iqseen % 8000) == 0)) {
             uint16_t val = s->data[addr];
             /* A/B (accumulateurs corr complexe, sign-ext 40b) + valeurs aux
              * AUTRES pointeurs (candidats réf cos/sin) PENDANT la lecture I/Q. */

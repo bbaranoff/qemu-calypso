@@ -82,6 +82,7 @@ static struct {
     int16_t  dac_value;     /* current DAC reg value (= dernière écriture firmware) */
     int      force_hz;      /* CALYPSO_TWL3025_AFC_HZ override (diag, default 0 = off) */
     bool     env_loaded;
+    int      afc_enabled;   /* CALYPSO_TWL3025_AFC (défaut 1=on, =0 désactive la rotation AFC) */
     uint64_t dac_writes;    /* compteur diag */
     uint64_t apply_calls;
 } twl;
@@ -92,13 +93,20 @@ static void twl3025_lazy_env(void)
     twl.env_loaded = true;
     const char *h = getenv("CALYPSO_TWL3025_AFC_HZ");
     twl.force_hz = (h && *h) ? atoi(h) : 0;
+    /* Gate maître de la boucle AFC (rotation des samples RX par l'offset VCXO).
+     * Défaut ON (=1) : l'AFC fait partie du chemin nominal osmocom. Opt-out
+     * CALYPSO_TWL3025_AFC=0 pour livrer l'I/Q brute (debug, AFC désactivée). */
+    const char *ae = getenv("CALYPSO_TWL3025_AFC");
+    twl.afc_enabled = (ae && *ae == '0') ? 0 : 1;
     /* Init DAC au point de calibration (-700) = "VCXO nominal" en QEMU :
      * le firmware démarre son AFC à afc_initial_dac_value puis converge.
      * Sans ça (dac=0 au boot) le modèle voit +700 LSB = +200kHz spurious. */
     twl.dac_value = TWL3025_AFC_INITIAL_DAC_VALUE;
     fprintf(stderr,
-            "[twl3025] chip model armed (slope=%.1f Hz/LSB, force_hz=%d)\n",
-            TWL3025_AFC_SLOPE_HZ_PER_LSB, twl.force_hz);
+            "[twl3025] chip model armed (slope=%.1f Hz/LSB, AFC=%s, force_hz=%d)\n",
+            TWL3025_AFC_SLOPE_HZ_PER_LSB,
+            twl.afc_enabled ? "ON(opt-out CALYPSO_TWL3025_AFC=0)" : "OFF",
+            twl.force_hz);
 }
 
 void calypso_twl3025_set_afc_dac(int16_t dac_value)
@@ -154,6 +162,7 @@ double calypso_twl3025_get_afc_hz(void)
 double calypso_twl3025_get_afc_phase_step(void)
 {
     twl3025_lazy_env();
+    if (!twl.afc_enabled) return 0.0;   /* CALYPSO_TWL3025_AFC=0 → pas de rotation AFC */
     double hz = calypso_twl3025_get_afc_hz();
     if (hz == 0.0) return 0.0;
     /* Phase step per sample = 2π × freq / fs.

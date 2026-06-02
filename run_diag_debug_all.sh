@@ -9,22 +9,27 @@
 # DSP_REG_MODE (c54x|bin|hybrid) only affects modes that actually emulate the
 # c54x (full/bridge/bare); shunt/shunt-ipc bypass it → swept once (reg=n/a).
 #
-# Usage (inside docker osmo-operator-1):
-#   bash /root/run_diag_debug_all.sh                       # default matrix
-#   WINDOW=9 bash /root/run_diag_debug_all.sh              # deeper window
-#   MODES="full shunt" REGMODES="bin c54x" bash /root/run_diag_debug_all.sh
-#   IDLEMODES="1 0" bash /root/run_diag_debug_all.sh       # governor on AND off
+# DÉFAUT = la config qu'on veut faire marcher : full / mobile / c54x (1 combo,
+# sondes décisives bas volume). Le reste (bin, scanners, bridge/bare, FORCE_TOA,
+# icount off, governor off) est OPT-IN via les axes. Presets :
+#   # contraste reg-mode :   REGMODES="c54x bin"
+#   # cause A/B/C :          TOAMODES="off 23" DEBUG_TOKENS="TRX,WATCH-READ"
+#   # icount on/off :        ICOUNTMODES="auto off"
+#   # governor on/off :      IDLEMODES="1 0"
+#   # sweep non-régression : MODES="full bridge bare" REGMODES="c54x bin"
 #
 set +e
-WINDOW="${WINDOW:-7}"
+WINDOW="${WINDOW:-15}"           # 7s ratait le dispatch FB (~+11-13s en c54x)
 OUT="${OUT:-/tmp/diag_all.txt}"
 SESS=calypso
 QEMU_BIN=qemu-system-arm
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
-MODES="${MODES:-full shunt shunt-ipc bridge bare}"
-REGMODES="${REGMODES:-c54x bin hybrid}"     # applied to DSP modes only
+MODES="${MODES:-full}"                       # défaut : chemin réel E2E
+REGMODES="${REGMODES:-c54x}"                 # défaut : mode sain (vrai FB)
 IDLEMODES="${IDLEMODES:-1}"                  # set "1 0" to compare governor on/off
-L2CLIENTS="${L2CLIENTS:-mobile ccch_scan cell_log}"   # L2 app variants to sweep
+L2CLIENTS="${L2CLIENTS:-mobile}"             # seul client qui drive un FBSB ciblé 514
+ICOUNTMODES="${ICOUNTMODES:-auto}"           # CALYPSO_ICOUNT ; set "auto off" pour tester sans icount
+AFCHZ="${AFCHZ:-}"                            # oracle AFC amont : CALYPSO_TWL3025_AFC_HZ=N (force offset). vide=off
 
 # ---- CC-web requested knobs --------------------------------------------------
 # DRAIN_PTYS=1   : drain the SPARE serial pty (the one osmocon does NOT hold) to
@@ -32,14 +37,17 @@ L2CLIENTS="${L2CLIENTS:-mobile ccch_scan cell_log}"   # L2 app variants to sweep
 #                  UART TX FIFO. Safe (does not steal osmocon's link). [default 1]
 # DRAIN_ALL_PTYS=1: HARD test — drain BOTH ptys incl. osmocon's. Breaks L1CTL,
 #                  use ONLY to isolate the uart_reg_read spin hypothesis. [default 0]
-# FORCE_TOA=N    : pass CALYPSO_FORCE_TOA=N (force a complete FB-result block:
-#                  d_fb_det=1 TOA=N). Empty = off. [default off]
-# DEBUG_TOKENS=…  : passed as CALYPSO_DEBUG (comma list) to light up probes, e.g.
-#                  "SP-EVENTS,FBDB-PROBE". Empty = probes off (lighter). [default off]
+# TOAMODES=…     : AXE séparé FORCE_TOA. Valeurs balayées : "off" (pas de force)
+#                  et/ou un TOA, ex. "off 23" → 2 sous-runs par combo pour le
+#                  test cause-C (d_fb_det change-t-il quand on force le FB ?).
+#                  [default "off"]. "23" => CALYPSO_FORCE_TOA=23.
+# DEBUG_TOKENS=…  : passed as CALYPSO_DEBUG (comma list) to light up probes.
+#                  Pour le test cause-A (ARM lit-il d_fb_det ?) : "TRX,WATCH-READ".
+#                  [default off]
 DRAIN_PTYS="${DRAIN_PTYS:-1}"
 DRAIN_ALL_PTYS="${DRAIN_ALL_PTYS:-0}"
-FORCE_TOA="${FORCE_TOA:-}"
-DEBUG_TOKENS="${DEBUG_TOKENS:-}"
+TOAMODES="${TOAMODES:-off}"      # axe FORCE_TOA séparé : "off" et/ou "23" (ex: TOAMODES="off 23")
+DEBUG_TOKENS="${DEBUG_TOKENS:-TRX,AFC-APPLY,WATCH-READ,D_TASK_MD-RD}"   # AFC amont + handoff + ARM-read
 ARFCN="${ARFCN:-514}"            # mobile is sticked to ARFCN 514 (DCS) — cfg ~/.osmocom/bb/mobile_group1.cfg
 DRAIN_PIDS=""
 
@@ -96,11 +104,11 @@ PY
 }
 
 sample_combo(){
-  local MODE="$1" L2="$2" REG="$3" IDLE="$4"
+  local MODE="$1" L2="$2" REG="$3" IDLE="$4" TOA="$5" ICOUNT="$6"
   # L2 app log: mobile -> mobile.log ; ccch_scan/cell_log -> l2_client.log
   local L2LOG=/tmp/mobile.log; [ "$L2" != "mobile" ] && L2LOG=/tmp/l2_client.log
   hr
-  log "########## MODE=$MODE  L2=$L2  DSP_REG_MODE=$REG  CPU_IDLE=$IDLE  win=${WINDOW}s  $(date +%H:%M:%S) ##########"
+  log "########## MODE=$MODE  L2=$L2  DSP_REG_MODE=$REG  CPU_IDLE=$IDLE  FORCE_TOA=$TOA  ICOUNT=$ICOUNT  win=${WINDOW}s  $(date +%H:%M:%S) ##########"
   hr
   killall_pipeline
   rm -f /tmp/l2_client.log /tmp/runsh.combo.out 2>/dev/null
@@ -109,13 +117,14 @@ sample_combo(){
   # Build env. REG is "n/a" for shunt modes (c54x bypassed).
   local REGENV="" TOAENV="" DBGENV=""
   [ "$REG" != "n/a" ]    && REGENV="CALYPSO_DSP_REG_MODE=$REG"
-  [ -n "$FORCE_TOA" ]    && TOAENV="CALYPSO_FORCE_TOA=$FORCE_TOA"
+  [ "$TOA" != "off" ] && [ -n "$TOA" ] && TOAENV="CALYPSO_FORCE_TOA=$TOA"
   [ -n "$DEBUG_TOKENS" ] && DBGENV="CALYPSO_DEBUG=$DEBUG_TOKENS"
+  local AFCENV=""; [ -n "$AFCHZ" ] && AFCENV="CALYPSO_TWL3025_AFC_HZ=$AFCHZ"
 
-  log "[diag] launch: CALYPSO_MODE=$MODE CALYPSO_L2_CLIENT=$L2 (ARFCN=$ARFCN) $REGENV CALYPSO_CPU_IDLE=$IDLE $TOAENV $DBGENV"
+  log "[diag] launch: CALYPSO_MODE=$MODE CALYPSO_L2_CLIENT=$L2 (ARFCN=$ARFCN) $REGENV CALYPSO_ICOUNT=$ICOUNT CALYPSO_CPU_IDLE=$IDLE $TOAENV $DBGENV"
   ( env CALYPSO_MODE="$MODE" CALYPSO_L2_CLIENT="$L2" FORCE_RX_DONE=1 \
-        CALYPSO_CCCH_ARFCN="$ARFCN" CALYPSO_NO_ATTACH=1 \
-        CALYPSO_CPU_IDLE="$IDLE" $REGENV $TOAENV $DBGENV \
+        CALYPSO_CCCH_ARFCN="$ARFCN" CALYPSO_NO_ATTACH=1 CALYPSO_ICOUNT="$ICOUNT" \
+        CALYPSO_CPU_IDLE="$IDLE" $REGENV $TOAENV $DBGENV $AFCENV \
         timeout $((WINDOW+50)) /opt/GSM/qemu-src/run.sh ) >/tmp/runsh.combo.out 2>&1 &
 
   local PID="" i
@@ -193,6 +202,49 @@ sample_combo(){
   log "    ARM writes (d_task_md):"; grep -hE 'ARM TASK WR|D_TASK_MD_ALL|DMA proof.*task_md' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
   log "    DSP reads (d_task_md @0x0804/0x0818):"; grep -hE 'D_TASK_MD-RD' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
   log "    task-change (fbsb orchestration):"; grep -hE 'on_dsp_task_change' "$QLOG" 2>/dev/null | tail -3 | sed 's/^/      /' | tee -a "$OUT"
+  log "--- CAUSE-A : ARM lit-il d_fb_det ? (needs DEBUG_TOKENS=TRX) ---"
+  log "    ARM RD (d_fb_det/d_fb_mode/a_sync @0x01F0+):"; grep -hE 'ARM RD (d_fb_det|d_fb_mode|a_sync)' "$QLOG" 2>/dev/null | tail -6 | sed 's/^/      /' | tee -a "$OUT"
+  log "    DSP DETECTOR-RUN / WATCH-READ (DSP écrit d_fb_det):"; grep -hE 'DETECTOR-RUN|WATCH-READ d_fb_det' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
+  log "--- IPC->BSP SOURCE (osmo-trx-ipc/UDP 5702) — needs DEBUG_TOKENS=BSP ---"
+  log "    passthrough on? (sinon BSP génère un ton synthétique fs/4=67.7kHz, IPC ignoré):"; grep -hE 'IQ_PASSTHROUGH=' "$QLOG" 2>/dev/null | tail -1 | sed 's/^/      /' | tee -a "$OUT"
+  log "    RXSZ (paquets UDP reçus de l IPC + taille):"; grep -hE 'RXSZ' "$QLOG" 2>/dev/null | tail -3 | sed 's/^/      /' | tee -a "$OUT"
+  log "    IQ passthrough iq[0..3] (samples VENANT de l IPC — varient=vraie waveform):"; grep -hE 'IQ passthrough' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
+  log "--- I/Q AMONT (puissance) — needs DEBUG_TOKENS=BSP-DELIVER,IQ-READ ---"
+  log "    BSP-DELIVER (samples livrés BSP->DSP/frame):"; grep -hE 'BSP-DELIVER' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/      /' | tee -a "$OUT"
+  log "    IQ-READ (valeurs I/Q lues par le DSP — 0/tiny = pas de puissance):"; grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | tail -5 | sed 's/^/      /' | tee -a "$OUT"
+  # Interprétation I/Q : amplitude ET variance (un DC constant = pas de forme
+  # d'onde, ≠ vraie FCCH qui doit varier sample-à-sample), + fenêtre temporelle.
+  {
+    local iqv mx=0 nz=0 tot=0 v a distinct fi la
+    iqv=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'val=0x[0-9a-f]+' | sed 's/[vV][aA][lL]=0[xX]//' | tail -300)
+    if [ -z "$iqv" ]; then
+      log "    >> INTERPRÉTATION I/Q : aucune ligne IQ-READ (token absent, ou le DSP ne lit jamais le buffer corrélateur)"
+    else
+      for h in $iqv; do
+        v=$((16#$h)); [ "$v" -ge 32768 ] && v=$((v-65536)); a=${v#-}
+        tot=$((tot+1)); [ "$a" -gt 0 ] && nz=$((nz+1)); [ "$a" -gt "$mx" ] && mx=$a
+      done
+      distinct=$(printf '%s\n' $iqv | sort -u | wc -l | tr -d ' ')
+      # fenêtre insn des samples (boot ~3M vs détection ~70M+)
+      fi=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'insn=[0-9]+' | head -1 | sed 's/insn=//')
+      la=$(grep -hE 'IQ-READ' "$QLOG" 2>/dev/null | grep -oiE 'insn=[0-9]+' | tail -1 | sed 's/insn=//')
+      log "    >> INTERPRÉTATION I/Q : n=$tot non-nuls=$nz |max|=$mx valeurs_distinctes=$distinct (insn ${fi:-?}..${la:-?}, int16 ±32767)"
+      if   [ "$mx" -lt 16 ];  then
+        log "       VERDICT: I/Q PLAT (~0) → AUCUNE puissance au DSP → perte device→BSP→DSP (livraison/c54x_bsp_load)"
+      elif [ "${distinct:-0}" -le 3 ]; then
+        log "       VERDICT: I/Q CONSTANT (|max|=$mx mais $distinct valeur(s) distincte(s)) → DC, AUCUNE forme d'onde"
+        log "                → bug CONTENU I/Q (modulateur osmo-trx-ipc/bridge OU conversion BSP), PAS le PM."
+      else
+        log "       VERDICT: I/Q VARIE ($distinct distinctes, |max|=$mx) → vraie forme d'onde livrée → suspecter le CALCUL PM (renvoie 0 malgré I/Q réel)"
+      fi
+      [ -n "$fi" ] && [ "$fi" -lt 10000000 ] && log "       ⚠ samples capturés au BOOT (insn=$fi <10M) = buffer potentiellement STALE ; la sonde IQ-READ doit aussi tirer à l'instant détection (insn~70M) pour conclure sur le steady-state."
+    fi
+  }
+  log "--- AFC AMONT (convergence ?) — needs DEBUG_TOKENS=TRX,AFC-APPLY ---"
+  log "    AFC WR (firmware -> dac/hz):"; grep -hE 'AFC WR' "$QLOG" 2>/dev/null | tail -5 | sed 's/^/      /' | tee -a "$OUT"
+  log "    AFC-APPLY (offset Hz réellement appliqué/burst ; >±20kHz tue la FCCH):"; grep -hE 'AFC-APPLY' "$QLOG" 2>/dev/null | tail -5 | sed 's/^/      /' | tee -a "$OUT"
+  log "    d_fb_mode (FBMODE-WR / DETECTOR-RUN — fenêtre détecteur):"; grep -hE 'FBMODE-WR|DETECTOR-RUN' "$QLOG" 2>/dev/null | tail -3 | sed 's/^/      /' | tee -a "$OUT"
+  log "    rxlev plancher ? (mobile):"; grep -hE 'Found signal|rxlev' "$L2LOG" 2>/dev/null | tail -3 | sed 's/^/      /' | tee -a "$OUT"
   log "--- d_fb_det ARM/DSP reads + writes (shunt-ipc handshake) ---"
   grep -hE 'WATCH-READ d_fb_det|FBDET RD|FBWATCH-DET|d_fb_det' "$QLOG" 2>/dev/null | tail -6 | sed 's/^/    /' | tee -a "$OUT"
   log "--- shunt LATCH page read/write (page aliasing check) ---"
@@ -217,8 +269,8 @@ sample_combo(){
 log "#################################################################"
 log "#   Calypso QEMU exhaustive COMBO-matrix diag"
 log "#   date=$(date)"
-log "#   MODES=[$MODES]  L2CLIENTS=[$L2CLIENTS]  REGMODES=[$REGMODES]  IDLEMODES=[$IDLEMODES]  win=${WINDOW}s"
-log "#   ARFCN=$ARFCN  DRAIN_PTYS=$DRAIN_PTYS  DRAIN_ALL_PTYS=$DRAIN_ALL_PTYS  FORCE_TOA=[${FORCE_TOA:-off}]  DEBUG_TOKENS=[${DEBUG_TOKENS:-off}]"
+log "#   MODES=[$MODES]  L2CLIENTS=[$L2CLIENTS]  REGMODES=[$REGMODES]  IDLEMODES=[$IDLEMODES]  TOAMODES=[$TOAMODES]  ICOUNTMODES=[$ICOUNTMODES]  win=${WINDOW}s"
+log "#   ARFCN=$ARFCN  DRAIN_PTYS=$DRAIN_PTYS  DRAIN_ALL_PTYS=$DRAIN_ALL_PTYS  DEBUG_TOKENS=[${DEBUG_TOKENS:-off}]"
 log "#   qemu=$(ls -l /opt/GSM/qemu-src/build/$QEMU_BIN 2>/dev/null | awk '{print $6,$7,$8}')"
 log "#################################################################"
 log ""
@@ -227,15 +279,19 @@ N=0
 for m in $MODES; do
   for l2 in $L2CLIENTS; do
     for idle in $IDLEMODES; do
-      # reg-sweep only for the functional mobile path on DSP-real modes;
-      # scanners (ccch_scan/cell_log) + shunt run a single reg to limit heat.
-      if is_shunt "$m"; then
-        sample_combo "$m" "$l2" "n/a" "$idle"; N=$((N+1))
-      elif [ "$l2" = "mobile" ]; then
-        for reg in $REGMODES; do sample_combo "$m" "$l2" "$reg" "$idle"; N=$((N+1)); done
-      else
-        sample_combo "$m" "$l2" "bin" "$idle"; N=$((N+1))
-      fi
+      for toa in $TOAMODES; do
+       for ic in $ICOUNTMODES; do
+        # reg-sweep only for the functional mobile path on DSP-real modes;
+        # scanners (ccch_scan/cell_log) + shunt run a single reg to limit heat.
+        if is_shunt "$m"; then
+          sample_combo "$m" "$l2" "n/a" "$idle" "$toa" "$ic"; N=$((N+1))
+        elif [ "$l2" = "mobile" ]; then
+          for reg in $REGMODES; do sample_combo "$m" "$l2" "$reg" "$idle" "$toa" "$ic"; N=$((N+1)); done
+        else
+          sample_combo "$m" "$l2" "bin" "$idle" "$toa" "$ic"; N=$((N+1))
+        fi
+       done
+      done
     done
   done
 done
