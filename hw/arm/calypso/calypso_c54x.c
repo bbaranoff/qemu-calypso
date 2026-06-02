@@ -3472,10 +3472,17 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
  * OVLY (DARAM mirror) is handled at call site because it routes to s->data[]. */
 static inline uint32_t c54x_prog_xlate(const C54xState *s, uint16_t addr16)
 {
-    if (addr16 >= 0x8000) {
+    /* FIX 2026-06-02 (ROOT CAUSE #2 — runaway 0xee00) : seule la fenêtre
+     * 0x8000-0xDFFF est bankée par XPC (overlay PROM0/2/3). 0xE000-0xFFFF est
+     * de la ROM FIXE (PROM1, mirror à prog[0xE000+]) — NON bankée sur le
+     * silicium. L'ancien `>= 0x8000` appliquait XPC à 0xE000+ aussi → quand
+     * XPC=3, PC=0xee00 fetchait prog[0x3ee00] (au-delà des 8K de PROM3) = vide
+     * → exécution de PROM nulle (op=0x0000) → runaway de l'étage FB
+     * post-corrélateur. La ROM haute doit ignorer XPC. */
+    if (addr16 >= 0x8000 && addr16 < 0xE000) {
         return (((uint32_t)s->xpc << 16) | addr16) & (C54X_PROG_SIZE - 1);
     }
-    return addr16;
+    return addr16;   /* 0x0000-0x7FFF on-chip + 0xE000-0xFFFF PROM1 ROM (XPC-indépendant) */
 }
 
 static uint16_t prog_fetch(C54xState *s, uint16_t pc)
@@ -3829,7 +3836,28 @@ static int c54x_exec_one(C54xState *s)
      * PC/opcode/AR3/A AVANT chaque instr : si AR3 ne bouge pas d'une ligne à
      * l'autre, ou si A n'accumule pas, on a le coupable (post-incr *AR3+ / RPT
      * / MAC). One-shot ~60 instr. CALYPSO_DEBUG=CORR-TRACE. */
-    if (s->insn_count > 60000000u && s->pc >= 0x8560 && s->pc <= 0x8590
+    /* DERAIL-EE00 (2026-06-02) : attrape le saut DANS la zone PROM vide 0xee00
+     * (op=0x0000) post-fix SACCD. Logge le PC source + opcode + XPC pour
+     * trancher runaway firmware (branche fausse) vs bug paging XPC (adresse
+     * légitime bankée fetchée page 0). One-shot ~12. */
+    if (s->pc >= 0xee00 && s->pc < 0xef00 &&
+        !(s->last_exec_pc >= 0xee00 && s->last_exec_pc < 0xef00)) {
+        static unsigned dr = 0;
+        if (dr < 12) {
+            fprintf(stderr, "[c54x] DERAIL-EE00 #%u entré PC=0x%04x DEPUIS last_pc=0x%04x op_src=0x%04x XPC=%u op@pc=0x%04x SP=0x%04x insn=%u\n",
+                    dr, s->pc, s->last_exec_pc, prog_fetch(s, s->last_exec_pc),
+                    s->xpc & 0xFF, op, s->sp, s->insn_count);
+            dr++;
+        }
+    }
+
+    static int ct_lo = -1, ct_hi = -1;
+    if (ct_lo < 0) {
+        const char *l = getenv("CALYPSO_CORR_LO"); const char *h = getenv("CALYPSO_CORR_HI");
+        ct_lo = l ? (int)strtol(l, NULL, 0) : 0x8560;
+        ct_hi = h ? (int)strtol(h, NULL, 0) : 0x8590;
+    }
+    if (s->insn_count > 60000000u && s->pc >= (uint16_t)ct_lo && s->pc <= (uint16_t)ct_hi
         && calypso_debug_enabled("CORR-TRACE")) {
         static unsigned ct = 0;
         if (ct < 60) {
