@@ -3824,6 +3824,23 @@ static int c54x_exec_one(C54xState *s)
     s->lk_used = false;  /* reset before each instruction */
     s->writer_kind = WK_UNKNOWN;  /* attribution tag for DATA-W-MMR */
 
+    /* === CORR-TRACE (2026-06-02) : trace instruction-par-instruction la boucle
+     * MAC du corrélateur FB autour de 0x8576 à l'instant détection. Montre
+     * PC/opcode/AR3/A AVANT chaque instr : si AR3 ne bouge pas d'une ligne à
+     * l'autre, ou si A n'accumule pas, on a le coupable (post-incr *AR3+ / RPT
+     * / MAC). One-shot ~60 instr. CALYPSO_DEBUG=CORR-TRACE. */
+    if (s->insn_count > 60000000u && s->pc >= 0x8560 && s->pc <= 0x8590
+        && calypso_debug_enabled("CORR-TRACE")) {
+        static unsigned ct = 0;
+        if (ct < 60) {
+            int64_t aa = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+            fprintf(stderr, "[c54x] CORR-TRACE #%u PC=0x%04x op=%04x op2=%04x AR3=%04x data[AR3]=%04x A=%lld T=%04x BRC=%u insn=%u\n",
+                    ct, s->pc, op, prog_fetch(s, s->pc + 1), s->ar[3], s->data[s->ar[3]],
+                    (long long)aa, s->t, s->brc, s->insn_count);
+            ct++;
+        }
+    }
+
     /* === AR-CLOBBER probe (2026-05-29) ===
      * Track AR1/AR2/AR6/AR7 transitions to 0 — when an AR pointer
      * becomes 0, any subsequent indirect store *ARx will write to
