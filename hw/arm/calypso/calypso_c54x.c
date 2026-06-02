@@ -7193,22 +7193,41 @@ static int c54x_exec_one(C54xState *s)
             data_write(s, mmr, op2);
             return consumed + s->lk_used;
         }
-        /* REVERTED 2026-05-15 nuit : handlers 0x72/0x73 (MVDM/MVMD per
-         * binutils tic54x-opc.c) RETIRÉS d'ici. Le fix sémantiquement
-         * correct révèle un bug compensateur upstream du firmware qu'on n'a
-         * pas le temps d'attaquer maintenant. Régressions empiriques :
-         *   - A_CD-WR : 244 → 6 (-97%)
-         *   - D_TASK_D val=1 : 2/run → 0
-         *   - INT3 fire : 1583/min → 1 total
-         *   - DSP busy state : compute path → reset vector loop
-         * Voir doc/REVERT_MVMD_KNOWLEDGE.md pour analyse complète,
-         * criteria de re-application, et plan d'attaque future.
+        /* RE-APPLIQUÉ 2026-06-02 : MVDM/MVMD (0x72/0x73) en 2 MOTS, ISA-correct
+         * (tic54x-opc.c : mvdm 0x7200/0xFF00, mvmd 0x7300/0xFF00). Le revert
+         * 2026-05-15 (REVERT_MVMD_KNOWLEDGE.md) les avait retirés car le fix
+         * régressait — MAIS c'était AVANT les fix SACCD / XPC-paging / 0x86-87 /
+         * CMPS, qui satisfont précisément le critère #3 de ré-application du
+         * revert (« opcode upstream identifié et fixé »). La régression d'alors
+         * était un symptôme de ces bugs, maintenant corrigés.
          *
-         * Le fallthrough vers `(op & 0xF800) == 0x7000` (= STL src,Smem)
-         * est restoré, qui catch 0x72xx/0x73xx avec ce mask 0xF800.
-         * Notamment site critique PC=0x8208 op=0x7317 redevient mis-décodé
-         * comme STL B,*(DP+0x17) avec son side-effect compensatoire que
-         * le firmware exploite. */
+         * PREUVE MESURÉE (DECODE-AUDIT gaté insn>250M, 2026-06-02) : à
+         * PC=0xf564, op=0x7215 = MVDM data[0x0014]→AR5, AU CŒUR de la boucle
+         * dispatch FB (0xf561-0xf588). Décodé 1-mot (fallthrough STL), l'ému
+         * ne consommait pas l'opérande 0x0014 → l'exécutait comme un opcode
+         * (PC=0xf565 op=0014 hi8=00) → desync À CHAQUE itération → AR5 (pointeur
+         * du handler de tâche) jamais chargé → tâche FB (task_md=5) jamais
+         * dispatchée → 0x9ac0 jamais ré-atteint past-boot → d_fb_det jamais armé.
+         * = la cause (c) « décision jamais atteinte ».
+         *
+         * MVDM dmad, MMR : data[MMR] = data[dmad]  (MMR=op&0x7F, dmad=op2). */
+        if (hi8 == 0x72) {
+            uint8_t mmr = op & 0x7F;
+            op2 = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, mmr, data_read(s, op2));
+            return consumed + s->lk_used;
+        }
+        /* MVMD MMR, dmad : data[dmad] = data[MMR]  (MMR=op&0x7F, dmad=op2).
+         * Site historique PC=0x8208 op=0x7317 = MVMD AR7,BRC → BRC=AR7 (= le
+         * RPTB compute-loop count que le firmware arme avant la corrélation). */
+        if (hi8 == 0x73) {
+            uint8_t mmr = op & 0x7F;
+            op2 = prog_fetch(s, s->pc + 1);
+            consumed = 2;
+            data_write(s, op2, data_read(s, mmr));
+            return consumed + s->lk_used;
+        }
         /* LD / ST operations */
         if ((op & 0xF800) == 0x7000) {
             /* 70xx: STL src, Smem */
