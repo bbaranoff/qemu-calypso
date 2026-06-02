@@ -1843,7 +1843,7 @@ if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
             ;;
         ccch_scan)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-                "$L1CTL_WAIT && ccch_scan -a 1 2>&1 | $TSLOG | tee $L2_LOG" C-m
+                "$L1CTL_WAIT && ccch_scan -a ${CALYPSO_CCCH_ARFCN:-1} 2>&1 | $TSLOG | tee $L2_LOG" C-m
             ;;
         cell_log)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
