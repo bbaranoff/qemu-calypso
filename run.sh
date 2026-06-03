@@ -182,7 +182,7 @@ done
 # ---- --debug-full : export toutes les probes en une commande ----
 if [ "$DEBUG_FULL_MODE" = "1" ]; then
     echo "[run.sh] --debug-full : CALYPSO_DEBUG=ALL (toutes les sondes)"
-    export CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"
+    export CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"
     export CALYPSO_L2_CLIENT="${CALYPSO_L2_CLIENT:-mobile}"
     # UNE seule var pilote TOUTES les sondes diagnostic (c54x + BSP + TRX + ...).
     export CALYPSO_DEBUG="${CALYPSO_DEBUG:-ALL}"
@@ -449,6 +449,7 @@ if [ "$MENU_MODE" = "1" ]; then
     # ---- 1) MODE general (--menu : ENTER directly selects) ----
     CALYPSO_MODE=$(whiptail --backtitle "$BACKTITLE" \
       --title "[1/4] General mode" \
+      --default-item "full-grgsm" \
       --notags --menu \
       "\n Pick a preset (ENTER on item to select). Level 2 inherits it.\n\n \
  Fine override: env vars CALYPSO_SKIP_*, CALYPSO_DSP_SHUNT, ...\
@@ -606,6 +607,7 @@ if [ "$MENU_MODE" = "1" ]; then
     else
       ICOUNT=$(whiptail --backtitle "$BACKTITLE" \
         --title "[3/4] QEMU icount mode" \
+        --default-item "off" \
         --notags --menu \
         "\n Pacing horloge virtuelle QEMU.\n" \
         14 76 3 \
@@ -1093,7 +1095,7 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 # le mobile campe pour de vrai. Aucun shunt, aucun bridge, aucune injection.
 # Chemins de debug opt-in : CALYPSO_MODE=shunt-ipc (bridge gr-gsm, démod externe),
 # CALYPSO_MODE=shunt (FB/SB cannés). À n'utiliser que pour diag, pas par défaut.
-CALYPSO_MODE="${CALYPSO_MODE:-full}"
+CALYPSO_MODE="${CALYPSO_MODE:-full-grgsm}"   # defaut full-grgsm (pipeline grgsm decode valide 2026-06-03)
 # icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
 : "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
 # IPC TX (uplink) ON par défaut : le device module les bursts UL du mobile
@@ -1143,6 +1145,9 @@ case "$CALYPSO_MODE" in
         CALYPSO_DSP_L1_STUB=0
         CALYPSO_FORCE_FBSB=0          # pas d'oracle FBSB_CONF
         CALYPSO_FORCE_AGCH=0          # pas de réécriture DATA_IND BCCH SI
+        # FIFOs live (1 par consommateur e2e) : fft(host) grgsm(decode) record(drainer) asciifft(fenetre run.sh)
+        : "${CALYPSO_RELAY_FIFOS:=/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo:/tmp/iq_asciifft.fifo}"
+        export CALYPSO_RELAY_FIFOS
         export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_RELAY_ALSO_BSP CALYPSO_SHUNT_NO_CANNED \
                CALYPSO_DSP_L1STUB CALYPSO_DSP_L1_STUB \
                CALYPSO_FORCE_FBSB CALYPSO_FORCE_AGCH
@@ -1346,7 +1351,7 @@ export CALYPSO_W1C_LATCH \
 #   auto              shift dynamic, wall-clock aligned (recommended)
 #   shift=N,sleep=on  fixed shift (1<<N instr ~= 1ns), explicit sleep
 #   off               disable (legacy default-clock mode)
-CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-auto}"  # default auto since 2026-05-27 SIM fix (read-to-clear + WT timer on MASKIT unmask, calypso_sim.c). Pipeline complet OK sous auto.
+CALYPSO_ICOUNT="${CALYPSO_ICOUNT:-off}"  # DEFAUT OFF 2026-06-03 (full-grgsm : DATA_IND via socket l1ctl, insensible au LOST UART ; cfile decode plus rapide). Override =auto si besoin AFC. Ancien default auto since 2026-05-27 SIM fix (read-to-clear + WT timer on MASKIT unmask, calypso_sim.c). Pipeline complet OK sous auto.
 export CALYPSO_ICOUNT
 
 # ---- MTTCG mode (Phase C : multi-thread TCG, ARM en thread distinct
@@ -1487,7 +1492,7 @@ rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
       "$IPC_MSOCK_PATH" "${IPC_MSOCK_PATH}_0"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc python3 >/dev/null 2>&1 || true
+killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc >/dev/null 2>&1 || true   # PAS python3 (tue le tslog -> Killed moche) ; les pkills cibles gerent grgsm/si_bridge
 pkill -9 -f calypso-ipc-device 2>/dev/null || true
 # full-grgsm : tuer les restes qui tiennent des ports (5810/5811/6700/6800/4730)
 pkill -9 -f "grgsm_trx"   2>/dev/null || true
@@ -1508,6 +1513,10 @@ pkill -9 -x osmo-bts-trx         2>/dev/null || true
 pkill -9 -x osmocon              2>/dev/null || true
 pkill -9 -x mobile               2>/dev/null || true
 pkill -9 -f "inject_si3"         2>/dev/null || true
+pkill -9 -f "si_bridge"        2>/dev/null || true
+pkill -9 -f "relay_continu"     2>/dev/null || true
+pkill -9 -f "record_drain"     2>/dev/null || true
+rm -f /tmp/relay_continu.cfile /tmp/record.cfile 2>/dev/null || true  # vieux record (ring externalise maintenant)
 sleep 1   # laisse les sockets UDP/TCP se libérer avant de relancer
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
@@ -1714,6 +1723,12 @@ for _sec in PROM0 PROM1 PROM2 PROM3 DROM PDROM REGISTERS; do
 done
 unset _sec _var _val _prop
 
+# DATA_IND : par defaut on N INJECTE PAS le court-circuit l1ctl_inject_dl_si
+# (CALYPSO_SHUNT_DL_INJECT=0) => le SI passe UNIQUEMENT par a_cd -> firmware L1
+# -> UART (le vrai chemin). Mettre =1 pour reactiver le court-circuit direct.
+: "${CALYPSO_SHUNT_DL_INJECT:=0}"
+export CALYPSO_SHUNT_DL_INJECT
+
 # Override delibere : pour le child QEMU seulement, L1CTL_SOCK pointe vers
 # le dummy (/tmp/qemu_l1ctl_disabled). QEMU/l1ctl_sock.c cree son socket a
 # cette adresse-poubelle (= L1CTL QEMU desactive). Le VRAI socket L1CTL
@@ -1834,7 +1849,7 @@ if [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ]; then
     tmux new-window -t "$SESSION" -n ipc-device
     if [ -n "$CALYPSO_IPC_DEVICE" ] && [ -x "$CALYPSO_IPC_DEVICE" ]; then
         tmux send-keys -t "$SESSION:ipc-device" \
-            ": > $IPC_DEVICE_LOG && CALYPSO_IPC_RELAY=${CALYPSO_IPC_RELAY:-0} CALYPSO_TRX_IQ_HOST=${CALYPSO_TRX_IQ_HOST:-127.0.0.1} CALYPSO_TRX_IQ_RX_PORT=${CALYPSO_TRX_IQ_RX_PORT:-5810} CALYPSO_TRX_IQ_TX_PORT=${CALYPSO_TRX_IQ_TX_PORT:-5811} $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
+            ": > $IPC_DEVICE_LOG && CALYPSO_IPC_RELAY=${CALYPSO_IPC_RELAY:-0} CALYPSO_TRX_IQ_HOST=${CALYPSO_TRX_IQ_HOST:-127.0.0.1} CALYPSO_TRX_IQ_RX_PORT=${CALYPSO_TRX_IQ_RX_PORT:-5810} CALYPSO_TRX_IQ_TX_PORT=${CALYPSO_TRX_IQ_TX_PORT:-5811} CALYPSO_RELAY_FIFOS=${CALYPSO_RELAY_FIFOS:-/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo:/tmp/iq_asciifft.fifo} $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
         echo -n "Waiting for calypso-ipc-device master sock ($IPC_MSOCK_PATH)..."
         for i in $(seq 1 30); do
             [ -S "$IPC_MSOCK_PATH" ] && break
@@ -1969,21 +1984,21 @@ fi
 # ecrit le SI dans la zone sortie -> shunt_poll_si_shm -> feed_si -> a_cd -> le
 # mobile (osmocon) campe sur la VRAIE SI decodee. mmap = fix shmat conteneur.
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+    # RECORD drainer : iq_record.fifo (ecrit NON-BLOQUANT par qemu, frame par
+    # frame) -> /tmp/record.cfile (ring 128MB) HORS du hot-path qemu => PLUS
+    # d underrun (c est le fwrite du ring DANS qemu qui les causait). si_bridge
+    # relit record.cfile offline (= ancien comportement, SI preserve).
+    pkill -9 -f record_drain.py 2>/dev/null || true
+    ( python3 /opt/GSM/record_drain.py >/tmp/record_drain.log 2>&1 & )
     tmux new-window -t "$SESSION" -n grgsm-decode
     tmux send-keys -t "$SESSION:grgsm-decode" \
-        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=4 CALYPSO_TRX_IN_SPS=4 CALYPSO_GRGSM_REFRAME=0 CALYPSO_GRGSM_DCBLOCK=1 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+        "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
-    # Bridge SI (2026-06-03) : grgsm_decode (cfile CONTINU /tmp/relay_continu.cfile,
+    # Bridge SI : grgsm_decode lit le FIFO LIVE /tmp/iq_grgsm.fifo (flux continu pousse
     # -s 1083333 = 4 SPS) DECODE le vrai SI2/SI3/SI4/SI13 de la BTS -> parse ->
     # GSMTAP 4730 -> shunt feed_si -> a_cd + DATA_IND -> mobile. C'est CE chemin qui
     # casse le mur demod (le cfile continu, pas les bursts BSP discontinus).
     # Gated CALYPSO_SI_BRIDGE (defaut 1). sleep 15 = laisse la pile cfile se remplir.
-    if [ "${CALYPSO_SI_BRIDGE:-1}" = "1" ]; then
-        tmux new-window -t "$SESSION" -n si-bridge
-        tmux send-keys -t "$SESSION:si-bridge" \
-            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/si_bridge.log" C-m
-        echo "[run.sh] full-grgsm : si_bridge_loop (grgsm_decode cfile -> SI -> feed_si -> mobile) lance"
-    fi
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
@@ -2055,7 +2070,7 @@ for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
     if [ "$log" = "__FFT__" ]; then
         # FFT live du cfile BSP (lien grgsm<->BSP) — remplace tcpdump (vire pour l'instant).
-        cmd="clear; source /root/.env/bin/activate 2>/dev/null; python3 /opt/GSM/grgsm_fft_live.py"
+        cmd="clear; source /root/.env/bin/activate 2>/dev/null; CFILE=/tmp/iq_asciifft.fifo FS=1083333 python3 /opt/GSM/grgsm_fft_live.py"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide

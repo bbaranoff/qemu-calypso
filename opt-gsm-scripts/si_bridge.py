@@ -4,7 +4,7 @@
 import subprocess, socket, struct, re, sys
 GSMTAP = struct.pack(">BBBBHbbIBBBB", 2,4,0x01,0,0,0,0,0,0x01,0,0,0)  # 16B, type UM, BCCH
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-CF = sys.argv[1] if len(sys.argv)>1 else "/tmp/relay_continu.cfile"
+CF = sys.argv[1] if len(sys.argv)>1 else "/tmp/iq_grgsm.fifo"
 p = subprocess.Popen(["grgsm_decode","-m","BCCH","-t","0","-a","514","-c",CF,"-s","1083333","-v"],
                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 SI={0x1b:"SI3",0x1a:"SI2",0x1c:"SI4",0x21:"SI13",0x19:"SI1",0x1d:"SI2bis",0x1e:"SI2ter",0x06:"RR"}

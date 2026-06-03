@@ -30,6 +30,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <osmocom/core/logging.h>
@@ -771,19 +773,51 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                 sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
                        MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
                        sizeof(g_relay_dl_dst));
-            /* PILE cfile CONTINU : le MÊME full chunk relay (tous TS, continu) ->
-             * /tmp/relay_continu.cfile. C'est ce que grgsm_decode -c veut (flux
-             * continu, pas les bursts TS0 discontinus du cfile BSP). Gated
-             * CALYPSO_RELAY_CFILE (defaut /tmp/relay_continu.cfile, vide=off). */
+            /* FIFOs LIVE frame-par-frame : on pousse CHAQUE "trame cfile" (le
+             * full chunk relay continu = ns*2 floats fc32, 1 write() = 1 trame)
+             * dans 1 FIFO par consommateur (fft, grgsm, record). NON-BLOQUANT :
+             * si un lecteur est lent/absent on DROP la trame => aucun stall du
+             * hot-path DL => PLUS d'underrun. (C'est le fwrite du RING cfile
+             * entier 128MB sur tmpfs + fseek qui causait les underruns.)
+             * Le RECORD se fait A COTE : un drainer externe (run.sh) lit
+             * iq_record.fifo -> record.cfile, hors du hot-path qemu.
+             * Liste CALYPSO_RELAY_FIFOS (':'-separes), defaut fft:grgsm:record.*/
             {
-                static FILE *rcf = (FILE *)-1;
-                if (rcf == (FILE *)-1) {
-                    const char *e = getenv("CALYPSO_RELAY_CFILE");
-                    const char *path = e ? e : "/tmp/relay_continu.cfile";
-                    rcf = (e && !*e) ? NULL : fopen(path, "wb");
-                    if (rcf) setvbuf(rcf, NULL, _IOFBF, 1 << 20);
+                enum { MAXFIFO = 4 };
+                static int   fifo_fd[MAXFIFO];
+                static char  fifo_path[MAXFIFO][128];
+                static int   nfifo = -1;
+                if (nfifo < 0) {
+                    nfifo = 0;
+                    const char *e = getenv("CALYPSO_RELAY_FIFOS");
+                    const char *list = (e && *e) ? e
+                        : "/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo";
+                    char buf[512];
+                    strncpy(buf, list, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+                    char *sav = NULL, *tok = strtok_r(buf, ":", &sav);
+                    while (tok && nfifo < MAXFIFO) {
+                        strncpy(fifo_path[nfifo], tok, 127);
+                        fifo_path[nfifo][127] = 0;
+                        fifo_fd[nfifo] = -1;
+                        mkfifo(fifo_path[nfifo], 0666);   /* ignore EEXIST */
+                        nfifo++;
+                        tok = strtok_r(NULL, ":", &sav);
+                    }
                 }
-                if (rcf) fwrite(g_relay_fbuf, sizeof(float), (size_t)ns * 2, rcf);
+                size_t fbytes = (size_t)ns * 2 * sizeof(float);   /* 1 trame cfile */
+                for (int f = 0; f < nfifo; f++) {
+                    if (fifo_fd[f] < 0) {
+                        /* O_NONBLOCK : -1/ENXIO tant qu'aucun lecteur n'a ouvert */
+                        fifo_fd[f] = open(fifo_path[f], O_WRONLY | O_NONBLOCK);
+                        if (fifo_fd[f] < 0) continue;
+                        fcntl(fifo_fd[f], F_SETPIPE_SZ, 1 << 20); /* 1MB = marge ~50 trames */
+                    }
+                    ssize_t w = write(fifo_fd[f], g_relay_fbuf, fbytes);
+                    if (w < 0 && (errno == EPIPE || errno == EBADF)) {
+                        close(fifo_fd[f]); fifo_fd[f] = -1;   /* lecteur parti -> reouvrira */
+                    }
+                    /* EAGAIN (pipe plein, lecteur lent) : DROP cette trame. */
+                }
             }
             /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
              * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour

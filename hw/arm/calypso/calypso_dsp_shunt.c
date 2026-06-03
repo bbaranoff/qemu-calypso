@@ -133,6 +133,13 @@ struct dsp_shunt_state {
      * Si si_valid, shunt_dispatch_allc écrit si_buf dans a_cd au lieu du canned. */
     uint8_t    si_buf[23];
     bool       si_valid;
+    /* (A) Set SI COMPLET : un buffer par type (SI1/2/3/4/2bis/2ter). Sinon le
+     * mobile ne reçoit qu'UN type → "No sysinfo yet" → sync timeout. On tourne
+     * au début de chaque bloc (burst 0) pour tenir un type STABLE sur les 4
+     * bursts (a_cd mono-frame ; sinon frame incohérente → CRC fail). */
+    uint8_t    si_set[6][23];
+    bool       si_set_have[6];
+    int        si_rr;                 /* index round-robin du dernier type servi */
 };
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
@@ -315,15 +322,8 @@ static void shunt_dispatch_sb(uint8_t page_idx)
  *   [10..11]=cell options + cell select
  *   [12..14]=RACH ctrl
  *   [15..22] = padding 0x2B */
-static const uint8_t SHUNT_CANNED_SI3_L2[23] = {
-    0x49, 0x06, 0x1B,                   /* L2 hdr + RR PD + SI3 mt */
-    0x00, 0x01,                         /* Cell ID = 1 */
-    0x00, 0xF1, 0x10,                   /* MCC=001 MNC=01 */
-    0x00, 0x01,                         /* LAC = 1 */
-    0x01, 0x00,                         /* cell opts + cell select */
-    0x18, 0xFF, 0xFF,                   /* RACH ctrl */
-    0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B
-};
+/* SHUNT_CANNED_SI3_L2 RETIRÉ (no-hack 2026-06-03) : le SI vient
+ * UNIQUEMENT du vrai décode grgsm (g_shunt.si_buf via feed_si). */
 
 static void shunt_dispatch_allc(uint8_t page_idx)
 {
@@ -349,6 +349,58 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     if (no_canned && !g_shunt.si_valid)
         return;
 
+    /* (A) ROTATION par bloc : au début du bloc (burst 0) on avance au prochain
+     * type SI disponible et on le copie dans si_buf (STABLE pour les 4 bursts).
+     * Le mobile collecte ainsi TOUT le set (SI1/2/3/4) au fil des blocs au lieu
+     * du seul SI3. Round-robin = aucune dépendance FN (jitter-proof). */
+    if (g_shunt.d_burst_d == 0) {
+        for (int k = 1; k <= 6; k++) {
+            int s = (g_shunt.si_rr + k) % 6;
+            if (g_shunt.si_set_have[s]) {
+                memcpy(g_shunt.si_buf, g_shunt.si_set[s], 23);
+                g_shunt.si_rr = s;
+                break;
+            }
+        }
+    }
+
+    /* #12 ORDONNANCEMENT BCCH (no-hack) : présenter le SI UNIQUEMENT sur les
+     * blocs BCCH du multiframe-51 (TC = fn%51 ∈ [2,5]). Sur un bloc CCCH le SI3
+     * fuiterait en PCH/AGCH ("Unknown PCH/AGCH message"). d_fn = vraie FN (#4).
+     * Gated CALYPSO_SHUNT_BCCH_SCHED (défaut 1). */
+    static int bcch_sched = -1, bcch_ofs = 0;
+    if (bcch_sched < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_BCCH_SCHED");
+        bcch_sched = (e && *e == '1') ? 1 : 0;        /* DEFAUT OFF (chan_nr pas le gate du camping) */
+        const char *o = getenv("CALYPSO_SHUNT_BCCH_OFS");
+        bcch_ofs = o ? atoi(o) : 0;
+    }
+    if (bcch_sched) {
+        /* FN = le device (vraie FN GSM de la BTS, alignée mf-51), PAS d_fn
+         * (que le firmware laisse à 0). Bloc BCCH non-combiné C0T0 = TC ∈ [2,5]
+         * (FCCH@0/10/.., SCH@1/11/.., BCCH@2-5, CCCH@6-9/12-15..). Offset
+         * réglable CALYPSO_SHUNT_BCCH_OFS si l'alignement dispatch≠bloc. */
+        static unsigned long n_disp = 0, n_bcch = 0, n_since_bcch = 0;
+        int tc = (int)((((long)calypso_trx_get_fn() + bcch_ofs) % 51 + 51) % 51);
+        int is_bcch = (tc >= 2 && tc <= 5);
+        n_disp++;
+        if (is_bcch) { n_bcch++; n_since_bcch = 0; } else n_since_bcch++;
+        if ((n_disp % 51) == 0)
+            fprintf(stderr, "[dsp-shunt] #12 BCCH-sched: %lu disp / %lu BCCH "
+                    "(tc=%d ofs=%d)\n", n_disp, n_bcch, tc, bcch_ofs);
+        /* Garde anti-famine : grace au boot (200 disp) + si 0 BCCH depuis 102
+         * dispatches (désalignement total) on présente quand même → dégrade
+         * vers "SI partout" au lieu de famine totale. */
+        if (!is_bcch && n_disp > 200 && n_since_bcch < 102) {
+            uint32_t addr0 = BASE_API_NDB + NDB_A_CD;
+            uint32_t rp_c  = rp_base(page_idx);
+            shunt_write_w(addr0 + 0, 0x0003);          /* a_cd[0] FIRE = CRC fail */
+            shunt_write_w(rp_c + RP_D_TASK_D,  ALLC_DSP_TASK);
+            shunt_write_w(rp_c + RP_D_BURST_D, g_shunt.d_burst_d);
+            return;                          /* pas de SI sur le CCCH */
+        }
+    }
+
     /* a_cd[0..2] = status words = 0 (CRC pass, no biterr) */
     shunt_write_w(addr_a_cd + 0, 0x0000);  /* a_cd[0] */
     shunt_write_w(addr_a_cd + 2, 0x0000);  /* a_cd[1] */
@@ -357,7 +409,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     /* a_cd[3..14] = 23B L2 frame, packé en 12 mots LE.
      * Source : le SI RÉEL démodulé (gr-gsm ou C natif via feed_si) si dispo,
      * sinon le SI3 canned (fallback). C'est le swap canned→réel = le "sans hack". */
-    const uint8_t *si = g_shunt.si_valid ? g_shunt.si_buf : SHUNT_CANNED_SI3_L2;
+    const uint8_t *si = g_shunt.si_buf;  /* no-hack : vrai SI grgsm seulement */
     for (int i = 0; i < 23; i += 2) {
         uint8_t lo = si[i];
         uint8_t hi = (i + 1 < 23) ? si[i + 1] : 0x2B;
@@ -509,14 +561,20 @@ static void shunt_gsmtap_read(void *opaque)
         uint8_t sub_type = buf[12];  /* channel @12 */
         if (type != GSMTAP_TYPE_UM || sub_type != GSMTAP_CHANNEL_BCCH)
             continue;                /* on ne prend que le BCCH (les SI) */
-        /* gr-gsm tague aussi du paging (mt=0x21) comme channel BCCH ; le slot
-         * a_cd est le slot "SI3" (comme le canned). On NE latche QUE le SI3 réel
-         * (RR PD=0x06, mt=0x1B) pour que paging/autres SI n'écrasent pas a_cd.
+        /* (A) On accepte le SET BCCH COMPLET (SI1/2/3/4/2bis/2ter), pas juste
+         * SI3 — sinon le mobile n'a jamais le set complet ("No sysinfo yet").
+         * feed_si range chaque type dans son slot, dispatch_allc tourne dessus.
+         * On EXCLUT paging/IMM-ASS (mt=0x21 etc.) qui ne va pas sur le slot BCCH.
          * L2 = buf+16 : [0]=pseudo-len, [1]=PD, [2]=message type. */
-        if (n < GSMTAP_HDR_LEN + 3 ||
-            buf[GSMTAP_HDR_LEN + 1] != 0x06 ||      /* RR PD */
-            buf[GSMTAP_HDR_LEN + 2] != 0x1B)        /* SI3 message type */
-            continue;
+        if (n < GSMTAP_HDR_LEN + 3 || buf[GSMTAP_HDR_LEN + 1] != 0x06)
+            continue;                               /* pas RR PD */
+        switch (buf[GSMTAP_HDR_LEN + 2]) {
+        case 0x19: case 0x1a: case 0x1b:            /* SI1 SI2 SI3 */
+        case 0x1c: case 0x1d: case 0x1e:            /* SI4 SI2bis SI2ter */
+            break;
+        default:
+            continue;                               /* paging, IMM-ASS, SI13... : drop */
+        }
         calypso_dsp_shunt_feed_si(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
     }
 }
@@ -719,6 +777,27 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
         return;
     }
     int n = len < 23 ? len : 23;
+    /* (A) range la frame dans le slot de SON type (RR PD=0x06, mt=l2[2]) :
+     *   SI1=0x19 SI2=0x1a SI3=0x1b SI4=0x1c SI2bis=0x1d SI2ter=0x1e.
+     * shunt_dispatch_allc tourne ensuite sur les slots dispo (set complet). */
+    int slot = -1;
+    if (n >= 3 && l2[1] == 0x06) {
+        switch (l2[2]) {
+        case 0x19: slot = 0; break;  /* SI1   */
+        case 0x1a: slot = 1; break;  /* SI2   */
+        case 0x1b: slot = 2; break;  /* SI3   */
+        case 0x1c: slot = 3; break;  /* SI4   */
+        case 0x1d: slot = 4; break;  /* SI2bis*/
+        case 0x1e: slot = 5; break;  /* SI2ter*/
+        default:   break;
+        }
+    }
+    if (slot >= 0) {
+        memcpy(g_shunt.si_set[slot], l2, n);
+        for (int i = n; i < 23; i++) g_shunt.si_set[slot][i] = 0x2B;
+        g_shunt.si_set_have[slot] = true;
+    }
+    /* compat / fallback : si_buf = dernier reçu */
     memcpy(g_shunt.si_buf, l2, n);
     /* pad fin avec 0x2B (filler LAPDm) si la frame est plus courte */
     for (int i = n; i < 23; i++)
