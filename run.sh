@@ -786,13 +786,18 @@ if [ "$MENU_MODE" = "1" ]; then
     export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
            CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
 
+    # Gate DATA_IND direct (court-circuit l1ctl_inject) : OFF par defaut (le SI
+    # passe UNIQUEMENT par a_cd -> firmware L1 -> UART, le vrai chemin).
+    : "${CALYPSO_SHUNT_DL_INJECT:=0}"
+    export CALYPSO_SHUNT_DL_INJECT
+
     # ---- 3f) Expert : editer TOUTE variable CALYPSO_* (menuconfig-style) ----
     if whiptail --backtitle "$BACKTITLE" --title "[3/4] Expert : toutes les variables" \
         --defaultno --yesno \
         "\n Editer n'importe quelle variable CALYPSO_* ?\n\n Liste complete + edition unitaire (vide = unset).\n Les modes de base restent ceux choisis plus haut." \
         12 72 3>&1 1>&2 2>&3; then
       _ALLVARS="CALYPSO_DEBUG CALYPSO_MODE CALYPSO_ICOUNT CALYPSO_MTTCG \
-CALYPSO_QEMU_HALT CALYPSO_L2_CLIENT CALYPSO_DSP_SHUNT CALYPSO_BSP_IQ_PASSTHROUGH \
+CALYPSO_QEMU_HALT CALYPSO_L2_CLIENT CALYPSO_DSP_SHUNT CALYPSO_SHUNT_DL_INJECT CALYPSO_BSP_IQ_PASSTHROUGH \
 CALYPSO_IRDA_CAPTURE CALYPSO_W1C_LATCH CALYPSO_DSP_IDLE_FF CALYPSO_DSP_IDLE_RANGE \
 CALYPSO_TDMA_REALTIME CALYPSO_FORCE_INTM_ONESHOT CALYPSO_FORCE_INTM_AT_PC \
 CALYPSO_BSP_DARAM_ADDR CALYPSO_NDB_D_RACH_OFFSET CALYPSO_RACH_FORCE_BSIC \
