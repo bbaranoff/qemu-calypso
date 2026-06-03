@@ -495,9 +495,7 @@ double uhdwrap_set_txatt(void *dev, double a, size_t chan)
  * L'alignement FN fin se règle quand le mobile TX réellement (post-camp).
  * ============================================================================ */
 #include <math.h>
-#define UL_PORT          5702
 #define UL_TRXD_HDR      8
-static int  g_ul_fd   = -1;            /* socket UDP UL (bind 5702) */
 static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
 static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * 2];   /* dernier burst modulé */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
@@ -514,19 +512,61 @@ static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
     }
 }
 
-/* Draine la socket UL (non-bloquant), module le dernier burst dispo. */
+/* Draine l'UL sur g_bsp_fd (le BSP renvoie l'UL à la source du DL = nous,
+ * cf. calypso_bsp.c:381), module le dernier burst dispo. Non-bloquant. */
 static void ul_drain(void)
 {
-    if (g_ul_fd < 0) return;
+    if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
     int got = 0;
     for (;;) {
-        ssize_t n = recvfrom(g_ul_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
-        if (n < UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN) break;
+        ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
+        if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
         ul_gmsk_mod((const int8_t *)(pkt + UL_TRXD_HDR), g_ul_iq);
         got = 1;
     }
     if (got) g_ul_pending = 1;
+}
+
+/* === RELAIS I/Q CONTINU (mode full-grgsm) ===
+ * CALYPSO_IPC_RELAY=1 : au lieu d'extraire un burst TS0 → TRXDv0 → BSP Calypso,
+ * on RELAIE l'I/Q CONTINU (fc32) entre osmo-trx et le transceiver gr-gsm du
+ * mobile (radio_if_udp). DL : chunk osmo-trx (cs16) → fc32 → UDP RX_PORT.
+ * UL : UDP TX_PORT (fc32) → cs16 → ios_rx_from_device → osmo-trx.
+ * Plus de DSP Calypso → plus de congestion. */
+static int  g_relay_on    = -1;
+static int  g_relay_dl_fd = -1;   /* send DL fc32 → radio_if_udp RX (5810) */
+static struct sockaddr_in g_relay_dl_dst;
+static int  g_relay_ul_fd = -1;   /* recv UL fc32 ← radio_if_udp TX (5811) */
+static float g_relay_fbuf[CALYPSO_SHM_BUFSIZE * 2];
+
+static void relay_init(void)
+{
+    if (g_relay_on >= 0) return;
+    const char *e = getenv("CALYPSO_IPC_RELAY");
+    g_relay_on = (e && *e == '1') ? 1 : 0;
+    if (!g_relay_on) return;
+    const char *host = getenv("CALYPSO_TRX_IQ_HOST");
+    if (!host || !*host) host = "127.0.0.1";
+    const char *rxp = getenv("CALYPSO_TRX_IQ_RX_PORT");
+    const char *txp = getenv("CALYPSO_TRX_IQ_TX_PORT");
+    int rx_port = (rxp && *rxp) ? atoi(rxp) : 5810;
+    int tx_port = (txp && *txp) ? atoi(txp) : 5811;
+    g_relay_dl_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&g_relay_dl_dst, 0, sizeof(g_relay_dl_dst));
+    g_relay_dl_dst.sin_family = AF_INET;
+    g_relay_dl_dst.sin_port   = htons(rx_port);
+    g_relay_dl_dst.sin_addr.s_addr = inet_addr(host);
+    g_relay_ul_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int one = 1; setsockopt(g_relay_ul_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET; a.sin_port = htons(tx_port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(g_relay_ul_fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+        LOGP(DDEV, LOGL_ERROR, "RELAY UL bind(:%d) failed\n", tx_port);
+    LOGP(DDEV, LOGL_NOTICE,
+         "IPC RELAY ON : DL fc32 → %s:%d, UL fc32 ← :%d (full-grgsm)\n",
+         host, rx_port, tx_port);
 }
 
 /* ---- RX (uplink_thread loop) : produces UL heartbeat zeros to osmo-trx ---- */
@@ -543,26 +583,14 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         zeros_init = true;
     }
 
-    /* UL (IPC TX) init : bind 5702 pour recevoir les bursts UL du BSP. */
+    /* UL (IPC TX) init : pas de bind — l'UL arrive sur g_bsp_fd (le BSP renvoie
+     * l'UL à la source du DL). On se contente du flag + drain. */
     if (g_ul_on < 0) {
         const char *e = getenv("CALYPSO_IPC_UL");
         g_ul_on = (e && *e == '1') ? 1 : 0;
-        if (g_ul_on) {
-            g_ul_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            int one = 1;
-            setsockopt(g_ul_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-            struct sockaddr_in a; memset(&a, 0, sizeof(a));
-            a.sin_family = AF_INET; a.sin_port = htons(UL_PORT);
-            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            if (bind(g_ul_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
-                LOGP(DDEV, LOGL_ERROR, "UL bind(:%d) failed — UL off\n", UL_PORT);
-                close(g_ul_fd); g_ul_fd = -1; g_ul_on = 0;
-            } else {
-                LOGP(DDEV, LOGL_NOTICE,
-                     "UL (IPC TX) ON : bind :%d → mod GMSK → ios_rx_from_device\n",
-                     UL_PORT);
-            }
-        }
+        if (g_ul_on)
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL (IPC TX) ON : g_bsp_fd → mod GMSK → ios_rx_from_device\n");
     }
     if (g_ul_on) ul_drain();
 
@@ -597,8 +625,16 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * → les deux pacing restent alignés tant que le host kernel est
      * stable (= toujours, sauf charge extrême). */
     static struct timespec next_deadline = { .tv_sec = 0, .tv_nsec = 0 };
-    /* 625 samples / 270833 sps = 2307.692 µs exact = 2307692 ns. */
-    static const long PERIOD_NS = 2307692L;
+    /* 625 samples / 270833 sps = 2307.692 µs exact = 2307692 ns (= WALL_TDMA_NS/2,
+     * le heartbeat est une demi-frame). Configurable via CALYPSO_TDMA_NS (la
+     * MÊME var que le clk_master QEMU) pour ralentir la timeline uniformément
+     * si l'émulation ne tient pas le temps réel → cohérence osmo-trx ↔ QEMU. */
+    static long PERIOD_NS = 0;
+    if (PERIOD_NS == 0) {
+        PERIOD_NS = 2307692L;
+        const char *e = getenv("CALYPSO_TDMA_NS");
+        if (e && *e) { long long v = atoll(e); if (v >= 4615384LL) PERIOD_NS = (long)(v / 2); }
+    }
 
     if (next_deadline.tv_sec == 0) {
         clock_gettime(CLOCK_MONOTONIC, &next_deadline);
@@ -609,6 +645,26 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         next_deadline.tv_sec  += 1;
     }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_deadline, NULL);
+
+    /* RELAIS UL : I/Q fc32 du transceiver gr-gsm → cs16 → osmo-trx. Si rien
+     * ce tick, zéros (le clock doit avancer). Buffer local (thread DL séparé). */
+    relay_init();
+    int16_t relay_ul[CALYPSO_SHM_BUFSIZE * 2];
+    if (g_relay_on && g_relay_ul_fd >= 0) {
+        float ulf[CALYPSO_SHM_BUFSIZE * 2];
+        ssize_t n = recvfrom(g_relay_ul_fd, ulf, sizeof(ulf), MSG_DONTWAIT, NULL, NULL);
+        memset(relay_ul, 0, sizeof(relay_ul));
+        if (n > 0) {
+            int ns = (int)(n / (2 * sizeof(float)));
+            if (ns > CALYPSO_SHM_BUFSIZE) ns = CALYPSO_SHM_BUFSIZE;
+            for (int i = 0; i < ns * 2; i++) {
+                float v = ulf[i] * 32768.0f;
+                if (v > 32767.0f) v = 32767.0f; else if (v < -32768.0f) v = -32768.0f;
+                relay_ul[i] = (int16_t)v;
+            }
+        }
+        ul_src = relay_ul;
+    }
 
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {
         if (!ios_rx_from_device[c]) continue;
@@ -661,6 +717,21 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
             continue;
         }
         any = true;
+
+        /* RELAIS : I/Q continu (TOUS les samples du chunk, tous TS) → fc32 →
+         * UDP vers le transceiver gr-gsm. gsm.receiver trouve lui-même le bon
+         * timeslot/timing. On NE fait PAS l'extraction per-burst TRXDv0. */
+        relay_init();
+        if (g_relay_on) {
+            int ns = (rv < DL_READ_SAMPLES) ? rv : DL_READ_SAMPLES;
+            for (int i = 0; i < ns * 2; i++)
+                g_relay_fbuf[i] = (float)((int16_t)dl_read_buf[i]) / 32768.0f;
+            if (g_relay_dl_fd >= 0)
+                sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
+                       MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
+                       sizeof(g_relay_dl_dst));
+            continue;   /* relais pur : pas de TRXDv0/BSP */
+        }
 
         /* TS=0 slice : SAMPLES_PER_FRAME=1250 at 1 SPS = 8 × 156.25.
          * osmo-trx commits half-frames (625 samples) → chunks pair at

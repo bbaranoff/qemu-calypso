@@ -794,12 +794,20 @@ static void *clk_master_loop(void *arg)
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
 
+    /* Période TDMA configurable : si l'émulation c54x ne tient pas le 4.615ms
+     * wall réel (→ osmocon LOST), ralentir UNIFORMÉMENT toute la timeline via
+     * CALYPSO_TDMA_NS (le device heartbeat lit la MÊME var → osmo-trx/BTS
+     * suivent → cohérent à vitesse réduite). Défaut = sample-exact réel. */
+    long long wall_ns = WALL_TDMA_NS;
+    const char *e = getenv("CALYPSO_TDMA_NS");
+    if (e && *e) { long long v = atoll(e); if (v >= WALL_TDMA_NS) wall_ns = v; }
+
     fprintf(stderr,
-            "[clk-master] pthread armed (CLOCK_MONOTONIC ABSTIME, %lld ns/frame)\n",
-            (long long)WALL_TDMA_NS);
+            "[clk-master] pthread armed (CLOCK_MONOTONIC ABSTIME, %lld ns/frame%s)\n",
+            wall_ns, (wall_ns != WALL_TDMA_NS) ? " [SLOWED via CALYPSO_TDMA_NS]" : "");
 
     while (g_clk_master_running) {
-        next.tv_nsec += WALL_TDMA_NS;
+        next.tv_nsec += wall_ns;
         while (next.tv_nsec >= 1000000000LL) {
             next.tv_nsec -= 1000000000LL;
             next.tv_sec  += 1;

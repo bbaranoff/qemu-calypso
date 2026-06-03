@@ -1116,15 +1116,19 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
         ;;
     shunt-ipc)
-        : "${CALYPSO_DSP_SHUNT:=1}"
+        # Archi : IPC TX → VRAI DSP (démod) → gr-gsm (décode) → SI. Plus de
+        # shunt DSP (DSP_SHUNT=0) : le c54x tourne pour de vrai. La chaîne IPC
+        # DL alimente le DSP ; gr-gsm décode la sortie. On coupe l'UL de l'IPC
+        # et le TX de gr-gsm.
+        : "${CALYPSO_DSP_SHUNT:=0}"
         : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
         : "${CALYPSO_SKIP_TRX_IPC:=0}"
         : "${CALYPSO_SKIP_BTS:=0}"
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
-        : "${CALYPSO_SKIP_DEMOD_BRIDGE:=0}"   # bridge gr-gsm I/Q→GSMTAP→a_cd
-        : "${CALYPSO_SHUNT_NO_CANNED:=1}"     # SANS HACK : pas de SI canned
+        : "${CALYPSO_SKIP_DEMOD_BRIDGE:=0}"   # bridge gr-gsm (décode sortie DSP)
+        : "${CALYPSO_SHUNT_NO_CANNED:=1}"
         ;;
     bridge)
         : "${CALYPSO_DSP_SHUNT:=0}"
