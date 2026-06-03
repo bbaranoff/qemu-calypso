@@ -1078,7 +1078,14 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 #
 #   bare       -- QEMU + osmocon seulement. Pour debug fw isole, gdb,
 #                tests qui n'ont pas besoin du L2/L3.
+# Défaut = full : le chemin NORMAL, ZÉRO HACK. Le vrai DSP c54x reçoit l'I/Q
+# RÉELLE (BSP_IQ_PASSTHROUGH=1) et fait FB/SB/BCCH lui-même → vrais SI → a_cd →
+# le mobile campe pour de vrai. Aucun shunt, aucun bridge, aucune injection.
+# Chemins de debug opt-in : CALYPSO_MODE=shunt-ipc (bridge gr-gsm, démod externe),
+# CALYPSO_MODE=shunt (FB/SB cannés). À n'utiliser que pour diag, pas par défaut.
 CALYPSO_MODE="${CALYPSO_MODE:-full}"
+# icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
+: "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
 case "$CALYPSO_MODE" in
     full|shunt|shunt-ipc|bridge|bare|free) ;;
     *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
@@ -1113,6 +1120,8 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        : "${CALYPSO_SKIP_DEMOD_BRIDGE:=0}"   # bridge gr-gsm I/Q→GSMTAP→a_cd
+        : "${CALYPSO_SHUNT_NO_CANNED:=1}"     # SANS HACK : pas de SI canned
         ;;
     bridge)
         : "${CALYPSO_DSP_SHUNT:=0}"
@@ -1146,9 +1155,15 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
         ;;
 esac
+# Defaults pour les autres modes (full/shunt/bridge/bare/free) : pas de bridge
+# démod, et le canned reste dispo (NO_CANNED=0) pour ne pas casser le shunt pur.
+: "${CALYPSO_SKIP_DEMOD_BRIDGE:=1}"
+: "${CALYPSO_SHUNT_NO_CANNED:=0}"
+: "${CALYPSO_IQ_TEE_PORT:=6703}"
 export CALYPSO_DSP_SHUNT CALYPSO_MODE
 export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
-       CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY
+       CALYPSO_SKIP_L2 CALYPSO_SKIP_GSMTAP CALYPSO_SKIP_BRIDGE_PY \
+       CALYPSO_SKIP_DEMOD_BRIDGE CALYPSO_SHUNT_NO_CANNED CALYPSO_IQ_TEE_PORT
 
 # ---- Auto-resolution implications / exclusions ----
 # Apres les presets + override env, on applique les regles de coherence.
@@ -1213,6 +1228,13 @@ export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
 # ---- DSP / DIAG instruments (override at command line if needed) ----
 # CALYPSO_DSP_ROM (legacy single-txt) supprime — utilise CALYPSO_DSP_ROM_TXT
 # pour la source .txt auto-splitee en per-section bins (cf L1422+).
+# Défaut 0x2a00 : adresse CORRECTE du buffer DMA I/Q du BSP, confirmée par
+#   - le canary 0xCAFE E2E (DSP READS 0x2a00..0x2a13 via PC=0x93a5),
+#   - le IQ-READ tracer calypso_c54x.c:1596 ([0x2a00..0x2b27] = buffer DMA).
+# NB : 0x2bc0..0x2bff = coefficients corrélateur (PAS l'I/Q) ; 0x80..0x3A3 =
+# pattern de réf FB (AR3 sweep). Le blocage FB-det (fb0_att=0) n'est PAS une
+# question d'adresse mais un bug DSP (timing/coeffs/fenêtre compute, cf.
+# instrumentation 2026-05-14 calypso_c54x.c:147).
 CALYPSO_BSP_DARAM_ADDR="${CALYPSO_BSP_DARAM_ADDR:-0x2a00}"
 CALYPSO_SIM_CFG="${CALYPSO_SIM_CFG:-$MOBILE_CFG}"
 # tdma_timer = REALTIME by default (revert 2026-05-29 v2).
@@ -1787,6 +1809,31 @@ if [ "${CALYPSO_SKIP_BTS:-0}" != "1" ]; then
         ": > $BTS_LOG && osmo-bts-trx -c $BTS_CFG 2>&1 | $TSLOG | tee $BTS_LOG" C-m
 else
     echo "[run.sh] SKIP_BTS=1 -- osmo-bts-trx non lance"
+fi
+
+# ---------- 4bis. bridge de démod native (gr-gsm) ----------
+# Chemin SANS HACK : le BTS émet l'I/Q DL réelle → le BSP qemu (sous shunt) la
+# tee vers UDP $CALYPSO_IQ_TEE_PORT (6703). Ce bridge la démodule (GMSK diff) +
+# la décode (gr-gsm gsm_bcch_ccch_demapper + control_channels_decoder) → GSMTAP
+# 127.0.0.1:$CALYPSO_SHUNT_GSMTAP_PORT (4730) → le listener du shunt appelle
+# feed_si → a_cd. Le mobile campe sur le VRAI SI démodulé du signal du BTS.
+# Requiert : shunt actif (tee) + BTS présent (I/Q). venv /root/.env (gnuradio+gsm).
+if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_SKIP_BTS:-0}" != "1" ] \
+   && [ "${CALYPSO_SKIP_DEMOD_BRIDGE:-1}" != "1" ]; then
+    DEMOD_BRIDGE="${CALYPSO_DEMOD_BRIDGE:-/opt/GSM/qemu_bcch_grgsm.py}"
+    DEMOD_BRIDGE_LOG="${DEMOD_BRIDGE_LOG:-/tmp/demod_bridge.log}"
+    DEMOD_PYTHON="${CALYPSO_BRIDGE_PYTHON:-/root/.env/bin/python3}"
+    [ -x "$DEMOD_PYTHON" ] || DEMOD_PYTHON=python3
+    if [ -f "$DEMOD_BRIDGE" ]; then
+        tmux new-window -t "$SESSION" -n demod-bridge
+        tmux send-keys -t "$SESSION:demod-bridge" \
+            ": > $DEMOD_BRIDGE_LOG && IQ_TEE_PORT=${CALYPSO_IQ_TEE_PORT:-6703} \
+GSMTAP_PORT=${CALYPSO_SHUNT_GSMTAP_PORT:-4730} ARFCN=${CALYPSO_CCCH_ARFCN:-514} \
+BIT_SIGN=${BIT_SIGN:-1} $DEMOD_PYTHON -u $DEMOD_BRIDGE 2>&1 | $TSLOG | tee $DEMOD_BRIDGE_LOG" C-m
+        echo "[run.sh] demod-bridge (gr-gsm) : I/Q ${CALYPSO_IQ_TEE_PORT:-6703} -> GSMTAP ${CALYPSO_SHUNT_GSMTAP_PORT:-4730} -> a_cd (python=$DEMOD_PYTHON)"
+    else
+        echo "[run.sh] WARN demod-bridge introuvable ($DEMOD_BRIDGE) -- pas de démod native"
+    fi
 fi
 
 # ---------- 5. L2 client (mobile / ccch_scan / cell_log) ----------

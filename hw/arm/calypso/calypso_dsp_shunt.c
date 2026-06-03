@@ -43,11 +43,17 @@
 #include "exec/address-spaces.h"
 #include "hw/sysbus.h"
 #include "sysemu/dma.h"
+#include "qemu/main-loop.h"
 #include "calypso_dsp_shunt.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <errno.h>
 
 /* ---- Memory map (ARM-side addresses, from osmocom-bb dsp_api.h:18-23) ---- */
 #define BASE_API_W_PAGE_0   0xFFD00000UL  /* 20 words MCU→DSP page 0 */
@@ -80,15 +86,16 @@
 #define NDB_D_FB_DET        0x48
 #define NDB_D_FB_MODE       0x4A
 #define NDB_A_SYNC_DEMOD    0x4C   /* [4] words */
-#define NDB_A_CD            0x1DC  /* a_cd[15] : CCCH demod result.
-                                       FIX 2026-05-28 : 0x1FC → 0x1DC.
-                                       Validated end-to-end via DSP L1 stub (scripts/
-                                       make_dsp_bin_L1.py) : stub écrit SI3 LAPDm bytes
-                                       à NDB+0x1DC, mobile firmware decode et accepte les SI.
-                                       Confirme DWARF 2026-05-26 (CLAUDE.md). L'empirique
-                                       précédent à 0x1FC observait probablement un autre
-                                       struct variant (a_cd doublé ou aliasé), pas le slot
-                                       que la firmware ARM lit réellement. */
+#define NDB_A_CD            0x1FC  /* a_cd[15] : CCCH demod result.
+                                       FIX 2026-06-02 : 0x1DC → 0x1FC (retour à la
+                                       valeur DWARF autoritaire). Le DWARF de
+                                       layer1.highram.elf donne offsetof(T_NDB_MCU_DSP,
+                                       a_cd)=0x1FC (vérifié gdb : d_fb_det=0x48→ARM
+                                       0x1F0 ✓ cohérent FORCE_TOA, a_sync_demod=0x4C ✓).
+                                       Avec 0x1DC le firmware lisait num_biterr=0xff +
+                                       CRC fail (a_cd écrit À CÔTÉ → SI3 canned jamais
+                                       atteint). Le "FIX 2026-05-28 0x1FC→0x1DC" était
+                                       faux (validé sur un autre build, pas cet ELF). */
 #define NDB_A_SCH26         0x54   /* [5] words */
 
 /* ---- l1_environment.h constants ---- */
@@ -96,6 +103,7 @@
 #define B_GSM_TASK          (1 << 1)
 #define B_SCH_CRC           8
 
+#define PM_DSP_TASK         1     /* power measurement (l1s pm_cmd) — lit a_pm */
 #define FB_DSP_TASK         5
 #define SB_DSP_TASK         6
 #define ALLC_DSP_TASK       24
@@ -119,6 +127,10 @@ struct dsp_shunt_state {
     uint16_t   d_burst_d;
     uint16_t   d_fn;
     uint32_t   tick_cnt;              /* FRAME IRQ ticks since shunt enabled */
+    /* SI réel injecté (gr-gsm ou démod C native) via calypso_dsp_shunt_feed_si.
+     * Si si_valid, shunt_dispatch_allc écrit si_buf dans a_cd au lieu du canned. */
+    uint8_t    si_buf[23];
+    bool       si_valid;
 };
 
 static struct dsp_shunt_state g_shunt;
@@ -144,6 +156,8 @@ static inline uint32_t rp_base(uint8_t page_idx) {
     return page_idx ? BASE_API_R_PAGE_1 : BASE_API_R_PAGE_0;
 }
 
+static void shunt_dispatch_pm(uint8_t page_idx);   /* fwd : appelé depuis le latch */
+
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
 static void shunt_latch_task(uint16_t new_d_dsp_page)
 {
@@ -162,6 +176,12 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     g_shunt.d_task_ra = shunt_read_w(wp + WP_D_TASK_RA);
     g_shunt.d_fn      = shunt_read_w(wp + WP_D_FN);
     g_shunt.pending   = true;
+
+    /* PM : valeur statique, écrite IMMÉDIATEMENT (pas de service déféré au
+     * prochain frame IRQ). Sinon le firmware lit a_pm AVANT le dispatch déféré
+     * → 0 stale → rxlev=-110. On écrit a_pm sur la page lue tout de suite. */
+    if (g_shunt.d_task_md == PM_DSP_TASK)
+        shunt_dispatch_pm(page_idx);
 
     fprintf(stderr,
         "[dsp-shunt] LATCH page=%u task_md=%u task_d=%u task_ra=%u fn=%u\n",
@@ -303,15 +323,32 @@ static void shunt_dispatch_allc(uint8_t page_idx)
      */
     uint32_t addr_a_cd = BASE_API_NDB + NDB_A_CD;
 
+    /* "sans hack" : CALYPSO_SHUNT_NO_CANNED=1 → on n'injecte JAMAIS le SI3
+     * canned. Tant que le démod réel (bridge gr-gsm via feed_si) n'a rien
+     * livré (si_valid=0), on ne dispatch rien → le firmware bail (pas de
+     * DATA_IND) → le mobile ne campe QUE sur le VRAI SI décodé de l'I/Q du
+     * BTS. C'est ça qui rend la victoire non-truquée : si le démod casse,
+     * rien ne campe (le bug est visible, pas masqué par le canned). */
+    static int no_canned = -1;
+    if (no_canned < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_NO_CANNED");
+        no_canned = (e && *e == '1') ? 1 : 0;
+    }
+    if (no_canned && !g_shunt.si_valid)
+        return;
+
     /* a_cd[0..2] = status words = 0 (CRC pass, no biterr) */
     shunt_write_w(addr_a_cd + 0, 0x0000);  /* a_cd[0] */
     shunt_write_w(addr_a_cd + 2, 0x0000);  /* a_cd[1] */
     shunt_write_w(addr_a_cd + 4, 0x0000);  /* a_cd[2] */
 
-    /* a_cd[3..14] = 23B L2 frame, packed in 12 words LE */
+    /* a_cd[3..14] = 23B L2 frame, packé en 12 mots LE.
+     * Source : le SI RÉEL démodulé (gr-gsm ou C natif via feed_si) si dispo,
+     * sinon le SI3 canned (fallback). C'est le swap canned→réel = le "sans hack". */
+    const uint8_t *si = g_shunt.si_valid ? g_shunt.si_buf : SHUNT_CANNED_SI3_L2;
     for (int i = 0; i < 23; i += 2) {
-        uint8_t lo = SHUNT_CANNED_SI3_L2[i];
-        uint8_t hi = (i + 1 < 23) ? SHUNT_CANNED_SI3_L2[i + 1] : 0x2B;
+        uint8_t lo = si[i];
+        uint8_t hi = (i + 1 < 23) ? si[i + 1] : 0x2B;
         uint16_t w = lo | (hi << 8);
         shunt_write_w(addr_a_cd + 6 + i, w);   /* +6 = a_cd[3] base */
     }
@@ -339,6 +376,30 @@ static void shunt_dispatch_allc(uint8_t page_idx)
         "a_serv_demod canned\n", page_idx, g_shunt.d_burst_d);
 }
 
+/* ---- DISPATCH PM : tâche power-measurement (md=1). Écrit a_pm[3] @ +0x18,
+ * que le power scan (l1s pm_cmd) lit pour dériver le rxlev. Sans ça a_pm=0 →
+ * rxlev=-110 (plancher) → la cellule est rejetée AVANT même la sync, quel que
+ * soit le SI. Valeur réglable via CALYPSO_SHUNT_PM (défaut SHUNT_CANNED_PM,
+ * haut → rxlev fort). C'est le pendant "scan" du PM canné FB/SB. ---- */
+static void shunt_dispatch_pm(uint8_t page_idx)
+{
+    uint32_t rp = rp_base(page_idx);
+    static int pm_val = -1;
+    if (pm_val < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_PM");
+        pm_val = (e && *e) ? (int)strtol(e, NULL, 0) : SHUNT_CANNED_PM;
+    }
+    shunt_write_w(rp + RP_A_PM + 0 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_A_PM + 1 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_A_PM + 2 * 2, (uint16_t)pm_val);
+    shunt_write_w(rp + RP_D_TASK_MD, PM_DSP_TASK);
+    static unsigned pm_log = 0;
+    if (pm_log++ < 5)
+        fprintf(stderr,
+                "[dsp-shunt] DISPATCH PM page=%u → a_pm[0..2]=0x%04x (rxlev)\n",
+                page_idx, (uint16_t)pm_val);
+}
+
 static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
 {
     /* TODO : NB DL = decoded BCCH/CCCH burst payload into NDB a_cd[].
@@ -362,7 +423,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
 
     /* Priority order: md tasks (FB/SB) > NB DL > NB UL > ALLC.
      * Refine when canned policies land. */
-    if (md == FB_DSP_TASK) {
+    if (md == PM_DSP_TASK) {
+        shunt_dispatch_pm(page);
+    } else if (md == FB_DSP_TASK) {
         shunt_dispatch_fb(page);
     } else if (md == SB_DSP_TASK) {
         shunt_dispatch_sb(page);
@@ -406,6 +469,70 @@ static const MemoryRegionOps shunt_ndb_trigger_ops = {
     .impl  = { .min_access_size = 2, .max_access_size = 2 },
 };
 
+/* ---- GSMTAP listener : reçoit le SI décodé par gr-gsm (front py) ----
+ * gr-gsm (grgsm_decode -m BCCH) sort des frames GSMTAP. On écoute sur un port
+ * UDP (CALYPSO_SHUNT_GSMTAP_PORT, défaut 4730 pour ne pas taper le 4729 du
+ * BTS), on extrait le L2 (après le hdr GSMTAP de 16 o) des frames BCCH, et on
+ * appelle feed_si → a_cd. = le pont gr-gsm→a_cd, côté qemu. */
+#define GSMTAP_HDR_LEN          16
+#define GSMTAP_TYPE_UM          0x01
+#define GSMTAP_CHANNEL_BCCH     0x01
+static int g_gsmtap_fd = -1;
+
+static void shunt_gsmtap_read(void *opaque)
+{
+    uint8_t buf[512];
+    for (;;) {
+        ssize_t n = recv(g_gsmtap_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+        }
+        if (n < GSMTAP_HDR_LEN + 1)
+            continue;
+        uint8_t type     = buf[2];   /* GSMTAP hdr : type @2 */
+        uint8_t sub_type = buf[12];  /* channel @12 */
+        if (type != GSMTAP_TYPE_UM || sub_type != GSMTAP_CHANNEL_BCCH)
+            continue;                /* on ne prend que le BCCH (les SI) */
+        /* gr-gsm tague aussi du paging (mt=0x21) comme channel BCCH ; le slot
+         * a_cd est le slot "SI3" (comme le canned). On NE latche QUE le SI3 réel
+         * (RR PD=0x06, mt=0x1B) pour que paging/autres SI n'écrasent pas a_cd.
+         * L2 = buf+16 : [0]=pseudo-len, [1]=PD, [2]=message type. */
+        if (n < GSMTAP_HDR_LEN + 3 ||
+            buf[GSMTAP_HDR_LEN + 1] != 0x06 ||      /* RR PD */
+            buf[GSMTAP_HDR_LEN + 2] != 0x1B)        /* SI3 message type */
+            continue;
+        calypso_dsp_shunt_feed_si(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
+    }
+}
+
+static void shunt_gsmtap_init(void)
+{
+    const char *p = getenv("CALYPSO_SHUNT_GSMTAP_PORT");
+    int port = (p && *p) ? atoi(p) : 4730;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        error_report("[dsp-shunt] GSMTAP socket() failed: %s", strerror(errno));
+        return;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        error_report("[dsp-shunt] GSMTAP bind(:%d) failed: %s", port, strerror(errno));
+        close(fd);
+        return;
+    }
+    g_gsmtap_fd = fd;
+    qemu_set_fd_handler(fd, shunt_gsmtap_read, NULL, NULL);
+    error_report("[dsp-shunt] GSMTAP listener udp:127.0.0.1:%d → feed_si(a_cd) "
+                 "(gr-gsm grgsm_decode -m BCCH y envoie le SI réel)", port);
+}
+
 /* ---- init : called from machine setup when CALYPSO_DSP_SHUNT=1 ---- */
 void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
 {
@@ -430,6 +557,9 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
                                         trigger,
                                         /*priority=*/10);
 
+    /* Pont gr-gsm → a_cd : écoute le SI décodé (GSMTAP) et l'injecte. */
+    shunt_gsmtap_init();
+
     error_report("[dsp-shunt] active — c54x emulator should be skipped, "
                  "BSP DMA→DARAM should be gated. Phase 1: canned dispatch "
                  "TODO. Watch /tmp/qemu.log for LATCH/DISPATCH lines.");
@@ -442,6 +572,28 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
 {
     /* TODO Phase 2 */
     (void)found; (void)toa; (void)pm; (void)angle; (void)snr;
+}
+
+/* Point d'injection COMMUN du SI réel (2026-06-02) : gr-gsm (via pont) OU la
+ * démod C native appellent ceci avec une frame L2 de 23 octets décodée depuis
+ * l'I/Q réel du BTS. Le shunt l'écrit ensuite dans a_cd (shunt_dispatch_allc)
+ * à la place du SI3 canned → "sans hack", vrai signal. len doit être 23 (XCCH
+ * L2). Réécrit à chaque nouveau SI (rotation SI1/2/3/4 du BCCH). */
+void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
+{
+    if (!l2 || len <= 0) {
+        g_shunt.si_valid = false;
+        return;
+    }
+    int n = len < 23 ? len : 23;
+    memcpy(g_shunt.si_buf, l2, n);
+    /* pad fin avec 0x2B (filler LAPDm) si la frame est plus courte */
+    for (int i = n; i < 23; i++)
+        g_shunt.si_buf[i] = 0x2B;
+    g_shunt.si_valid = true;
+    fprintf(stderr, "[dsp-shunt] feed_si: SI réel %d o injecté → a_cd "
+            "(L2[0..2]=%02x %02x %02x)\n", n, l2[0],
+            n > 1 ? l2[1] : 0, n > 2 ? l2[2] : 0);
 }
 
 /* Public getter — gate condition for BSP/TPU DMA into DARAM. */

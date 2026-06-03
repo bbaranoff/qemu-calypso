@@ -27,4 +27,9 @@ bool calypso_dsp_shunt_active(void);
 void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
                                       int16_t pm, int16_t angle, int16_t snr);
 
+/* Injection du SI RÉEL (gr-gsm via pont, ou démod C native) : frame L2 23 o
+ * décodée depuis l'I/Q réel du BTS, écrite dans a_cd à la place du SI3 canned.
+ * Point d'injection commun aux deux fronts de démod. */
+void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len);
+
 #endif /* CALYPSO_DSP_SHUNT_H */

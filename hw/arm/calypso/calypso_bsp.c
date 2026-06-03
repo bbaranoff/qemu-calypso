@@ -339,6 +339,35 @@ static void bsp_trxd_readable(void *opaque)
                          (struct sockaddr *)&addr, &alen);
     if (n < 8) return;
 
+    /* Tee I/Q vers le bridge de démod (gr-gsm py) sous shunt : le BSP gate
+     * la livraison DARAM de toute façon (calypso_bsp.c ~990), donc on forwarde
+     * le burst brut (8 hdr + I/Q cs16) vers CALYPSO_IQ_TEE_PORT (défaut 6703).
+     * Le bridge démode → GSMTAP → 4730 → shunt feed_si → a_cd. ZÉRO hack :
+     * c'est le VRAI signal du BTS qui transite, juste copié hors-bande.
+     * Sert aussi au FFT live (lit le tee 6703). Gaté shunt only (diag). */
+    if (calypso_dsp_shunt_active()) {
+        static int tee_fd = -1;
+        static struct sockaddr_in tee_dst;
+        if (tee_fd == -1) {
+            tee_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            const char *p = getenv("CALYPSO_IQ_TEE_PORT");
+            int port = (p && *p) ? atoi(p) : 6703;
+            /* Dest configurable : 127.0.0.1 (bridge in-container) par défaut,
+             * ou CALYPSO_IQ_TEE_HOST=172.20.0.1 (gateway gsm-inter) pour viser
+             * l'hôte → FFT live pop-up côté hôte (X natif, pas de X dans docker). */
+            const char *h = getenv("CALYPSO_IQ_TEE_HOST");
+            memset(&tee_dst, 0, sizeof(tee_dst));
+            tee_dst.sin_family = AF_INET;
+            tee_dst.sin_port = htons(port);
+            tee_dst.sin_addr.s_addr = (h && *h) ? inet_addr(h)
+                                                : htonl(INADDR_LOOPBACK);
+            BSP_LOG("IQ-TEE -> %s:%d (bridge/FFT)", (h && *h) ? h : "127.0.0.1", port);
+        }
+        if (tee_fd >= 0)
+            sendto(tee_fd, buf, n, MSG_DONTWAIT,
+                   (struct sockaddr *)&tee_dst, sizeof(tee_dst));
+    }
+
     /* Diag : log first 10 recv sizes pour vérifier que bridge envoie bien
      * 600 bytes (= IQ mode) et que BSP buffer ne tronque pas. */
     {

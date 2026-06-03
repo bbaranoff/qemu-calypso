@@ -9,7 +9,9 @@
 # DSP_REG_MODE (c54x|bin|hybrid) only affects modes that actually emulate the
 # c54x (full/bridge/bare); shunt/shunt-ipc bypass it → swept once (reg=n/a).
 #
-# DÉFAUT = la config qu'on veut faire marcher : full / mobile / c54x (1 combo,
+# DÉFAUT = le chemin SANS HACK : shunt-ipc / mobile (BTS réel émet l'I/Q, le
+# bridge gr-gsm la démode/décode → vrai SI → a_cd). Pour l'ancien c54x : MODES=full.
+# (legacy) full / mobile / c54x (1 combo,
 # sondes décisives bas volume). Le reste (bin, scanners, bridge/bare, FORCE_TOA,
 # icount off, governor off) est OPT-IN via les axes. Presets :
 #   # contraste reg-mode :   REGMODES="c54x bin"
@@ -24,8 +26,8 @@ OUT="${OUT:-/tmp/diag_all.txt}"
 SESS=calypso
 QEMU_BIN=qemu-system-arm
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
-MODES="${MODES:-full}"                       # défaut : chemin réel E2E
-REGMODES="${REGMODES:-c54x}"                 # défaut : mode sain (vrai FB)
+MODES="${MODES:-full}"                       # défaut NORMAL sans hack : vrai DSP c54x + I/Q réel (passthrough=1)
+REGMODES="${REGMODES:-c54x}"                 # n/a en shunt (c54x bypassé) ; c54x utile en MODES=full
 IDLEMODES="${IDLEMODES:-1}"                  # set "1 0" to compare governor on/off
 L2CLIENTS="${L2CLIENTS:-mobile}"             # seul client qui drive un FBSB ciblé 514
 ICOUNTMODES="${ICOUNTMODES:-auto}"           # CALYPSO_ICOUNT ; set "auto off" pour tester sans icount
@@ -190,6 +192,16 @@ sample_combo(){
     n=$(grep -ic "$pat" "$QLOG" "$L2LOG" 2>/dev/null | awk -F: '{s+=$2}END{print s}')
     [ "${n:-0}" -gt 0 ] && echo "  $pat: $n" | tee -a "$OUT"
   done
+  log "--- DÉMOD NATIVE (shunt-ipc) : I/Q réel → gr-gsm → vrai SI → a_cd ---"
+  log "    [1] tee I/Q (qemu BSP → bridge, sous shunt) :"
+  grep -hE 'IQ-TEE' "$QLOG" 2>/dev/null | tail -2 | sed 's/^/        /' | tee -a "$OUT"
+  log "    [2] bridge gr-gsm (bursts reçus + SI décodés) :"
+  grep -hE 'fed burst|I/Q in udp|SI déco|décodé' /tmp/demod_bridge.log 2>/dev/null | tail -6 | sed 's/^/        /' | tee -a "$OUT"
+  log "    [3] shunt feed_si (a_cd écrit depuis le SI RÉEL ; sinon NO_CANNED → rien) :"
+  grep -hE 'feed_si|DISPATCH ALLC' "$QLOG" 2>/dev/null | tail -4 | sed 's/^/        /' | tee -a "$OUT"
+  log "    [bridge tail brut] :"
+  tail -8 /tmp/demod_bridge.log 2>/dev/null | sed 's/^/        /' | tee -a "$OUT"
+
   log "--- ARFCN / cell-sync (expect $ARFCN) ---"
   grep -hiE "Sync to ARFCN|Found signal|Scanning frequencies|Channel synched" "$L2LOG" 2>/dev/null | tail -4 | sed 's/^/    /' | tee -a "$OUT"
   if grep -qiE "ARFCN[ =]?$ARFCN" "$L2LOG" 2>/dev/null; then log "    >> OK: $ARFCN referenced"; else log "    >> WARN: ARFCN $ARFCN not seen in $L2LOG"; fi

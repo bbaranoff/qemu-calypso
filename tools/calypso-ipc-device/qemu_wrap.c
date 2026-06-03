@@ -599,13 +599,35 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
             continue;
         }
 
-        int n_samples = (rv < CALYPSO_BSP_BURSTLEN) ? rv : CALYPSO_BSP_BURSTLEN;
+        /* Offset d'extraction du burst dans le chunk de 625 samples : le burst
+         * actif TS0 n'est pas forcément à l'offset 0 du slot (156.25 samples).
+         * Le démod gr-gsm a montré un décalage (TSC@62 au lieu de @61) → un
+         * mauvais offset désaligne le FCCH/midambule pour le corrélateur FB-det
+         * du DSP (d_fb_det reste 0 sur de vrais samples). Réglable via
+         * CALYPSO_DL_BURST_OFFSET (samples, défaut 0) pour sweeper l'alignement. */
+        static int burst_off = -1;
+        static int iq_conj = -1;
+        if (burst_off < 0) {
+            const char *e = getenv("CALYPSO_DL_BURST_OFFSET");
+            burst_off = (e && *e) ? atoi(e) : 0;
+            if (burst_off < 0) burst_off = 0;
+            const char *c = getenv("CALYPSO_DL_IQ_CONJ");
+            iq_conj = (c && *c == '1') ? 1 : 0;
+            LOGP(DDEV, LOGL_NOTICE,
+                 "DL burst extraction offset = %d samples, iq_conj = %d "
+                 "(CALYPSO_DL_BURST_OFFSET / CALYPSO_DL_IQ_CONJ)\n",
+                 burst_off, iq_conj);
+        }
+        int avail = (int)rv - burst_off;
+        int n_samples = (avail < CALYPSO_BSP_BURSTLEN) ? avail : CALYPSO_BSP_BURSTLEN;
+        if (n_samples < 0) n_samples = 0;
+        const int16_t *burst_src = (const int16_t *)dl_read_buf + 2 * burst_off;
         size_t payload_len = (size_t)n_samples * 4u;
         uint32_t internal_fn = (uint32_t)(ts / 1250ULL);
 
         /* Detect FCCH inline — purely for diag log (helps spot when
          * we serve an FCCH vs other bursts). Not used for routing. */
-        bool is_fcch = is_fcch_burst_iq((const int16_t *)dl_read_buf, n_samples);
+        bool is_fcch = is_fcch_burst_iq(burst_src, n_samples);
 
         /* Push TS=0 burst to FIFO tail. clk_listener will pop it and
          * tag with qfn when QEMU is ready. */
@@ -632,7 +654,15 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
         fe->pkt[0] = 0;
         fe->pkt[1] = 0; fe->pkt[2] = 0; fe->pkt[3] = 0; fe->pkt[4] = 0;
         fe->pkt[5] = 0; fe->pkt[6] = 0; fe->pkt[7] = 0;
-        memcpy(fe->pkt + TRXD_HDR_LEN, dl_read_buf, payload_len);
+        memcpy(fe->pkt + TRXD_HDR_LEN, burst_src, payload_len);
+        if (iq_conj) {
+            /* Conjugaison I/Q (-Q) : le démod gr-gsm a montré rot=-1 (tone FCCH
+             * de signe opposé à la réf du corrélateur DSP). Flip le signe de Q
+             * remet le tone à la bonne fréquence pour le FB-det. */
+            int16_t *p = (int16_t *)(fe->pkt + TRXD_HDR_LEN);
+            for (int k = 0; k < n_samples; k++)
+                p[2 * k + 1] = (int16_t)(-p[2 * k + 1]);
+        }
         g_dl_fifo_tail = tail + 1;
         size_t new_depth = g_dl_fifo_tail - g_dl_fifo_head;
         pthread_mutex_unlock(&g_dl_fifo_mutex);
