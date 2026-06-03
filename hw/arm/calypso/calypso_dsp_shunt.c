@@ -54,6 +54,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 /* ---- Memory map (ARM-side addresses, from osmocom-bb dsp_api.h:18-23) ---- */
 #define BASE_API_W_PAGE_0   0xFFD00000UL  /* 20 words MCU→DSP page 0 */
@@ -157,6 +159,7 @@ static inline uint32_t rp_base(uint8_t page_idx) {
 }
 
 static void shunt_dispatch_pm(uint8_t page_idx);   /* fwd : appelé depuis le latch */
+static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm→a_cd) */
 
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
 static void shunt_latch_task(uint16_t new_d_dsp_page)
@@ -412,7 +415,10 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 void calypso_dsp_shunt_on_frame_tick(void)
 {
-    if (!g_shunt.active || !g_shunt.pending) {
+    if (!g_shunt.active)
+        return;
+    shunt_poll_si_shm();   /* gr-gsm a-t-il ecrit un nouveau SI dans le shm ? */
+    if (!g_shunt.pending) {
         return;
     }
     g_shunt.tick_cnt++;
@@ -533,6 +539,121 @@ static void shunt_gsmtap_init(void)
                  "(gr-gsm grgsm_decode -m BCCH y envoie le SI réel)", port);
 }
 
+/* ========================================================================
+ * Buffers partages (shm) — gr-gsm AU MILIEU du shunt DSP (pas de FIFO/UDP).
+ *   ENTREE du DSP shunte : l'I/Q que la BSP livre (DARAM 0x2a00) est recopiee
+ *     ici via calypso_dsp_shunt_feed_iq() ; gr-gsm la LIT.
+ *   SORTIE du DSP shunte : gr-gsm ECRIT le SI decode ; le shunt le LIT au frame
+ *     tick (shunt_poll_si_shm) et le pousse dans a_cd -> l'ARM le lit.
+ * Semantique BUFFER (pas fifo) : un compteur de sequence par sens ; le lecteur
+ * poll le seq et ne consomme que s'il a change. shm POSIX /calypso_dsp_shunt.
+ * ====================================================================== */
+#define SHM_NAME      "/calypso_dsp_shunt"
+#define SHM_IQ_SLOTS  64           /* ring de bursts (absorbe les stalls du decode gr-gsm) */
+#define SHM_IQ_LEN    320          /* int16 par slot (>= 296 = 148 complexes cs16) */
+
+struct shm_iq_slot {
+    uint32_t fn;                   /* frame number du burst */
+    uint32_t n;                    /* nb d'int16 valides (I,Q entrelaces) */
+    int16_t  iq[SHM_IQ_LEN];
+};
+
+struct dsp_shunt_shm {
+    uint32_t magic;                /* 0x43445350 = 'CDSP' */
+    /* --- ENTREE : ring de bursts I/Q (shunt ecrit <- BSP, gr-gsm lit) --- */
+    volatile uint32_t iq_wr;       /* nb total de bursts ecrits (compteur write) */
+    struct shm_iq_slot iq[SHM_IQ_SLOTS];
+    /* --- SORTIE : SI decode (gr-gsm ecrit, shunt lit -> a_cd) --- */
+    volatile uint32_t si_seq;      /* bumpe a chaque nouveau SI decode */
+    uint32_t          si_len;      /* octets L2 (<=23) */
+    uint8_t           si[32];
+};
+
+static struct dsp_shunt_shm *g_shm;
+static uint32_t              g_shm_last_si_seq;
+static FILE                 *g_iq_cfile;   /* enreg .cfile fc32 de l'I/Q d'entree */
+
+static void shunt_shm_init(void)
+{
+    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        error_report("[dsp-shunt] shm_open(%s): %s", SHM_NAME, strerror(errno));
+        return;
+    }
+    if (ftruncate(fd, sizeof(struct dsp_shunt_shm)) != 0) {
+        error_report("[dsp-shunt] ftruncate shm: %s", strerror(errno));
+        close(fd);
+        return;
+    }
+    void *m = mmap(NULL, sizeof(struct dsp_shunt_shm),
+                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) {
+        error_report("[dsp-shunt] mmap shm: %s", strerror(errno));
+        return;
+    }
+    g_shm = m;
+    g_shm->magic = 0x43445350;
+    g_shm_last_si_seq = g_shm->si_seq;
+    error_report("[dsp-shunt] shm %s (=/dev/shm%s, %zu o) : I/Q in (feed_iq->gr-gsm) "
+                 "+ SI out (gr-gsm->a_cd). gr-gsm AU MILIEU du shunt.",
+                 SHM_NAME, SHM_NAME, sizeof(struct dsp_shunt_shm));
+
+    /* Enregistrement .cfile (gr_complex fc32 I,Q normalise) de l'I/Q d'entree
+     * du DSP shunte, pour rejeu deterministe (grgsm_cfile_decode.py). Defaut
+     * /tmp/dsp_iq.cfile ; CALYPSO_SHUNT_IQ_CFILE= (vide) pour desactiver. */
+    const char *cf = getenv("CALYPSO_SHUNT_IQ_CFILE");
+    if (!cf)
+        cf = "/tmp/dsp_iq.cfile";
+    if (*cf) {
+        g_iq_cfile = fopen(cf, "wb");
+        if (g_iq_cfile)
+            error_report("[dsp-shunt] enregistre l'I/Q d'entree -> %s (cfile fc32)", cf);
+        else
+            error_report("[dsp-shunt] fopen(%s) cfile: %s", cf, strerror(errno));
+    }
+}
+
+/* ENTREE du DSP shunte : la BSP appelle ceci avec l'I/Q DL (cs16, n int16
+ * entrelaces I,Q) qu'elle DMA dans la DARAM. Publie dans le shm pour gr-gsm. */
+void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
+{
+    if (!g_shm || !iq || n <= 0)
+        return;
+    if (n > SHM_IQ_LEN)
+        n = SHM_IQ_LEN;
+    struct shm_iq_slot *slot = &g_shm->iq[g_shm->iq_wr % SHM_IQ_SLOTS];
+    slot->fn = fn;
+    slot->n  = (uint32_t)n;
+    memcpy(slot->iq, iq, (size_t)n * sizeof(int16_t));
+    __sync_synchronize();
+    g_shm->iq_wr++;               /* publie le burst (le lecteur poll iq_wr) */
+
+    /* Enregistre aussi l'I/Q en .cfile fc32 (rejeu deterministe). */
+    if (g_iq_cfile) {
+        float fbuf[SHM_IQ_LEN];
+        for (int i = 0; i < n; i++)
+            fbuf[i] = (float)iq[i] / 32768.0f;
+        fwrite(fbuf, sizeof(float), (size_t)n, g_iq_cfile);
+    }
+}
+
+/* SORTIE du DSP shunte : gr-gsm a-t-il ecrit un nouveau SI ? Si oui -> a_cd. */
+static void shunt_poll_si_shm(void)
+{
+    if (!g_shm)
+        return;
+    uint32_t seq = g_shm->si_seq;
+    if (seq == g_shm_last_si_seq)
+        return;
+    __sync_synchronize();
+    g_shm_last_si_seq = seq;
+    uint32_t len = g_shm->si_len;
+    if (len == 0 || len > sizeof(g_shm->si))
+        return;
+    calypso_dsp_shunt_feed_si(g_shm->si, (int)len);
+}
+
 /* ---- init : called from machine setup when CALYPSO_DSP_SHUNT=1 ---- */
 void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
 {
@@ -559,6 +680,9 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
 
     /* Pont gr-gsm → a_cd : écoute le SI décodé (GSMTAP) et l'injecte. */
     shunt_gsmtap_init();
+
+    /* Buffers shm : gr-gsm au milieu du shunt (I/Q in + SI out, pas de fifo). */
+    shunt_shm_init();
 
     error_report("[dsp-shunt] active — c54x emulator should be skipped, "
                  "BSP DMA→DARAM should be gated. Phase 1: canned dispatch "

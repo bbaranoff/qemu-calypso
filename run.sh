@@ -1118,8 +1118,8 @@ case "$CALYPSO_MODE" in
         ;;
     full-grgsm)
         # qemu (Calypso) GARDÉ (firmware chargé par osmocon + lien série CP210x),
-        # mais la RADIO du mobile passe par gr-gsm : device en RELAIS I/Q continu
-        # → grgsm_trx → trxcon → mobile. La BSP de qemu est starvée (normal).
+        # mais la RADIO du mobile passe par gr-gsm : le device LIVRE le DL au BSP
+        # qui le publie en buffer shm (feed_iq) ; grgsm_shm_decode.py decode -> a_cd.
         # DSP SHUNT ON : c54x canné (léger) → qemu ne congestionne pas et ne se
         # coince pas sur le DSP (sa radio n'est pas utilisée de toute façon).
         : "${CALYPSO_DSP_SHUNT:=1}"
@@ -1129,9 +1129,20 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
-        : "${CALYPSO_IPC_RELAY:=1}"        # device relaie l'I/Q vers grgsm_trx
+        : "${CALYPSO_IPC_RELAY:=0}"            # 0 = device LIVRE le DL au BSP (pas de relais 5810) -> feed_iq -> shm gr-gsm
+        : "${CALYPSO_BSP_IQ_PASSTHROUGH:=1}"   # BSP interprete le payload comme I/Q cs16 (requis par feed_iq)
         : "${CALYPSO_SHUNT_NO_CANNED:=1}"  # PAS de SI3 canned (l'ancien bypass DSP)
-        export CALYPSO_IPC_RELAY CALYPSO_SHUNT_NO_CANNED
+        # Non-truqué : aucune injection SI legacy ne doit concurrencer le feed_si
+        # gr-gsm (a_cd). Override (=) et pas default (:=) → même un env exporté
+        # périmé ne peut pas les rallumer.
+        CALYPSO_SHUNT_NO_CANNED=1     # canned shunt OFF (verrouillé)
+        CALYPSO_DSP_L1STUB=0          # pas de PROM0 publisher SI3 baked
+        CALYPSO_DSP_L1_STUB=0
+        CALYPSO_FORCE_FBSB=0          # pas d'oracle FBSB_CONF
+        CALYPSO_FORCE_AGCH=0          # pas de réécriture DATA_IND BCCH SI
+        export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_SHUNT_NO_CANNED \
+               CALYPSO_DSP_L1STUB CALYPSO_DSP_L1_STUB \
+               CALYPSO_FORCE_FBSB CALYPSO_FORCE_AGCH
         ;;
     shunt)
         : "${CALYPSO_DSP_SHUNT:=1}"
@@ -1206,7 +1217,10 @@ export CALYPSO_SKIP_IPC_DEVICE CALYPSO_SKIP_TRX_IPC CALYPSO_SKIP_BTS \
 # Regle 1 : DSP_SHUNT=1 : BTS chain inutile (canned ne touche pas la radio).
 # N'override pas si user a explicitement set SKIP_BTS=0 (= "je veux la
 # radio quand meme meme en shunt", cas shunt-ipc).
-if [ "$CALYPSO_DSP_SHUNT" = "1" ] && [ "$CALYPSO_MODE" != "shunt-ipc" ]; then
+# EXEMPTION full-grgsm : le shunt est ON (c54x leger) mais la chaine radio
+# (BTS->trx->ipc-device) DOIT tourner pour relayer l'I/Q vers gr-gsm (5810).
+# Sans cette exemption, SKIP_BTS=1 starve gr-gsm -> feed_si ne tire jamais.
+if [ "$CALYPSO_DSP_SHUNT" = "1" ] && [ "$CALYPSO_MODE" != "shunt-ipc" ] && [ "$CALYPSO_MODE" != "full-grgsm" ]; then
     if [ -z "${_USER_SET_SKIP_IPC_DEVICE:-}" ]; then
         [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" = "0" ] && echo "[run.sh] DSP_SHUNT=1 : SKIP_IPC_DEVICE=1 (canned, pas besoin)"
         CALYPSO_SKIP_IPC_DEVICE=1
@@ -1375,7 +1389,10 @@ if [ "${CALYPSO_QEMU_HALT:-0}" = "1" ] && [ "${CALYPSO_SKIP_GDB_PANE:-1}" = "1" 
 fi
 # R8 CONFLICT : BSP_IQ_PASSTHROUGH alimente le correlateur ; incompatible
 # avec DSP_SHUNT (court-circuite le BSP). SHUNT gagne.
-if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_BSP_IQ_PASSTHROUGH:-0}" = "1" ]; then
+# EXEMPTION full-grgsm : ici gr-gsm EST le consommateur de l'I/Q (feed_iq->shm),
+# donc le passthrough a un sens meme sous shunt -> on NE le desactive pas.
+if [ "${CALYPSO_DSP_SHUNT:-0}" = "1" ] && [ "${CALYPSO_BSP_IQ_PASSTHROUGH:-0}" = "1" ] \
+   && [ "$CALYPSO_MODE" != "full-grgsm" ]; then
     echo "[kconfig] CONFLICT DSP_SHUNT <-> BSP_IQ_PASSTHROUGH -- IQ passthrough desactive" >&2
     CALYPSO_BSP_IQ_PASSTHROUGH=0; export CALYPSO_BSP_IQ_PASSTHROUGH
 fi
@@ -1472,6 +1489,8 @@ pkill -9 -f calypso-ipc-device 2>/dev/null || true
 # full-grgsm : tuer les restes qui tiennent des ports (5810/5811/6700/6800/4730)
 pkill -9 -f "grgsm_trx"   2>/dev/null || true
 pkill -9 -f "grgsm_relay" 2>/dev/null || true
+pkill -9 -f "inject.py"     2>/dev/null || true   # pas d'injecteur SI gdb concurrent (a_cd)
+pkill -9 -f "validating.py" 2>/dev/null || true
 pkill -9 -x trxcon        2>/dev/null || true
 pkill -9 -f "cp210x_tee"  2>/dev/null || true
 sleep 1   # laisse les sockets UDP/TCP se libérer avant de relancer
@@ -1719,14 +1738,11 @@ echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 # Tee bidirectionnel du lien série CP210x (PTY série0 qemu) → osmocon + trxcon.
 # osmocon prend /tmp/cp210x_osmocon ; trxcon prend /tmp/cp210x_trxcon.
 OSMOCON_SERIAL="$PTY_MODEM"
-if [ "$CALYPSO_MODE" = "full-grgsm" ] && [ -n "$PTY_MODEM" ]; then
-    tmux new-window -t "$SESSION" -n cp210x-tee
-    tmux send-keys -t "$SESSION:cp210x-tee" \
-        "python3 /opt/GSM/cp210x_tee.py $PTY_MODEM 2>&1 | $TSLOG" C-m
-    echo -n "Waiting for CP210x tee (/tmp/cp210x_osmocon)..."
-    for i in $(seq 1 20); do [ -e /tmp/cp210x_osmocon ] && break; sleep 0.3; echo -n "."; done
-    if [ -e /tmp/cp210x_osmocon ]; then echo " OK"; OSMOCON_SERIAL="/tmp/cp210x_osmocon"; else echo " WARN -- tee absent"; fi
-fi
+# full-grgsm : trxcon RETIRE -> PAS de cp210x_tee, PAS de socket trxcon.
+# Le tee 3-voies (osmocon+trxcon) ne servait qu'a partager le PTY serie entre
+# osmocon ET trxcon. Sans trxcon c'est un middleman Python qui PERD des octets
+# quand le firmware flood l'UART -> osmocon "LOST" en masse -> freeze mobile.
+# osmocon parle DIRECT au PTY serie du firmware ($PTY_MODEM). "osmocon only".
 
 # ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
 # Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
@@ -1931,16 +1947,17 @@ if [ "$CALYPSO_MOBILE_DEBUG" = "all" ]; then
     CALYPSO_MOBILE_DEBUG="DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK"
 fi
 
-# ---------- 3ter. décodeur gr-gsm (mode full-grgsm) ----------
-# DÉCODEUR (pas transceiver, pas de trxcon) : lit l'I/Q continu relayée par le
-# device (5810) → gsm.receiver (FCCH/SCH sync + démod) → BCCH/CCCH decode →
-# GSMTAP → le listener du shunt (4730) → feed_si → a_cd → le mobile (osmocon)
-# campe sur la VRAIE SI décodée par gr-gsm. mmap = fix shmat conteneur.
+# ---------- 3ter. DSP gr-gsm shm (mode full-grgsm) ----------
+# gr-gsm EST le DSP, branché sur le BUFFER SHM (pas UDP/relay) : le BSP publie
+# l'I/Q d'entrée du DSP shunté dans /dev/shm/calypso_dsp_shunt (ring, via
+# feed_iq) ; grgsm_shm_decode.py lit le ring -> demod (theta) + decode BCCH ->
+# ecrit le SI dans la zone sortie -> shunt_poll_si_shm -> feed_si -> a_cd -> le
+# mobile (osmocon) campe sur la VRAIE SI decodee. mmap = fix shmat conteneur.
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     tmux new-window -t "$SESSION" -n grgsm-decode
     tmux send-keys -t "$SESSION:grgsm-decode" \
-        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=1 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
-    echo "[run.sh] full-grgsm : décodeur gr-gsm (I/Q relayée 5810 → GSMTAP 4730 → feed_si) lancé"
+        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap python3 /opt/GSM/grgsm_shm_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+    echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then

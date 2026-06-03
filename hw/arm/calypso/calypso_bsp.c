@@ -366,6 +366,16 @@ static void bsp_trxd_readable(void *opaque)
         if (tee_fd >= 0)
             sendto(tee_fd, buf, n, MSG_DONTWAIT,
                    (struct sockaddr *)&tee_dst, sizeof(tee_dst));
+
+        /* Buffer shm (pas UDP) : publie l'I/Q d'entree du DSP shunte pour
+         * gr-gsm. buf[8..] = int16 I/Q entrelaces (cs16, mode passthrough),
+         * comme le tee. gr-gsm lit ce buffer cote shm. */
+        if (n > 8) {
+            uint32_t _fn = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
+                           ((uint32_t)buf[3] << 8)  |  (uint32_t)buf[4];
+            calypso_dsp_shunt_feed_iq(_fn, (const int16_t *)(buf + 8),
+                                      (int)((n - 8) / 2));
+        }
     }
 
     /* Diag : log first 10 recv sizes pour vérifier que bridge envoie bien
@@ -386,6 +396,15 @@ static void bsp_trxd_readable(void *opaque)
         BSP_LOG("TRXD peer learned: %s:%d",
                 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     }
+
+    /* "le shunt dsp ne doit pas shunt l'ipc" : shunt actif = le vrai DSP ne
+     * consomme JAMAIS la DARAM (gr-gsm decode via le shm feed_iq). On a deja
+     * draine l'UDP (recvfrom) + publie l'I/Q (feed_iq) + appris le peer UL.
+     * On NE remplit donc PAS la queue DARAM (bsp_enqueue) -> sinon elle sature
+     * (bursts_dropped_queue_full) -> backpressure qui remonte et TUE l'IPC/BTS.
+     * On rend la main : l'IPC continue de couler, le shm est nourri. */
+    if (calypso_dsp_shunt_active())
+        return;
 
     /* TRXDv0 DL: tn(1) fn(4) rssi(1) toa(2) bits(148) = 156 bytes.
      * (Confirmed empirically 2026-05-07 — earlier "asymmetric 6-byte

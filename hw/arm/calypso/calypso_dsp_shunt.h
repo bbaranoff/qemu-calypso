@@ -32,4 +32,8 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * Point d'injection commun aux deux fronts de démod. */
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len);
 
+/* ENTREE du DSP shunte : la BSP pousse l'I/Q DL (cs16, n int16 entrelaces
+ * I,Q) dans le buffer shm pour que gr-gsm (le DSP) la lise et la decode. */
+void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n);
+
 #endif /* CALYPSO_DSP_SHUNT_H */
