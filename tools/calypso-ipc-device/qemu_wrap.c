@@ -50,7 +50,10 @@
  * first 148 (TS=0) before forwarding to QEMU BSP (which expects 148-sample
  * bursts in its TRXD UDP datagram). The remaining 477 samples (TS 1..3 of
  * the half-frame) are dropped — FBSB only listens on C0 TN=0. */
-#define CALYPSO_SHM_BUFSIZE   625         /* samples per shm commit (matches osmo-trx CHUNK at 1 SPS) */
+#define CALYPSO_SHM_BUFSIZE   2500         /* samples per shm commit (matches osmo-trx CHUNK at 1 SPS) */
+#define CALYPSO_TRX_OSR       4                                     /* 4 SPS natif */
+#define CALYPSO_DL_BURSTLEN   (CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR)  /* 592 I/Q @ 4 SPS */
+#define CALYPSO_FRAME_SAMPLES (1250 * CALYPSO_TRX_OSR)              /* 5000 samples/frame @ 4 SPS */
 #define CALYPSO_BSP_BURSTLEN  148         /* samples per UDP datagram to QEMU BSP (= correlator window) */
 
 /* ---- Timing frame CANONIQUE (logique GSM, robuste) ----
@@ -144,7 +147,7 @@ struct dl_fifo_entry {
     bool     is_fcch;  /* for diag log only */
     uint64_t ts;       /* internal osmo-trx ts (for diag) */
     /* Pre-built TRXDv0 packet, header rewritten at send time with qfn. */
-    uint8_t  pkt[TRXD_HDR_LEN + CALYPSO_BSP_BURSTLEN * 4];
+    uint8_t  pkt[TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4];
 };
 static struct dl_fifo_entry g_dl_fifo[DL_FIFO_SIZE];
 static volatile size_t      g_dl_fifo_head = 0;   /* next pop index */
@@ -267,14 +270,18 @@ static void *clk_listener(void *arg)
             continue;
         }
         struct dl_fifo_entry *e = &g_dl_fifo[head % DL_FIFO_SIZE];
-        /* Patch fn into header in place. */
+        /* Patch fn into header : la VRAIE FN du burst (depuis e->ts), PAS le qfn
+         * courant. Sinon la latence FIFO (DL_PREFILL=32) decale la FN de ~32
+         * frames -> fn%51 faux -> blocs BCCH mal assembles -> decode foire.
+         * LA derniere piece : fifo_depth=32 scramblait la FN. */
+        uint32_t bfn = (uint32_t)(e->ts / ((uint64_t)CALYPSO_FRAME_SAMPLES));
         e->pkt[0] = 0; /* tn=0 */
-        e->pkt[1] = (uint8_t)(fn >> 24);
-        e->pkt[2] = (uint8_t)(fn >> 16);
-        e->pkt[3] = (uint8_t)(fn >>  8);
-        e->pkt[4] = (uint8_t)(fn);
+        e->pkt[1] = (uint8_t)(bfn >> 24);
+        e->pkt[2] = (uint8_t)(bfn >> 16);
+        e->pkt[3] = (uint8_t)(bfn >>  8);
+        e->pkt[4] = (uint8_t)(bfn);
         ssize_t sent = sendto(g_bsp_fd, e->pkt,
-                              TRXD_HDR_LEN + CALYPSO_BSP_BURSTLEN * 4, 0,
+                              TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4, 0,
                               (struct sockaddr *)&g_bsp_peer,
                               sizeof(g_bsp_peer));
         bool was_fcch = e->is_fcch;
@@ -404,8 +411,9 @@ void uhdwrap_fill_info_cnf(struct ipc_sk_if *ipc_prim)
     info->iq_scaling_val_tx = 1.0;
     info->max_num_chans = CALYPSO_NUM_CHANS;
     snprintf(info->dev_desc, sizeof(info->dev_desc),
-             "calypso-ipc-device (QEMU UDP 6702 bridge), GSM 1 SPS %.0f Hz",
-             (double)CALYPSO_FS_NUM / (double)CALYPSO_FS_DEN);
+             "calypso-ipc-device (QEMU UDP 6702 bridge), GSM %d SPS %.0f Hz",
+             CALYPSO_TRX_OSR,
+             (double)CALYPSO_FS_NUM / (double)CALYPSO_FS_DEN * CALYPSO_TRX_OSR);
 
     for (size_t i = 0; i < CALYPSO_NUM_CHANS; i++) {
         struct ipc_sk_if_info_chan *ci = &info->chan_info[i];
@@ -418,8 +426,8 @@ void uhdwrap_fill_info_cnf(struct ipc_sk_if *ipc_prim)
         ci->nominal_tx_power = 0.0; /* dBm — placeholder */
     }
 
-    LOGP(DDEV, LOGL_INFO, "qemu_wrap_fill_info_cnf: 1 chan, fs=%.0f Hz, 1 SPS\n",
-         (double)CALYPSO_FS_NUM / (double)CALYPSO_FS_DEN);
+    LOGP(DDEV, LOGL_INFO, "qemu_wrap_fill_info_cnf: 1 chan, fs=%.0f Hz, %d SPS\n",
+         (double)CALYPSO_FS_NUM / (double)CALYPSO_FS_DEN * CALYPSO_TRX_OSR, CALYPSO_TRX_OSR);
 }
 
 /* ---- buffer sizing + timing ---- */
@@ -606,7 +614,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * un chunk TS0 (ts%1250==0), on l'injecte dans le slot TS0 (samples 0..147). */
     static int16_t ul_chunk[CALYPSO_SHM_BUFSIZE * 2];
     int16_t *ul_src = zeros_iq;
-    if (g_ul_on && g_ul_pending && (d->rx_ts % 1250ULL) == 0) {
+    if (g_ul_on && g_ul_pending && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         memset(ul_chunk, 0, sizeof(ul_chunk));
         memcpy(ul_chunk, g_ul_iq, sizeof(g_ul_iq));   /* TS0 = 148 samples */
         ul_src = ul_chunk;
@@ -726,7 +734,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
  * burst, forwarded to BSP. Rest is discarded for FBSB phase. */
 #define DL_READ_SAMPLES       CALYPSO_SHM_BUFSIZE
 static uint16_t dl_read_buf[DL_READ_SAMPLES * 2];   /* cs16 I,Q interleaved */
-static uint8_t  dl_send_pkt[TRXD_HDR_LEN + CALYPSO_BSP_BURSTLEN * 4];
+static uint8_t  dl_send_pkt[TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4];
 
 int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
 {
@@ -763,6 +771,20 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                 sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
                        MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
                        sizeof(g_relay_dl_dst));
+            /* PILE cfile CONTINU : le MÊME full chunk relay (tous TS, continu) ->
+             * /tmp/relay_continu.cfile. C'est ce que grgsm_decode -c veut (flux
+             * continu, pas les bursts TS0 discontinus du cfile BSP). Gated
+             * CALYPSO_RELAY_CFILE (defaut /tmp/relay_continu.cfile, vide=off). */
+            {
+                static FILE *rcf = (FILE *)-1;
+                if (rcf == (FILE *)-1) {
+                    const char *e = getenv("CALYPSO_RELAY_CFILE");
+                    const char *path = e ? e : "/tmp/relay_continu.cfile";
+                    rcf = (e && !*e) ? NULL : fopen(path, "wb");
+                    if (rcf) setvbuf(rcf, NULL, _IOFBF, 1 << 20);
+                }
+                if (rcf) fwrite(g_relay_fbuf, sizeof(float), (size_t)ns * 2, rcf);
+            }
             /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
              * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour
              * alimenter feed_iq (cfile + shm ring grgsm↔BSP). Defaut: relais pur. */
@@ -776,7 +798,7 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
          * osmo-trx commits half-frames (625 samples) → chunks pair at
          * ts%1250==0 carry TS0..3, chunks impair (ts%1250==625) carry
          * TS4..7. We only forward TS=0 (first 148 of pair chunks). */
-        uint32_t ts_in_frame = (uint32_t)(ts % 1250ULL);
+        uint32_t ts_in_frame = (uint32_t)(ts % ((uint64_t)CALYPSO_FRAME_SAMPLES));
         int has_ts0 = (ts_in_frame == 0);
         if (!has_ts0) {
             static uint64_t skip_count = 0;
@@ -810,11 +832,11 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                  burst_off, iq_conj);
         }
         int avail = (int)rv - burst_off;
-        int n_samples = (avail < CALYPSO_BSP_BURSTLEN) ? avail : CALYPSO_BSP_BURSTLEN;
+        int n_samples = (avail < CALYPSO_DL_BURSTLEN) ? avail : CALYPSO_DL_BURSTLEN;
         if (n_samples < 0) n_samples = 0;
         const int16_t *burst_src = (const int16_t *)dl_read_buf + 2 * burst_off;
         size_t payload_len = (size_t)n_samples * 4u;
-        uint32_t internal_fn = (uint32_t)(ts / 1250ULL);
+        uint32_t internal_fn = (uint32_t)(ts / ((uint64_t)CALYPSO_FRAME_SAMPLES));
 
         /* Detect FCCH inline — purely for diag log (helps spot when
          * we serve an FCCH vs other bursts). Not used for routing. */
@@ -900,7 +922,7 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                              "alpha sweep START (skipped %d, will capture %d chunks)\n",
                              dump_skipped, capture_target);
                     }
-                    uint64_t internal_fn = ts / 1250ULL;
+                    uint64_t internal_fn = ts / ((uint64_t)CALYPSO_FRAME_SAMPLES);
                     char path[128];
                     snprintf(path, sizeof(path),
                              "/tmp/fcch_sweep_%03d.bin", dump_count);

@@ -1496,6 +1496,18 @@ pkill -9 -f "inject.py"     2>/dev/null || true   # pas d'injecteur SI gdb concu
 pkill -9 -f "validating.py" 2>/dev/null || true
 pkill -9 -x trxcon        2>/dev/null || true
 pkill -9 -f "cp210x_tee"  2>/dev/null || true
+# --- Kill exhaustif (2026-06-03) : chaque run part 100% propre (plus de 3 decodeurs) ---
+pkill -9 -f "grgsm_shm_decode"   2>/dev/null || true
+pkill -9 -f "grgsm_fft_live"     2>/dev/null || true
+pkill -9 -f "gsmtap_relay"       2>/dev/null || true
+pkill -9 -f "bin/grgsm_decode"   2>/dev/null || true   # le tool standard (par chemin, pas de sur-match)
+pkill -9 -f "grgsm_cfile"        2>/dev/null || true
+pkill -9 -f "qemu-system-arm"    2>/dev/null || true
+pkill -9 -f "osmo-trx-ipc"       2>/dev/null || true
+pkill -9 -x osmo-bts-trx         2>/dev/null || true
+pkill -9 -x osmocon              2>/dev/null || true
+pkill -9 -x mobile               2>/dev/null || true
+pkill -9 -f "inject_si3"         2>/dev/null || true
 sleep 1   # laisse les sockets UDP/TCP se libérer avant de relancer
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
@@ -1959,8 +1971,19 @@ fi
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     tmux new-window -t "$SESSION" -n grgsm-decode
     tmux send-keys -t "$SESSION:grgsm-decode" \
-        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=4 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=4 CALYPSO_TRX_IN_SPS=4 CALYPSO_GRGSM_REFRAME=0 CALYPSO_GRGSM_DCBLOCK=1 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
+    # Bridge SI (2026-06-03) : grgsm_decode (cfile CONTINU /tmp/relay_continu.cfile,
+    # -s 1083333 = 4 SPS) DECODE le vrai SI2/SI3/SI4/SI13 de la BTS -> parse ->
+    # GSMTAP 4730 -> shunt feed_si -> a_cd + DATA_IND -> mobile. C'est CE chemin qui
+    # casse le mur demod (le cfile continu, pas les bursts BSP discontinus).
+    # Gated CALYPSO_SI_BRIDGE (defaut 1). sleep 15 = laisse la pile cfile se remplir.
+    if [ "${CALYPSO_SI_BRIDGE:-1}" = "1" ]; then
+        tmux new-window -t "$SESSION" -n si-bridge
+        tmux send-keys -t "$SESSION:si-bridge" \
+            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/si_bridge.log" C-m
+        echo "[run.sh] full-grgsm : si_bridge_loop (grgsm_decode cfile -> SI -> feed_si -> mobile) lance"
+    fi
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
