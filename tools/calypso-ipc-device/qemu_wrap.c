@@ -486,6 +486,49 @@ double uhdwrap_set_txatt(void *dev, double a, size_t chan)
     return a;
 }
 
+/* ============================================================================
+ * UL (IPC TX) : le BSP qemu envoie les bursts UL du mobile en TRXDv0 (8 hdr +
+ * 148 soft-bits ±127) vers 127.0.0.1:5702. On les reçoit, on les MODULE en
+ * GMSK I/Q (osmo-trx attend de l'I/Q), et on les injecte dans le slot TS0 du
+ * chunk UL au lieu des zéros. Opt-in CALYPSO_IPC_UL=1 (défaut off → heartbeat).
+ * Sync : best-effort — on place le dernier burst reçu sur le prochain chunk TS0.
+ * L'alignement FN fin se règle quand le mobile TX réellement (post-camp).
+ * ============================================================================ */
+#include <math.h>
+#define UL_PORT          5702
+#define UL_TRXD_HDR      8
+static int  g_ul_fd   = -1;            /* socket UDP UL (bind 5702) */
+static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
+static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * 2];   /* dernier burst modulé */
+static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
+
+/* GMSK/MSK mod : 148 soft-bits (±127) → 148 cs16 I/Q. Phase ±π/2 par bit
+ * (convention osmo-trx : bit 1 → +π/2). Amplitude ~0.6 full-scale. */
+static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
+{
+    double ph = 0.0;
+    for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) {
+        iq[2 * i]     = (int16_t)(cos(ph) * 20000.0);
+        iq[2 * i + 1] = (int16_t)(sin(ph) * 20000.0);
+        ph += ((bits[i] > 0) ? 1.0 : -1.0) * (M_PI / 2.0);
+    }
+}
+
+/* Draine la socket UL (non-bloquant), module le dernier burst dispo. */
+static void ul_drain(void)
+{
+    if (g_ul_fd < 0) return;
+    uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
+    int got = 0;
+    for (;;) {
+        ssize_t n = recvfrom(g_ul_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
+        if (n < UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN) break;
+        ul_gmsk_mod((const int8_t *)(pkt + UL_TRXD_HDR), g_ul_iq);
+        got = 1;
+    }
+    if (got) g_ul_pending = 1;
+}
+
 /* ---- RX (uplink_thread loop) : produces UL heartbeat zeros to osmo-trx ---- */
 
 int32_t uhdwrap_read(void *dev, uint32_t num_chans)
@@ -498,6 +541,44 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
     if (!zeros_init) {
         memset(zeros_iq, 0, sizeof(zeros_iq));
         zeros_init = true;
+    }
+
+    /* UL (IPC TX) init : bind 5702 pour recevoir les bursts UL du BSP. */
+    if (g_ul_on < 0) {
+        const char *e = getenv("CALYPSO_IPC_UL");
+        g_ul_on = (e && *e == '1') ? 1 : 0;
+        if (g_ul_on) {
+            g_ul_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            int one = 1;
+            setsockopt(g_ul_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in a; memset(&a, 0, sizeof(a));
+            a.sin_family = AF_INET; a.sin_port = htons(UL_PORT);
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(g_ul_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+                LOGP(DDEV, LOGL_ERROR, "UL bind(:%d) failed — UL off\n", UL_PORT);
+                close(g_ul_fd); g_ul_fd = -1; g_ul_on = 0;
+            } else {
+                LOGP(DDEV, LOGL_NOTICE,
+                     "UL (IPC TX) ON : bind :%d → mod GMSK → ios_rx_from_device\n",
+                     UL_PORT);
+            }
+        }
+    }
+    if (g_ul_on) ul_drain();
+
+    /* Chunk UL : zéros par défaut ; si un burst UL est dispo et qu'on est sur
+     * un chunk TS0 (ts%1250==0), on l'injecte dans le slot TS0 (samples 0..147). */
+    static int16_t ul_chunk[CALYPSO_SHM_BUFSIZE * 2];
+    int16_t *ul_src = zeros_iq;
+    if (g_ul_on && g_ul_pending && (d->rx_ts % 1250ULL) == 0) {
+        memset(ul_chunk, 0, sizeof(ul_chunk));
+        memcpy(ul_chunk, g_ul_iq, sizeof(g_ul_iq));   /* TS0 = 148 samples */
+        ul_src = ul_chunk;
+        g_ul_pending = 0;
+        static unsigned ul_inj = 0;
+        if (ul_inj++ < 20 || (ul_inj % 200) == 0)
+            LOGP(DDEV, LOGL_INFO, "UL inject #%u burst → ts=%llu (TS0)\n",
+                 ul_inj, (unsigned long long)d->rx_ts);
     }
 
     /* ---- WALL-PACED UL heartbeat (clock_nanosleep ABSTIME) ----
@@ -534,7 +615,7 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         int32_t rc = ipc_shm_enqueue(ios_rx_from_device[c],
                                      d->rx_ts,
                                      CALYPSO_SHM_BUFSIZE,
-                                     (uint16_t *)zeros_iq);
+                                     (uint16_t *)ul_src);
         if (rc < 0) {
             static unsigned overruns = 0;
             if (overruns++ < 5)

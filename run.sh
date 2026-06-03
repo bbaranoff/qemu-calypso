@@ -1086,6 +1086,9 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 CALYPSO_MODE="${CALYPSO_MODE:-full}"
 # icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
 : "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
+# IPC TX (uplink) ON par défaut : le device module les bursts UL du mobile
+# (BSP→5702) en GMSK et les injecte vers osmo-trx→BTS (sinon UL = zéros).
+: "${CALYPSO_IPC_UL:=1}"; export CALYPSO_IPC_UL
 case "$CALYPSO_MODE" in
     full|shunt|shunt-ipc|bridge|bare|free) ;;
     *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
