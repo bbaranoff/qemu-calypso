@@ -454,12 +454,13 @@ if [ "$MENU_MODE" = "1" ]; then
  Fine override: env vars CALYPSO_SKIP_*, CALYPSO_DSP_SHUNT, ...\
 " \
       20 84 7 \
-      "full"      "Full radio pipeline (default legacy)" \
-      "shunt"     "DSP shunt canned -- bissection FBSB" \
-      "shunt-ipc" "DSP shunt + radio chain" \
-      "bridge"    "Legacy bridge.py Python" \
-      "bare"      "QEMU + osmocon only" \
-      "free"      "Free mode -- pick everything yourself" \
+      "full"       "Full radio pipeline (default legacy)" \
+      "full-grgsm" "gr-gsm transceiver (mobile) -- IPC pour BTS seul, NO DSP" \
+      "shunt"      "DSP shunt canned -- bissection FBSB" \
+      "shunt-ipc"  "DSP shunt + radio chain" \
+      "bridge"     "Legacy bridge.py Python" \
+      "bare"       "QEMU + osmocon only" \
+      "free"       "Free mode -- pick everything yourself" \
       3>&1 1>&2 2>&3) || _cancel
     export CALYPSO_MODE
 
@@ -470,6 +471,13 @@ if [ "$MENU_MODE" = "1" ]; then
         _PRE_SHUNT=OFF; _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
         _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=ON; _PRE_IRDA=ON
         _PRE_DOC=ON;    _PRE_MTTCG=OFF
+        ;;
+      full-grgsm)
+        # qemu gardé (fw+CP210x), DSP SHUNT ON (c54x canné léger). Mobile =
+        # trxcon + gr-gsm (radio). L2 ON (L1CTL via trxcon, pas osmocon).
+        _PRE_SHUNT=ON;  _PRE_IPC=ON;  _PRE_TRX=ON;  _PRE_BRIDGE=OFF
+        _PRE_BTS=ON;    _PRE_L2=ON;   _PRE_GSMTAP=OFF; _PRE_IRDA=OFF
+        _PRE_DOC=OFF;   _PRE_MTTCG=OFF
         ;;
       shunt)
         _PRE_SHUNT=ON;  _PRE_IPC=OFF; _PRE_TRX=OFF; _PRE_BRIDGE=OFF
@@ -1020,6 +1028,8 @@ if [ -f "$MOBILE_CFG_VERSIONED" ] && [ "${CALYPSO_SYNC_MOBILE_CFG:-1}" = "1" ]; 
     mkdir -p "$(dirname "$MOBILE_CFG")"
     cp "$MOBILE_CFG_VERSIONED" "$MOBILE_CFG"
     echo "[run.sh] mobile_group1.cfg synced from $MOBILE_CFG_VERSIONED"
+    # full-grgsm : le mobile communique DIRECT avec osmocon (L1CTL firmware,
+    # /tmp/osmocom_l2 = défaut du cfg). trxcon retiré → pas de redirect socket.
 fi
 
 # Override stick ARFCN si CALYPSO_STICK_ARFCN set (default = garde cfg versionnee).
@@ -1090,8 +1100,8 @@ CALYPSO_MODE="${CALYPSO_MODE:-full}"
 # (BSP→5702) en GMSK et les injecte vers osmo-trx→BTS (sinon UL = zéros).
 : "${CALYPSO_IPC_UL:=1}"; export CALYPSO_IPC_UL
 case "$CALYPSO_MODE" in
-    full|shunt|shunt-ipc|bridge|bare|free) ;;
-    *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
+    full|full-grgsm|shunt|shunt-ipc|bridge|bare|free) ;;
+    *) echo "[run.sh] ERR : CALYPSO_MODE=$CALYPSO_MODE inconnu (full|full-grgsm|shunt|shunt-ipc|bridge|bare|free)" >&2; exit 1 ;;
 esac
 
 # Defaults derives du preset. Chaque var peut etre overridee explicitement
@@ -1105,6 +1115,23 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        ;;
+    full-grgsm)
+        # qemu (Calypso) GARDÉ (firmware chargé par osmocon + lien série CP210x),
+        # mais la RADIO du mobile passe par gr-gsm : device en RELAIS I/Q continu
+        # → grgsm_trx → trxcon → mobile. La BSP de qemu est starvée (normal).
+        # DSP SHUNT ON : c54x canné (léger) → qemu ne congestionne pas et ne se
+        # coince pas sur le DSP (sa radio n'est pas utilisée de toute façon).
+        : "${CALYPSO_DSP_SHUNT:=1}"
+        : "${CALYPSO_SKIP_IPC_DEVICE:=0}"
+        : "${CALYPSO_SKIP_TRX_IPC:=0}"
+        : "${CALYPSO_SKIP_BTS:=0}"
+        : "${CALYPSO_SKIP_L2:=0}"
+        : "${CALYPSO_SKIP_GSMTAP:=0}"
+        : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
+        : "${CALYPSO_IPC_RELAY:=1}"        # device relaie l'I/Q vers grgsm_trx
+        : "${CALYPSO_SHUNT_NO_CANNED:=1}"  # PAS de SI3 canned (l'ancien bypass DSP)
+        export CALYPSO_IPC_RELAY CALYPSO_SHUNT_NO_CANNED
         ;;
     shunt)
         : "${CALYPSO_DSP_SHUNT:=1}"
@@ -1442,6 +1469,12 @@ rm -f "$QEMU_LOG" "$OSMOCON_LOG" "$MOBILE_LOG" "$BTS_LOG" \
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc python3 >/dev/null 2>&1 || true
 pkill -9 -f calypso-ipc-device 2>/dev/null || true
+# full-grgsm : tuer les restes qui tiennent des ports (5810/5811/6700/6800/4730)
+pkill -9 -f "grgsm_trx"   2>/dev/null || true
+pkill -9 -f "grgsm_relay" 2>/dev/null || true
+pkill -9 -x trxcon        2>/dev/null || true
+pkill -9 -f "cp210x_tee"  2>/dev/null || true
+sleep 1   # laisse les sockets UDP/TCP se libérer avant de relancer
 pkill -9 -f irda_capture.py 2>/dev/null || true
 rm -f "$L1CTL_SOCK" "$MON_SOCK" "$QEMU_DUMMY_SOCK" /tmp/osmocom_l2_*
 rm -f /tmp/fw-irda.log /tmp/irda_capture.pid /tmp/irda.pty.link
@@ -1682,6 +1715,19 @@ if [ -z "$PTY_MODEM" ]; then
 fi
 echo " OK ($PTY_MODEM, QEMU_PID=$QEMU_PID)"
 
+# ---------- 1ter. CP210x tee (mode full-grgsm) ----------
+# Tee bidirectionnel du lien série CP210x (PTY série0 qemu) → osmocon + trxcon.
+# osmocon prend /tmp/cp210x_osmocon ; trxcon prend /tmp/cp210x_trxcon.
+OSMOCON_SERIAL="$PTY_MODEM"
+if [ "$CALYPSO_MODE" = "full-grgsm" ] && [ -n "$PTY_MODEM" ]; then
+    tmux new-window -t "$SESSION" -n cp210x-tee
+    tmux send-keys -t "$SESSION:cp210x-tee" \
+        "python3 /opt/GSM/cp210x_tee.py $PTY_MODEM 2>&1 | $TSLOG" C-m
+    echo -n "Waiting for CP210x tee (/tmp/cp210x_osmocon)..."
+    for i in $(seq 1 20); do [ -e /tmp/cp210x_osmocon ] && break; sleep 0.3; echo -n "."; done
+    if [ -e /tmp/cp210x_osmocon ]; then echo " OK"; OSMOCON_SERIAL="/tmp/cp210x_osmocon"; else echo " WARN -- tee absent"; fi
+fi
+
 # ---------- 1bis. IrDA capture (UART_IRDA = serial1, IRQ 18, 0xFFFF5000) ----------
 # Phase 3 du plan PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md :
 # le firmware compal_e88 fait deja `cons_bind_uart(UART_IRDA)` (init.c:105),
@@ -1737,7 +1783,7 @@ fi
 # ---------- 2. osmocon ----------
 tmux new-window -t "$SESSION" -n osmocon
 tmux send-keys -t "$SESSION:osmocon" \
-    ": > $OSMOCON_LOG && stdbuf -oL -eL $OSMOCON -m romload -i 100 -p $PTY_MODEM -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
+    ": > $OSMOCON_LOG && stdbuf -oL -eL $OSMOCON -m romload -i 100 -p $OSMOCON_SERIAL -s $L1CTL_SOCK $FW_BIN -d tr 2>&1 | $TSLOG | tee $OSMOCON_LOG" C-m
 
 echo -n "Waiting for osmocon to expose $L1CTL_SOCK..."
 for i in $(seq 1 30); do
@@ -1757,7 +1803,7 @@ if [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ]; then
     tmux new-window -t "$SESSION" -n ipc-device
     if [ -n "$CALYPSO_IPC_DEVICE" ] && [ -x "$CALYPSO_IPC_DEVICE" ]; then
         tmux send-keys -t "$SESSION:ipc-device" \
-            ": > $IPC_DEVICE_LOG && $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
+            ": > $IPC_DEVICE_LOG && CALYPSO_IPC_RELAY=${CALYPSO_IPC_RELAY:-0} CALYPSO_TRX_IQ_HOST=${CALYPSO_TRX_IQ_HOST:-127.0.0.1} CALYPSO_TRX_IQ_RX_PORT=${CALYPSO_TRX_IQ_RX_PORT:-5810} CALYPSO_TRX_IQ_TX_PORT=${CALYPSO_TRX_IQ_TX_PORT:-5811} $CALYPSO_IPC_DEVICE -u /tmp -n 0 2>&1 | $TSLOG | tee $IPC_DEVICE_LOG" C-m
         echo -n "Waiting for calypso-ipc-device master sock ($IPC_MSOCK_PATH)..."
         for i in $(seq 1 30); do
             [ -S "$IPC_MSOCK_PATH" ] && break
@@ -1883,6 +1929,18 @@ CALYPSO_MOBILE_DEBUG="${CALYPSO_MOBILE_DEBUG:-DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMN
 # Note : separateur = `:` pour osmocom-bb mobile (pas `,`).
 if [ "$CALYPSO_MOBILE_DEBUG" = "all" ]; then
     CALYPSO_MOBILE_DEBUG="DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK"
+fi
+
+# ---------- 3ter. décodeur gr-gsm (mode full-grgsm) ----------
+# DÉCODEUR (pas transceiver, pas de trxcon) : lit l'I/Q continu relayée par le
+# device (5810) → gsm.receiver (FCCH/SCH sync + démod) → BCCH/CCCH decode →
+# GSMTAP → le listener du shunt (4730) → feed_si → a_cd → le mobile (osmocon)
+# campe sur la VRAIE SI décodée par gr-gsm. mmap = fix shmat conteneur.
+if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+    tmux new-window -t "$SESSION" -n grgsm-decode
+    tmux send-keys -t "$SESSION:grgsm-decode" \
+        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=1 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+    echo "[run.sh] full-grgsm : décodeur gr-gsm (I/Q relayée 5810 → GSMTAP 4730 → feed_si) lancé"
 fi
 
 if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
