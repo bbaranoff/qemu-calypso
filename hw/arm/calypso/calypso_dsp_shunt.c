@@ -135,6 +135,10 @@ struct dsp_shunt_state {
     bool       si_valid;
 };
 
+/* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
+extern uint32_t calypso_trx_get_fn(void);
+extern void l1ctl_inject_dl_si(const uint8_t *l2, int l2len, uint32_t fn);
+
 static struct dsp_shunt_state g_shunt;
 
 /* ---- Helpers : read/write API RAM via AddressSpace (16-bit LE) ---- */
@@ -178,6 +182,11 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     g_shunt.d_task_md = shunt_read_w(wp + WP_D_TASK_MD);
     g_shunt.d_task_ra = shunt_read_w(wp + WP_D_TASK_RA);
     g_shunt.d_fn      = shunt_read_w(wp + WP_D_FN);
+    /* RECODE FN (#4) : le firmware poste souvent d_fn=0 (FBSB = recherche, pas
+     * de frame precise). On substitue la VRAIE FN TDMA pour le frame_nr aval
+     * (DATA_IND / sync). */
+    if (g_shunt.d_fn == 0)
+        g_shunt.d_fn = (uint16_t)(calypso_trx_get_fn() & 0xFFFF);
     g_shunt.pending   = true;
 
     /* PM : valeur statique, écrite IMMÉDIATEMENT (pas de service déféré au
@@ -715,6 +724,14 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
     for (int i = n; i < 23; i++)
         g_shunt.si_buf[i] = 0x2B;
     g_shunt.si_valid = true;
+    /* Hop 5 : injecte AUSSI directement en L1CTL DATA_IND -> mobile (gated
+     * CALYPSO_SHUNT_DL_INJECT, defaut ON). FN reelle via calypso_trx_get_fn. */
+    {
+        static int inj = -1;
+        if (inj < 0) { const char *e = getenv("CALYPSO_SHUNT_DL_INJECT");
+                       inj = (e && *e == '0') ? 0 : 1; }
+        if (inj) l1ctl_inject_dl_si(g_shunt.si_buf, 23, calypso_trx_get_fn());
+    }
     fprintf(stderr, "[dsp-shunt] feed_si: SI réel %d o injecté → a_cd "
             "(L2[0..2]=%02x %02x %02x)\n", n, l2[0],
             n > 1 ? l2[1] : 0, n > 2 ? l2[2] : 0);

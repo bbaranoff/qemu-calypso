@@ -52,6 +52,14 @@
  * the half-frame) are dropped — FBSB only listens on C0 TN=0. */
 #define CALYPSO_SHM_BUFSIZE   625         /* samples per shm commit (matches osmo-trx CHUNK at 1 SPS) */
 #define CALYPSO_BSP_BURSTLEN  148         /* samples per UDP datagram to QEMU BSP (= correlator window) */
+
+/* ---- Timing frame CANONIQUE (logique GSM, robuste) ----
+ * 1 frame TDMA = CALYPSO_FRAME_QBITS qbits (1250 symboles x 4) = CALYPSO_FRAME_NS.
+ * Le budget DSP n'est PAS hardcode : le gating se fait sur le qfn du firmware
+ * (g_qemu_qfn), qui avance quand le firmware a fini sa frame = budget DSP consomme
+ * implicitement. On suit la frame REELLE du firmware, pas une constante devinee. */
+#define CALYPSO_FRAME_QBITS   5000
+#define CALYPSO_FRAME_NS      4615384L   /* 5000 qbits / 1083333.33 qbits/s = 60/13 ms */
 #define CALYPSO_NUM_CHANS     1
 #define CALYPSO_PATH_NAME     "TX"        /* placeholder ; matches osmo-trx-ipc.cfg */
 #define CALYPSO_RX_PATH_NAME  "RX"
@@ -629,22 +637,47 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * le heartbeat est une demi-frame). Configurable via CALYPSO_TDMA_NS (la
      * MÊME var que le clk_master QEMU) pour ralentir la timeline uniformément
      * si l'émulation ne tient pas le temps réel → cohérence osmo-trx ↔ QEMU. */
-    static long PERIOD_NS = 0;
+    static long PERIOD_NS = 0, QFN_LEAD = 0, QFN_FLOOR_NS = 0;
+    static int  QFN_FORCE = -1;
+    static uint64_t local_half = 0;
     if (PERIOD_NS == 0) {
-        PERIOD_NS = 2307692L;
+        PERIOD_NS = CALYPSO_FRAME_NS / 2;   /* demi-frame, budget firmware 4908 qbits */
         const char *e = getenv("CALYPSO_TDMA_NS");
-        if (e && *e) { long long v = atoll(e); if (v >= 4615384LL) PERIOD_NS = (long)(v / 2); }
+        if (e && *e) { long long v = atoll(e); if (v >= CALYPSO_FRAME_NS) PERIOD_NS = (long)(v / 2); }
+        const char *f = getenv("CALYPSO_QFN_FORCE");    QFN_FORCE    = (f && *f == '1') ? 1 : 0;
+        const char *l = getenv("CALYPSO_QFN_LEAD");     QFN_LEAD     = (l && *l) ? atol(l) : 32;
+        const char *g = getenv("CALYPSO_QFN_FLOOR_NS"); QFN_FLOOR_NS = (g && *g) ? atol(g) : 50000000L;
     }
 
-    if (next_deadline.tv_sec == 0) {
-        clock_gettime(CLOCK_MONOTONIC, &next_deadline);
+    /* ---- LOCK SUR L'HORLOGE QEMU (CALYPSO_QFN_FORCE=1) : budget constant ----
+     * Le device se cale sur le qfn de qemu (g_qemu_qfn, clk_listener port 6700).
+     * osmo-trx (master clock = nos UL) ET le relay->gr-gsm verrouillent sur le
+     * firmware. Budget = 148 cplx/frame (DARAM 0x2a00) ; heartbeat = demi-frame
+     * -> 2/qfn. local_half <= qfn*2 + QFN_LEAD (sinon attend qemu, poll-sleep).
+     * QFN_FLOOR_NS = anti-starve (pas de hard-timeout qui crashait). Defaut
+     * (QFN_FORCE=0) = wall historique. */
+    if (QFN_FORCE && __atomic_load_n(&g_qfn_seen, __ATOMIC_ACQUIRE)) {
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            uint32_t qfn = __atomic_load_n(&g_qemu_qfn, __ATOMIC_ACQUIRE);
+            if (local_half <= (uint64_t)qfn * 2 + (uint64_t)QFN_LEAD) break;
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            long el = (now.tv_sec - t0.tv_sec) * 1000000000L + (now.tv_nsec - t0.tv_nsec);
+            if (el >= QFN_FLOOR_NS) break;
+            usleep(100);
+        }
+        local_half++;
+    } else {
+        if (next_deadline.tv_sec == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &next_deadline);
+        }
+        next_deadline.tv_nsec += PERIOD_NS;
+        while (next_deadline.tv_nsec >= 1000000000L) {
+            next_deadline.tv_nsec -= 1000000000L;
+            next_deadline.tv_sec  += 1;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_deadline, NULL);
     }
-    next_deadline.tv_nsec += PERIOD_NS;
-    while (next_deadline.tv_nsec >= 1000000000L) {
-        next_deadline.tv_nsec -= 1000000000L;
-        next_deadline.tv_sec  += 1;
-    }
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_deadline, NULL);
 
     /* RELAIS UL : I/Q fc32 du transceiver gr-gsm → cs16 → osmo-trx. Si rien
      * ce tick, zéros (le clock doit avancer). Buffer local (thread DL séparé). */
@@ -730,7 +763,13 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                 sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
                        MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
                        sizeof(g_relay_dl_dst));
-            continue;   /* relais pur : pas de TRXDv0/BSP */
+            /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
+             * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour
+             * alimenter feed_iq (cfile + shm ring grgsm↔BSP). Defaut: relais pur. */
+            static int also_bsp = -1;
+            if (also_bsp < 0) { const char *e = getenv("CALYPSO_RELAY_ALSO_BSP");
+                                also_bsp = (e && *e=='1') ? 1 : 0; }
+            if (!also_bsp) continue;   /* relais pur */
         }
 
         /* TS=0 slice : SAMPLES_PER_FRAME=1250 at 1 SPS = 8 × 156.25.

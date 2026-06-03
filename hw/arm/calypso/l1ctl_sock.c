@@ -154,6 +154,27 @@ static void l1ctl_send_to_mobile(L1CTLSock *s, const uint8_t *payload, int len)
     }
 }
 
+/* Hop 5 : injection directe DL SI -> mobile en L1CTL DATA_IND (court-circuite
+ * a_cd->ARM->UART qui perd des octets). Appele par le shunt GSMTAP listener. */
+void l1ctl_inject_dl_si(const uint8_t *l2, int l2len, uint32_t fn)
+{
+    if (g_l1ctl.cli_fd < 0 || !l2 || l2len <= 0) return;
+    if (l2len > 23) l2len = 23;
+    uint8_t pl[16 + 23];
+    memset(pl, 0, sizeof(pl));
+    pl[0] = 0x03;                                  /* L1CTL_DATA_IND */
+    pl[4] = 0x80;                                  /* chan_nr = BCCH */
+    pl[6] = (uint8_t)(514 >> 8); pl[7] = (uint8_t)(514 & 0xFF);  /* band_arfcn 514 */
+    pl[8]=(uint8_t)(fn>>24); pl[9]=(uint8_t)(fn>>16);
+    pl[10]=(uint8_t)(fn>>8);  pl[11]=(uint8_t)fn;  /* frame_nr (BE) */
+    pl[12] = 40;                                   /* rx_level */
+    pl[13] = 30;                                   /* snr */
+    /* pl[14]=num_biterr=0, pl[15]=fire_crc=0 (CRC OK) */
+    memcpy(pl + 16, l2, l2len);
+    l1ctl_send_to_mobile(&g_l1ctl, pl, 16 + l2len);
+    L1CTL_LOG("INJECT DL DATA_IND BCCH fn=%u l2len=%d -> mobile", fn, l2len);
+}
+
 /* ---- Process a complete sercomm frame from firmware TX ---- */
 
 static void sercomm_frame_complete(L1CTLSock *s)

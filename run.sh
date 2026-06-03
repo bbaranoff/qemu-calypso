@@ -1129,8 +1129,11 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_SKIP_L2:=0}"
         : "${CALYPSO_SKIP_GSMTAP:=0}"
         : "${CALYPSO_SKIP_BRIDGE_PY:=1}"
-        : "${CALYPSO_IPC_RELAY:=0}"            # 0 = device LIVRE le DL au BSP (pas de relais 5810) -> feed_iq -> shm gr-gsm
+        : "${CALYPSO_IPC_RELAY:=1}"            # 1 = device RELAIE le chunk CONTINU (625 samples, guard inclus) -> 5810 -> gr-gsm gsm.receiver (pas de troncature 148)
         : "${CALYPSO_BSP_IQ_PASSTHROUGH:=1}"   # BSP interprete le payload comme I/Q cs16 (requis par feed_iq)
+        : "${CALYPSO_RELAY_ALSO_BSP:=1}"       # 1 = device relaie 5810 ET nourrit le BSP (feed_iq -> cfile) -> FFT live par defaut
+        : "${CALYPSO_TWL3025_AFC_HZ:=16000}"   # force AFC FIXE 16kHz : stoppe la chasse AFC -> carrier stable (le drift que le demod constant ne peut pas suivre) -> demod
+        export CALYPSO_TWL3025_AFC_HZ
         : "${CALYPSO_SHUNT_NO_CANNED:=1}"  # PAS de SI3 canned (l'ancien bypass DSP)
         # Non-truqué : aucune injection SI legacy ne doit concurrencer le feed_si
         # gr-gsm (a_cd). Override (=) et pas default (:=) → même un env exporté
@@ -1140,7 +1143,7 @@ case "$CALYPSO_MODE" in
         CALYPSO_DSP_L1_STUB=0
         CALYPSO_FORCE_FBSB=0          # pas d'oracle FBSB_CONF
         CALYPSO_FORCE_AGCH=0          # pas de réécriture DATA_IND BCCH SI
-        export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_SHUNT_NO_CANNED \
+        export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_RELAY_ALSO_BSP CALYPSO_SHUNT_NO_CANNED \
                CALYPSO_DSP_L1STUB CALYPSO_DSP_L1_STUB \
                CALYPSO_FORCE_FBSB CALYPSO_FORCE_AGCH
         ;;
@@ -1956,7 +1959,7 @@ fi
 if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     tmux new-window -t "$SESSION" -n grgsm-decode
     tmux send-keys -t "$SESSION:grgsm-decode" \
-        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap python3 /opt/GSM/grgsm_shm_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+        "source /root/.env/bin/activate 2>/dev/null; GR_VMCIRCBUF_DEFAULT_FACTORY=mmap CALYPSO_TRX_OSR=4 python3 /opt/GSM/grgsm_relay_decode.py 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
 fi
 
@@ -2015,7 +2018,7 @@ tmux new-window -t "$SESSION" -n all \
     "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
 # Build dynamic spec list selon ce qui tourne reellement.
 _ALL_SPECS=("osmocon|$OSMOCON_LOG")
-[ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("tcpdump|__TCPDUMP__")
+[ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("fft|__FFT__")
 [ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ] && _ALL_SPECS+=("ipc-device|$IPC_DEVICE_LOG")
 [ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ] && _ALL_SPECS+=("osmo-trx-ipc|$OSMO_TRX_IPC_LOG")
 [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
@@ -2027,10 +2030,9 @@ _ALL_SPECS=("osmocon|$OSMOCON_LOG")
 [ "${CALYPSO_SKIP_GDB_PANE:-1}" != "1" ] && _ALL_SPECS+=("gdb|__GDB__")
 for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
-    if [ "$log" = "__TCPDUMP__" ]; then
-        # Live tcpdump hex + ASCII (sans -w pour ne pas dupliquer le pcap
-        # canonique gere par la fenetre `gsmtap`).
-        cmd="clear; echo '=== $name ==='; sleep 5 && tcpdump -i any -X udp port 4729"
+    if [ "$log" = "__FFT__" ]; then
+        # FFT live du cfile BSP (lien grgsm<->BSP) — remplace tcpdump (vire pour l'instant).
+        cmd="clear; source /root/.env/bin/activate 2>/dev/null; python3 /opt/GSM/grgsm_fft_live.py"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide
