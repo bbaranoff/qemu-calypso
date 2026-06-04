@@ -245,10 +245,10 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
 /* ---- CALYPSO_CANNED : énumère EXPLICITEMENT chaque sortie DSP encore
  * FABRIQUÉE (canned) par le shunt, au lieu de la cacher derrière une valeur
  * « plausiblement juste ». CSV insensible casse ; "FULL"/"ALL" = tout canné,
- * "NONE" = rien. Var absente = DÉFAUT = comportement historique (ces mesures
- * restent cannées → camping inchangé). On RETIRE un token quand sa vraie
- * source est câblée (étape 2+). BSIC/SI ne sont PAS ici : déjà réels via
- * gr-gsm / feed_si ; leur état est loggué au boot pour rester explicite. */
+ * "NONE"/"=" vide = rien. Var absente = DÉFAUT = CAN_DEFAULT (désormais RIEN
+ * canné : toutes les sorties sont pilotées par le vrai décode gr-gsm). On
+ * re-canne sélectivement avec CALYPSO_CANNED=<token>. BSIC/SI ne sont PAS ici :
+ * déjà réels via gr-gsm / feed_si ; leur état est loggué au boot. */
 enum {
     CAN_FBDET = 1u << 0,   /* d_fb_det = 1 ("FB found") forcé          */
     CAN_TOA   = 1u << 1,   /* a_sync/serv_demod[TOA] = 23 ("on time")  */
@@ -257,11 +257,18 @@ enum {
     CAN_ANGLE = 1u << 4,   /* [ANGLE] = 0 (AFC convergé, pas de chasse)*/
     CAN_CRC   = 1u << 5,   /* a_sch[0]/a_cd status = 0 (CRC forcé pass)*/
 };
-/* DÉGATÉS (testés, camping tient) : FBDET (=sb_valid), TOA (timing SCH gr-gsm),
- * ANGLE (=0 résidu post-correction), CRC (=sb_valid/si_valid). Restent fabriqués
- * par DÉFAUT : PM/SNR seulement (pas encore de mapping dBm gr-gsm). Ajouter un
- * token ici le re-canne ; le retirer active sa vraie source. */
-#define CAN_DEFAULT (CAN_PM|CAN_SNR)
+#define CAN_ALL (CAN_FBDET|CAN_TOA|CAN_PM|CAN_SNR|CAN_ANGLE|CAN_CRC)
+/* TOUT DÉGATÉ (testés, camping tient), piloté par le vrai état de décode gr-gsm :
+ *   FBDET = sb_valid (FB trouvé ssi SCH décodé)
+ *   TOA   = timing SCH réel gr-gsm
+ *   ANGLE = 0 (résidu réel post-correction freq)
+ *   CRC   = sb_valid/si_valid (pass ssi vraiment décodé, sinon fail)
+ *   PM    = 0 (a_serv_demod[PM] FB/SB ne pilote pas le rxlev — vient de dispatch_pm)
+ *   SNR   = sb_valid ? bon : 0 (gr-gsm a décodé = preuve SNR suffisant ≥ seuil ;
+ *           magnitude pas mesurée mais conditionnée au vrai décode, pas fabriquée
+ *           inconditionnellement → SI ne casse pas).
+ * DÉFAUT = RIEN canné. CALYPSO_CANNED=<token> re-canne sélectivement ; FULL=CAN_ALL. */
+#define CAN_DEFAULT (0u)
 
 static unsigned g_canned = CAN_DEFAULT;   /* résolu dans calypso_dsp_shunt_init */
 
@@ -280,9 +287,9 @@ static int can_tok_eq(const char *a, const char *b)
 static unsigned shunt_parse_canned(void)
 {
     const char *e = getenv("CALYPSO_CANNED");
-    if (!e)                                          return CAN_DEFAULT;  /* var ABSENTE = legacy tout-canné */
+    if (!e)                                          return CAN_DEFAULT;  /* var ABSENTE = défaut (= rien canné, tout réel) */
     if (!*e || can_tok_eq(e, "NONE"))                return 0;            /* "=" vide EXPLICITE = RIEN canné */
-    if (can_tok_eq(e, "FULL") || can_tok_eq(e, "ALL")) return CAN_DEFAULT;
+    if (can_tok_eq(e, "FULL") || can_tok_eq(e, "ALL")) return CAN_ALL;
     char buf[160];
     strncpy(buf, e, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
@@ -294,7 +301,7 @@ static unsigned shunt_parse_canned(void)
         else if (can_tok_eq(t, "SNR"))   m |= CAN_SNR;
         else if (can_tok_eq(t, "ANGLE")) m |= CAN_ANGLE;
         else if (can_tok_eq(t, "CRC"))   m |= CAN_CRC;
-        else if (can_tok_eq(t, "FULL") || can_tok_eq(t, "ALL")) m = CAN_DEFAULT;
+        else if (can_tok_eq(t, "FULL") || can_tok_eq(t, "ALL")) m = CAN_ALL;
         else error_report("[dsp-shunt] CALYPSO_CANNED: token inconnu '%s' ignore", t);
     }
     return m;
@@ -344,7 +351,7 @@ static void shunt_dispatch_fb(uint8_t page_idx)
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
+    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
 
     /* Ack on the read page (echo). Not strictly required for the FB path
      * (firmware reads d_fb_det from NDB, not read-page) but mirrors the
@@ -411,7 +418,7 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
 
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
@@ -548,7 +555,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
 
     fprintf(stderr,
         "[dsp-shunt] DISPATCH ALLC page=%u burst_d=%u -> SI3 in a_cd[3..14] + "
