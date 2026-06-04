@@ -144,6 +144,7 @@ struct dsp_shunt_state {
      * shunt_sch_read). Remplace SHUNT_CANNED_BSIC dans shunt_dispatch_sb. */
     uint8_t    sb_bsic;               /* BSIC reel = ncc<<3|bcc (decode_sch gr-gsm) */
     uint32_t   sb_fn;                 /* FN reelle du SCH */
+    int16_t    sb_toa;                /* TOA reel mesure du SCH (base 23 = on-time) */
     bool       sb_valid;              /* gr-gsm a poste au moins un SCH reel */
 };
 
@@ -256,7 +257,11 @@ enum {
     CAN_ANGLE = 1u << 4,   /* [ANGLE] = 0 (AFC convergé, pas de chasse)*/
     CAN_CRC   = 1u << 5,   /* a_sch[0]/a_cd status = 0 (CRC forcé pass)*/
 };
-#define CAN_DEFAULT (CAN_FBDET|CAN_TOA|CAN_PM|CAN_SNR|CAN_ANGLE|CAN_CRC)
+/* DÉGATÉS (testés, camping tient) : FBDET (=sb_valid), TOA (timing SCH gr-gsm),
+ * ANGLE (=0 résidu post-correction), CRC (=sb_valid/si_valid). Restent fabriqués
+ * par DÉFAUT : PM/SNR seulement (pas encore de mapping dBm gr-gsm). Ajouter un
+ * token ici le re-canne ; le retirer active sa vraie source. */
+#define CAN_DEFAULT (CAN_PM|CAN_SNR)
 
 static unsigned g_canned = CAN_DEFAULT;   /* résolu dans calypso_dsp_shunt_init */
 
@@ -297,6 +302,16 @@ static unsigned shunt_parse_canned(void)
 
 static inline bool shunt_is_canned(unsigned bit) { return (g_canned & bit) != 0; }
 
+/* Valeur TOA pour a_*_demod[TOA] : cannée (23 = on-time) si CAN_TOA, sinon le
+ * TOA REEL mesuré par gr-gsm (sb_toa) dès qu'un SCH a été décodé ; fallback 23
+ * tant qu'aucun SCH (pas 0 : évite de catastropher l'alignement avant lock). */
+static inline int shunt_toa_val(void)
+{
+    if (shunt_is_canned(CAN_TOA))
+        return SHUNT_CANNED_TOA;
+    return g_shunt.sb_valid ? g_shunt.sb_toa : SHUNT_CANNED_TOA;
+}
+
 /* Pack {bsic, t1, t2, t3} into 32-bit sb (inverse of prim_fbsb.c:125-144). */
 static uint32_t shunt_encode_sb(uint8_t bsic, uint16_t t1, uint8_t t2, uint8_t t3)
 {
@@ -317,13 +332,16 @@ static void shunt_dispatch_fb(uint8_t page_idx)
 {
     /* d_fb_det = 1 ("FOUND"). prim_fbsb.c:404 reads this from NDB.
      * Canned CAN_FBDET = on force "trouvé" (pas de vrai détecteur FB ici). */
-    shunt_write_w(BASE_API_NDB + NDB_D_FB_DET, shunt_is_canned(CAN_FBDET) ? 1 : 0);
+    /* FBDET non-canné = état RÉEL de détection gr-gsm : "trouvé" ssi un SCH a
+     * été décodé (sb_valid). Avant lock → 0 (FB pas trouvé, comme un vrai DSP). */
+    shunt_write_w(BASE_API_NDB + NDB_D_FB_DET,
+                  (shunt_is_canned(CAN_FBDET) || g_shunt.sb_valid) ? 1 : 0);
 
     /* a_sync_demod[4] @ NDB+0x4C, 4 consecutive 16-bit words. Read by
      * read_fb_result (prim_fbsb.c:306-309) from NDB. Chaque mesure : valeur
      * cannée si son token est dans CALYPSO_CANNED, sinon 0 (pas encore de
      * vraie source → un-canner sans source casse, c'est voulu/visible). */
-    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, shunt_is_canned(CAN_TOA)   ? SHUNT_CANNED_TOA   : 0);
+    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
@@ -375,7 +393,8 @@ static void shunt_dispatch_sb(uint8_t page_idx)
      * sans vraie source CRC on écrit le bit d'échec → fail VISIBLE (le SB sera
      * rejeté) au lieu de masquer. Défaut canné → pass → camping inchangé. */
     shunt_write_w(rp + RP_A_SCH + 0 * 2,
-                  (uint16_t)(shunt_is_canned(CAN_CRC) ? 0x0000 : B_SCH_CRC));
+                  (uint16_t)((shunt_is_canned(CAN_CRC) || g_shunt.sb_valid)
+                             ? 0x0000 : B_SCH_CRC));   /* pass RÉEL ssi SCH décodé */
 
     /* sb = encode_sb(bsic, t1, t2, t3) → a_sch[3] | a_sch[4]<<16
      * (prim_fbsb.c:198). Two separate 16-bit stores, both LE. */
@@ -389,7 +408,7 @@ static void shunt_dispatch_sb(uint8_t page_idx)
 
     /* a_serv_demod[4] @ +0x10. read_sb_result reads from READ PAGE here,
      * NOT NDB (prim_fbsb.c:148-151). Chaque mesure cannée/0 selon CALYPSO_CANNED. */
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_is_canned(CAN_TOA)   ? SHUNT_CANNED_TOA   : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
@@ -400,7 +419,7 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     fprintf(stderr,
         "[dsp-shunt] DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
         page_idx, sb, bsic, fn,
-        g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", SHUNT_CANNED_TOA);
+        g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
 }
 
 /* Canned SI3 bytes — 23 L2-frame bytes (RR PD + SI3 mt + payload).
@@ -497,7 +516,8 @@ static void shunt_dispatch_allc(uint8_t page_idx)
 
     /* a_cd[0..2] = status words. CAN_CRC canné = CRC pass (0) ; non-canné =
      * pas de faux pass → FIRE=fail (0x0003) visible. a_cd[1/2] biterr = 0. */
-    shunt_write_w(addr_a_cd + 0, shunt_is_canned(CAN_CRC) ? 0x0000 : 0x0003);  /* a_cd[0] FIRE */
+    shunt_write_w(addr_a_cd + 0,
+                  (shunt_is_canned(CAN_CRC) || g_shunt.si_valid) ? 0x0000 : 0x0003);  /* a_cd[0] FIRE : pass RÉEL ssi SI décodé */
     shunt_write_w(addr_a_cd + 2, 0x0000);  /* a_cd[1] */
     shunt_write_w(addr_a_cd + 4, 0x0000);  /* a_cd[2] */
 
@@ -525,7 +545,7 @@ static void shunt_dispatch_allc(uint8_t page_idx)
     /* a_serv_demod[4] = {TOA, PM, ANGLE, SNR} per-burst measurements.
      * Firmware prim_rx_nb.c:89-94 reads these. Canned : TOA=23, PM=high,
      * ANGLE=0 (AFC converged), SNR=high (passes AFC_SNR_THRESHOLD). */
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_is_canned(CAN_TOA)   ? SHUNT_CANNED_TOA   : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_is_canned(CAN_SNR)   ? SHUNT_CANNED_SNR   : 0);
@@ -725,16 +745,26 @@ static void shunt_sch_read(void *opaque)
         memcpy(&fn_le,   buf + 8, 4);
         int32_t bsic = (int32_t)le32_to_cpu(bsic_le);
         int32_t fn   = (int32_t)le32_to_cpu(fn_le);
+        /* TOA reel : 3e int (>=16 o). Absent (ancien format 12 o) -> on garde 23.
+         * Clamp a +-64 qbits autour de 23 : au-dela = gr-gsm desaligne, on retombe
+         * sur 23 (on-time) pour ne pas catastropher l'alignement firmware. */
+        int32_t toa = 23;
+        if (n >= 16) {
+            uint32_t toa_le; memcpy(&toa_le, buf + 12, 4);
+            toa = (int32_t)le32_to_cpu(toa_le);
+            if (toa < 23 - 64 || toa > 23 + 64) toa = 23;
+        }
         bool first = !g_shunt.sb_valid;
         g_shunt.sb_bsic  = (uint8_t)(bsic & 0x3f);
         g_shunt.sb_fn    = (uint32_t)fn;
+        g_shunt.sb_toa   = (int16_t)toa;
         g_shunt.sb_valid = true;
         static unsigned schlog = 0;
         if (first || schlog++ < 20 || (schlog % 200) == 0)
             fprintf(stderr, "[dsp-shunt] SCH reel (gr-gsm): BSIC=%d "
-                    "(ncc=%d bcc=%d) FN=%d%s\n", (int)g_shunt.sb_bsic,
+                    "(ncc=%d bcc=%d) FN=%d TOA=%d%s\n", (int)g_shunt.sb_bsic,
                     (g_shunt.sb_bsic >> 3) & 7, g_shunt.sb_bsic & 7,
-                    (int)fn, first ? " [1er]" : "");
+                    (int)fn, (int)g_shunt.sb_toa, first ? " [1er]" : "");
     }
 }
 
