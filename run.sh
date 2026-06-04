@@ -589,9 +589,10 @@ if [ "$MENU_MODE" = "1" ]; then
         --title "[3/4] L2 client variant" \
         --notags --menu \
         "\n Application qui consomme L1CTL via /tmp/osmocom_l2.\n" \
-        14 76 3 \
+        15 76 4 \
         "mobile"    "mobile -- osmocom-bb stack L23 + VTY (default)" \
         "ccch_scan" "ccch_scan -- scan CCCH ARFCN, dump SI/IA" \
+        "bcch_scan" "bcch_scan -- scan BCCH ARFCN, dump SI" \
         "cell_log"  "cell_log -- scan cells + power measures" \
         3>&1 1>&2 2>&3) || _cancel
       export CALYPSO_L2_CLIENT
@@ -1150,12 +1151,13 @@ case "$CALYPSO_MODE" in
         CALYPSO_DSP_L1_STUB=0
         CALYPSO_FORCE_FBSB=0          # pas d'oracle FBSB_CONF
         CALYPSO_FORCE_AGCH=0          # pas de réécriture DATA_IND BCCH SI
+        : "${CALYPSO_CANNED:=NONE}"   # DÉFAUT : RIEN canné (toutes sorties DSP = vrai décode gr-gsm)
         # FIFOs live (1 par consommateur e2e) : fft(host) grgsm(decode) record(drainer) asciifft(fenetre run.sh)
         : "${CALYPSO_RELAY_FIFOS:=/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo:/tmp/iq_asciifft.fifo}"
         export CALYPSO_RELAY_FIFOS
         export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_RELAY_ALSO_BSP CALYPSO_SHUNT_NO_CANNED \
                CALYPSO_DSP_L1STUB CALYPSO_DSP_L1_STUB \
-               CALYPSO_FORCE_FBSB CALYPSO_FORCE_AGCH
+               CALYPSO_FORCE_FBSB CALYPSO_FORCE_AGCH CALYPSO_CANNED
         ;;
     shunt)
         : "${CALYPSO_DSP_SHUNT:=1}"
@@ -1469,13 +1471,15 @@ if [ -z "$CALYPSO_L2_CLIENT" ]; then
     echo
     echo "===== L2 client selection ====="
     echo "  1) mobile     (osmocom-bb mobile, full L23 stack + VTY)"
-    echo "  2) ccch_scan  (ccch_scan -a 1, scan CCCH ARFCN 1)"
-    echo "  3) cell_log   (cell_log, scan toutes cells + power)"
+    echo "  2) ccch_scan  (ccch_scan -a 514, scan CCCH ARFCN 514)"
+    echo "  3) bcch_scan  (bcch_scan -a 514, scan BCCH ARFCN 514)"
+    echo "  4) cell_log   (cell_log, scan toutes cells + power)"
     echo "==============================="
-    read -r -p "Choix [1/2/3] (default 1) : " L2_CHOICE
+    read -r -p "Choix [1/2/3/4] (default 1) : " L2_CHOICE
     case "${L2_CHOICE:-1}" in
         2) CALYPSO_L2_CLIENT=ccch_scan ;;
-        3) CALYPSO_L2_CLIENT=cell_log ;;
+        3) CALYPSO_L2_CLIENT=bcch_scan ;;
+        4) CALYPSO_L2_CLIENT=cell_log ;;
         *) CALYPSO_L2_CLIENT=mobile ;;
     esac
 fi
@@ -2035,7 +2039,11 @@ if [ "${CALYPSO_SKIP_L2:-0}" != "1" ]; then
             ;;
         ccch_scan)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
-                "$L1CTL_WAIT && ccch_scan -a ${CALYPSO_CCCH_ARFCN:-1} 2>&1 | $TSLOG | tee $L2_LOG" C-m
+                "$L1CTL_WAIT && ccch_scan -a ${CALYPSO_CCCH_ARFCN:-514} 2>&1 | $TSLOG | tee $L2_LOG" C-m
+            ;;
+        bcch_scan)
+            tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
+                "$L1CTL_WAIT && bcch_scan -a ${CALYPSO_CCCH_ARFCN:-514} 2>&1 | $TSLOG | tee $L2_LOG" C-m
             ;;
         cell_log)
             tmux send-keys -t "$SESSION:$CALYPSO_L2_CLIENT" \
@@ -2067,7 +2075,7 @@ fi  # CALYPSO_SKIP_GSMTAP
 # moment de la creation des panes -- `tail -F` (majuscule) gere ce cas (suit
 # le fichier des qu'il apparait) sans crash.
 case "$CALYPSO_L2_CLIENT" in
-    ccch_scan|cell_log) L2_TAIL_LOG="$L2_LOG" ;;
+    ccch_scan|bcch_scan|cell_log) L2_TAIL_LOG="$L2_LOG" ;;
     *)                  L2_TAIL_LOG="$MOBILE_LOG" ;;
 esac
 # Creation sequentielle : `select-layout tiled` apres chaque split pour
