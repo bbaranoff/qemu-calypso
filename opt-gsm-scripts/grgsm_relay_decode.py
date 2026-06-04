@@ -15,12 +15,13 @@
 #
 # osr DOIT matcher le SPS d'osmo-trx (tx-sps=1 → osr=1). Si la sync n'accroche
 # pas à osr=1, passer osmo-trx en SPS=4 et CALYPSO_TRX_OSR=4.
-import os, sys
+import os, sys, socket, struct
 
 from gnuradio import gr, network, filter
 from gnuradio.filter import firdes
 from gnuradio.fft import window
 from gnuradio import gsm
+import pmt
 
 # OSR = oversampling vu par gsm.receiver. Il a besoin de ~4 pour locker la
 # FCCH/SCH et la récupération de timing GMSK. L'I/Q relayée est à 1 SPS
@@ -43,6 +44,47 @@ RX_PORT    = int(os.environ.get("CALYPSO_TRX_IQ_RX_PORT", "5810"))
 GSMTAP_HOST = os.environ.get("GSMTAP_HOST", "127.0.0.1")
 GSMTAP_PORT = int(os.environ.get("CALYPSO_SHUNT_GSMTAP_PORT", "4730"))
 TS         = int(os.environ.get("TS", "0"))
+# SCH sink : le receiver gr-gsm (= le DSP) publie ('sch', bsic, fn) sur son port
+# `measurements` (patch grgsm-receiver-publish-bsic-fn). On le forwarde au shunt
+# en UDP {magic 'SCH1', int32 bsic, int32 fn, LE} -> feed_sb -> shunt_dispatch_sb
+# (remplace SHUNT_CANNED_BSIC). Port distinct du GSMTAP (4730).
+SCH_HOST = os.environ.get("CALYPSO_SHUNT_SCH_HOST", GSMTAP_HOST)
+SCH_PORT = int(os.environ.get("CALYPSO_SHUNT_SCH_PORT", "4731"))
+
+
+class SchSink(gr.basic_block):
+    """Abonne le port `measurements` de gsm.receiver ; sur un tuple ('sch', bsic,
+    fn) envoie le BSIC/FN REEL au shunt en UDP. Ignore les autres mesures
+    (freq_offset/synchronized/sync_loss/current_time)."""
+    def __init__(self, host, port):
+        gr.basic_block.__init__(self, name="sch_sink", in_sig=[], out_sig=[])
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.dst = (host, port)
+        self.n = 0
+        self.last_bsic = None
+        self.message_port_register_in(pmt.intern("in"))
+        self.set_msg_handler(pmt.intern("in"), self._h)
+
+    def _h(self, msg):
+        try:
+            if not pmt.is_tuple(msg) or pmt.length(msg) < 3:
+                return
+            if pmt.symbol_to_string(pmt.tuple_ref(msg, 0)) != "sch":
+                return
+            bsic = int(pmt.to_long(pmt.tuple_ref(msg, 1)))
+            fn = int(pmt.to_long(pmt.tuple_ref(msg, 2)))
+        except Exception:
+            return
+        try:
+            self.sock.sendto(b"SCH1" + struct.pack("<ii", bsic, fn), self.dst)
+        except OSError:
+            return
+        self.n += 1
+        if bsic != self.last_bsic or self.n <= 5 or self.n % 200 == 0:
+            print("[grgsm-relay-decode] SCH -> shunt udp:%d : BSIC=%d (ncc=%d bcc=%d) FN=%d (#%d)"
+                  % (SCH_PORT, bsic, (bsic >> 3) & 7, bsic & 7, fn, self.n), flush=True)
+        self.last_bsic = bsic
+
 
 tb = gr.top_block("grgsm relay decode")
 
@@ -95,9 +137,11 @@ if corr is not None:
     tb.connect((corr, 0), (rx, 0))
 else:
     tb.connect((lpf, 0), (rx, 0))
+sch_snk = SchSink(SCH_HOST, SCH_PORT)
 tb.msg_connect((rx, 'C0'), (dm, 'bursts'))
 tb.msg_connect((dm, 'bursts'), (dec, 'bursts'))
 tb.msg_connect((dec, 'msgs'), (snk, 'pdus'))
+tb.msg_connect((rx, 'measurements'), (sch_snk, 'in'))
 
 print("[grgsm-relay-decode] I/Q udp:%d (osr=%d, %.0f Hz) -> GSMTAP %s:%d -> feed_si"
       % (RX_PORT, OSR, SAMP_RATE, GSMTAP_HOST, GSMTAP_PORT), flush=True)

@@ -455,8 +455,8 @@ if [ "$MENU_MODE" = "1" ]; then
  Fine override: env vars CALYPSO_SKIP_*, CALYPSO_DSP_SHUNT, ...\
 " \
       20 84 7 \
-      "full"       "Full radio pipeline (default legacy)" \
-      "full-grgsm" "gr-gsm transceiver (mobile) -- IPC pour BTS seul, NO DSP" \
+      "full-grgsm" "gr-gsm = le DSP (archi par defaut) -- IPC pour BTS seul" \
+      "full"       "Full radio pipeline + vrai c54x -- TO DEV / WIP (chantier)" \
       "shunt"      "DSP shunt canned -- bissection FBSB" \
       "shunt-ipc"  "DSP shunt + radio chain" \
       "bridge"     "Legacy bridge.py Python" \
@@ -1996,9 +1996,25 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     pkill -9 -f record_drain.py 2>/dev/null || true
     ( python3 /opt/GSM/record_drain.py >/tmp/record_drain.log 2>&1 & )
     tmux new-window -t "$SESSION" -n grgsm-decode
-    tmux send-keys -t "$SESSION:grgsm-decode" \
-        "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
-    echo "[run.sh] full-grgsm : DSP gr-gsm shm (ring feed_iq -> demod/decode -> si[] -> a_cd) lance"
+    # Decodeur gr-gsm AUTO (defaut = relay). grgsm_relay_decode.py lit l'I/Q
+    # continu relaye par l'IPC device (UDP 5810) -> gsm.receiver (sync FCCH/SCH,
+    # patch grgsm-receiver-publish-bsic-fn) -> SI vers GSMTAP 4730 (feed_si) ET
+    # BSIC/FN REELS vers UDP 4731 (feed_sb -> shunt_dispatch_sb, remplace
+    # SHUNT_CANNED_BSIC). Subsume le si_bridge (grgsm_decode sur fifo = SI seul,
+    # pas de SCH). CALYPSO_GRGSM_DECODER=si-bridge pour revenir au SI-only legacy.
+    RELAY_DECODE=/opt/GSM/qemu-src/opt-gsm-scripts/grgsm_relay_decode.py
+    # DEFAUT = si-bridge (PROUVE : grgsm_decode sur la FIFO /tmp/iq_grgsm.fifo,
+    # SI OK). Le relay_decode lit UDP 5810 qui n'est PAS alimente ici -> SI mort
+    # (regression 2026-06-04). CALYPSO_GRGSM_DECODER=relay seulement si 5810 est
+    # reellement nourri. Le SCH/BSIC reel passe par un autre chemin (cf si_bridge).
+    if [ "${CALYPSO_GRGSM_DECODER:-si-bridge}" = "si-bridge" ]; then
+        tmux send-keys -t "$SESSION:grgsm-decode" \
+            "sleep 15; bash /opt/GSM/si_bridge_loop.sh 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+    else
+        tmux send-keys -t "$SESSION:grgsm-decode" \
+            "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
+    fi
+    echo "[run.sh] full-grgsm : decodeur gr-gsm (${CALYPSO_GRGSM_DECODER:-relay}) lance -> SI (4730) + SCH/BSIC reel (4731)"
     # Bridge SI : grgsm_decode lit le FIFO LIVE /tmp/iq_grgsm.fifo (flux continu pousse
     # -s 1083333 = 4 SPS) DECODE le vrai SI2/SI3/SI4/SI13 de la BTS -> parse ->
     # GSMTAP 4730 -> shunt feed_si -> a_cd + DATA_IND -> mobile. C'est CE chemin qui

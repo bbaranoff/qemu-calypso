@@ -140,6 +140,11 @@ struct dsp_shunt_state {
     uint8_t    si_set[6][23];
     bool       si_set_have[6];
     int        si_rr;                 /* index round-robin du dernier type servi */
+    /* Resultat de sync REEL poste par gr-gsm (= le DSP) via UDP SCH (4731,
+     * shunt_sch_read). Remplace SHUNT_CANNED_BSIC dans shunt_dispatch_sb. */
+    uint8_t    sb_bsic;               /* BSIC reel = ncc<<3|bcc (decode_sch gr-gsm) */
+    uint32_t   sb_fn;                 /* FN reelle du SCH */
+    bool       sb_valid;              /* gr-gsm a poste au moins un SCH reel */
 };
 
 /* FN TDMA reelle (calypso_trx.c) pour recoder la FN du shunt (LATCH d_fn=0). */
@@ -281,12 +286,37 @@ static void shunt_dispatch_sb(uint8_t page_idx)
 {
     uint32_t rp = rp_base(page_idx);
 
+    /* gr-gsm (= le DSP) a-t-il poste un vrai SCH (BSIC/FN reels via UDP 4731) ?
+     * En mode no-canned (full-grgsm), tant qu'aucun SCH reel n'est arrive on ne
+     * dispatch PAS le SB : le firmware FBSB attend le vrai SCH, comme un vrai
+     * mobile. Pas de BSIC canne -> aucun masquage d'echec de decode. */
+    static int no_canned = -1;
+    if (no_canned < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_NO_CANNED");
+        no_canned = (e && *e == '1') ? 1 : 0;
+    }
+    if (!g_shunt.sb_valid && no_canned) {
+        static unsigned waitlog = 0;
+        if (waitlog++ < 10)
+            fprintf(stderr, "[dsp-shunt] SB: pas encore de SCH reel (gr-gsm) "
+                    "-> pas de dispatch (no-canned, le firmware attend)\n");
+        return;
+    }
+
+    /* BSIC/FN : REELS (gr-gsm decode_sch) si dispo, sinon canned (legacy only).
+     * FN -> {t1,t2,t3} GSM : T1=FN/(26*51), T2=FN%26, T3=FN%51 (encode_sb derive T3'). */
+    uint8_t  bsic = g_shunt.sb_valid ? g_shunt.sb_bsic : SHUNT_CANNED_BSIC;
+    uint32_t fn   = g_shunt.sb_valid ? g_shunt.sb_fn   : 0;
+    uint16_t t1   = (uint16_t)(fn / (26u * 51u));
+    uint8_t  t2   = (uint8_t)(fn % 26u);
+    uint8_t  t3   = (uint8_t)(fn % 51u);
+
     /* a_sch[0] CRC bit clear = success (prim_fbsb.c:181, B_SCH_CRC=8). */
     shunt_write_w(rp + RP_A_SCH + 0 * 2, 0x0000);
 
-    /* sb = encode_sb(bsic, t1=0, t2=0, t3=0) → a_sch[3] | a_sch[4]<<16
+    /* sb = encode_sb(bsic, t1, t2, t3) → a_sch[3] | a_sch[4]<<16
      * (prim_fbsb.c:198). Two separate 16-bit stores, both LE. */
-    uint32_t sb = shunt_encode_sb(SHUNT_CANNED_BSIC, 0, 0, 0);
+    uint32_t sb = shunt_encode_sb(bsic, t1, t2, t3);
     shunt_write_w(rp + RP_A_SCH + 3 * 2, (uint16_t)(sb & 0xFFFF));
     shunt_write_w(rp + RP_A_SCH + 4 * 2, (uint16_t)(sb >> 16));
 
@@ -305,8 +335,9 @@ static void shunt_dispatch_sb(uint8_t page_idx)
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
 
     fprintf(stderr,
-        "[dsp-shunt] DISPATCH SB page=%u → sb=0x%08x BSIC=%u TOA=%d (read-page only)\n",
-        page_idx, sb, SHUNT_CANNED_BSIC, SHUNT_CANNED_TOA);
+        "[dsp-shunt] DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
+        page_idx, sb, bsic, fn,
+        g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", SHUNT_CANNED_TOA);
 }
 
 /* Canned SI3 bytes — 23 L2-frame bytes (RR PD + SI3 mt + payload).
@@ -606,6 +637,70 @@ static void shunt_gsmtap_init(void)
                  "(gr-gsm grgsm_decode -m BCCH y envoie le SI réel)", port);
 }
 
+/* ---- SCH listener : recoit le BSIC/FN REELS decodes par gr-gsm (= le DSP) ----
+ * grgsm_relay_decode.py forwarde le tuple ('sch',bsic,fn) du port `measurements`
+ * de gsm.receiver en UDP {magic 'SCH1', int32 bsic, int32 fn, LE} sur ce port
+ * (CALYPSO_SHUNT_SCH_PORT, defaut 4731 — distinct du GSMTAP 4730). On stocke le
+ * resultat -> shunt_dispatch_sb encode le VRAI BSIC/FN au lieu de
+ * SHUNT_CANNED_BSIC. C'est le "DSP qui poste son decode SCH dans le NDB". */
+static int g_sch_fd = -1;
+
+static void shunt_sch_read(void *opaque)
+{
+    uint8_t buf[64];
+    for (;;) {
+        ssize_t n = recv(g_sch_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+        }
+        if (n < 12 || memcmp(buf, "SCH1", 4) != 0)
+            continue;                       /* pas notre datagramme */
+        uint32_t bsic_le, fn_le;
+        memcpy(&bsic_le, buf + 4, 4);
+        memcpy(&fn_le,   buf + 8, 4);
+        int32_t bsic = (int32_t)le32_to_cpu(bsic_le);
+        int32_t fn   = (int32_t)le32_to_cpu(fn_le);
+        bool first = !g_shunt.sb_valid;
+        g_shunt.sb_bsic  = (uint8_t)(bsic & 0x3f);
+        g_shunt.sb_fn    = (uint32_t)fn;
+        g_shunt.sb_valid = true;
+        static unsigned schlog = 0;
+        if (first || schlog++ < 20 || (schlog % 200) == 0)
+            fprintf(stderr, "[dsp-shunt] SCH reel (gr-gsm): BSIC=%d "
+                    "(ncc=%d bcc=%d) FN=%d%s\n", (int)g_shunt.sb_bsic,
+                    (g_shunt.sb_bsic >> 3) & 7, g_shunt.sb_bsic & 7,
+                    (int)fn, first ? " [1er]" : "");
+    }
+}
+
+static void shunt_sch_init(void)
+{
+    const char *p = getenv("CALYPSO_SHUNT_SCH_PORT");
+    int port = (p && *p) ? atoi(p) : 4731;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        error_report("[dsp-shunt] SCH socket() failed: %s", strerror(errno));
+        return;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        error_report("[dsp-shunt] SCH bind(:%d) failed: %s", port, strerror(errno));
+        close(fd);
+        return;
+    }
+    g_sch_fd = fd;
+    qemu_set_fd_handler(fd, shunt_sch_read, NULL, NULL);
+    error_report("[dsp-shunt] SCH listener udp:127.0.0.1:%d → feed_sb(BSIC/FN reels "
+                 "gr-gsm) → shunt_dispatch_sb (remplace SHUNT_CANNED_BSIC)", port);
+}
+
 /* ========================================================================
  * Buffers partages (shm) — gr-gsm AU MILIEU du shunt DSP (pas de FIFO/UDP).
  *   ENTREE du DSP shunte : l'I/Q que la BSP livre (DARAM 0x2a00) est recopiee
@@ -747,6 +842,10 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
 
     /* Pont gr-gsm → a_cd : écoute le SI décodé (GSMTAP) et l'injecte. */
     shunt_gsmtap_init();
+
+    /* Pont gr-gsm → SB : écoute le BSIC/FN réels (SCH) et les injecte dans
+     * shunt_dispatch_sb (remplace SHUNT_CANNED_BSIC). */
+    shunt_sch_init();
 
     /* Buffers shm : gr-gsm au milieu du shunt (I/Q in + SI out, pas de fifo). */
     shunt_shm_init();
