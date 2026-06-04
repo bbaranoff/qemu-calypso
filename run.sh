@@ -1468,20 +1468,28 @@ fi
 # Set CALYPSO_L2_CLIENT=mobile|ccch_scan|cell_log to override the prompt.
 CALYPSO_L2_CLIENT="${CALYPSO_L2_CLIENT:-}"
 if [ -z "$CALYPSO_L2_CLIENT" ]; then
-    echo
-    echo "===== L2 client selection ====="
-    echo "  1) mobile     (osmocom-bb mobile, full L23 stack + VTY)"
-    echo "  2) ccch_scan  (ccch_scan -a 514, scan CCCH ARFCN 514)"
-    echo "  3) bcch_scan  (bcch_scan -a 514, scan BCCH ARFCN 514)"
-    echo "  4) cell_log   (cell_log, scan toutes cells + power)"
-    echo "==============================="
-    read -r -p "Choix [1/2/3/4] (default 1) : " L2_CHOICE
-    case "${L2_CHOICE:-1}" in
-        2) CALYPSO_L2_CLIENT=ccch_scan ;;
-        3) CALYPSO_L2_CLIENT=bcch_scan ;;
-        4) CALYPSO_L2_CLIENT=cell_log ;;
-        *) CALYPSO_L2_CLIENT=mobile ;;
-    esac
+    if [ -t 0 ]; then
+        echo
+        echo "===== L2 client selection ====="
+        echo "  1) mobile     (osmocom-bb mobile, full L23 stack + VTY)"
+        echo "  2) ccch_scan  (ccch_scan -a 514, scan CCCH ARFCN 514)"
+        echo "  3) bcch_scan  (bcch_scan -a 514, scan BCCH ARFCN 514)"
+        echo "  4) cell_log   (cell_log, scan toutes cells + power)"
+        echo "==============================="
+        read -r -p "Choix [1/2/3/4] (default 1) : " L2_CHOICE
+        case "${L2_CHOICE:-1}" in
+            2) CALYPSO_L2_CLIENT=ccch_scan ;;
+            3) CALYPSO_L2_CLIENT=bcch_scan ;;
+            4) CALYPSO_L2_CLIENT=cell_log ;;
+            *) CALYPSO_L2_CLIENT=mobile ;;
+        esac
+    else
+        # PAS de TTY (ex: `docker exec` SANS `-t`, sortie pipée) : surtout NE PAS
+        # bloquer sur `read`. C'EST ça qui faisait hang `./run.sh` seul (alors que
+        # `--menu`, lui, fixe deja CALYPSO_L2_CLIENT). Defaut = mobile.
+        CALYPSO_L2_CLIENT=mobile
+        echo "[run.sh] L2 client = mobile (pas de TTY ; CALYPSO_L2_CLIENT=ccch_scan|bcch_scan|cell_log pour forcer)"
+    fi
 fi
 echo "L2 client = $CALYPSO_L2_CLIENT"
 echo "CALYPSO_BSP_IQ_PASSTHROUGH = $CALYPSO_BSP_IQ_PASSTHROUGH"
@@ -2018,7 +2026,7 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
         tmux send-keys -t "$SESSION:grgsm-decode" \
             "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee /tmp/grgsm_decode.log" C-m
     fi
-    echo "[run.sh] full-grgsm : decodeur gr-gsm (${CALYPSO_GRGSM_DECODER:-relay}) lance -> SI (4730) + SCH/BSIC reel (4731)"
+    echo "[run.sh] full-grgsm : decodeur gr-gsm (${CALYPSO_GRGSM_DECODER:-si-bridge}) lance -> SI (4730) + SCH/BSIC reel (4731)"
     # Bridge SI : grgsm_decode lit le FIFO LIVE /tmp/iq_grgsm.fifo (flux continu pousse
     # -s 1083333 = 4 SPS) DECODE le vrai SI2/SI3/SI4/SI13 de la BTS -> parse ->
     # GSMTAP 4730 -> shunt feed_si -> a_cd + DATA_IND -> mobile. C'est CE chemin qui
@@ -2123,15 +2131,20 @@ done
 # Une fenetre tmux dediee qui attend 30s que le pipeline se stabilise puis
 # lance pytest in-container pour produire la doc en arriere-plan. Pas de
 # rappel recursif a run.sh -- on inline la commande pytest avec ses ignores
-# et env vars. Desactivable via CALYPSO_AUTO_GEN_DOC=0.
-CALYPSO_AUTO_GEN_DOC="${CALYPSO_AUTO_GEN_DOC:-1}"
+# et env vars. Activable via CALYPSO_AUTO_GEN_DOC=1 (ou menu DOC).
+# DEFAUT = 0 : le bloc gen-doc faisait un `pip install` pytest/pycotap en
+# FOREGROUND synchrone -> stall PyPI -> `./run.sh` nu (sans -t) HANG ici (le
+# `--menu` exporte deja =0, d'ou "marche avec menu, pas en nu"). Off par defaut.
+CALYPSO_AUTO_GEN_DOC="${CALYPSO_AUTO_GEN_DOC:-0}"
 if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
     # Pre-install des deps Python (silencieux, idempotent)
+    # `timeout 20` + --disable-pip-version-check : même si gen-doc est activé,
+    # un PyPI injoignable ne gèle PLUS le launch (au pire la doc manque).
     pip_install_silent() {
         python3 -c "import $1" 2>/dev/null && return 0
-        (pip install "$1" 2>&1 \
-         || pip3 install "$1" 2>&1 \
-         || python3 -m pip install "$1" 2>&1) >/dev/null
+        (timeout 20 pip install --disable-pip-version-check "$1" 2>&1 \
+         || timeout 20 pip3 install --disable-pip-version-check "$1" 2>&1 \
+         || timeout 20 python3 -m pip install --disable-pip-version-check "$1" 2>&1) >/dev/null
         python3 -c "import $1" 2>/dev/null
     }
     pip_install_silent pytest  || true
@@ -2307,12 +2320,18 @@ echo
 
 tmux select-window -t "$SESSION:all" 2>/dev/null || tmux select-window -t "$SESSION:qemu"
 
-# CALYPSO_NO_ATTACH=1 : ne pas attacher tmux (mode non-interactif, utile
-# pour run-all.sh ou tests pytest qui orchestrent plusieurs runs).
-if [ "${CALYPSO_NO_ATTACH:-0}" = "1" ]; then
-    echo "[run.sh] CALYPSO_NO_ATTACH=1 -- session tmux '$SESSION' tourne en background"
+# Attach tmux SEULEMENT si c'est sûr. `exec tmux attach` HANG/échoue si :
+#   - CALYPSO_NO_ATTACH=1 (orchestration : run-all.sh, pytest)
+#   - pas de TTY (ex: `docker exec` SANS `-t`, ou sortie pipée) -> attach bloque
+#   - déjà dans une session tmux ($TMUX) -> "sessions should be nested with care"
+# Dans ces cas : la session tourne en BACKGROUND (le pipeline marche, camping
+# inclus), on rend la main avec les commandes d'attach/kill. C'est ce qui faisait
+# que `./run.sh` seul (sans -t) "hang" alors que `--menu` (TTY interactif) marche.
+if [ "${CALYPSO_NO_ATTACH:-0}" = "1" ] || [ -n "${TMUX:-}" ] || ! [ -t 0 ] || ! [ -t 1 ]; then
+    _why="NO_ATTACH"; [ -n "${TMUX:-}" ] && _why="déjà dans tmux"; { [ -t 0 ] && [ -t 1 ]; } || _why="pas de TTY"
+    echo "[run.sh] pas d'attach ($_why) -- session tmux '$SESSION' tourne en BACKGROUND (pipeline actif)."
     echo "[run.sh] Attach manuel : tmux attach -t $SESSION"
-    echo "[run.sh] Kill : tmux kill-session -t $SESSION"
+    echo "[run.sh] Kill         : tmux kill-session -t $SESSION"
     exit 0
 fi
 exec tmux attach -t "$SESSION"
