@@ -1153,7 +1153,7 @@ case "$CALYPSO_MODE" in
         CALYPSO_FORCE_AGCH=0          # pas de réécriture DATA_IND BCCH SI
         : "${CALYPSO_CANNED:=NONE}"   # DÉFAUT : RIEN canné (toutes sorties DSP = vrai décode gr-gsm)
         # FIFOs live (1 par consommateur e2e) : fft(host) grgsm(decode) record(drainer) asciifft(fenetre run.sh)
-        : "${CALYPSO_RELAY_FIFOS:=/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo:/tmp/iq_asciifft.fifo}"
+        : "${CALYPSO_RELAY_FIFOS:=/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo:/tmp/iq_asciifft.fifo:/tmp/iq_si.fifo:/tmp/iq_bursts.fifo}"
         export CALYPSO_RELAY_FIFOS
         export CALYPSO_IPC_RELAY CALYPSO_BSP_IQ_PASSTHROUGH CALYPSO_RELAY_ALSO_BSP CALYPSO_SHUNT_NO_CANNED \
                CALYPSO_DSP_L1STUB CALYPSO_DSP_L1_STUB \
@@ -2094,10 +2094,16 @@ tmux new-window -t "$SESSION" -n all \
 # Build dynamic spec list selon ce qui tourne reellement.
 _ALL_SPECS=("osmocon|$OSMOCON_LOG")
 [ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("fft|__FFT__")
-[ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ] && _ALL_SPECS+=("ipc-device|$IPC_DEVICE_LOG")
-[ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ] && _ALL_SPECS+=("osmo-trx-ipc|$OSMO_TRX_IPC_LOG")
+# Les 3 panes du milieu (ipc-device / osmo-trx-ipc / bts) sont RETIRÉS de 'all'
+# (ils restent dans leurs fenêtres dédiées 3/4/5) et remplacés par 2 panes :
+#   bursts = bursts GSM bruts en bits (grgsm_decode -p)
+#   si     = SI/CCCH décodés en hexa  (grgsm_decode -v)
+# Source = fifos relay dédiées iq_bursts/iq_si (l'IPC les alimente, non-bloquant).
+if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
+    _ALL_SPECS+=("bursts|__BURSTS__")
+    _ALL_SPECS+=("si|__SI__")
+fi
 [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
-[ "${CALYPSO_SKIP_BTS:-0}" != "1" ] && _ALL_SPECS+=("bts|$BTS_LOG")
 [ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
 # gdb pane dans la window 'all'. Default OFF (CALYPSO_SKIP_GDB_PANE=1).
 # Activer avec CALYPSO_SKIP_GDB_PANE=0 (= opt-in pour debug). Le pane gdb
@@ -2108,6 +2114,13 @@ for spec in "${_ALL_SPECS[@]}"; do
     if [ "$log" = "__FFT__" ]; then
         # FFT live du cfile BSP (lien grgsm<->BSP) — remplace tcpdump (vire pour l'instant).
         cmd="clear; source /root/.env/bin/activate 2>/dev/null; CFILE=/tmp/iq_asciifft.fifo FS=1083333 python3 /opt/GSM/grgsm_fft_live.py"
+    elif [ "$log" = "__BURSTS__" ]; then
+        # bursts GSM bruts (bits + FN + count) : grgsm_decode -p sur la fifo relay
+        # dediee iq_bursts (l'IPC l'alimente, non-bloquant). while = relance si EOF.
+        cmd="clear; source /root/.env/bin/activate 2>/dev/null; echo '=== bursts GSM (grgsm_decode -p) ==='; while :; do grgsm_decode -p -c /tmp/iq_bursts.fifo -s 1083333 -m BCCH -t 0 -a ${CALYPSO_CCCH_ARFCN:-514} 2>/dev/null; sleep 1; done"
+    elif [ "$log" = "__SI__" ]; then
+        # SI/CCCH decodes en HEXA : grgsm_decode -v sur la fifo relay dediee iq_si.
+        cmd="clear; source /root/.env/bin/activate 2>/dev/null; echo '=== SI/CCCH hexa (grgsm_decode -v) ==='; while :; do grgsm_decode -v -c /tmp/iq_si.fifo -s 1083333 -m BCCH -t 0 -a ${CALYPSO_CCCH_ARFCN:-514} 2>/dev/null; sleep 1; done"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide

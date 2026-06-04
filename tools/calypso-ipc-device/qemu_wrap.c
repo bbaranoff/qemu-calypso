@@ -783,7 +783,7 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
              * iq_record.fifo -> record.cfile, hors du hot-path qemu.
              * Liste CALYPSO_RELAY_FIFOS (':'-separes), defaut fft:grgsm:record.*/
             {
-                enum { MAXFIFO = 4 };
+                enum { MAXFIFO = 8 };   /* fft grgsm record asciifft + si bursts (+marge) */
                 static int   fifo_fd[MAXFIFO];
                 static char  fifo_path[MAXFIFO][128];
                 static int   nfifo = -1;
