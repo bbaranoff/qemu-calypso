@@ -1,0 +1,161 @@
+
+=== META — binary + log ===
+-rwxr-xr-x 1 root root 126640664 May 16 01:08 /opt/GSM/qemu-src/build/qemu-system-arm
+-rw-r--r-- 1 root root  42467978 May 16 11:50 /root/qemu.log
+-rw-r--r-- 1 root root   2024908 May 16 11:50 /tmp/bridge.log
+Last insn=3102000000  log=41466KB  ≈62s DSP wall
+
+=== ENV — variables détectées ===
+1778931473.258 +0.101s [BSP] CALYPSO_RACH_FORCE_BSIC unset → BSIC read from d_rach
+1778931473.311 +0.155s [calypso-trx] CALYPSO_W1C_LATCH=1 (latch on a_sync_SNR snapshot, consume on ARM read)
+1778931473.331 +0.175s [calypso-trx] CALYPSO_DSP_BUDGET = 192000 insn/c54x_run (default 256000)
+1778931477.552 +4.395s [calypso-fbsb] CALYPSO_FBSB_SYNTH=1 (synth, dev-assist path)
+
+=== MARKERS — counts globaux ===
+  IMR-W *ZERO*                 2
+  SP-CATASTROPHE               5
+  DUAL-OP-INTERPRET            0
+  HOT-OPS-DUMP                 0
+  INTM-TRANS                   200
+  DISP-FLAG-W                  135
+  ENTER-770c                   0
+  ENTER-7700                   0
+  ENTER-8d2d                   0
+  DSP WR a_sync_SNR            1
+  DSP WR a_sync_TOA            33
+  d_fb_det WR                  354
+  fbsb hook fired              4114
+  L1CTL_DATA_IND               0
+  ARM TASK WR                  3948
+  IRQ events                   62
+  BSP LOAD                     15
+  BSP DMA fn=*                 0
+  STALE ratio                  82
+  MAC-7700                     100
+  MAC-8d33                     0
+  VEC-TRACE                    0
+  PENDING IRQ                  0
+
+=== PC HIST — last 3 windows ===
+1778932247.365 +774.209s [c54x] PC HIST insn=3098000000 top: 820c:142858 820d:142858 8208:142857 8209:142857 820a:142857 820e:142857 820f:142857 8211:142857 8213:142857 8214:142857
+1778932247.440 +774.284s [c54x] PC HIST insn=3100000000 top: 820e:142858 820f:142858 8208:142857 8209:142857 820a:142857 820c:142857 820d:142857 8211:142857 8213:142857 8214:142857
+1778932247.512 +774.356s [c54x] PC HIST insn=3102000000 top: 8211:142858 8213:142858 8208:142857 8209:142857 820a:142857 820c:142857 820d:142857 820e:142857 820f:142857 8214:142857
+
+=== STAGNATION — DSP stuck detection ===
+  STUCK — sum-delta=0 (< 1000) between last 2 PC HIST windows
+  Hot region: 0x8211  (sum1=1428572 sum2=1428572)
+  Zone: 0x82XX = correlator routine (with W1C_LATCH=1)
+
+=== PC ZONES — high-level visit map ===
+  zone 0x7700 :   1 distinct PCs visited in PC HIST
+  zone 0x8d   :   0 distinct PCs visited in PC HIST
+  zone 0xeb   :   0 distinct PCs visited in PC HIST
+  zone 0xfc   :   0 distinct PCs visited in PC HIST
+  zone 0x82   :  19 distinct PCs visited in PC HIST
+  zone 0x99   :   5 distinct PCs visited in PC HIST
+  zone 0x16   : 100 distinct PCs visited in PC HIST
+  zone 0x17   : 100 distinct PCs visited in PC HIST
+  zone 0xa0   :   0 distinct PCs visited in PC HIST
+  zone 0xc8   :   0 distinct PCs visited in PC HIST
+  zone 0xff   :   0 distinct PCs visited in PC HIST
+
+=== BSP DMA — sample delivery to DSP ===
+--- Stats from STALE ratio log ---
+1778932217.861 +744.705s [BSP] STALE ratio: stale=400000 written=5169 (cur_fn=50977)
+1778932226.361 +753.205s [BSP] STALE ratio: stale=405000 written=5230 (cur_fn=51610)
+1778932237.426 +764.269s [BSP] STALE ratio: stale=410000 written=5303 (cur_fn=52242)
+--- BSP DMA log (per-1000 + first 10) — sample of fn delivered ---
+...
+--- fn%51 distribution — DSP-delivered (sparse, log-rate-limited) ---
+      1 7
+      1 5
+      1 49
+      1 45
+      1 44
+      1 43
+      1 42
+      1 41
+--- fn%51 distribution — bridge sent (full) ---
+   2420 30
+   2399 40
+   2382 0
+   2381 20
+   2361 10
+    302 9
+    293 39
+    284 29
+
+=== SP-CATASTROPHE — opcode breakdown + AR analysis ===
+--- Top opcodes (count × op) ---
+      2 op=0x9ab1
+      1 op=0x9918
+      1 op=0x8018
+      1 op=0x7718
+--- Top PCs (count × PC) ---
+      2 PC=0x8217
+      1 PC=0xfd2a
+      1 PC=0x8a46
+      1 PC=0x0120
+--- Last 5 events (full) ---
+1778931473.348 +0.192s [c54x] SP-CATASTROPHE Δ=-13658 PC=0x0120 op=0x7718 SP 0x9022 → 0x5ac8 INTM=0 AR0..7: fbff 0495 09...
+1778931473.351 +0.194s [c54x] SP-CATASTROPHE Δ=-19986 PC=0xfd2a op=0x8018 SP 0x9006 → 0x41f4 INTM=0 AR0..7: fbff 0000 10...
+1778931473.354 +0.198s [c54x] SP-CATASTROPHE Δ=-18432 PC=0x8a46 op=0x9918 SP 0x4800 → 0x0000 INTM=0 AR0..7: fbff ffff 11...
+1778931473.398 +0.241s [c54x] SP-CATASTROPHE Δ=-4814 PC=0x8217 op=0x9ab1 SP 0x0006 → 0xed38 INTM=1 AR0..7: 9fce 604a cc6...
+1778931473.402 +0.246s [c54x] SP-CATASTROPHE Δ=+6581 PC=0x8217 op=0x9ab1 SP 0xed38 → 0x06ed INTM=1 AR0..7: b024 4ff4 b95...
+--- AR analysis : how often is some AR=0x0018 (MMR_SP) post-instruction? ---
+  events with any AR pos visible at 0x0018: 0 / 5
+  events with any AR pos visible at 0x0000: 0 / 5
+
+=== IMR-W *ZERO* — culprits ===
+--- Distinct PC+op (count × PC+op) ---
+      1 PC=0xfffd op=0x8000
+      1 PC=0x821a op=0x6f96
+--- Dual-op (C8-CB) IMR=0 — relates to encoding fix ---
+  C8-CB hits: 0
+
+=== DUAL-OP-INTERPRET — encoding evidence ===
+  0 hits — fix C8/C9/CA/CB tient (no SP-cat on 0xC8xx)
+
+=== a_sync_SNR — DSP-side demod output ===
+  1 writes, 1 distinct value → demod ne converge plus / figé
+--- Distribution (count × value) ---
+      1 = 0x7a0e
+--- Write PCs (sites du correlator qui produit SNR) ---
+      1 PC=0x8217
+--- Determinism check (signature 21× 0x2fb0 attendue) ---
+  0x2fb0=0  0x164e=0 (cumulative — déterministe across runs)
+
+=== INTM-TRANS — last 6 (avec cause prev_exec) ===
+1778931473.413 +0.256s [c54x] INTM-TRANS 1->0 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1265308
+1778931473.413 +0.256s [c54x] INTM-TRANS 0->1 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1265630
+1778931473.413 +0.256s [c54x] INTM-TRANS 1->0 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1265952
+1778931473.413 +0.256s [c54x] INTM-TRANS 0->1 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1266274
+1778931473.413 +0.256s [c54x] INTM-TRANS 1->0 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1266596
+1778931473.413 +0.256s [c54x] INTM-TRANS 0->1 current PC=0x8208 op=0x7317 | cause prev_exec PC=0x821a op=0x6f96 | XPC=3 IFR=0x0000 SP=0x06ed insn=1266918
+
+=== MAC traces (FB-det correlator instrumentation) ===
+--- MAC-7700 (FB-det at PROM0 0x7700) ---
+1778931473.331 +0.175s [c54x] MAC-7700 #1 AR2=0x0001 data[AR2]=0x0008 T=0x0000 A_pre=0000000000 ST0=0x581f ST1=0x6900
+1778931473.331 +0.175s [c54x] MAC-7700 #1 ARs: AR0=0000 AR1=0000 AR2=0001 AR3=0000 AR4=0000 AR5=0000 AR6=0000 AR7=0000 SP=5ac7
+1778931473.333 +0.176s [c54x] MAC-7700 #50 AR2=0x0063 data[AR2]=0x0000 T=0x0000 A_pre=0000000000 ST0=0x581f ST1=0x6900
+1778931473.333 +0.176s [c54x] MAC-7700 #50 ARs: AR0=0000 AR1=0000 AR2=0063 AR3=0000 AR4=0000 AR5=0000 AR6=0000 AR7=0000 SP=5ac7
+--- MAC-8d33 + ENTER-8d2d (instrumented zone — for runs that reach it) ---
+  MAC-8d33: 0  ENTER-8d2d: 0
+
+=== IRQ activity ===
+--- Last 3 IRQ events ---
+1778932196.062 +722.906s [c54x] IRQ #4000 vec=19 bit=3: INTM=0 IMR=0x0000 IFR=0x0028 idle=0 PC=0x821a PMST=0xfff8 IPTR=0x1ff
+1778932212.770 +739.614s [c54x] IRQ #4100 vec=19 bit=3: INTM=0 IMR=0x0000 IFR=0x0028 idle=0 PC=0x820e PMST=0xfff8 IPTR=0x1ff
+1778932230.361 +757.204s [c54x] IRQ #4200 vec=19 bit=3: INTM=0 IMR=0x0000 IFR=0x0028 idle=0 PC=0x8214 PMST=0xfff8 IPTR=0x1ff
+--- IPTR distribution (which vector base did the IRQs land at?) ---
+     62 IPTR=0x1ff
+--- IMR distribution (was service ever possible?) ---
+     62 IMR=0x0000
+
+=== SUMMARY — verdict consolidé ===
+  State        : STUCK at 0x8211
+  Insn count   : 3102000000
+  L1 progress  : L1CTL_DATA_IND=0  fbsb_hook=4114
+  DSP errors   : IMR=0=2  SP-cat=5  dual-op-cat=0
+  → DSP STUCK at 0x8211 — investigate hot zone
+

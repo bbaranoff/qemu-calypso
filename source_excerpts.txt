@@ -1,0 +1,274 @@
+=== calypso_c54x.c — version + size ===
+-rw-rw-r-- 1 nirvana nirvana 356571 mai   15 21:06 /home/nirvana/qemu-src/hw/arm/calypso/calypso_c54x.c
+
+=== ST||LD dual-op handler (C8-CB) ===
+5376:        /* CA/CB handled by the unified C8/C9/CA/CB block below. */
+5479:        /* 0xC8/C9/CA/CB: ST SRC, Ymem || LD Xmem, DST  (1-word parallel)
+                /* RPT Smem — load BRC from mem[Smem] */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->brc = val;
+                s->rpt_active = (val != 0);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x48 || op8 == 0x49) {
+                /* LDM MMR, dst — load accumulator from a memory-mapped reg */
+                int mmr = op & 0x7F;
+                uint16_t val = data_read(s, mmr);
+                *acc_dst = sext40((int16_t)val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4A) {
+                /* PSHM MMR — push memory-mapped reg onto stack */
+                int mmr = op & 0x7F;
+                uint16_t val = data_read(s, mmr);
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4B) {
+                /* PSHD Smem — push data memory onto stack */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->sp = (s->sp - 1) & 0xFFFF;
+                data_write(s, s->sp, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4C) {
+                /* LTD Smem — T = mem[Smem]; mem[Smem+1] = mem[Smem] */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                s->t = val;
+                data_write(s, (addr + 1) & 0xFFFF, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4D) {
+                /* DELAY Smem — mem[Smem+1] = mem[Smem] (delay-line shift) */
+                addr = resolve_smem(s, op, &ind);
+                uint16_t val = data_read(s, addr);
+                data_write(s, (addr + 1) & 0xFFFF, val);
+                return consumed + s->lk_used;
+            }
+            if (op8 == 0x4E || op8 == 0x4F) {
+                /* DST src, Lmem — store accumulator to long memory.
+                 * Lmem = even-aligned 32-bit pair: mem[L]=high, mem[L+1]=low */
+                addr = resolve_smem(s, op, &ind) & 0xFFFE;
+                int64_t v = *acc_dst;
+                data_write(s, addr,         (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, (addr+1)&0xFFFF, (uint16_t)(v & 0xFFFF));
+                return consumed + s->lk_used;
+            }
+        }
+        return consumed + s->lk_used;
+
+    case 0x5:
+        /* 5xxx: shifts — SFTA, SFTL, various forms.
+         * NOTE: 0x56xx/0x57xx are SFTL/SFTA with Smem (1-word), NOT MVPD.
+         * MVPD is at 0x8Cxx (hi8=0x8C). The old 0x56 MVPD decode was wrong
+
+=== MAC dual-op handler (D0-D9) ===
+            break;
+        }
+        case 0x2: { /* 0x1400: LD Smem, TS, DST — shift by T[5:0] (signed) */
+            int8_t ts = (int8_t)((s->t & 0x3F) | ((s->t & 0x20) ? 0xC0 : 0));
+            int64_t base = (s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val;
+            v = (ts >= 0) ? (base << ts) : (base >> -ts);
+            break;
+        }
+        case 0x3: { /* 0x1600: LDR Smem, DST — load with rounding (+0x8000) */
+            v = (s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val;
+            v = (v << 16) + 0x8000;
+            v &= 0xFFFFFFFF0000LL;  /* clear low 16 after rounding */
+            if (dst) s->b = sext40(v); else s->a = sext40(v);
+            return consumed + s->lk_used;
+        }
+        default:
+            v = (s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val;
+            break;
+        }
+        if (dst) s->b = sext40(v); else s->a = sext40(v);
+        /* CALAD-zone LD trace: every LD/LDU/LDR that targets A while
+         * executing in DARAM near the CALAD cluster. Reveals what
+         * address/value is feeding A right before each CALAD A. */
+        if (dst == 0 && (s->pmst & PMST_OVLY) &&
+            s->pc >= 0x10b0 && s->pc < 0x1100) {
+            static uint64_t ldA_total;
+            ldA_total++;
+            if (ldA_total <= 60 || (ldA_total % 5000) == 0) {
+                C54_LOG("LD-A-TRACE #%llu PC=0x%04x op=0x%04x sub=%d addr=0x%04x val=0x%04x A_after=0x%04x DP=0x%03x",
+                        (unsigned long long)ldA_total,
+                        s->pc, op, sub, addr, val,
+                        (uint16_t)(s->a & 0xFFFF),
+                        (s->st0 & 0x1FF));
+            }
+        }
+        return consumed + s->lk_used;
+    }
+
+    case 0x0: {
+        /* 0xxx: ADD / ADDS / ADD,TS / SUB / SUBS / SUB,TS  (mask FE00):
+         *   0x0000 ADD  Smem, SRC1 (no shift, SXM honoured)
+         *   0x0200 ADDS Smem, SRC1 (no shift, zero-extended)
+         *   0x0400 ADD  Smem, TS, SRC1
+         *   0x0800 SUB  Smem, SRC1
+         *   0x0A00 SUBS Smem, SRC1
+         *   0x0C00 SUB  Smem, TS, SRC1
+         * Previous handler always shifted by 16 — wrong for plain ADD/SUB.
+         */
+        addr = resolve_smem(s, op, &ind);
+
+=== MASA / SQUR (DB / DC) ===
+        if (ts_shift) {
+            int8_t ts = (int8_t)((s->t & 0x3F) | ((s->t & 0x20) ? 0xC0 : 0));
+            v = (ts >= 0) ? (v << ts) : (v >> -ts);
+        }
+        if (is_sub) {
+            if (dst) s->b = sext40(s->b - v);
+            else     s->a = sext40(s->a - v);
+        } else {
+            if (dst) s->b = sext40(s->b + v);
+            else     s->a = sext40(s->a + v);
+        }
+        /* CALAD-zone ADD/SUB trace: same scope as LD-A-TRACE. */
+        if (dst == 0 && (s->pmst & PMST_OVLY) &&
+            s->pc >= 0x10b0 && s->pc < 0x1100) {
+            static uint64_t addA_total;
+            addA_total++;
+            if (addA_total <= 30 || (addA_total % 5000) == 0) {
+                C54_LOG("ADDSUB-A-TRACE #%llu PC=0x%04x op=0x%04x sub=%d addr=0x%04x val=0x%04x A_after=%010llx",
+                        (unsigned long long)addA_total,
+                        s->pc, op, sub, addr, val,
+                        (unsigned long long)(s->a & 0xFFFFFFFFFFULL));
+            }
+        }
+        return consumed + s->lk_used;
+    }
+
+    case 0x3:
+        /* 3xxx: MAC / MAS */
+        addr = resolve_smem(s, op, &ind);
+        {
+            int dst = (op >> 8) & 1;
+            uint16_t val = data_read(s, addr);
+            int64_t product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+            if (s->st1 & ST1_FRCT) product <<= 1;
+            if (dst) s->b = sext40(s->b + product);
+            else     s->a = sext40(s->a + product);
+        }
+        return consumed + s->lk_used;
+
+    case 0x2:
+        /* 2xxx: MPY, SQUR, MAS, MAC variants */
+        {
+            int sub = (op >> 8) & 0xF;
+            addr = resolve_smem(s, op, &ind);
+            uint16_t val = data_read(s, addr);
+            int64_t product;
+            int dst;
+            switch (sub) {
+            case 0x0: case 0x1: /* MPY Smem, A/B */
+                product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                if (sub & 1) s->b = sext40(product);
+                else         s->a = sext40(product);
+                return consumed + s->lk_used;
+            case 0x4: case 0x5: /* SQUR Smem, A/B */
+                product = (int64_t)(int16_t)val * (int64_t)(int16_t)val;
+                if (s->st1 & ST1_FRCT) product <<= 1;
+                s->t = val;
+                if (sub & 1) s->b = sext40(product);
+                else         s->a = sext40(product);
+                return consumed + s->lk_used;
+
+=== XC-COND probe (line ~5005-5070) ===
+            if (s->st1 & ST1_FRCT) prod <<= 1;
+            /* Round if R bit set (odd hi8) */
+            if (hi8 & 0x01) prod += 0x8000;
+            /* Determine dest and operation */
+            int is_sub = (hi8 >= 0xB4 && hi8 <= 0xB7);
+            int dst_b;
+            if (hi8 >= 0xA4 && hi8 <= 0xA7) dst_b = (hi8 >= 0xA6);
+            else if (hi8 >= 0xB4 && hi8 <= 0xB7) dst_b = (hi8 >= 0xB6);
+            else dst_b = (hi8 & 0x02) ? 1 : 0; /* 0xB0/B1→A, 0xB2/B3→B */
+            if (dst_b) {
+                if (is_sub) s->b = sext40(s->b - prod);
+                else        s->b = sext40(s->b + prod);
+            } else {
+                if (is_sub) s->a = sext40(s->a - prod);
+                else        s->a = sext40(s->a + prod);
+            }
+            /* T = Ymem */
+            s->t = yval_d;
+            return consumed + s->lk_used;
+        }
+
+        /* SQDST Xmem, Ymem — Squared Distance (1-word dual-operand)
+         * Encoding: 1010 0001 XXXX YYYY
+         * Per SPRU172C: B += (AH - Xmem)^2; A = Ymem << 16; T = Xmem */
+        if (hi8 == 0xA1) {
+            int xar_sq = (op >> 4) & 0x07;
+            int yar_sq = op & 0x07;
+            uint16_t xval_sq = data_read(s, s->ar[xar_sq]);
+            uint16_t yval_sq = data_read(s, s->ar[yar_sq]);
+            if ((op >> 7) & 1) s->ar[xar_sq]--; else s->ar[xar_sq]++;
+            if ((op & 0x08) == 0) s->ar[yar_sq]++; else s->ar[yar_sq]--;
+            int16_t ah_sq = (int16_t)((s->a >> 16) & 0xFFFF);
+            int32_t diff = (int32_t)ah_sq - (int32_t)(int16_t)xval_sq;
+            int64_t sq = (int64_t)diff * (int64_t)diff;
+            if (s->st1 & ST1_FRCT) sq <<= 1;
+            s->b = sext40(s->b + sq);
+            s->a = sext40((int64_t)(int16_t)yval_sq << 16);
+            s->t = xval_sq;
+            return consumed + s->lk_used;
+        }
+
+        /* POLY Xmem, Ymem — Polynomial evaluation (1-word dual-operand)
+         * Encoding: 1011 110D XXXX YYYY (0xBC=A, 0xBD=B)
+         *           1011 111D XXXX YYYY (0xBE/0xBF variants — ABDST or POLY)
+         * Per SPRU172C: B += AH * T (with round); A = Xmem << 16; T = Ymem */
+        if (hi8 == 0xBC || hi8 == 0xBD || hi8 == 0xBE || hi8 == 0xBF) {
+            int xar_p = (op >> 4) & 0x07;
+            int yar_p = op & 0x07;
+            uint16_t xval_p = data_read(s, s->ar[xar_p]);
+            uint16_t yval_p = data_read(s, s->ar[yar_p]);
+            if ((op >> 7) & 1) s->ar[xar_p]--; else s->ar[xar_p]++;
+            if ((op & 0x08) == 0) s->ar[yar_p]++; else s->ar[yar_p]--;
+            int16_t ah_p = (int16_t)((s->a >> 16) & 0xFFFF);
+            int64_t prod_p = (int64_t)ah_p * (int64_t)(int16_t)s->t;
+            if (s->st1 & ST1_FRCT) prod_p <<= 1;
+            prod_p += 0x8000; /* round */
+            s->b = sext40(s->b + prod_p);
+            s->a = sext40((int64_t)(int16_t)xval_p << 16);
+            s->t = yval_p;
+            return consumed + s->lk_used;
+        }
+
+        /* B8-BB: MAS/MASR Xmem, Ymem (subtract variants) or POLY-like */
+        if (hi8 == 0xB8 || hi8 == 0xB9 || hi8 == 0xBA || hi8 == 0xBB) {
+            /* Check if it's actually LDMM (BA) or POPM (BD) — those are handled below */
+            if (hi8 == 0xBA) goto ba_handler;
+            int xar_b8 = (op >> 4) & 0x07;
+            int yar_b8 = op & 0x07;
+            uint16_t xval_b8 = data_read(s, s->ar[xar_b8]);
+            uint16_t yval_b8 = data_read(s, s->ar[yar_b8]);
+            if ((op >> 7) & 1) s->ar[xar_b8]--; else s->ar[xar_b8]++;
+            if ((op & 0x08) == 0) s->ar[yar_b8]++; else s->ar[yar_b8]--;
+            int64_t prod_b8 = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_b8;
+            if (s->st1 & ST1_FRCT) prod_b8 <<= 1;
+            if (hi8 & 0x01) prod_b8 += 0x8000;
+            int dst_b8 = (hi8 & 0x02) ? 1 : 0;
+
+=== SP-CATASTROPHE + DUAL-OP-INTERPRET tracer ===
+5264:         * aligned with binutils. Expected aftermath : new SP-CATASTROPHE on
+5494:         * Bug fix 2026-05-08 v2 evidence (DUAL-OP-INTERPRET log) :
+6929:                        "[c54x] SP-CATASTROPHE Δ=%+d PC=0x%04x op=0x%04x "
+6942:        /* === DUAL-OP-INTERPRET diagnostic ===
+6946:         * SP-CATASTROPHE just fired, we have evidence the encoding is
+6960:                        "[c54x] DUAL-OP-INTERPRET op=0x%04x PC=0x%04x : "
+
+=== INTM-TRANS tracer (uses last_exec_pc) ===
+1615:    /* INTM-TRANS probe : log toute transition INTM 0→1.
+1630:                        "[c54x] INTM-TRANS #%u 0->1 PC=0x%04x insn=%u SP=0x%04x "
+2866:         * 0xfacf, ...} all PC=0x8eb9 op=0xf3e1, INTM-TRANS XPC=0
+6289:                C54_LOG("INTM-TRANS %u->%u current PC=0x%04x op=0x%04x | "
+6976:         * tracers (in particular INTM-TRANS at top of next iteration)

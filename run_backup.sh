@@ -2082,14 +2082,22 @@ esac
 # redistribuer l'espace, sinon la 3e/4e pane devient trop etroite et tmux
 # rejette le split suivant avec "no space for new pane".
 tmux new-window -t "$SESSION" -n all \
-    "clear; echo '=== qemu ==='; tail -F $QEMU_LOG"
+    "clear; echo '=== osmocon ==='; tail -F $OSMOCON_LOG"
+# qemu (qemu.log) RETIRE du pane all -> le process qemu VIT toujours dans sa
+# fenetre dediee 'qemu'. osmocon devient le pane de base.
 # Build dynamic spec list selon ce qui tourne reellement.
-_ALL_SPECS=("osmocon|$OSMOCON_LOG")
-[ "${CALYPSO_SKIP_GSMTAP:-0}" != "1" ] && _ALL_SPECS+=("fft|__FFT__")
-[ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ] && _ALL_SPECS+=("ipc-device|$IPC_DEVICE_LOG")
-[ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ] && _ALL_SPECS+=("osmo-trx-ipc|$OSMO_TRX_IPC_LOG")
+_ALL_SPECS=()
+# FFT ascii RETIREE du pane all (on utilise la FFT osmo_egprs matplotlib via fft.sh).
+# ipc-device + osmo-trx-ipc RETIRES du pane all -> vivent dans leurs fenetres dediees.
+# qemu (qemu.log) prend la place de osmo-trx-ipc (en haut a droite). Le process
+# qemu tourne dans la fenetre 'qemu' ; ici c'est juste la vue tail -F.
+_ALL_SPECS+=("qemu|$QEMU_LOG")
+# AU MILIEU (rangee horizontale centrale du tiled) : decode SI + decode BURST,
+# sniff PASSIF (gsm_sniff.py, raw socket, aucune fifo, aucune perturbation).
+[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("si|__SI__")
+[ "${CALYPSO_SKIP_DECODE_PANES:-0}" != "1" ] && _ALL_SPECS+=("burst|__BURST__")
 [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ] && _ALL_SPECS+=("bridge-py|${BRIDGE_LOG:-/tmp/bridge.py.log}")
-[ "${CALYPSO_SKIP_BTS:-0}" != "1" ] && _ALL_SPECS+=("bts|$BTS_LOG")
+# bts RETIRE du pane all -> process osmo-bts-trx vit dans la fenetre dediee 'bts'.
 [ "${CALYPSO_SKIP_L2:-0}" != "1" ] && _ALL_SPECS+=("$CALYPSO_L2_CLIENT|$L2_TAIL_LOG")
 # gdb pane dans la window 'all'. Default OFF (CALYPSO_SKIP_GDB_PANE=1).
 # Activer avec CALYPSO_SKIP_GDB_PANE=0 (= opt-in pour debug). Le pane gdb
@@ -2097,9 +2105,12 @@ _ALL_SPECS=("osmocon|$OSMOCON_LOG")
 [ "${CALYPSO_SKIP_GDB_PANE:-1}" != "1" ] && _ALL_SPECS+=("gdb|__GDB__")
 for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
-    if [ "$log" = "__FFT__" ]; then
-        # FFT live du cfile BSP (lien grgsm<->BSP) — remplace tcpdump (vire pour l'instant).
-        cmd="clear; source /root/.env/bin/activate 2>/dev/null; CFILE=/tmp/iq_asciifft.fifo FS=1083333 python3 /opt/GSM/grgsm_fft_live.py"
+    if [ "$log" = "__SI__" ]; then
+        # decode SI live (type + FN + hexa L2) via sniff passif des GSMTAP 4729/4730.
+        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py si"
+    elif [ "$log" = "__BURST__" ]; then
+        # decode BURST live (SCH 4731 + TRXD 5700-5702) via sniff passif.
+        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u /opt/GSM/gsm_sniff.py burst"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide
