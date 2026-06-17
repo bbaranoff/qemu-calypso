@@ -23,10 +23,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -35,6 +37,9 @@
 #include <unistd.h>
 
 #include <osmocom/core/logging.h>
+#include <osmocom/core/bits.h>
+#include <osmocom/coding/gsm0503_coding.h>
+#include <osmocom/gsm/a5.h>      /* osmo_a5() : chiffrement A5/1 UL */
 
 #include "debug.h"
 #include "ipc_shm.h"
@@ -57,6 +62,12 @@
 #define CALYPSO_DL_BURSTLEN   (CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR)  /* 592 I/Q @ 4 SPS */
 #define CALYPSO_FRAME_SAMPLES (1250 * CALYPSO_TRX_OSR)              /* 5000 samples/frame @ 4 SPS */
 #define CALYPSO_BSP_BURSTLEN  148         /* samples per UDP datagram to QEMU BSP (= correlator window) */
+/* FIX LU 2026-06-05 : guard de tete (complex samples) AVANT les bits actifs de
+ * la RACH UL. Le correlateur RACH osmo-trx (sigProcLib.cpp:1683 TOA gate <3*sps,
+ * :1788 target ~sym48) rejette un burst place a l'offset 0 du slot (pic en bord
+ * -> rejete -> NOPE/-110). Un vrai access-burst a ~68 sym de guard avant la sync.
+ * ~32 sym @ OSR4 = 128 samples placent la sync dans la fenetre du correlateur. */
+#define CALYPSO_UL_SLOT_OFFSET 128
 
 /* ---- Timing frame CANONIQUE (logique GSM, robuste) ----
  * 1 frame TDMA = CALYPSO_FRAME_QBITS qbits (1250 symboles x 4) = CALYPSO_FRAME_NS.
@@ -515,33 +526,395 @@ double uhdwrap_set_txatt(void *dev, double a, size_t chan)
 #include <math.h>
 #define UL_TRXD_HDR      8
 static int  g_ul_on   = -1;            /* CALYPSO_IPC_UL */
-static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * 2];   /* dernier burst modulé */
+/* FIX OSR 2026-06-04 : osmo-trx tourne a CALYPSO_TRX_OSR=4 SPS. Le modulateur
+ * DOIT produire 148 symboles * OSR samples (= 592 @ 4 SPS), sinon les 148
+ * samples 1-SPS sont lus comme ~37 symboles de charabia -> aucune correlation
+ * d'access-burst cote osmo-trx -> NOPE -> RACH jamais detectee. */
+static int16_t g_ul_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];   /* dernier burst modulé @ OSR */
 static volatile int g_ul_pending = 0;  /* 1 = un burst à injecter */
+static volatile uint32_t g_ul_real_fn = 0;  /* FN firmware (sideband) du dernier RACH -> FN-lock */
+/* === RACH waveform DEDIE (FIX MT-SMS 2026-06-09) ============================
+ * g_ul_iq est ECRASE a CHAQUE frame par le chemin SDCCH-idle (ul_mod_laurent ->
+ * g_ul_iq, ~119x/run). Pour le LU c'etait masque : le firmware re-livrait la RACH
+ * 30x sur g_bsp_fd, donc g_ul_iq etait re-rempli juste avant un slot eligible.
+ * La paging-response (RA=0x98) n'est encodee QU'UNE fois -> entre l'encode et le
+ * 1er vrai slot RACH (max 51 frames), le SDCCH-idle clobbe g_ul_iq -> meme avec la
+ * gate corrigee, le burst inject serait du SDCCH, pas la RACH. On latch donc la
+ * waveform RACH dans un buffer SEPARE (g_rach_iq) et on l'arme STICKY pour quelques
+ * slots RACH-eligibles, re-injectee sur le 1er fn_ok. */
+static int16_t g_rach_iq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2]; /* waveform RACH latchee */
+static volatile int g_rach_pending = 0;       /* nb de slots RACH-eligibles restants a tenter */
+static volatile uint32_t g_rach_arm_seq = 0;  /* incremente a chaque nouvel arm (debug) */
 
-/* GMSK/MSK mod : 148 soft-bits (±127) → 148 cs16 I/Q. Phase ±π/2 par bit
- * (convention osmo-trx : bit 1 → +π/2). Amplitude ~0.6 full-scale. */
+/* MSK phase-continue a OSR samples/symbole : 148 soft-bits (±127) -> 148*OSR
+ * cs16 I/Q. Increment de phase ±(π/2)/OSR par SAMPLE (convention osmo-trx :
+ * bit 1 → +π/2 par symbole). Amplitude ~0.6 full-scale (override CALYPSO_UL_AMP). */
 static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
 {
-    double ph = 0.0;
-    for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) {
-        iq[2 * i]     = (int16_t)(cos(ph) * 20000.0);
-        iq[2 * i + 1] = (int16_t)(sin(ph) * 20000.0);
-        ph += ((bits[i] > 0) ? 1.0 : -1.0) * (M_PI / 2.0);
+    static double AMP = -1.0;
+    static int ACT = -2;
+    if (AMP < 0.0) { const char *e = getenv("CALYPSO_UL_AMP"); AMP = (e && *e) ? atof(e) : 20000.0; }
+    if (ACT == -2) { const char *e = getenv("CALYPSO_UL_ACTIVE_SYMS"); ACT = (e && *e) ? atoi(e) : -1; }
+    /* ACCESS BURST (RACH) : seulement 88 symboles ACTIFS (8 tail + 41 sync etendu
+     * + 36 data + 3 tail), puis 60 symboles de GUARD = SILENCE (IQ=0, PAS du GMSK :
+     * un 0 GMSK-module est un tone fc/4, le correlateur RACH veut un gap d'energie).
+     * 88*OSR=352 GMSK + 60*OSR=240 zeros = 592 = burst. Auto-detection access-vs-
+     * normal : tail[0..7]==0 ET guard[88..147]==0 -> access burst. Override
+     * CALYPSO_UL_ACTIVE_SYMS (>0 force, -1/unset = auto). */
+    static int INV = -1, USEG = -1;
+    if (INV < 0)  { const char *e = getenv("CALYPSO_UL_INVERT"); INV = (e && *e == '1') ? 1 : 0; }
+    if (USEG < 0) { const char *e = getenv("CALYPSO_UL_GMSK");   USEG = (!e || *e != '0'); }  /* defaut GMSK */
+    const int N = CALYPSO_BSP_BURSTLEN, OSR = CALYPSO_TRX_OSR, NS = N * OSR;
+    int active = N;
+    if (ACT > 0) active = ACT;
+    else {
+        int tail0 = 1, guard0 = 1;
+        for (int i = 0; i < 8 && i < N; i++) if (bits[i] > 0) { tail0 = 0; break; }
+        for (int i = 88; i < N; i++) if (bits[i] > 0) { guard0 = 0; break; }
+        if (tail0 && guard0) active = 88;   /* access burst (RACH) */
     }
+    if (active > N) active = N;
+
+    if (!USEG) {
+        /* MSK fallback (CALYPSO_UL_GMSK=0) */
+        double ph = 0.0; int idx = 0;
+        for (int i = 0; i < N; i++) {
+            if (i >= active) { for (int s=0;s<OSR;s++){iq[2*idx]=0;iq[2*idx+1]=0;idx++;} continue; }
+            int b = ((bits[i] > 0) ? 1 : 0) ^ INV;
+            double step = (b ? 1.0 : -1.0) * (M_PI/2.0)/(double)OSR;
+            for (int s=0;s<OSR;s++){iq[2*idx]=(int16_t)(cos(ph)*AMP);iq[2*idx+1]=(int16_t)(sin(ph)*AMP);ph+=step;idx++;}
+        }
+        return;
+    }
+
+    /* GMSK BT=0.3 : pulse de frequence gaussien (osmo-trx correle du GMSK, pas du MSK).
+     * freq[n] = Sum_k alpha[k]*g(n-k*OSR) ; phi = cumsum(freq)*pi/2 ; I/Q=AMP*(cos,sin). */
+    #define GMSK_L 4
+    static double g_pulse[GMSK_L * CALYPSO_TRX_OSR];
+    static int g_init = 0;
+    if (!g_init) {
+        const double BT = 0.3, ln2 = 0.6931471805599453, kk = 2.0*M_PI*BT/sqrt(ln2);
+        int Lo = GMSK_L*OSR; double sum = 0;
+        for (int m = 0; m < Lo; m++) {
+            double t = ((double)m - Lo/2.0 + 0.5)/OSR;   /* symboles, centre */
+            double q1 = 0.5*erfc(kk*(t-0.5)/sqrt(2.0));
+            double q2 = 0.5*erfc(kk*(t+0.5)/sqrt(2.0));
+            g_pulse[m] = q1 - q2; sum += g_pulse[m];
+        }
+        if (sum != 0.0) for (int m = 0; m < Lo; m++) g_pulse[m] /= sum;  /* Sigma=1 -> pi/2 par symbole */
+        g_init = 1;
+    }
+    static double freq[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR];
+    for (int n = 0; n < NS; n++) freq[n] = 0.0;
+    int Lo = GMSK_L*OSR;
+    for (int k = 0; k < active; k++) {
+        double al = (((bits[k] > 0) ? 1 : 0) ^ INV) ? 1.0 : -1.0;
+        int base = k*OSR - Lo/2;
+        for (int m = 0; m < Lo; m++) { int pos = base+m; if (pos >= 0 && pos < NS) freq[pos] += al*g_pulse[m]; }
+    }
+    /* ROTATION GMSK (osmo-trx GMSKRotate) : +pi/2 par SYMBOLE = +pi/(2*OSR) par sample.
+     * Sans elle, le signal est decale de fs/(2*OSR) -> le demod osmo-trx (qui dé-rote
+     * de la meme quantite) recoit du garbage -> BER 456/456. C'etait LA piece manquante
+     * (le RACH echouait pareil). Gate CALYPSO_UL_ROT (def 1), signe CALYPSO_UL_ROT_SGN. */
+    static int ROT = -2; static double ROTSGN = 1.0;
+    if (ROT == -2) {
+        const char *e = getenv("CALYPSO_UL_ROT");     ROT = (!e || *e != '0') ? 1 : 0;
+        const char *s = getenv("CALYPSO_UL_ROT_SGN"); ROTSGN = (s && atoi(s) < 0) ? -1.0 : 1.0;
+    }
+    const double ROTSTEP = ROTSGN * (M_PI / 2.0) / (double)OSR;   /* pi/8 @ OSR=4 */
+    double phi = 0.0; int active_end = active*OSR + Lo; if (active_end > NS) active_end = NS;
+    for (int n = 0; n < NS; n++) {
+        phi += (M_PI/2.0)*freq[n];
+        double pt = ROT ? (phi + ROTSTEP * (double)n) : phi;
+        if (n < active_end) { iq[2*n] = (int16_t)(cos(pt)*AMP); iq[2*n+1] = (int16_t)(sin(pt)*AMP); }
+        else { iq[2*n] = 0; iq[2*n+1] = 0; }   /* guard silence */
+    }
+}
+
+/* === Modulateur GMSK Laurent EXACT d'osmo-trx (port C de sigProcLib::modulateBurstLaurent).
+ * Le GMSK maison ne correle pas le detecteur osmo-trx (BER 456/456) ; CE modulateur si
+ * (la table RACH = son dump -> rc=3). bits[nbits] soft +/-1 -> symboles +/-1 @ sps=4,
+ * rotation pi/(2*sps)/sample, convolution pulse Laurent c0 (+ c1 = j*XOR(b[i-1],b[i-2])),
+ * somme. Sortie cs16 (scale CALYPSO_UL_AMP, def 20000) sur CALYPSO_BSP_BURSTLEN*OSR samples.
+ * convolve START_ONLY : out[n] = sum_{j=0}^{H-1} in[n-(H-1)+j]*h[j] (in=0 si index<0). */
+static void ul_mod_laurent(const int8_t *bits, int nbits, int16_t *iq)
+{
+    const int sps = CALYPSO_TRX_OSR;        /* 4 */
+    const int BL  = 625;                     /* burst_len osmo-trx */
+    static const double C0[16] = {
+        0.0, 4.46348606e-03, 2.84385729e-02, 1.03184855e-01, 2.56065552e-01,
+        4.76375085e-01, 7.05961177e-01, 8.71291644e-01, 9.29453645e-01,
+        8.71291644e-01, 7.05961177e-01, 4.76375085e-01, 2.56065552e-01,
+        1.03184855e-01, 2.84385729e-02, 4.46348606e-03 };
+    static const double C1[8] = {
+        0.0, 8.16373112e-03, 2.84385729e-02, 5.64158904e-02,
+        7.05463553e-02, 5.64158904e-02, 2.84385729e-02, 8.16373112e-03 };
+    static double AMP = -1.0;
+    if (AMP < 0.0) { const char *e = getenv("CALYPSO_UL_AMP"); AMP = (e && *e) ? atof(e) : 20000.0; }
+    if (nbits > 156) nbits = 156;
+
+    static double sym[625], c0r[625], c0i[625], c1r[625], c1i[625];
+    for (int n = 0; n < BL; n++) { sym[n]=0; c0r[n]=0; c0i[n]=0; c1r[n]=0; c1i[n]=0; }
+    int b[160]; for (int i = 0; i < nbits; i++) b[i] = (bits[i] > 0) ? 1 : 0;
+
+    /* symboles +/-1 : index 0 = padding tail(-1), sps,2sps.. = 2*bit-1, puis padding tail. */
+    int idx = 0;
+    sym[idx] = -1.0; idx += sps;
+    for (int i = 0; i < nbits; i++) { sym[idx] = 2.0*b[i]-1.0; idx += sps; }
+    if (idx < BL) sym[idx] = -1.0;
+
+    /* rotation GMSK : c0[n] = sym[n] * e^(j n pi/(2*sps)) */
+    const double rstep = (M_PI/2.0)/(double)sps;
+    for (int n = 0; n < BL; n++) { double ph = rstep*(double)n; c0r[n] = sym[n]*cos(ph); c0i[n] = sym[n]*sin(ph); }
+
+    /* c1[k] = c0[k] * (j*phase) = -phase*c0i + j*phase*c0r ; phase=2*(b[i-1]^b[i-2])-1.
+     * start magic (k=sps*2, phase=-1), i=2..nbits-1, end magic (i=nbits). */
+    if (nbits >= 2) {
+        int k = sps*2; double phase = -1.0;
+        c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; k += sps;
+        for (int i = 2; i < nbits; i++) {
+            phase = 2.0*(double)(b[i-1]^b[i-2]) - 1.0;
+            if (k < BL) { c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; }
+            k += sps;
+        }
+        phase = 2.0*(double)(b[nbits-1]^b[nbits-2]) - 1.0;
+        if (k < BL) { c1r[k] = -phase*c0i[k]; c1i[k] = phase*c0r[k]; }
+    }
+
+    int NS = CALYPSO_BSP_BURSTLEN * sps;     /* 592 */
+    for (int n = 0; n < NS; n++) {
+        double or_ = 0.0, oi_ = 0.0;
+        for (int j = 0; j < 16; j++) { int s = n-15+j; if (s>=0 && s<BL) { or_ += c0r[s]*C0[j]; oi_ += c0i[s]*C0[j]; } }
+        for (int j = 0; j < 8;  j++) { int s = n-7+j;  if (s>=0 && s<BL) { or_ += c1r[s]*C1[j]; oi_ += c1i[s]*C1[j]; } }
+        double I = or_*AMP, Q = oi_*AMP;
+        if (I>32767.0) I=32767.0; else if (I<-32768.0) I=-32768.0;
+        if (Q>32767.0) Q=32767.0; else if (Q<-32768.0) Q=-32768.0;
+        iq[2*n] = (int16_t)I; iq[2*n+1] = (int16_t)Q;
+    }
+}
+
+/* RACH access-burst complet en soft-bits +/-1 pour ul_gmsk_mod :
+ * [8 tail][41 sync TS0][36 bits codes gsm0503_rach_ext_encode][3 tail], reste guard.
+ * La sync = GSM::gRACHSynchSequenceTS0 (exactement ce que correle osmo-trx). Le DSP
+ * Calypso fait normalement ce codage+sync ; shunte, on le refait ici. RA/BSIC env :
+ * CALYPSO_UL_RA (defaut 3, fixe pour prouver rc>0), CALYPSO_UL_BSIC (defaut 7 = BSIC
+ * reel ; colore la parite -> requis pour CHAN RQD cote osmo-bts, pas pour rc). */
+static void ul_build_rach_ra(int8_t *ab, int ra_arg, int bsic_arg)
+{
+    static const char SYNC[] = "01001011011111111001100110101010001111000";  /* 41 */
+    static int RA_env = -1, BSIC_env = -1;
+    if (RA_env < 0)   { const char *e = getenv("CALYPSO_UL_RA");   RA_env   = (e && *e) ? (int)strtol(e, 0, 0) : 3; }
+    if (BSIC_env < 0) { const char *e = getenv("CALYPSO_UL_BSIC"); BSIC_env = (e && *e) ? atoi(e) : 7; }
+    int RA   = (ra_arg   >= 0) ? ra_arg   : RA_env;     /* RA reelle du mobile (paging: >=0x80) */
+    int BSIC = (bsic_arg >= 0) ? bsic_arg : BSIC_env;
+    ubit_t coded[40]; memset(coded, 0, sizeof(coded));
+    gsm0503_rach_ext_encode(coded, (uint16_t)RA, (uint8_t)BSIC, false);   /* 36 bits codes */
+    for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) ab[i] = -1;            /* tail/guard par defaut */
+    int p = 0;
+    for (int i = 0; i < 8;  i++) ab[p++] = -1;                            /* extended tail */
+    for (int i = 0; i < 41; i++) ab[p++] = (SYNC[i] == '1') ? 1 : -1;     /* synch sequence */
+    for (int i = 0; i < 36; i++) ab[p++] = coded[i] ? 1 : -1;            /* RA codee (BSIC color) */
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                            /* tail */
+    /* p==88 ; [88..147]=-1 -> ul_gmsk_mod auto-detecte active=88 + guard silence */
+}
+
+/* compat : RA/BSIC depuis l'env (CALYPSO_UL_RA / _BSIC). */
+static void ul_build_rach(int8_t *ab) { ul_build_rach_ra(ab, -1, -1); }
+
+/* Construit le burst NORMAL #bid (0..3) du bloc SDCCH/SACCH depuis la L2 (23o) :
+ * gsm0503_xcch_encode -> 4*116 bits e[] (GSM 05.03 conv+FIRE+interleave). Burst normal
+ * = [3 tail][58 e (57 data + steal)][26 TSC7][58 e][3 tail] en soft-bits +/-1. Tout actif
+ * (148) -> ul_gmsk_mod fait du GMSK plein (le motif != access-burst -> pas de guard). */
+static void ul_build_sdcch_burst(int8_t *ab, const uint8_t *l2, int bid)
+{
+    static const uint8_t TSC7[26] = {
+        1,1,1,0,1,1,1,1,0,0,0,1,0,0,1,0,1,1,1,0,1,1,1,1,0,0 };
+    ubit_t e[4 * 116];
+    memset(e, 0, sizeof(e));
+    gsm0503_xcch_encode(e, l2);
+    const ubit_t *cB = e + (bid & 3) * 116;
+    int p = 0;
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                  /* tail */
+    for (int i = 0; i < 58; i++) ab[p++] = cB[i]      ? 1 : -1; /* data 1 (57 + steal) */
+    for (int i = 0; i < 26; i++) ab[p++] = TSC7[i]    ? 1 : -1; /* midamble TSC7 */
+    for (int i = 0; i < 58; i++) ab[p++] = cB[58 + i] ? 1 : -1; /* data 2 */
+    for (int i = 0; i < 3;  i++) ab[p++] = -1;                  /* tail */
+    /* p==148, tout actif -> GMSK plein */
+}
+
+/* SELF-TEST (#12) : module l'access-burst (le MÊME que rach_ref.cs16 = dump du vrai
+ * modulateBurst osmo-trx) avec ul_mod_laurent et compare. maxdiff~0 => port correct.
+ * Le pattern du diff isole le bug : echelle (AMP), decalage (convolution/TOA),
+ * conjugue (signe rotation), renverse (sens convol). Appelé 1x. */
+static void ul_laurent_selftest(void)
+{
+    int8_t ab[CALYPSO_BSP_BURSTLEN];
+    ul_build_rach(ab);                                   /* 88 bits actifs = ceux de rach_ref */
+    static int16_t my[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+    ul_mod_laurent(ab, 88, my);
+    FILE *f = fopen("/root/rach_ref.cs16", "rb");
+    if (!f) { LOGP(DDEV, LOGL_NOTICE, "LAURENT-SELFTEST: pas de /root/rach_ref.cs16\n"); return; }
+    static int16_t ref[CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+    size_t got = fread(ref, 2 * sizeof(int16_t), CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR, f);
+    fclose(f);
+    int N = (int)got; if (N > CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR) N = CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR;
+    long maxd = 0, sumd = 0;
+    for (int i = 0; i < N * 2; i++) { long d = labs((long)my[i] - (long)ref[i]); if (d > maxd) maxd = d; sumd += d; }
+    LOGP(DDEV, LOGL_NOTICE,
+         "LAURENT-SELFTEST: N=%d maxdiff=%ld avgdiff=%ld | mine[0..7]=%d,%d %d,%d %d,%d %d,%d "
+         "ref[0..7]=%d,%d %d,%d %d,%d %d,%d\n", N, maxd, sumd / (N * 2 + 1),
+         my[0],my[1],my[2],my[3],my[4],my[5],my[6],my[7],
+         ref[0],ref[1],ref[2],ref[3],ref[4],ref[5],ref[6],ref[7]);
+}
+
+/* Sideband RACH (NO-HARDCODE) : lit la VRAIE RA+BSIC+FN publiee par QEMU
+ * (calypso_trx.c calypso_rach_publish) dans /dev/shm/calypso_rach. Fichier
+ * REGULIER (pas un FIFO -> jamais bloquant). Layout 16o fige, partage avec QEMU :
+ *   [0..3]=seq(u32 LE)  [4]=ra  [5]=bsic  [8..11]=fn(u32 LE). Retourne 1 si seq>0. */
+static int calypso_rach_read(uint8_t *ra, uint8_t *bsic, uint32_t *fn)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_rach", O_RDONLY);   /* retry tant que QEMU ne l'a pas cree */
+    if (fd < 0) return 0;
+    uint8_t buf[16];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf + 0, sizeof(seq));
+    if (seq == 0) return 0;
+    if (ra)   *ra   = buf[4];
+    if (bsic) *bsic = buf[5];
+    if (fn)   memcpy(fn, buf + 8, sizeof(*fn));
+    return 1;
+}
+
+/* Lit /dev/shm/calypso_kc (ecrit par QEMU l1ctl_sock sur L1CTL_CRYPTO_REQ) :
+ * [0..3]seq(LE) [4]algo [5]key_len [6..21]Kc. Retourne le seq (0 = pas de cipher
+ * actif : aucun CIPHER MODE COMMAND, ou canal reset via DM_EST/DM_REL). */
+static uint32_t calypso_kc_read(uint8_t *algo, uint8_t *kc, uint8_t *klen)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_kc", O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t buf[32];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf, 4);
+    if (seq == 0) return 0;
+    if (algo) *algo = buf[4];
+    if (klen) *klen = buf[5];
+    if (kc)   memcpy(kc, buf + 6, 16);
+    return seq;
+}
+
+/* SDCCH/SACCH UL sideband (#12 PIÈCE 2) : lit la L2 montante (a_cu) publiée par QEMU
+ * (calypso_dsp_shunt) dans /dev/shm/calypso_sdcch_ul. Layout 48o : seq@0(u32)
+ * l1s_fn@4(u32) fn@8(u32) task_u@12(u16) l1s%51@14(u8) l2[23]@16. Retourne 1 si seq>0. */
+static int calypso_sdcch_ul_read(uint8_t *l2, uint8_t *l1s_mod51, uint32_t *l1s_fn, uint32_t *seq_out)
+{
+    static int fd = -1;
+    if (fd < 0) fd = open("/dev/shm/calypso_sdcch_ul", O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t buf[48];
+    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t seq; memcpy(&seq, buf + 0, sizeof(seq));
+    if (seq == 0) return 0;
+    if (seq_out)   *seq_out = seq;
+    if (l1s_fn)    memcpy(l1s_fn, buf + 4, sizeof(*l1s_fn));
+    if (l1s_mod51) *l1s_mod51 = buf[14];
+    if (l2)        memcpy(l2, buf + 16, 23);
+    return 1;
 }
 
 /* Draine l'UL sur g_bsp_fd (le BSP renvoie l'UL à la source du DL = nous,
  * cf. calypso_bsp.c:381), module le dernier burst dispo. Non-bloquant. */
 static void ul_drain(void)
 {
+    static int _stdone = 0;
+    if (!_stdone) { _stdone = 1; ul_laurent_selftest(); }   /* #12 : valide le port Laurent 1x */
     if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
     int got = 0;
     for (;;) {
         ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
         if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
-        ul_gmsk_mod((const int8_t *)(pkt + UL_TRXD_HDR), g_ul_iq);
+        const int8_t *bits = (const int8_t *)(pkt + UL_TRXD_HDR);
+        /* RACH ENC (defaut ON) : reconstruit l'access-burst code+sync (le DSP shunte
+         * ne le fait plus), au lieu de moduler les bits firmware (sans sync). */
+        static int rach_enc = -1;
+        if (rach_enc < 0) { const char *e = getenv("CALYPSO_UL_RACH_ENC"); rach_enc = (!e || *e != '0'); }
+
+        /* === NO-HARDCODE : TABLE de modulation per-RA ===========================
+         * La VRAIE RA du mobile (d_rach@0x0474, plombee via /dev/shm/calypso_rach)
+         * varie a chaque burst. osmo-trx a pre-genere /root/rach_ref_RA<nn>.cs16
+         * (sa modulation Laurent EXACTE, qui correle son detecteur) pour chaque RA.
+         * On selectionne le ref de la VRAIE RA -> le BTS voit la bonne RA, plus le
+         * RA=3 fixe. Repli : ancien rach_ref.cs16 (RA fixe), puis GMSK maison. */
+        static int16_t ref_tab[16][CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR * 2];
+        static int     ref_n[16];          /* 0=pas charge, <0=absent, >0=samples */
+        static int     ref_init = 0;
+        if (!ref_init) { for (int i = 0; i < 16; i++) ref_n[i] = 0; ref_init = 1; }
+
+        int used_tab = 0;
+        if (rach_enc) {
+            uint8_t real_ra = 0xff, real_bsic = 0; uint32_t real_fn = 0;
+            /* #SMS/paging : encode l'access-burst pour la VRAIE RA a la volee (tout RA
+             * 0x00-0xff). La paging response a une RA >= 0x80 (cause "answer to paging") ;
+             * l'ancien gate real_ra<16 + table per-RA 0x00-0x0f la ratait -> repli RA=3 ->
+             * IMM ASS reqref mismatch -> echec. ul_build_rach_ra + ul_mod_laurent = forme
+             * d'onde EXACTE osmo-trx (cf LAURENT-SELFTEST) ; la detection osmo-trx correle
+             * la sync (RA-indep) puis decode RA+BSIC -> reqref correcte -> le mobile matche. */
+            if (calypso_rach_read(&real_ra, &real_bsic, &real_fn)) {
+                g_ul_real_fn = real_fn;            /* stash pour le FN-lock (uhdwrap_read) */
+                int8_t ab_rach[CALYPSO_BSP_BURSTLEN];
+                ul_build_rach_ra(ab_rach, (int)real_ra, (int)real_bsic);
+                ul_mod_laurent(ab_rach, 88, g_ul_iq);   /* 88 bits actifs = access-burst */
+                /* FIX MT-SMS : latch la waveform RACH dans son buffer dedie et arme
+                 * STICKY sur N slots RACH-eligibles. Le chemin SDCCH-idle ecrase g_ul_iq
+                 * a chaque frame ; g_rach_iq lui reste intact -> la paging-response (un
+                 * seul encode) survit jusqu'a un vrai slot RACH. CALYPSO_UL_RACH_STICKY =
+                 * nb de slots eligibles a tenter (def 8 ~ couvre >1 multiframe-51). */
+                memcpy(g_rach_iq, g_ul_iq, sizeof(g_rach_iq));
+                { static int rsticky = -1;
+                  if (rsticky < 0) { const char *e = getenv("CALYPSO_UL_RACH_STICKY"); rsticky = (e && *e) ? atoi(e) : 0;        /* defaut OFF (gate vide) : sticky retire */ }
+                  g_rach_pending = rsticky; g_rach_arm_seq++; }
+                used_tab = 1;
+                static int last_ra = -1;
+                if ((int)real_ra != last_ra) {
+                    last_ra = real_ra;
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "UL RACH RA REELLE=0x%02x bsic=0x%02x (encode a la volee, fn=%u)\n",
+                         real_ra, real_bsic, real_fn);
+                }
+            }
+        }
+
+        /* (DECANNE 2026-06-07 : ancien repli rach_ref.cs16 RA=3 supprime) */
+        if (used_tab) {
+            /* g_ul_iq rempli par la VRAIE RA encodee a la volee */
+        } else {
+            /* DECANNE (2026-06-07) : plus de repli RA=3 canne (rach_ref.cs16 / maison).
+             * Sans vraie RA publiee dans /dev/shm/calypso_rach, on module les bits BSP
+             * bruts (sans sync RACH reconstruite) -> osmo-trx ne les detecte PAS comme un
+             * Channel Request. Fin des RACH RA=3 fantomes qui inondaient le BSC en CHAN
+             * RQD et saturaient le pool SDCCH. */
+            ul_gmsk_mod(bits, g_ul_iq);
+        }
         got = 1;
+        /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
+         * VOIR si c'est un vrai access-burst (sync RACH 41b) ou autre chose, et
+         * confirmer la sortie OSR=4. Couper via CALYPSO_UL_DEBUG=0. */
+        static int ul_dbg = -1, ul_seen = 0;
+        if (ul_dbg < 0) { const char *e = getenv("CALYPSO_UL_DEBUG"); ul_dbg = (!e || *e!='0'); }
+        if (ul_dbg && ul_seen < 8) {
+            ul_seen++;
+            char bs[CALYPSO_BSP_BURSTLEN + 1];
+            int nz = 0;
+            for (int i = 0; i < CALYPSO_BSP_BURSTLEN; i++) { bs[i] = bits[i] > 0 ? '1':'0'; if (bits[i]) nz++; }
+            bs[CALYPSO_BSP_BURSTLEN] = 0;
+            int s0 = g_ul_iq[0], s1 = g_ul_iq[1], smid = g_ul_iq[CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR];
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL-DBG #%d in=%db(nz=%d) out=%d samp [%d,%d..mid=%d] bits=%s\n",
+                 ul_seen, CALYPSO_BSP_BURSTLEN, nz,
+                 CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR, s0, s1, smid, bs);
+        }
     }
     if (got) g_ul_pending = 1;
 }
@@ -587,6 +960,132 @@ static void relay_init(void)
          host, rx_port, tx_port);
 }
 
+/* === FIFO writer FRAME-ATOMIQUE, decouple du hot-path (fix SACCH grgsm) =======
+ * BUG corrige (construction IQ "mauvaise a partir de la fifo") : l'ancien
+ * write(O_NONBLOCK) direct sur le pipe (a) laissait passer des writes PARTIELS
+ * (0<w<fbytes) -> desalignement byte PERMANENT du flux fc32 -> grgsm en garbage ;
+ * (b) DROPpait des trames sur EAGAIN -> trous temporels -> grgsm perd la
+ * 51-multitrame -> SDCCH/4 SACCH (SI5/SI6) jamais decodee (le BCCH/CCCH resync
+ * lui via FCCH/SCH, d'ou "ca marche a moitie").
+ * FIX : 1 thread writer DEDIE par FIFO + ring de TRAMES. Le hot-path DL pousse
+ * une trame (memcpy sous lock court ~20KB) ou la DROP ENTIERE si le ring est
+ * plein ; le writer fait des write() BLOQUANTS COMPLETS (jamais partiels) ->
+ * alignement byte toujours correct, jamais d'underrun cote QEMU. */
+enum { RELAY_NFIFO_MAX = 8, RELAY_RING = 64,   /* 8 : fft+grgsm+record+asciifft + grgsm_ciph (decipher DL) */
+       RELAY_FRAME_FLOATS = CALYPSO_SHM_BUFSIZE * 2 };
+typedef struct {
+    char            path[128];
+    int             fd;                 /* writer-thread-owned */
+    pthread_t       th;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;
+    float           ring[RELAY_RING][RELAY_FRAME_FLOATS];
+    size_t          rlen[RELAY_RING];
+    unsigned        head, tail;         /* SPSC : producer=hot-path, consumer=thread */
+    unsigned long   dropped, written;
+} relay_fifo_t;
+static relay_fifo_t g_rfifo[RELAY_NFIFO_MAX];
+static int          g_rfifo_n = -1;
+
+static void *relay_fifo_writer(void *arg)
+{
+    relay_fifo_t *rf = arg;
+    static __thread float local[RELAY_FRAME_FLOATS];
+    for (;;) {
+        size_t nfloats;
+        pthread_mutex_lock(&rf->mtx);
+        while (rf->head == rf->tail)
+            pthread_cond_wait(&rf->cv, &rf->mtx);
+        unsigned h = rf->head % RELAY_RING;
+        nfloats = rf->rlen[h];
+        memcpy(local, rf->ring[h], nfloats * sizeof(float));
+        rf->head++;
+        pthread_mutex_unlock(&rf->mtx);
+
+        if (rf->fd < 0) {
+            /* OUVERTURE NON-BLOQUANTE : pas de lecteur (ENXIO) -> on DROP cette
+             * trame et on retentera a la suivante. CRUCIAL : l'ancien open(O_WRONLY)
+             * BLOQUANT figeait ce thread tant qu'aucun grgsm n'etait lecteur ; or
+             * quand si_bridge TUE grgsm pour le respawn cipher, le lecteur
+             * disparait -> ce writer + la cascade relay gelaient l'ipc-device
+             * (DL FIFO plein -> osmo-trx SETPOWER no-response -> feed_iq gele ->
+             * pas de LU accept). Avec O_NONBLOCK le churn de lecteur (kill/respawn
+             * grgsm) est INOFFENSIF. Une fois ouvert, on RETIRE O_NONBLOCK pour
+             * garder des write() BLOQUANTS COMPLETS (frame-atomique preserve). */
+            int fd = open(rf->path, O_WRONLY | O_NONBLOCK);
+            if (fd < 0) { rf->dropped++; continue; }   /* ENXIO : aucun lecteur */
+            int fl = fcntl(fd, F_GETFL, 0);
+            if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);  /* writes bloquants */
+            fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+            rf->fd = fd;
+        }
+        const char *p = (const char *)local;
+        size_t left = nfloats * sizeof(float);
+        while (left) {                            /* write COMPLET, jamais partiel */
+            ssize_t w = write(rf->fd, p, left);
+            if (w > 0) { p += (size_t)w; left -= (size_t)w; continue; }
+            if (w < 0 && errno == EINTR) continue;
+            close(rf->fd); rf->fd = -1; break;    /* EPIPE/EBADF : reader parti */
+        }
+        if (!left) rf->written++;
+    }
+    return NULL;
+}
+
+static void relay_fifo_init(void)
+{
+    if (g_rfifo_n >= 0) return;
+    /* SIGPIPE ignore : un write() sur une FIFO dont le lecteur (grgsm) vient de
+     * disparaitre doit renvoyer EPIPE (gere par la boucle write -> reopen), PAS
+     * tuer le process. */
+    signal(SIGPIPE, SIG_IGN);
+    g_rfifo_n = 0;
+    const char *e = getenv("CALYPSO_RELAY_FIFOS");
+    const char *list = (e && *e) ? e
+        : "/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo";
+    char buf[512];
+    strncpy(buf, list, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+    char *sav = NULL, *tok = strtok_r(buf, ":", &sav);
+    while (tok && g_rfifo_n < RELAY_NFIFO_MAX) {
+        relay_fifo_t *rf = &g_rfifo[g_rfifo_n];
+        strncpy(rf->path, tok, 127); rf->path[127] = 0;
+        rf->fd = -1; rf->head = rf->tail = 0; rf->dropped = rf->written = 0;
+        pthread_mutex_init(&rf->mtx, NULL);
+        pthread_cond_init(&rf->cv, NULL);
+        mkfifo(rf->path, 0666);                  /* ignore EEXIST */
+        pthread_create(&rf->th, NULL, relay_fifo_writer, rf);
+        g_rfifo_n++;
+        tok = strtok_r(NULL, ":", &sav);
+    }
+    LOGP(DDEV, LOGL_NOTICE,
+         "RELAY FIFO: %d writer-threads (frame-atomic, ring=%d trames)\n",
+         g_rfifo_n, RELAY_RING);
+}
+
+/* hot-path : pousse 1 trame dans chaque FIFO ; DROP entiere si ring plein. */
+static void relay_fifo_push(const float *frame, size_t nfloats)
+{
+    if (g_rfifo_n < 0) relay_fifo_init();
+    if (nfloats > (size_t)RELAY_FRAME_FLOATS) nfloats = RELAY_FRAME_FLOATS;
+    for (int f = 0; f < g_rfifo_n; f++) {
+        relay_fifo_t *rf = &g_rfifo[f];
+        pthread_mutex_lock(&rf->mtx);
+        if (rf->tail - rf->head >= RELAY_RING) {
+            rf->dropped++;                        /* ring plein -> drop TRAME entiere */
+            if ((rf->dropped % 500) == 1)
+                LOGP(DDEV, LOGL_INFO, "RELAY FIFO %s drop=%lu written=%lu\n",
+                     rf->path, rf->dropped, rf->written);
+        } else {
+            unsigned t = rf->tail % RELAY_RING;
+            memcpy(rf->ring[t], frame, nfloats * sizeof(float));
+            rf->rlen[t] = nfloats;
+            rf->tail++;
+            pthread_cond_signal(&rf->cv);
+        }
+        pthread_mutex_unlock(&rf->mtx);
+    }
+}
+
 /* ---- RX (uplink_thread loop) : produces UL heartbeat zeros to osmo-trx ---- */
 
 int32_t uhdwrap_read(void *dev, uint32_t num_chans)
@@ -616,15 +1115,234 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * un chunk TS0 (ts%1250==0), on l'injecte dans le slot TS0 (samples 0..147). */
     static int16_t ul_chunk[CALYPSO_SHM_BUFSIZE * 2];
     int16_t *ul_src = zeros_iq;
-    if (g_ul_on && g_ul_pending && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+    /* --- reglages UL (sweepables sans rebuild) ---
+     * CALYPSO_UL_FN_OFFSET : decalage FN device->osmo-trx (observe = 31).
+     * CALYPSO_UL_FN_GATE   : 1 = n'injecter que sur un FN RACH-eligible (combined
+     *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
+     * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
+    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : 36;       /* hardcode : offset FN device->osmo-trx (gate vide=36) */ }
+    if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : 1875;   /* hardcode : TOA intra-slot RACH (gate vide=1875) */ }
+    uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
+    uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
+    /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte
+     * sur SON fn == internal_fn (PROUVE : la seule RACH-DET du run est a osmo-trx fn=4058,
+     * exactement = inject#1 internal_fn=4058, que le gate avait etiquete osmo_fn=4094).
+     * L'ancien gate testait osmo_fn%51 = (internal_fn+36)%51 -> il autorisait des slots
+     * (internal%51 in {0,9,10,37..44,47..50}) ou osmo-trx fait tourner le correlateur
+     * NORMAL-BURST, JAMAIS le correlateur RACH -> burst jamais detecte comme access-burst.
+     * Le LU n'a marche QUE par coincidence (inject#1 tombait sur internal%51=29, un vrai
+     * slot RACH). La paging-response (RA=0x98) n'a JAMAIS touche un vrai slot RACH -> aucune
+     * 2e RACH-DET -> pas de CHAN RQD -> pas d'IMM ASS -> SMS jamais livre.
+     * FIX : evaluer l'eligibilite RACH sur internal_fn (== osmo-trx fn), set combination-V
+     * {4,5,14..36,45,46} = exactement osmo-trx Transceiver::expectedCorrType() case V.
+     * NB : le bloc SDCCH (ligne ~1059) garde son propre osmo_fn+eff_ofs (calibre
+     * independamment, SABM/UA OK) -> on NE touche QUE la gate RACH. */
+    uint32_t m51 = internal_fn % 51;
+    int fn_ok = !ul_fngate || (m51 == 4 || m51 == 5 || (m51 >= 14 && m51 <= 36) || m51 == 45 || m51 == 46);
+
+    /* === FN-LOCK (NO-HARDCODE, env CALYPSO_UL_FN_LOCK=1 ; OFF par defaut) =======
+     * Le mobile matche la request-reference de l'IMM ASSIGN sur (ra, T1/T2/T3) =
+     * FN mod 42432 (=32*26*51). Il a memorise (real_fn-1) [prim_rach.c:94] ; osmo-trx
+     * tamponne le burst injecte avec SA FN (= internal_fn + K_trx). Les 3 horloges
+     * sont rate-lockees 1:1 (offset constant verifie ~2016926). On auto-mesure UNE
+     * FOIS la congruence cible cal_off au 1er RACH (ZERO FN hardcode), puis on
+     * n'injecte que sur le slot ou (internal_fn+cal_off)%42432 == (real_fn-1)%42432.
+     * CALYPSO_UL_FN_ADJ = sweep +/- frames (le -1 prim_rach + SB2_LATENCY peut
+     * decaler de 1-2). Invisible tant que l'IMM ASSIGN AGCH n'atteint pas le mobile. */
+    static int ul_fnlock = -1, fn_adj = -99999;
+    if (ul_fnlock < 0)      { const char *e = getenv("CALYPSO_UL_FN_LOCK"); ul_fnlock = (e && *e == '1') ? 1 : 0; }
+    if (fn_adj == -99999)   { const char *e = getenv("CALYPSO_UL_FN_ADJ");  fn_adj = e ? atoi(e) : 0; }
+    int fnlock_ok = 1;
+    if (ul_fnlock) {
+        uint32_t real_fn = g_ul_real_fn;
+        static int cal_done = 0; static uint32_t cal_off = 0;
+        if (!cal_done && real_fn && g_ul_pending) {
+            cal_off = ((real_fn - 1u) - internal_fn) % 42432u;   /* live, magic-free */
+            cal_done = 1;
+            LOGP(DDEV, LOGL_NOTICE, "UL FN-LOCK cal_off=%u (internal_fn=%u real_fn=%u)\n",
+                 cal_off, internal_fn, real_fn);
+        }
+        if (cal_done && real_fn) {
+            int64_t w = ((int64_t)real_fn - 1 + fn_adj) % 42432; if (w < 0) w += 42432;
+            uint32_t have = (internal_fn + cal_off) % 42432u;
+            fnlock_ok = ((uint32_t)w == have);
+        } else {
+            fnlock_ok = 0;                /* pas encore calibre -> attendre un RACH */
+        }
+    }
+    /* RACH a injecter : soit fraichement livre (g_ul_pending, comportement LU 30x),
+     * soit latche STICKY pour la paging-response (g_rach_pending, un seul encode).
+     * On prefere g_rach_iq (intact) a g_ul_iq (clobbe par le SDCCH-idle). */
+    int rach_inject = (g_ul_pending || g_rach_pending > 0);
+    if (g_ul_on && rach_inject && fn_ok && fnlock_ok && (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
         memset(ul_chunk, 0, sizeof(ul_chunk));
-        memcpy(ul_chunk, g_ul_iq, sizeof(g_ul_iq));   /* TS0 = 148 samples */
+        int off = ul_slotoff < 0 ? 0 : ul_slotoff;
+        if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;  /* borne */
+        /* g_rach_iq survit au clobber SDCCH-idle -> source preferentielle */
+        memcpy(ul_chunk + 2 * off, g_rach_iq, sizeof(g_rach_iq));
         ul_src = ul_chunk;
         g_ul_pending = 0;
+        if (g_rach_pending > 0) g_rach_pending--;   /* consomme un slot eligible */
         static unsigned ul_inj = 0;
-        if (ul_inj++ < 20 || (ul_inj % 200) == 0)
-            LOGP(DDEV, LOGL_INFO, "UL inject #%u burst → ts=%llu (TS0)\n",
-                 ul_inj, (unsigned long long)d->rx_ts);
+        if (ul_inj++ < 30 || (ul_inj % 100) == 0)
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL inject #%u → internal_fn=%u osmo_fn=%u (%%51=%u) slotoff=%d ts=%llu rach_pend=%d seq=%u\n",
+                 ul_inj, internal_fn, osmo_fn, m51, off, (unsigned long long)d->rx_ts,
+                 g_rach_pending, g_rach_arm_seq);
+    }
+
+    /* === SDCCH/SACCH UL (#12 PIÈCE 2) : burst NORMAL encodé sur le slot dédié =======
+     * Le firmware met la L2 montante (SABM/SACCH/idle) dans a_cu -> sideband. On
+     * l'encode (gsm0503_xcch + TSC7) et on l'injecte sur le slot SDCCH/4 SS0 UL
+     * (osmo_fn%51 ∈ {37..40}, burst bid = osmo_fn%51-37). Priorité sur le relay
+     * (ul_src=ul_chunk -> le relay 5811 skip via `ul_src != ul_chunk`). N'écrase PAS
+     * le RACH (gate ul_src != ul_chunk). Tunables CALYPSO_UL_SDCCH(=1), _SDCCH_OFS. */
+    static int ul_sdcch = -1, sd_ofs = -99999;
+    if (ul_sdcch < 0)    { const char *e = getenv("CALYPSO_UL_SDCCH");     ul_sdcch = (!e || *e != '0') ? 1 : 0; }
+    if (sd_ofs == -99999){ const char *e = getenv("CALYPSO_UL_SDCCH_OFS"); sd_ofs = e ? atoi(e) : 0; }
+    if (ul_sdcch &&
+        (d->rx_ts % ((uint64_t)CALYPSO_FRAME_SAMPLES)) == 0) {
+        /* POLL le sideband a CHAQUE frame (pas seulement aux slots inject). La SABM
+         * (ctrl 0x3f) est publiee a l1s%51={36-39} mais l'offset l1s<->osmo_fn faisait
+         * que les reads gates sur les slots SDCCH tombaient sur de l'idle -> SABM
+         * jamais vue. Poller chaque frame la capture des qu'elle est publiee -> cache
+         * sticky, tenu CALYPSO_UL_SABM_TTL blocs, prefere a l'idle au latch bid 0 ->
+         * elle part sur un bloc complet aligne -> osmo-bts Rx SABM -> UA.
+         * CALYPSO_UL_SABM_STICKY=0 desactive. */
+        static uint8_t pend_l2[23]; static int pend_valid = 0;   /* trame UL en attente (1 bloc) */
+        static uint32_t last_seq = 0; static int sticky = -1;
+        static uint8_t l1s51 = 0xff;
+        static int sd_autoofs = -99999;          /* offset auto-calibre l1s%51 -> osmo s51 */
+        if (sticky < 0) { const char *e = getenv("CALYPSO_UL_SABM_STICKY"); sticky = (!e || *e != '0') ? 1 : 0; }
+        { uint8_t l2[23]; uint32_t lfn = 0, seq = 0;
+          if (calypso_sdcch_ul_read(l2, &l1s51, &lfn, &seq)) {
+              /* #2 UL DCCH, CONSUME-ONCE PAR SEQ : chaque transmission firmware = un seq
+               * nouveau. On capture la trame une fois par seq nouveau (SAPI0 signalisation
+               * OU SAPI3 SMS), injectee sur UN bloc SDCCH puis effacee (cf injection bid 0).
+               * Remplace le buffer sticky a TTL partage qui faisait SAPI3 ecraser SAPI0
+               * pendant le SMS -> lien principal down. Le firmware multiplexe deja SAPI0/
+               * SAPI3 par bloc ; un miss -> retransmission T200 (nouveau seq) -> recapture.
+               * Filtre : idle (UI 0x03) et SACCH SAPI1 (sapi=(a0>>2)&7) ecartes.
+               * NB : depuis le fix PUBLISH-NO-IDLE cote QEMU, l'idle n'est PLUS publie ->
+               * tout seq nouveau est porteur ; le filtre is_fill reste (defensif). */
+              int sapi = (l2[0] >> 2) & 0x07;
+              int is_fill = (l2[1] == 0x03);
+              if (sticky && seq != last_seq && (sapi == 0 || sapi == 3) && !is_fill) {
+                  last_seq = seq;
+                  memcpy(pend_l2, l2, sizeof(pend_l2)); pend_valid = 1;
+                  /* #2 v3 ALIGNEMENT DETERMINISTE (2026-06-09) : l'ancien auto-calib
+                   * (sd_autoofs = 37 - osmo_fn%51) derivait l'offset de l'INSTANT ou le
+                   * firmware publie la SABM, dicte par l1s.current_time.fn -> seede par
+                   * le SCH FN que gr-gsm decode au sync -> RUN-VARIANT. SUPPRIME.
+                   * Avec osmo-trx START_FN=0 ET IPCDevice ts_initial snappe a 102*5000,
+                   * osmo_trx_fn == internal_fn (mod 102) ; ul_fnoff=36 -> eff_ofs FIXE=15
+                   * place bid0..3 sur osmo_trx_fn%51 {37,38,39,40} = SDCCH/4 SS0 UL.
+                   * CALYPSO_UL_SDCCH_OFS surcharge pour sweeper si besoin. */
+              }
+          } }
+        int eff_ofs = (sd_ofs != 0) ? sd_ofs : 15;
+        uint32_t s51 = (uint32_t)((((long)osmo_fn + eff_ofs) % 51 + 51) % 51);
+        if (ul_src != ul_chunk && s51 >= 37 && s51 <= 40) {   /* SDCCH/4 SS0 UL block */
+            int bid = (int)s51 - 37;
+            /* COHÉRENCE DE BLOC (#2 v2) : osmo-bts desentrelace les 4 bursts osmo%51
+             * {37,38,39,40} EN UN bloc L2 -> les 4 DOIVENT porter le MEME L2. On TIENT
+             * donc la derniere trame signalisante captee (held_l2) de facon persistante
+             * et on la snapshot -> blk_l2 UNIQUEMENT a bid 0, reutilisee pour bid 1..3.
+             * Plus de latch mid-bloc (qui rendait le bloc incoherent : bid0=idle +
+             * bid1-3=SABM -> CRC fail). held tient jusqu'a remplacement par une nouvelle
+             * capture OU expiration (CALYPSO_UL_SABM_HOLD_TTL blocs, def 30 ~7s ; rafraichi
+             * a chaque capture). La SABM etant retransmise ~1/s (T200) et injectee sur
+             * ~4 blocs/s, osmo-bts voit plusieurs blocs SABM COHERENTS -> decode -> UA.
+             * CALYPSO_UL_SABM_HOLD=0 = legacy (pas de hold persistant). */
+            static uint8_t held_l2[23]; static int held_valid = 0; static int held_ttl = 0;
+            static uint8_t blk_l2[23]; static int blk_valid = 0;
+            static int hold_on = -1, hold_ttl_max = -1;
+            if (hold_on < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD"); hold_on = (!e || *e != '0') ? 1 : 0; }
+            if (hold_ttl_max < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD_TTL"); hold_ttl_max = (e && *e) ? atoi(e) : 30; }
+            /* capture persistante : toute nouvelle trame signalisante remplace held_l2 */
+            if (sticky && pend_valid) {
+                memcpy(held_l2, pend_l2, sizeof(held_l2)); held_valid = 1;
+                held_ttl = hold_on ? hold_ttl_max : 1; pend_valid = 0;
+            }
+            if (bid == 0) {                         /* snapshot 1×/bloc -> 4 bursts coherents */
+                if (held_valid && held_ttl > 0) {
+                    memcpy(blk_l2, held_l2, sizeof(blk_l2)); blk_valid = 1;
+                    if (--held_ttl == 0) held_valid = 0;
+                } else {
+                    blk_l2[0] = 0x01; blk_l2[1] = 0x03; blk_l2[2] = 0x01;   /* idle UI SDCCH FIXE SAPI0 */
+                    memset(blk_l2 + 3, 0x2b, sizeof(blk_l2) - 3); blk_valid = 1;
+                }
+            }
+            if (blk_valid) {
+                int8_t ab[CALYPSO_BSP_BURSTLEN];
+                ul_build_sdcch_burst(ab, blk_l2, bid);
+                /* === CHIFFREMENT A5 UL ============================================
+                 * Si un Kc a ete capture (CIPHER MODE COMMAND -> /dev/shm/calypso_kc),
+                 * on chiffre les 114 bits data du burst (mapping IDENTIQUE a osmo-bts
+                 * scheduler.c:1614 : negation soft-bit ab[i+3] / ab[i+88]). osmo-bts
+                 * dechiffre l'UL avec le FN du burst -> A5 est FN-keye : FN = osmo_fn
+                 * (+ CALYPSO_CIPH_FN_ADJ, sweepable car l'alignement FN device<->bts
+                 * est la variable critique). CALYPSO_CIPH_A5 force le n (debug). */
+                {
+                    static int ci_init = -1, ci_fn_adj = 0, ci_force_n = -1;
+                    static uint8_t kc[16]; static int n_a5 = 0;
+                    if (ci_init < 0) {
+                        const char *e = getenv("CALYPSO_CIPH_FN_ADJ"); ci_fn_adj = e ? atoi(e) : 0;
+                        const char *f = getenv("CALYPSO_CIPH_A5");     ci_force_n = (f && *f) ? atoi(f) : -1;
+                        ci_init = 1;
+                    }
+                    uint8_t cgalgo = 0, cklen = 0;
+                    if (calypso_kc_read(&cgalgo, kc, &cklen))
+                        n_a5 = (ci_force_n >= 0) ? ci_force_n
+                                                 : ((cgalgo >= 1 && cgalgo <= 3) ? cgalgo : 0);
+                    else
+                        n_a5 = 0;                       /* seq=0 -> cipher off */
+                    if (n_a5 >= 1 && n_a5 <= 3) {
+                        ubit_t ks[114];
+                        /* FN du keystream = internal_fn (= horloge osmo-trx/osmo-bts,
+                         * PROUVE par la RACH-DET a osmo-trx fn==internal_fn), PAS osmo_fn
+                         * (=internal_fn+36, label legacy trompeur). osmo-bts dechiffre le
+                         * burst UL recu avec SON FN = internal_fn ; on doit chiffrer au
+                         * meme FN sinon keystream different (A5 FN-keye) -> CIPHER MODE
+                         * COMPLETE illisible -> pas de LU ACCEPT. CALYPSO_CIPH_FN_ADJ=0. */
+                        uint32_t fnc = (uint32_t)((long)internal_fn + ci_fn_adj);
+                        osmo_a5(n_a5, kc, fnc, NULL, ks);       /* keystream UL */
+                        for (int i = 0; i < 57; i++) {
+                            if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
+                            if (ks[i + 57]) ab[i + 88] = (int8_t)-ab[i + 88];
+                        }
+                        static unsigned nci = 0;
+                        if (nci++ < 30 || (nci % 100) == 0)
+                            LOGP(DDEV, LOGL_NOTICE,
+                                 "UL CIPHER A5/%d bid=%d fn=%u (adj=%d) Kc=%02x%02x%02x%02x..\n",
+                                 n_a5, bid, fnc, ci_fn_adj, kc[0], kc[1], kc[2], kc[3]);
+                    }
+                }
+                ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
+                memset(ul_chunk, 0, sizeof(ul_chunk));
+                /* offset ÉCHANTILLON dédié au burst NORMAL (≠ access-burst RACH) : le
+                 * détecteur normal-burst d'osmo-trx corrèle le TSC à une position
+                 * différente du détecteur RACH -> au même offset que le RACH, le TSC
+                 * tombe hors fenêtre. CALYPSO_UL_SDCCH_SMP_OFS=N (échantillons, sweepable,
+                 * peut être négatif) décale le burst normal pour caler le TSC. */
+                static int sd_smp = -999999;
+                if (sd_smp == -999999) { const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS"); sd_smp = e ? atoi(e) : 0; }
+                int off = (ul_slotoff < 0 ? 0 : ul_slotoff) + sd_smp;
+                if (off < 0) off = 0;
+                if (2 * off + (int)sizeof(g_ul_iq) > (int)sizeof(ul_chunk)) off = 0;
+                memcpy(ul_chunk + 2 * off, g_ul_iq, sizeof(g_ul_iq));
+                ul_src = ul_chunk;
+                static unsigned sd_inj = 0;
+                int is_idle_inj = (blk_l2[0] == 0x01 && blk_l2[1] == 0x03 && blk_l2[2] == 0x01);
+                if (sd_inj++ < 40 || !is_idle_inj || (sd_inj % 200) == 0)
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "UL SDCCH inject #%u%s bid=%d osmo%%51=%u l1s%%51=%u eff_ofs=%d L2=%02x %02x %02x\n",
+                         sd_inj, is_idle_inj ? "" : " *SABM/SIG*", bid, s51, l1s51,
+                         eff_ofs, blk_l2[0], blk_l2[1], blk_l2[2]);
+            }
+        }
     }
 
     /* ---- WALL-PACED UL heartbeat (clock_nanosleep ABSTIME) ----
@@ -693,11 +1411,17 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * ce tick, zéros (le clock doit avancer). Buffer local (thread DL séparé). */
     relay_init();
     int16_t relay_ul[CALYPSO_SHM_BUFSIZE * 2];
-    if (g_relay_on && g_relay_ul_fd >= 0) {
+    /* FIX LU 2026-06-05 : PRIORITE ABSOLUE a la RACH injectee. Si ul_src==ul_chunk
+     * (IPC_UL a injecte une RACH ce tick), on SAUTE entierement le bloc relais —
+     * sinon recvfrom(5811) (le flowgraph gr-gsm emet sur 5811 en full-grgsm) renvoie
+     * n>0 et `ul_src = relay_ul` ECRASAIT la RACH -> enqueue de zeros -> NOPE/-110.
+     * (l'ancien garde ne protegeait que n<=0, pas n>0.) */
+    if (g_relay_on && g_relay_ul_fd >= 0 && ul_src != ul_chunk) {
         float ulf[CALYPSO_SHM_BUFSIZE * 2];
         ssize_t n = recvfrom(g_relay_ul_fd, ulf, sizeof(ulf), MSG_DONTWAIT, NULL, NULL);
-        memset(relay_ul, 0, sizeof(relay_ul));
         if (n > 0) {
+            /* Le relais (transceiver gr-gsm, 5811) a des donnees -> prioritaire. */
+            memset(relay_ul, 0, sizeof(relay_ul));
             int ns = (int)(n / (2 * sizeof(float)));
             if (ns > CALYPSO_SHM_BUFSIZE) ns = CALYPSO_SHM_BUFSIZE;
             for (int i = 0; i < ns * 2; i++) {
@@ -705,10 +1429,33 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 if (v > 32767.0f) v = 32767.0f; else if (v < -32768.0f) v = -32768.0f;
                 relay_ul[i] = (int16_t)v;
             }
+            ul_src = relay_ul;
+        } else if (ul_src != ul_chunk) {
+            /* Pas de RACH injectee par IPC_UL ce tick -> zeros (l'horloge avance). */
+            memset(relay_ul, 0, sizeof(relay_ul));
+            ul_src = relay_ul;
         }
-        ul_src = relay_ul;
+        /* FIX LU 2026-06-04 : sinon (relais vide MAIS IPC_UL a injecte une RACH)
+         * on GARDE ul_chunk. Avant, ce bloc ecrasait INCONDITIONNELLEMENT ul_src
+         * par relay_ul (vide en full-grgsm : transceiver 5811 absent) -> la RACH
+         * du mobile (BSP -> ul_gmsk_mod -> ul_chunk) etait jetee -> osmo-trx
+         * envoyait des NOPE -> BTS jamais de CHAN RQD -> Location Update echouait. */
     }
 
+    /* INSTR : a l'enqueue, quand le burst RACH est dans ul_src (==ul_chunk),
+     * prouver qu'il porte de l'energie ET qu'il part vers un stream RX valide. */
+    {
+        static int eqdbg = -1; if (eqdbg < 0) { const char *e = getenv("CALYPSO_UL_DEBUG"); eqdbg = (!e || *e != '0'); }
+        if (eqdbg && ul_src == ul_chunk) {
+            static unsigned eqn = 0;
+            int nz = 0; for (int i = 0; i < CALYPSO_SHM_BUFSIZE * 2; i++) if (ul_src[i]) nz++;
+            if (eqn++ < 40)
+                LOGP(DDEV, LOGL_NOTICE,
+                     "ENQ-RACH #%u ts=%llu num_chans=%u rx0=%p nz=%d s0=[%d,%d]\n",
+                     eqn, (unsigned long long)d->rx_ts, num_chans,
+                     (void *)ios_rx_from_device[0], nz, ul_src[0], ul_src[1]);
+        }
+    }
     for (uint32_t c = 0; c < num_chans && c < 8; c++) {
         if (!ios_rx_from_device[c]) continue;
         int32_t rc = ipc_shm_enqueue(ios_rx_from_device[c],
@@ -773,52 +1520,12 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
                 sendto(g_relay_dl_fd, g_relay_fbuf, (size_t)ns * 2 * sizeof(float),
                        MSG_DONTWAIT, (struct sockaddr *)&g_relay_dl_dst,
                        sizeof(g_relay_dl_dst));
-            /* FIFOs LIVE frame-par-frame : on pousse CHAQUE "trame cfile" (le
-             * full chunk relay continu = ns*2 floats fc32, 1 write() = 1 trame)
-             * dans 1 FIFO par consommateur (fft, grgsm, record). NON-BLOQUANT :
-             * si un lecteur est lent/absent on DROP la trame => aucun stall du
-             * hot-path DL => PLUS d'underrun. (C'est le fwrite du RING cfile
-             * entier 128MB sur tmpfs + fseek qui causait les underruns.)
-             * Le RECORD se fait A COTE : un drainer externe (run.sh) lit
-             * iq_record.fifo -> record.cfile, hors du hot-path qemu.
-             * Liste CALYPSO_RELAY_FIFOS (':'-separes), defaut fft:grgsm:record.*/
-            {
-                enum { MAXFIFO = 4 };
-                static int   fifo_fd[MAXFIFO];
-                static char  fifo_path[MAXFIFO][128];
-                static int   nfifo = -1;
-                if (nfifo < 0) {
-                    nfifo = 0;
-                    const char *e = getenv("CALYPSO_RELAY_FIFOS");
-                    const char *list = (e && *e) ? e
-                        : "/tmp/iq_fft.fifo:/tmp/iq_grgsm.fifo:/tmp/iq_record.fifo";
-                    char buf[512];
-                    strncpy(buf, list, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
-                    char *sav = NULL, *tok = strtok_r(buf, ":", &sav);
-                    while (tok && nfifo < MAXFIFO) {
-                        strncpy(fifo_path[nfifo], tok, 127);
-                        fifo_path[nfifo][127] = 0;
-                        fifo_fd[nfifo] = -1;
-                        mkfifo(fifo_path[nfifo], 0666);   /* ignore EEXIST */
-                        nfifo++;
-                        tok = strtok_r(NULL, ":", &sav);
-                    }
-                }
-                size_t fbytes = (size_t)ns * 2 * sizeof(float);   /* 1 trame cfile */
-                for (int f = 0; f < nfifo; f++) {
-                    if (fifo_fd[f] < 0) {
-                        /* O_NONBLOCK : -1/ENXIO tant qu'aucun lecteur n'a ouvert */
-                        fifo_fd[f] = open(fifo_path[f], O_WRONLY | O_NONBLOCK);
-                        if (fifo_fd[f] < 0) continue;
-                        fcntl(fifo_fd[f], F_SETPIPE_SZ, 1 << 20); /* 1MB = marge ~50 trames */
-                    }
-                    ssize_t w = write(fifo_fd[f], g_relay_fbuf, fbytes);
-                    if (w < 0 && (errno == EPIPE || errno == EBADF)) {
-                        close(fifo_fd[f]); fifo_fd[f] = -1;   /* lecteur parti -> reouvrira */
-                    }
-                    /* EAGAIN (pipe plein, lecteur lent) : DROP cette trame. */
-                }
-            }
+            /* FIFOs LIVE frame-par-frame -> writer-thread FRAME-ATOMIQUE
+             * (cf relay_fifo_push / relay_fifo_writer ci-dessus). Plus de write
+             * partiel ni de desalignement byte -> grgsm garde la 51-multitrame
+             * -> SDCCH/4 SACCH (SI5/SI6) decodee. Drop = TRAME entiere si ring
+             * plein (continuite byte preservee). CALYPSO_RELAY_FIFOS (':'-sep).*/
+            relay_fifo_push(g_relay_fbuf, (size_t)ns * 2);
             /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
              * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour
              * alimenter feed_iq (cfile + shm ring grgsm↔BSP). Defaut: relais pur. */

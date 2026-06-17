@@ -93,6 +93,15 @@ typedef struct L1CTLSock {
 
 static L1CTLSock g_l1ctl;
 
+/* FN-FIX : le FN que le firmware envoie au mobile dans L1CTL_RACH_CONF (msg type
+ * 0x0c), capture ICI au moment EXACT ou le mobile le recoit (= ce qu'il memorise
+ * pour matcher la req-ref de l'IMM ASSIGN, gsm48_rr.c:3372). Lu par le shunt
+ * (calypso_dsp_shunt.c) pour reecrire la req-ref. Source race-free : pas de lecture
+ * paresseuse de last_rach.fn @0x836500 (qui est asynchrone vs l'IMM ASS du BTS). */
+volatile uint32_t g_last_rach_conf_fn = 0;
+volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
+extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
+
 /* ---- Sercomm helpers ---- */
 
 static int sercomm_wrap(uint8_t dlci, const uint8_t *payload, int plen,
@@ -228,6 +237,14 @@ static void sercomm_frame_complete(L1CTLSock *s)
                 L1CTL_LOG("GATE-AGCH #2 pch: IMM ASSIGNMENT injecté");
             }
         }
+        /* FN-FIX : capture le FN du RACH_CONF (0x0c) = le FN que le mobile memorise.
+         * Layout : l1ctl_hdr(4) + l1ctl_info_dl ; frame_nr (BE) @ payload[8..11]. */
+        if (payload[0] == 0x0c && plen >= 12) {
+            g_last_rach_conf_fn = ((uint32_t)payload[8] << 24) | ((uint32_t)payload[9] << 16) |
+                                  ((uint32_t)payload[10] << 8) | (uint32_t)payload[11];
+            g_rach_conf_fn[g_last_recorded_ra] = g_last_rach_conf_fn;   /* per-ra : keye par le ra de la derniere RACH */
+            L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile, ra=0x%02x)", g_last_rach_conf_fn, g_last_recorded_ra);
+        }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
         l1ctl_send_to_mobile(s, payload, plen);
@@ -314,6 +331,51 @@ static void l1ctl_client_readable(void *opaque)
         if (s->lp_len < 2 + msglen) break;  /* incomplete */
 
         uint8_t *payload = &s->lp_buf[2];
+
+        /* === CAPTURE Kc (chiffrement A5) : L1CTL_CRYPTO_REQ (0x15) mobile->fw ===
+         * payload : [0]=0x15 [1]flags [2..3]pad [4]chan_nr [5]link_id [6..7]pad
+         * [8]algo [9]key_len [10..]Kc. On ecrit /dev/shm/calypso_kc (seq,algo,
+         * key_len,Kc) -> l'ipc-device chiffre l'UL (osmo_a5) et si_bridge relance
+         * grgsm -k pour dechiffrer le DL. Le Kc capture = celui derive par le
+         * mobile (A8) = exactement celui du reseau. */
+        if (payload[0] == 0x15 && msglen >= 10) {
+            uint8_t algo = payload[8];
+            uint8_t klen = payload[9];
+            if (klen > 16) klen = 16;
+            if (10 + (int)klen <= msglen) {
+                static uint32_t kc_seq = 0;
+                uint8_t kbuf[32];
+                memset(kbuf, 0, sizeof(kbuf));
+                kc_seq++;
+                memcpy(kbuf, &kc_seq, 4);              /* [0..3] seq (LE) */
+                kbuf[4] = algo; kbuf[5] = klen;        /* [4]algo [5]key_len */
+                memcpy(kbuf + 6, &payload[10], klen);  /* [6..] Kc */
+                int kfd = open("/dev/shm/calypso_kc",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (kfd >= 0) {
+                    if (write(kfd, kbuf, sizeof(kbuf)) < 0) { /* ignore */ }
+                    close(kfd);
+                }
+                L1CTL_LOG("CRYPTO_REQ: algo=%u klen=%u "
+                          "Kc=%02x%02x%02x%02x%02x%02x%02x%02x -> "
+                          "/dev/shm/calypso_kc#%u", algo, klen,
+                          payload[10], payload[11], payload[12], payload[13],
+                          payload[14], payload[15], payload[16], payload[17],
+                          kc_seq);
+            }
+        }
+        /* Reset cipher a l'etablissement/liberation du canal dedie : chaque
+         * nouveau canal demarre EN CLAIR jusqu'a son propre CIPHER MODE COMMAND
+         * (sinon un Kc perime chiffrerait la SABM du canal suivant). */
+        if (payload[0] == 0x05 || payload[0] == 0x12) {   /* DM_EST_REQ / DM_REL_REQ */
+            int kfd = open("/dev/shm/calypso_kc",
+                           O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (kfd >= 0) {
+                uint8_t z[32]; memset(z, 0, sizeof(z));
+                if (write(kfd, z, sizeof(z)) < 0) { /* ignore */ }
+                close(kfd);
+            }
+        }
 
         /* Wrap in sercomm and inject into UART RX */
         uint8_t frame[1024];

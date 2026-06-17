@@ -29,6 +29,7 @@
 
 extern CalypsoUARTState *g_uart_modem;
 extern CalypsoUARTState *g_uart_irda;
+/* calypso_dsp_shunt_record_rach() : prototype dans calypso_dsp_shunt.h */
 
 #include "hw/arm/calypso/calypso_debug.h"
 #define TRX_LOG(fmt, ...) \
@@ -328,6 +329,30 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     return val;
 }
 
+/* === Sideband RACH (NO-HARDCODE) ============================================
+ * Le firmware ecrit la VRAIE RACH dans d_rach (mot NDB 0x023A = byte 0x0474) :
+ * value = (ra<<8) | (bsic<<2). On la publie au device (qemu_wrap ul_drain) via
+ * un fichier REGULIER /dev/shm/calypso_rach (PAS un FIFO -> pas de blocage).
+ * Layout fige (16 octets), partage avec qemu_wrap.c. Single-writer/single-reader,
+ * pwrite atomique 16o, seq ecrite en dernier. Remplace le RA=3 hardcode du device. */
+static void calypso_rach_publish(uint8_t ra, uint8_t bsic, uint32_t fn)
+{
+    static int fd = -2;
+    if (fd == -2) {
+        fd = open("/dev/shm/calypso_rach", O_CREAT | O_RDWR, 0644);
+        if (fd >= 0 && ftruncate(fd, 16) < 0) { /* best-effort */ }
+    }
+    if (fd < 0) return;
+    static uint32_t seq = 0;
+    seq++;
+    uint8_t buf[16] = {0};
+    buf[4] = ra;
+    buf[5] = bsic;
+    memcpy(buf + 8, &fn, sizeof(fn));
+    memcpy(buf + 0, &seq, sizeof(seq));   /* seq en premier mais ecrit atomiquement */
+    if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
+}
+
 static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     CalypsoTRX *s = opaque;
@@ -515,6 +540,23 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                         i, (unsigned)ring[k].off, v, ring[k].sz,
                         -d_insn, ra, bsic, ring[k].fn, tag);
             }
+        }
+    }
+
+    /* NO-HARDCODE : publie la VRAIE RA+FN au mot d_rach (byte = word*2). Tire a
+     * CHAQUE ecriture d_rach par le firmware -> fiable, independant de la voie
+     * d_task_ra/page (qui rate cote shunt LATCH). value = (ra<<8)|(bsic<<2). */
+    {
+        static uint32_t dr_byte = 0;
+        if (!dr_byte) {
+            const char *e = getenv("CALYPSO_NDB_D_RACH_OFFSET");
+            uint32_t w = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x023A;
+            dr_byte = w * 2;   /* 0x023A word -> 0x0474 ARM byte */
+        }
+        if (offset == dr_byte && value != 0 && (size == 2 || size == 4)) {
+            uint8_t ra = (uint8_t)((value >> 8) & 0xFF);
+            calypso_rach_publish(ra, (uint8_t)((value & 0xFF) >> 2), s->fn);
+            calypso_dsp_shunt_record_rach(ra);   /* SONDE B : l1s.current_time.fn par RA */
         }
     }
 

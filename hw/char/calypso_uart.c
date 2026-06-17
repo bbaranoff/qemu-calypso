@@ -455,32 +455,17 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
     }
 
-    /* IrDA UART: burst-only channel from bridge.
-     * Parse sercomm, extract DLCI 4, route to calypso_trx_rx_burst.
-     * Nothing goes to FIFO — this UART is dedicated to bursts. */
+    /* IrDA UART: raw debug / IrDA-stack channel.  The firmware irphy SIR
+     * de-framer reads these bytes via the RX FIFO (uart_getchar_nb), so push
+     * them straight into the FIFO and raise LSR_DR + the RX IRQ (same as
+     * calypso_uart_inject_raw).  Legacy burst-over-UART routing removed: GSM
+     * DL bursts arrive via UDP/BSP, never this UART. */
     if (s->label && !strcmp(s->label, "irda")) {
-        static uint8_t ir_buf[512];
-        static int ir_len = 0;
-        static int ir_state = 0;
-        for (int i = 0; i < size; i++) {
-            uint8_t b = buf[i];
-            if (ir_state == 0) {
-                if (b == 0x7E) { ir_state = 1; ir_len = 0; }
-            } else if (ir_state == 2) {
-                if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b ^ 0x20;
-                ir_state = 1;
-            } else {
-                if (b == 0x7E) {
-                    if (ir_len >= 2 && ir_buf[0] == 4)
-                        calypso_trx_rx_burst(&ir_buf[2], ir_len - 2);
-                    ir_len = 0;
-                } else if (b == 0x7D) {
-                    ir_state = 2;
-                } else {
-                    if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b;
-                }
-            }
-        }
+        for (int i = 0; i < size; i++)
+            fifo_push(s, buf[i]);
+        if (s->rx_count > 0)
+            s->lsr |= LSR_DR;
+        calypso_uart_update_irq(s);
         return;
     }
 

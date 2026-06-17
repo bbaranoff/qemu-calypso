@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pdftotext -layout /home/nirvana/qemu-src/hw/arm/calypso/doc/spru172c.pdf /tmp/spru.txt)"
+      "Bash(mkdir -p build)",
+      "Bash(../configure --target-list=arm-softmmu --disable-docs)",
+      "Bash(find build/ -name qemu-system-* -type f)",
+      "Bash(ls build/qemu-system-*)",
+      "Bash(rm -rf build)",
+      "Bash(mkdir build:*)",
+      "Bash(ls hw/arm/Kconfig*)",
+      "Bash(rm:*)",
+      "Bash(chmod +x /home/nirvana/qemu/run-mobile.sh)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/nirvana/.claude/hooks/sync_calypso_mirrors.sh"
+          }
+        ]
+      }
     ]
   }
 }

@@ -8,6 +8,7 @@ CFLAGS  += -Wall -Wextra -O2 -g -I. -D_GNU_SOURCE
 CFLAGS  += $(shell pkg-config --cflags libosmocore 2>/dev/null)
 LDFLAGS +=
 LDLIBS  += $(shell pkg-config --libs libosmocore 2>/dev/null || echo "-losmocore")
+LDLIBS  += -L/usr/local/lib -losmocoding -losmogsm -losmoisdn -losmocodec -losmocore -ltalloc -lmnl
 LDLIBS  += -lpthread -lrt -lm
 
 SRCS = \
