@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Corrélateur FCCH — d_fb_det = 0</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root{
+  --bg:#091020; --panel:#0e1626; --panel2:#121d31;
+  --line:#23304f; --line-soft:#192340;
+  --ink:#dde6f7; --muted:#8493b6; --faint:#5b6a8e;
+  --pass:#48c08c; --fault:#f0726f; --hot:#e6b24a; --reg:#5cc8e0; --flow:#7aa2f7;
+  --mono:'JetBrains Mono','SF Mono','Cascadia Code',ui-monospace,Menlo,monospace;
+  --sans:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--sans); line-height:1.55;
+  background-image:
+    linear-gradient(var(--line-soft) 1px,transparent 1px),
+    linear-gradient(90deg,var(--line-soft) 1px,transparent 1px);
+  background-size:30px 30px;
+  background-position:center;
+}
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none;
+  background:radial-gradient(120% 80% at 50% -10%,rgba(122,162,247,.10),transparent 60%);
+}
+.wrap{max-width:1080px; margin:0 auto; padding:56px 24px 80px; position:relative}
+
+/* ---- header ---- */
+.eyebrow{font-family:var(--mono); font-size:11.5px; letter-spacing:.22em; text-transform:uppercase; color:var(--flow); margin:0 0 14px}
+h1{font-size:clamp(26px,4.5vw,40px); font-weight:700; letter-spacing:-.02em; margin:0 0 16px; line-height:1.1}
+h1 code{font-family:var(--mono); font-weight:700; color:var(--fault); font-size:.82em; background:rgba(240,114,111,.08); padding:.05em .28em; border-radius:5px}
+.lede{font-size:16px; color:var(--muted); max-width:74ch; margin:0 0 22px}
+.lede b{color:var(--ink); font-weight:600}
+.lede code{font-family:var(--mono); font-size:.86em; color:var(--reg)}
+.meta{display:flex; flex-wrap:wrap; gap:8px; margin-top:6px}
+.tag{font-family:var(--mono); font-size:11.5px; letter-spacing:.04em; padding:5px 11px; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:var(--panel)}
+.tag.ok{color:var(--pass); border-color:rgba(72,192,140,.35); background:rgba(72,192,140,.06)}
+
+/* ---- sections ---- */
+section{margin-top:60px}
+.sec-head{display:flex; align-items:baseline; gap:14px; margin:0 0 26px; padding-bottom:14px; border-bottom:1px solid var(--line)}
+.sec-num{font-family:var(--mono); font-size:13px; color:var(--flow); font-weight:700}
+h2{font-size:19px; font-weight:600; letter-spacing:-.01em; margin:0}
+.sec-head .sub{margin-left:auto; font-family:var(--mono); font-size:11.5px; color:var(--faint)}
+
+/* ---- pipeline (schéma 1) ---- */
+.pipe{display:flex; flex-direction:column; align-items:center}
+.node{
+  width:100%; max-width:680px; background:var(--panel); border:1px solid var(--line);
+  border-radius:11px; padding:15px 19px; position:relative; transition:transform .15s ease,border-color .15s ease;
+}
+.node:hover{transform:translateY(-1px); border-color:#2e3f63}
+.node .nh{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.node .nt{font-family:var(--mono); font-weight:700; font-size:14px; letter-spacing:.01em}
+.node .nfile{font-family:var(--mono); font-size:12px; color:var(--reg); font-weight:500}
+.node .nb{font-family:var(--mono); font-size:12px; color:var(--muted); margin-top:7px; line-height:1.7}
+.node .nb b{color:var(--ink); font-weight:500}
+.node.heart{border-color:rgba(230,178,74,.5); background:linear-gradient(180deg,rgba(230,178,74,.07),var(--panel))}
+.node.heart .nt{color:var(--hot)}
+.node.goal{border-color:rgba(72,192,140,.4); background:linear-gradient(180deg,rgba(72,192,140,.06),var(--panel))}
+.node.goal .nt{color:var(--pass)}
+.pill{font-family:var(--mono); font-size:10px; letter-spacing:.04em; padding:2px 8px; border-radius:999px; white-space:nowrap}
+.pill.warn{color:var(--hot); background:rgba(230,178,74,.12); border:1px solid rgba(230,178,74,.35)}
+.pill.blk{color:var(--fault); background:rgba(240,114,111,.1); border:1px solid rgba(240,114,111,.32)}
+
+.flow{display:flex; flex-direction:column; align-items:center; height:46px; position:relative}
+.flow .ln{width:1.5px; flex:1; background:linear-gradient(var(--flow),rgba(122,162,247,.35))}
+.flow .lbl{position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  font-family:var(--mono); font-size:11px; color:var(--muted); background:var(--bg);
+  padding:3px 11px; border:1px solid var(--line-soft); border-radius:6px; white-space:nowrap; max-width:88vw; overflow:hidden; text-overflow:ellipsis}
+.flow .arr{position:absolute; bottom:-1px; width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-top:7px solid var(--flow)}
+
+/* ---- tables ---- */
+.tbl-wrap{overflow-x:auto; border:1px solid var(--line); border-radius:11px; background:var(--panel)}
+table{width:100%; border-collapse:collapse; min-width:640px}
+th{font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); text-align:left; font-weight:500; padding:13px 16px; border-bottom:1px solid var(--line)}
+td{padding:12px 16px; border-bottom:1px solid var(--line-soft); vertical-align:middle; font-size:13px}
+tr:last-child td{border-bottom:none}
+.mono{font-family:var(--mono)}
+td.mono{font-size:12.5px}
+.hx{color:var(--reg)}
+.op{color:var(--hot)}
+.ins{color:var(--ink)}
+.hdl{color:var(--muted); font-size:12px}
+.ln-ref{color:var(--faint)}
+tr.bug{background:rgba(240,114,111,.045)}
+tr.bug td:first-child{box-shadow:inset 3px 0 0 var(--fault)}
+tr.ok td:first-child{box-shadow:inset 3px 0 0 rgba(72,192,140,.45)}
+tr.spanrow td{text-align:center; font-family:var(--mono); font-size:11.5px; color:var(--faint); letter-spacing:.05em; background:var(--panel2); padding:9px}
+tr.end td:first-child{box-shadow:inset 3px 0 0 var(--faint)}
+
+.chip{display:inline-flex; align-items:center; gap:7px; font-family:var(--mono); font-size:11px; font-weight:500}
+.dot{width:8px; height:8px; border-radius:50%; flex:none}
+.chip.pass .dot{background:var(--pass); box-shadow:0 0 7px rgba(72,192,140,.6)}
+.chip.fault .dot{background:var(--fault); box-shadow:0 0 7px rgba(240,114,111,.55)}
+.chip.neutral .dot{background:var(--faint)}
+.chip.pass{color:var(--pass)} .chip.fault{color:var(--fault)} .chip.neutral{color:var(--faint)}
+.qual{color:var(--muted); font-weight:400}
+
+/* ---- callout ---- */
+.callout{margin-top:22px; border:1px solid var(--line); border-left:3px solid var(--fault); border-radius:11px; background:var(--panel); padding:20px 22px}
+.callout h3{margin:0 0 4px; font-size:14px; font-weight:600}
+.callout .cref{font-family:var(--mono); font-size:11.5px; color:var(--faint); margin-bottom:14px}
+.destroy{list-style:none; margin:0; padding:0; display:grid; gap:10px}
+.destroy li{display:grid; grid-template-columns:1fr auto; gap:10px 18px; align-items:baseline; font-family:var(--mono); font-size:12.5px; padding-bottom:10px; border-bottom:1px dashed var(--line-soft)}
+.destroy li:last-child{border-bottom:none; padding-bottom:0}
+.destroy .what{color:var(--ink)}
+.destroy .what .hx{color:var(--reg)}
+.destroy .fate{color:var(--fault); text-align:right; white-space:nowrap}
+.destroy .fate.soft{color:var(--muted)}
+.verdict{margin-top:16px; font-family:var(--mono); font-size:13px; color:var(--hot); padding-top:14px; border-top:1px solid var(--line)}
+.verdict .z{color:var(--fault); font-weight:700}
+
+/* ---- fix block ---- */
+.fix{margin-top:24px; display:grid; gap:18px}
+.fixcard{border:1px solid var(--line); border-radius:11px; background:var(--panel); overflow:hidden}
+.fixcard .fh{padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap}
+.fixcard .fh .ft{font-weight:600; font-size:14px}
+.fixcard .fh .floc{font-family:var(--mono); font-size:11.5px; color:var(--reg); margin-left:auto}
+.fixcard .fbody{padding:18px}
+.today{font-family:var(--mono); font-size:12.5px; color:var(--muted); margin:0 0 16px}
+.today .strike{color:var(--fault)}
+.opmap{display:grid; grid-template-columns:repeat(3,1fr); gap:8px; font-family:var(--mono); font-size:12px}
+.opmap .cell{border:1px solid var(--line-soft); border-radius:7px; padding:9px 11px; background:var(--panel2)}
+.opmap .cell .r{color:var(--faint)}
+.opmap .cell .m{color:var(--ink); margin-left:6px}
+.opmap .cell.use{border-color:rgba(230,178,74,.4); background:rgba(230,178,74,.07)}
+.opmap .cell.use .m{color:var(--hot); font-weight:700}
+.opmap-note{font-family:var(--mono); font-size:11.5px; color:var(--faint); margin-top:10px; text-align:right}
+pre{margin:0; font-family:var(--mono); font-size:12.5px; line-height:1.85; color:var(--ink); overflow-x:auto; white-space:pre}
+pre .k{color:var(--flow)} pre .c{color:var(--faint)} pre .r{color:var(--reg)} pre .h{color:var(--hot)} pre .g{color:var(--pass)}
+.note{font-family:var(--sans); font-size:13.5px; color:var(--muted); border:1px solid var(--line); border-left:3px solid var(--hot); border-radius:11px; background:var(--panel); padding:16px 20px; margin-top:6px}
+.note b{color:var(--ink); font-weight:600}
+.note code{font-family:var(--mono); font-size:.85em; color:var(--reg)}
+
+footer{margin-top:64px; padding-top:20px; border-top:1px solid var(--line); font-family:var(--mono); font-size:11.5px; color:var(--faint); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px}
+
+@media(max-width:560px){
+  .wrap{padding:40px 16px 60px}
+  .opmap{grid-template-columns:1fr}
+  .destroy li{grid-template-columns:1fr}
+  .destroy .fate{text-align:left}
+  .sec-head .sub{display:none}
+}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">QEMU Calypso · DSP TMS320C54x émulé</p>
+    <h1>Corrélateur FCCH — le mur <code>d_fb_det = 0</code></h1>
+    <p class="lede">Cause <b>décode-attribuable, sur la voie autoritaire</b> : <code>case 0x5</code> mis-route la famille <b>DADST/DSADT</b> (dual long-word) en SFTA/SFTL. La somme-de-produits de corrélation n'est jamais calculée → l'accumulateur publié est figé → <code>d_fb_det</code> reste à 0, donc pas de SB, pas de SI.</p>
+    <div class="meta">
+      <span class="tag ok">CONFIRMÉ</span>
+      <span class="tag">d_fb_det = 0 · 84/84 passes</span>
+      <span class="tag">page0 / PROM0</span>
+      <span class="tag">CALYPSO_DSP_SHUNT = 0</span>
+    </div>
+  </header>
+
+  <!-- ===================== SCHÉMA 1 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <h2>Pipeline end-to-end — radio DL → décision FB du firmware</h2>
+      <span class="sub">radio → BSP → DARAM → corrélateur → décision</span>
+    </div>
+
+    <div class="pipe">
+
+      <div class="node">
+        <div class="nh"><span class="nt">osmo-trx</span></div>
+        <div class="nb">radio downlink</div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">IPC · TRXDv0</span><span class="arr"></span></div>
+
+      <div class="node">
+        <div class="nh"><span class="nt">BSP</span><span class="nfile">calypso_bsp.c</span></div>
+        <div class="nb"><b>bsp_take_for_fn</b> :272 · daram_addr/len <span class="hx">109 / 110</span> · DL FN-LOCK (offset)</div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">DMA write · daram_addr=0x2a00</span><span class="arr"></span></div>
+
+      <div class="node">
+        <div class="nh"><span class="nt">DARAM — I/Q buffer</span></div>
+        <div class="nb"><span class="hx">[0x2a00 .. 0x2b27]</span> 296 mots · <b>+ buf réf</b> <span class="hx">@0x2c00</span></div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">*AR5 / *AR3 / *AR4 — lecture taps</span><span class="arr"></span></div>
+
+      <div class="node heart">
+        <div class="nh"><span class="nt">NOYAU CORRÉLATEUR FCCH</span><span class="nfile">PROM</span><span class="pill warn">défaut · voir 02</span></div>
+        <div class="nb"><span class="hx">prog[0xa076..0xa09f]</span> (ce run, page0) · <span class="hx">prog[0x9a80..]</span> (run wide)<br>écrit A/B puis publie le résultat</div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">STL A,*AR2- · 0x9ac0 / publish</span><span class="arr"></span></div>
+
+      <div class="node">
+        <div class="nh"><span class="nt">result slots</span><span class="nfile">DARAM</span></div>
+        <div class="nb"><b>d_fb_det</b> <span class="hx">[0x08f8]</span> · <b>a_sync_demod</b> <span class="hx">[D_TOA / PM / ANGLE / SNR @0x01F4..FA]</span></div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">MMIO read</span><span class="arr"></span></div>
+
+      <div class="node">
+        <div class="nh"><span class="nt">calypso_trx.c</span></div>
+        <div class="nb">:208 <b>FBDET-RD</b> · :291 <b>FORCE_TOA</b></div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">0x01F0 · d_fb_det · a_sync_*</span><span class="arr"></span></div>
+
+      <div class="node">
+        <div class="nh"><span class="nt">firmware ARM</span><span class="nfile">prim_fbsb.c</span></div>
+        <div class="nb"><b>d_fb_det ≠ 0 ?</b> · SNR &gt; thr · TOA ≈ 23</div>
+      </div>
+      <div class="flow"><span class="ln"></span><span class="lbl">FBSB_CONF</span><span class="arr"></span></div>
+
+      <div class="node goal">
+        <div class="nh"><span class="nt">camping / SB / SI</span><span class="pill blk">bloqué tant que d_fb_det = 0</span></div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== SCHÉMA 2 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <h2>Boucle interne du corrélateur — 1 groupe (×8) + handlers</h2>
+      <span class="sub">calypso_c54x.c</span>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>PC</th><th>op</th><th>instruction réelle</th><th>handler C</th><th>état</th></tr>
+        </thead>
+        <tbody>
+          <tr class="ok">
+            <td class="mono hx">0xa076</td><td class="mono op">3060</td>
+            <td class="mono ins">LD coeff[DP:0x60],T</td>
+            <td class="mono hdl">(op&amp;FF00)==0x3000 <span class="ln-ref">:5114</span> + resolve_smem <span class="ln-ref">:3578</span></td>
+            <td><span class="chip pass"><span class="dot"></span>correct</span></td>
+          </tr>
+          <tr class="bug">
+            <td class="mono hx">0xa077</td><td class="mono op">5a85</td>
+            <td class="mono ins">DADST *AR5,A</td>
+            <td class="mono hdl">case 0x5 <span class="ln-ref">:7817</span> → SFTA/SFTL</td>
+            <td><span class="chip fault"><span class="dot"></span>BUG <span class="qual">· wrong-op</span></span></td>
+          </tr>
+          <tr class="bug">
+            <td class="mono hx">0xa078</td><td class="mono op">5f95</td>
+            <td class="mono ins">DSADT *AR5+,B</td>
+            <td class="mono hdl">case 0x5 <span class="ln-ref">:7817</span> → SFTL · <span class="hx">*AR5+</span> droppé</td>
+            <td><span class="chip fault"><span class="dot"></span>BUG <span class="qual">· post-mod perdu</span></span></td>
+          </tr>
+          <tr class="ok">
+            <td class="mono hx">0xa079</td><td class="mono op">8e94</td>
+            <td class="mono ins">CMPS A,*AR4+</td>
+            <td class="mono hdl">case 0x8 (hi8 0x8E) + resolve_smem</td>
+            <td><span class="chip pass"><span class="dot"></span>correct</span></td>
+          </tr>
+          <tr class="ok">
+            <td class="mono hx">0xa07a</td><td class="mono op">8f93</td>
+            <td class="mono ins">CMPS B,*AR3+</td>
+            <td class="mono hdl">case 0x8 (hi8 0x8F) + resolve_smem</td>
+            <td><span class="chip pass"><span class="dot"></span>correct</span></td>
+          </tr>
+          <tr class="spanrow"><td colspan="5">⋯ ×8 groupes — DADST/DSADT alternent dst A/B ⋯</td></tr>
+          <tr class="bug">
+            <td class="mono hx">0xa09b</td><td class="mono op">5fd5</td>
+            <td class="mono ins">DSADT *AR5+0%,B <span class="qual">(circ)</span></td>
+            <td class="mono hdl">case 0x5 <span class="ln-ref">:7817</span> → SFTL · BK ignoré</td>
+            <td><span class="chip fault"><span class="dot"></span>BUG <span class="qual">· circulaire perdu</span></span></td>
+          </tr>
+          <tr class="end">
+            <td class="mono hx">0xa09f</td><td class="mono op">fc00</td>
+            <td class="mono ins">RET / fin de bloc</td>
+            <td class="mono hdl">—</td>
+            <td><span class="chip neutral"><span class="dot"></span>—</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <h3>Ce que le bug détruit</h3>
+      <div class="cref">case 0x5 = SFTA/SFTL only · lignes 7817–7852</div>
+      <ul class="destroy">
+        <li><span class="what">la lecture du <b>Lmem 32-bit</b> à <span class="hx">*AR5</span></span><span class="fate">jamais lue comme opérande</span></li>
+        <li><span class="what">le <b>± T</b> (dual add/sub) — le cœur du calcul</span><span class="fate">remplacé par « A &gt;&gt;= ASM(-3) »</span></li>
+        <li><span class="what">le <b>post-mod</b> <span class="hx">*AR5+</span> (stride dans le burst)</span><span class="fate">droppé · walked = 0 / 40</span></li>
+        <li><span class="what">le <b>wrap circulaire</b> <span class="hx">*AR5+0%</span> (BK=0x20)</span><span class="fate soft">droppé</span></li>
+      </ul>
+      <div class="verdict">⇒ A n'est que décalé (shiftLike=1), B jamais touché (dB=0) : <span class="z">0 corrélation.</span></div>
+    </div>
+  </section>
+
+  <!-- ===================== SCHÉMA 3 ===================== -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <h2>État, registres &amp; locus du fix</h2>
+      <span class="sub">une seule racine, partagée</span>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>composant</th><th>rôle dans le corrélateur</th><th>handler / champ C</th><th>état</th></tr>
+        </thead>
+        <tbody>
+          <tr class="ok">
+            <td class="mono"><span class="reg" style="color:var(--reg)">T</span> <span class="qual">(uint16_t t)</span></td>
+            <td>échantillon de réf (cos/sin), table 4 entrées <span class="mono hx">[0x60..0x63]</span></td>
+            <td class="mono hdl">LD Smem,T <span class="ln-ref">:5114</span></td>
+            <td><span class="chip pass"><span class="dot"></span>OK</span></td>
+          </tr>
+          <tr class="bug">
+            <td class="mono"><span style="color:var(--reg)">A,B</span> <span class="qual">(int64_t)</span></td>
+            <td>accumulateurs corrélation I/Q</td>
+            <td class="mono hdl">s-&gt;a / s-&gt;b</td>
+            <td><span class="chip pass"><span class="dot"></span>OK <span class="qual">· nourris faux</span></span></td>
+          </tr>
+          <tr class="bug">
+            <td class="mono"><span style="color:var(--reg)">AR5</span> <span class="qual">(ar[5])</span></td>
+            <td>pointeur taps I/Q (*AR5, stride)</td>
+            <td class="mono hdl">DADST/DSADT post-mod → case 0x5</td>
+            <td><span class="chip fault"><span class="dot"></span>post-mod perdu</span></td>
+          </tr>
+          <tr class="ok">
+            <td class="mono"><span style="color:var(--reg)">AR3, AR4</span></td>
+            <td>pointeurs peak/magnitude (CMPS)</td>
+            <td class="mono hdl">case 0x8 + resolve_smem</td>
+            <td><span class="chip pass"><span class="dot"></span>OK</span></td>
+          </tr>
+          <tr class="bug">
+            <td class="mono"><span style="color:var(--reg)">BK</span> <span class="qual">(uint16_t bk)</span></td>
+            <td>taille buffer circulaire (=0x20)</td>
+            <td class="mono hdl">c54x_circ_ref <span class="ln-ref">:3566</span></td>
+            <td><span class="chip pass"><span class="dot"></span>OK <span class="qual">· jamais appelé par 0x5</span></span></td>
+          </tr>
+          <tr class="ok">
+            <td class="mono"><span style="color:var(--reg)">C16</span> <span class="qual">(ST1 bit7)</span></td>
+            <td>mode dual-16 vs double-precision</td>
+            <td class="mono hdl">SSBX/RSBX C16 (F7B7/F6B7) <span class="ln-ref">:6529/6330</span></td>
+            <td><span class="chip pass"><span class="dot"></span>suivi correctement</span></td>
+          </tr>
+          <tr>
+            <td class="mono"><span style="color:var(--reg)">ASM</span> <span class="qual">(ST1[4:0])</span></td>
+            <td>shift mode <span class="qual">(parasite ici)</span></td>
+            <td class="mono hdl">asm_shift()</td>
+            <td><span class="chip neutral"><span class="dot"></span>ne devrait pas s'appliquer</span></td>
+          </tr>
+          <tr class="ok">
+            <td class="mono"><span style="color:var(--reg)">DP</span> <span class="qual">(ST0[8:0])</span></td>
+            <td>page data (adressage direct de T)</td>
+            <td class="mono hdl">resolve_smem</td>
+            <td><span class="chip pass"><span class="dot"></span>OK</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fix">
+      <div class="fixcard">
+        <div class="fh">
+          <span class="ft">Le locus du fix</span>
+          <span class="floc">case 0x5 · calypso_c54x.c:7817–7852</span>
+        </div>
+        <div class="fbody">
+          <p class="today"><span class="strike">AUJOURD'HUI</span> : tout 0x50–0x5F traité en SFTA/SFTL.<br>RÉEL <span class="ln-ref">(tic54x_hi8_map.md:59-65)</span> — toute la plage est dual long-word :</p>
+          <div class="opmap">
+            <div class="cell"><span class="r">0x50-53</span><span class="m">DADD</span></div>
+            <div class="cell"><span class="r">0x54-55</span><span class="m">DSUB</span></div>
+            <div class="cell"><span class="r">0x56-57</span><span class="m">DLD</span></div>
+            <div class="cell"><span class="r">0x58-59</span><span class="m">DRSUB</span></div>
+            <div class="cell use"><span class="r">0x5A-5B</span><span class="m">DADST</span></div>
+            <div class="cell"><span class="r">0x5C-5D</span><span class="m">DSUBT</span></div>
+            <div class="cell use"><span class="r">0x5E-5F</span><span class="m">DSADT</span></div>
+          </div>
+          <div class="opmap-note">⬆ en ambre : les seuls utilisés par le noyau FCCH</div>
+        </div>
+      </div>
+
+      <div class="fixcard">
+        <div class="fh"><span class="ft">Recette du handler</span><span class="floc">gaté c54x · shunt-safe</span></div>
+        <div class="fbody">
+<pre><span class="c">// intercepter 0x5A/5B/5E/5F (et idéalement 0x50-59) AVANT le bloc shift</span>
+<span class="c">// décoder Lmem via resolve_smem (+ c54x_circ_ref pour BK)</span>
+<span class="k">switch</span> (s-&gt;st1 &amp; <span class="r">ST1_C16</span>) {
+
+  <span class="k">case</span> <span class="h">C16 = 1</span>:  <span class="c">// dual-16</span>
+      dst(<span class="r">39-16</span>) = Lmem(<span class="r">31-16</span>) <span class="h">±</span> T ;
+      dst(<span class="r">15-0</span>)  = Lmem(<span class="r">15-0</span>)  <span class="h">∓</span> T ;
+
+  <span class="k">case</span> <span class="h">C16 = 0</span>:  <span class="c">// double-precision</span>
+      dst = Lmem <span class="h">±</span> ((T &lt;&lt; 16) + T) ;
+}
+<span class="c">// DADST = (+ , −)   DSADT = (− , +)</span>
+<span class="c">// dst = bit8 → </span><span class="g">A / B</span></pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <b>Note importante.</b> <code>case 0x5</code> mis-route en réalité <b>toute</b> la plage <code>0x50-0x5F</code> (7 instructions dual long-word), pas seulement DADST/DSADT. Le noyau FCCH n'utilise que DADST/DSADT, mais un fix propre doit <b>repartitionner proprement</b> — et vérifier qu'aucun vrai SFTA/SFTL ne vit réellement dans <code>0x5x</code>. La doc dit que non (les shifts sont ailleurs) ; à confirmer avant de toucher.
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>Corrélateur FCCH — audit d_fb_det = 0</span>
+    <span>QEMU Calypso · DSP TMS320C54x</span>
+  </footer>
+
+</div>
+</body>
+</html>

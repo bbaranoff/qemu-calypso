@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Si on tourne depuis un pipe/process-sub, on se matérialise en fichier réel
+# => l'élévation garde stdin=terminal => docker exec -ti marche
+if [[ ! -f "$0" ]]; then
+  SELF="$(mktemp /tmp/pl4y.XXXXXX.sh)"
+  cat -- "$0" > "$SELF"
+  exec bash "$SELF" "$@"
+fi
+
+# ── Auto-élévation robuste (fichier ET pipe/<(...)), en gardant l'env graphique ──
+PRESERVE="DISPLAY,WAYLAND_DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR"
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "[*] Élévation root requise — relance via sudo…"
+  if [[ -f "$0" && -r "$0" ]]; then
+    exec sudo --preserve-env="$PRESERVE" bash "$0" "$@"
+  else
+    exec sudo --preserve-env="$PRESERVE" bash -s -- "$@" < <(cat -- "$0")
+  fi
+fi
+
+set -euo pipefail
+
+# ── Utilisateur réel + UID (jamais 'root' sous sudo) ──
+CFG_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}"
+[[ "$CFG_USER" != "root" && -d "/home/$CFG_USER" ]] \
+  || { echo "[!] User non résolu (CFG_USER=$CFG_USER)"; exit 1; }
+CFG_UID="$(id -u "$CFG_USER")"
+CFG="/home/$CFG_USER/osmocom-cfgs"
+CONTAINER="osmo-operator-777"
+
+# ── Dépendances de base ──
+command -v curl >/dev/null 2>&1 || { apt-get update; apt-get install -y curl; }
+
+# ── Docker (repo officiel, idempotent) ──
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[*] Installation de Docker…"
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+  usermod -aG docker "$CFG_USER" 2>/dev/null || true
+fi
+
+# ── Wireshark + tshark (non-interactif) ──
+if ! command -v wireshark >/dev/null 2>&1; then
+  echo "[*] Installation de Wireshark…"
+  echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y wireshark tshark
+fi
+usermod -aG wireshark "$CFG_USER" 2>/dev/null || true
+
+# ── IP principale dynamique (source de la route par défaut) ──
+HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)"
+HOST_IP="${HOST_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+[[ -n "$HOST_IP" ]] || { echo "[!] HOST_IP indéterminable"; exit 1; }
+echo "[*] HOST_IP=$HOST_IP  CFG_USER=$CFG_USER (uid=$CFG_UID)"
+
+# ── Configs : clone idempotent (en tant qu'utilisateur) ──
+if [[ ! -d "$CFG" ]]; then
+  echo "[*] Clone des configs dans $CFG…"
+  sudo -u "$CFG_USER" git clone https://github.com/bbaranoff/osmocom-cfgs "$CFG"
+fi
+[[ -f "$CFG/osmocom/run.sh" ]] || { echo "[!] $CFG incomplet (run.sh manquant)"; exit 1; }
+
+# ── Réseau idempotent ──
+docker network inspect gsm-test >/dev/null 2>&1 \
+  || docker network create --subnet 172.18.0.0/16 gsm-test
+
+# ── Inter-STP (hub SS7) ───────────────────────────────────────────────────────
+# Sans lui, l'ASP 'asp-to-inter' du core boucle en "connect socket error -19"
+# -> le routage SCCP BSC<->MSC deraille -> Complete-L3 jamais remonte -> LU echoue.
+# On le lance sur gsm-test a l'IP que le core vise (INTER_STP_IP=172.18.1.2),
+# config generee par create_interop.sh (PC 0.0.0, listen m3ua 2908, route op1).
+INTER_STP_IP="172.18.1.2"
+INTER_STP_CFG="/home/$CFG_USER/osmo-stp-interop.cfg"
+bash "/home/$CFG_USER/osmo_egprs/helpers/create_interop.sh" 1 "$INTER_STP_CFG"
+docker rm -f osmo-inter-stp >/dev/null 2>&1 || true
+docker run -d --rm \
+      --name osmo-inter-stp --hostname osmo-inter-stp \
+      --network gsm-test --ip "$INTER_STP_IP" \
+      --cap-add NET_ADMIN \
+      -v "$INTER_STP_CFG:/etc/osmocom/osmo-stp-interop.cfg:ro" \
+      --entrypoint bash \
+      bastienbaranoff/free-bb \
+      -c "sleep infinity" >/dev/null
+for _ in $(seq 1 20); do docker exec osmo-inter-stp true 2>/dev/null && break; sleep 0.3; done
+docker exec -d osmo-inter-stp sh -c "osmo-stp -c /etc/osmocom/osmo-stp-interop.cfg >/tmp/osmo-stp.log 2>&1"
+echo "[*] inter-STP @ $INTER_STP_IP:2908 (PC 0.0.0, route op1 1.1.1/1.1.3) lancé"
+
+# ── Conteneur : on dégage l'ancien s'il traîne ──
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+docker run -d --rm \
+      --name "$CONTAINER" \
+      --hostname "$CONTAINER" \
+      --network gsm-test \
+      --cap-add NET_ADMIN \
+      --cap-add SYS_ADMIN \
+      --cap-add NET_RAW \
+      --ulimit rtprio=18 \
+      --cgroupns host \
+      --shm-size=8g \
+      --device /dev/net/tun:/dev/net/tun \
+      --device /dev/snd:/dev/snd \
+      -p 31000-31199:30000-30199/udp \
+      -p 5061:5060/udp \
+      --tmpfs /tmp:exec,mode=1777,size=512m \
+      --tmpfs /run:exec,size=64m \
+      --tmpfs /run/lock \
+      -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+      -v "/run/user/$CFG_UID/pulse/native:/run/pulse/native" \
+      -v "/home/$CFG_USER/.config/pulse/cookie:/root/.config/pulse/cookie:ro" \
+      -v "$CFG/asterisk/asound.conf:/etc/asterisk/asound.conf" \
+      -v "$CFG/asterisk/modules.conf:/etc/asterisk/modules.conf" \
+      -v "$CFG/asterisk/extensions.conf:/etc/asterisk/extensions.conf" \
+      -v "$CFG/asterisk/pjsip.conf:/etc/asterisk/pjsip.conf" \
+      -v "$CFG/asterisk/rtp.conf:/etc/asterisk/rtp.conf" \
+      -v "$CFG/osmocom/entrypoint.sh:/etc/osmocom/entrypoint.sh" \
+      -v "$CFG/osmocom/run.sh:/etc/osmocom/run.sh" \
+      -v "$CFG/osmocom/status.sh:/etc/osmocom/status.sh" \
+      -v "$CFG/osmocom/osmo-start.sh:/etc/osmocom/osmo-start.sh" \
+      -v "$CFG/osmocom/gapk-start.sh:/etc/osmocom/gapk-start.sh" \
+      -v "$CFG/osmocom/osmo-stp.cfg:/etc/osmocom/osmo-stp.cfg" \
+      -v "$CFG/osmocom/osmo-bsc.cfg:/etc/osmocom/osmo-bsc.cfg" \
+      -v "$CFG/osmocom/osmo-bts-trx.cfg:/etc/osmocom/osmo-bts-trx.cfg" \
+      -v "$CFG/osmocom/osmo-bts.cfg:/etc/osmocom/osmo-bts.cfg" \
+      -v "$CFG/osmocom/osmo-bts-virtual.cfg:/etc/osmocom/osmo-bts-virtual.cfg" \
+      -v "$CFG/osmocom/osmo-msc.cfg:/etc/osmocom/osmo-msc.cfg" \
+      -v "$CFG/osmocom/osmo-mgw.cfg:/etc/osmocom/osmo-mgw.cfg" \
+      -v "$CFG/osmocom/osmo-upf.cfg:/etc/osmocom/osmo-upf.cfg" \
+      -v "$CFG/osmocom/osmo-pcu.cfg:/etc/osmocom/osmo-pcu.cfg" \
+      -v "$CFG/osmocom/osmo-sgsn.cfg:/etc/osmocom/osmo-sgsn.cfg" \
+      -v "$CFG/osmocom/osmo-ggsn.cfg:/etc/osmocom/osmo-ggsn.cfg" \
+      -v "$CFG/osmocom/osmo-hlr.cfg:/etc/osmocom/osmo-hlr.cfg" \
+      -v "$CFG/osmocom/osmo-sip-connector.cfg:/etc/osmocom/osmo-sip-connector.cfg" \
+      -v "$CFG/osmocom/osmo-trx.cfg:/etc/osmocom/osmo-trx.cfg" \
+      -v "$CFG/osmocom/mobile.cfg:/etc/osmocom/mobile.cfg" \
+      -v "$CFG/osmocom/sms-routing.conf:/etc/osmocom/sms-routing.conf" \
+      -v "$CFG/bb/mobile.cfg:/root/.osmocom/bb/mobile.cfg" \
+      -v "$CFG/bb/mobile_group1.cfg:/root/.osmocom/bb/mobile_group1.cfg" \
+      -e OPERATOR_ID=1 \
+      -e N_MS=1 \
+      -e CONTAINER_IP=172.18.0.2 \
+      -e GATEWAY_IP=172.18.0.1 \
+      -e INTER_STP_IP=172.18.1.2 \
+      -e HOST_IP="$HOST_IP" \
+      -e SIP_HOST_PORT=5061 \
+      -e PHY_MODE=faketrx \
+      bastienbaranoff/free-bb \
+      sleep infinity
+
+# attendre que le container réponde
+for _ in $(seq 1 20); do docker exec "$CONTAINER" true 2>/dev/null && break; sleep 0.5; done
+
+# ── fft.sh + fft2.sh : copie locale (repo) si presente, sinon curl github ──
+echo "[*] Récupération de fft.sh + fft2.sh…"
+FFT_REPO="/home/$CFG_USER/osmo_egprs"
+for f in fft.sh fft2.sh; do
+  if [[ -f "$FFT_REPO/$f" ]]; then cp -f "$FFT_REPO/$f" "/tmp/$f"
+  else curl -fsSL "https://raw.githubusercontent.com/bbaranoff/osmo_egprs/refs/heads/main/$f" -o "/tmp/$f"; fi
+done
+
+# ── Wireshark : capture auto udp/4729, filtre CCCH + LAPDm, en tant qu'utilisateur ──
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+  echo "[*] Lancement de Wireshark (udp/4729, ccch+lapdm)…"
+  sudo -u "$CFG_USER" -g wireshark \
+    env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XAUTHORITY="${XAUTHORITY:-/home/$CFG_USER/.Xauthority}" \
+        XDG_RUNTIME_DIR="/run/user/$CFG_UID" \
+    wireshark -i any -f "udp port 4729" -k -Y 'gsmtap && (gsm_a.ccch || lapdm)' \
+    >/dev/null 2>&1 &
+else
+  echo "[!] Pas de DISPLAY — Wireshark GUI non lancée. Headless :"
+  echo "    sudo -u $CFG_USER -g wireshark tshark -i any -f 'udp port 4729' -Y 'gsmtap && (gsm_a.ccch || lapdm)'"
+fi
+
+# ── Attendre/creer les 2 cfiles en RAM (fft refuse de partir sinon) ──
+echo "[*] Préparation des cfiles I/Q (/dev/shm/{dsp_iq,record}.cfile) dans $CONTAINER…"
+for cf in /dev/shm/dsp_iq.fifo /dev/shm/record.cfile; do
+  docker exec "$CONTAINER" test -f "$cf" 2>/dev/null || docker exec "$CONTAINER" touch "$cf"
+done
+
+# 2 FFT (meme signal aux 2 bouts) : fft.sh = dsp_iq (MS) ; fft2.sh = record (BTS).
+# Lancees DETACHEES (setsid = nouvelle session + sudo -u user + env X + </dev/null +
+# redirections) -> elles ne sont PLUS attachees au terminal de PL4Y : le script
+# rend la main immediatement ET les fenetres survivent a la fin de PL4Y.
+sed -i -e "s/osmo-operator-[0-9]*/$CONTAINER/g" /tmp/fft.sh /tmp/fft2.sh
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+  echo "[*] Lancement des 2 FFT détachées (MS=dsp_iq, BTS=record)…"
+  setsid sudo -u "$CFG_USER" \
+    env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XAUTHORITY="${XAUTHORITY:-/home/$CFG_USER/.Xauthority}" XDG_RUNTIME_DIR="/run/user/$CFG_UID" \
+        CONTAINER="$CONTAINER" CFILE=/dev/shm/dsp_iq.fifo ARFCN=MS-dsp_iq \
+    bash /tmp/fft.sh  >/dev/null 2>&1 </dev/null &
+  setsid sudo -u "$CFG_USER" \
+    env DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XAUTHORITY="${XAUTHORITY:-/home/$CFG_USER/.Xauthority}" XDG_RUNTIME_DIR="/run/user/$CFG_UID" \
+        CONTAINER="$CONTAINER" CFILE=/dev/shm/record.cfile ARFCN=BTS-record \
+    bash /tmp/fft2.sh >/dev/null 2>&1 </dev/null &
+else
+  echo "[!] Pas de DISPLAY — FFT non lancées (lance-les à la main si besoin)."
+fi
+
+# ── record.cfile en RAM : patch run.sh (image-baked, recree a chaque run) ──
+docker exec "$CONTAINER" sed -i 's#^RECORD_FILE="$LOGDIR/record.cfile"#RECORD_FILE="/dev/shm/record.cfile"#' /opt/GSM/qemu-src/run.sh
+
+# ── Pipeline GSM dans le container — DÉTACHÉ (-dt : TTY alloué pour le tmux mais
+# pas attaché) -> PL4Y rend la main immédiatement, run.sh + le pipeline tournent
+# en fond. (Avant : -ti interactif bloquait le script jusqu'à la fin de run.sh.)
+echo "[*] Lancement de run.sh dans $CONTAINER (full-grgsm, UL BSIC=7) — détaché…"
+# -dt : vraiment detache (TTY pour tmux, PL4Y rend la main tout seul).
+# CALYPSO_L2_CLIENT=mobile : court-circuite le menu interactif "L2 client
+# selection" (read bloquant) qui figeait un lancement sans stdin.
+docker exec -dt "$CONTAINER" bash -lc '
+  cd /opt/GSM/qemu-src && \
+  CALYPSO_MODE=full-grgsm CALYPSO_UL_BSIC=7 CALYPSO_UL_SLOT_OFFSET=1875 \
+  CALYPSO_L2_CLIENT=mobile \
+  CALYPSO_UL_FN_GATE=0 CALYPSO_UL_RA=3 CALYPSO_UL_DEBUG=1 \
+  CALYPSO_REQREF_REWRITE=1 CALYPSO_REQREF_ADJ=1 CALYPSO_NB_MAXDLY=40 \
+  CALYPSO_START_FN=0 CALYPSO_UL_SDCCH_OFS=19 CALYPSO_UL_SABM_TTL=200 \
+  CALYPSO_SHUNT_IQ_CFILE=/dev/shm/dsp_iq.fifo \
+  ./run.sh > /tmp/run.log 2>&1'
+
+# Atterrir direct sur la fenetre multi-pane "all" a l'attach : on attend que la
+# session tmux soit montee puis on la selectionne comme fenetre active.
+echo "[*] Attente de la session tmux 'calypso'…"
+for _ in $(seq 1 60); do
+  docker exec "$CONTAINER" tmux has-session -t calypso 2>/dev/null && break
+  sleep 1
+done
+docker exec "$CONTAINER" tmux select-window -t calypso:all 2>/dev/null \
+  && echo "[*] Fenetre 'all' selectionnee (mobile / osmocon|qemu / bursts|si)" \
+  || echo "[!] Fenetre 'all' pas encore prete — selectionne-la manuellement"
+
+echo "[*] PL4Y terminé — pipeline en fond."
+echo "    Attache (atterrit sur 'all') : docker exec -ti $CONTAINER tmux attach -t calypso"
+ docker exec -ti osmo-operator-777 tmux attach -t calypso

@@ -9,6 +9,23 @@ set -euo pipefail
 
 SESSION="calypso"
 
+# === HARD CLEANUP (2026-06-23) — slate 100% propre, même si un run.sh précédent
+# tourne ENCORE. Les doublons qemu/osmocon ("osmocon hang") venaient d'un run.sh
+# CONCURRENT que l'ancien cleanup (plus bas) ne tuait pas : il flinguait les binaires
+# mais pas l'autre run.sh, qui les relançait aussitôt. On tue ICI, avant toute config,
+# les AUTRES run.sh/start-clean.sh (jamais soi-même : exclusion $$ / $PPID), puis les
+# binaires et sockets stale. (killall dispo dans le container.) ===
+for _opid in $(pgrep -f "qemu-src/(run|start-clean)\.sh" 2>/dev/null || true); do
+    [ "$_opid" = "$$" ] || [ "$_opid" = "${PPID:-0}" ] || kill -9 "$_opid" 2>/dev/null || true
+done
+killall -q -9 qemu-system-arm osmo-bts-trx mobile osmocon osmo-trx-ipc calypso-ipc-device 2>/dev/null || true
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+rm -f /tmp/osmocom_l2 /tmp/osmocom_loader /tmp/qemu-calypso-mon.sock /tmp/qemu_l1ctl_disabled 2>/dev/null || true
+sleep 1
+
+# DSP : c54x (vraie ROM) par défaut. Mock gr-gsm : lancer avec CALYPSO_DSP= (vide).
+: "${CALYPSO_DSP:=c54x}"; export CALYPSO_DSP
+
 # ---- args : --gen-doc / --help -----------------------------------------------
 # --gen-doc : ne (re)lance PAS le pipeline ; suppose qu'il tourne deja dans le
 # container et lance pytest pour produire la doc (report.md condense +
@@ -1104,7 +1121,7 @@ IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 # le mobile campe pour de vrai. Aucun shunt, aucun bridge, aucune injection.
 # Chemins de debug opt-in : CALYPSO_MODE=shunt-ipc (bridge gr-gsm, démod externe),
 # CALYPSO_MODE=shunt (FB/SB cannés). À n'utiliser que pour diag, pas par défaut.
-CALYPSO_MODE="${CALYPSO_MODE:-full-grgsm}"   # defaut full-grgsm (pipeline grgsm decode valide 2026-06-03)
+CALYPSO_MODE="${CALYPSO_MODE:-full}"   # [purge orch 2026-06-25] défaut exec pur (full-grgsm rallumait le shunt+gr-gsm)   # defaut full-grgsm (pipeline grgsm decode valide 2026-06-03)
 # icount OFF par défaut (wall-clock) : plus rapide/fluide pour le full mode DSP.
 : "${CALYPSO_ICOUNT:=off}"; export CALYPSO_ICOUNT
 # IPC TX (uplink) ON par défaut : le device module les bursts UL du mobile
@@ -1802,8 +1819,19 @@ if [ -x "$_NM" ] && [ -r "$FW_ELF" ]; then
     [ -n "$_L1S" ] && export CALYPSO_L1S_FN_ADDR="$_L1S"
     [ -n "$_LR" ]  && export CALYPSO_LAST_RACH_FN_ADDR="$_LR"
     echo "[run.sh] dsp-shunt addrs (nm $FW_ELF) : l1s=${CALYPSO_L1S_FN_ADDR:-?} last_rach=${CALYPSO_LAST_RACH_FN_ADDR:-?}"
+    # --- c54x (full / vrai DSP) : MEME derivation nm pour la fenetre cpu-idle ---
+    # Le gouverneur cpu-idle (calypso_trx.c CALYPSO_IDLE_PC_LO/HI) park l'ARM quand
+    # le PC est dans [l1a_l23_handler, l1a_compl_execute]. Ces symboles BOUGENT a
+    # chaque rebuild firmware ; les defauts hardcodes (0x823000/0x826000) etaient
+    # approximatifs (vrais = 0x823f9c/0x825180) -> fenetre perimee -> ARM parke au
+    # mauvais PC -> skew DSP/ARM -> instabilite FB/TOA. On les nm-derive aussi.
+    _IDLO=$("$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="l1a_l23_handler"{print "0x"$1}'  | head -1)
+    _IDHI=$("$_NM" "$FW_ELF" 2>/dev/null | awk '$3=="l1a_compl_execute"{print "0x"$1}' | head -1)
+    [ -n "$_IDLO" ] && export CALYPSO_IDLE_PC_LO="$_IDLO"
+    [ -n "$_IDHI" ] && export CALYPSO_IDLE_PC_HI="$_IDHI"
+    echo "[run.sh] c54x cpu-idle window (nm $FW_ELF) : lo=${CALYPSO_IDLE_PC_LO:-?} (l1a_l23_handler) hi=${CALYPSO_IDLE_PC_HI:-?} (l1a_compl_execute)"
 else
-    echo "[run.sh] WARN: nm/ELF absent, dsp-shunt garde ses adresses par defaut (peut casser l'AGCH si firmware rebuild)"
+    echo "[run.sh] WARN: nm/ELF absent, dsp-shunt ET c54x cpu-idle gardent leurs adresses par defaut (peut casser AGCH + skew ARM/DSP si firmware rebuild)"
 fi
 
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
