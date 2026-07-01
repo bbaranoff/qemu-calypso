@@ -163,28 +163,28 @@ tombe sur vec19 → `0xA04C`, et au boot sur le stub RET `0xFFCC` (IPTR=0x1FF).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Reset : PC=0xFF80 (IPTR=0x1FF)
+    [*] --> Reset : PC=0xFF80 IPTR=0x1FF
     Reset --> BootInit : boot ROM
-    BootInit --> ClearIMR : PC=0xb37e op=0x7700<br/>STM #0,IMR  IMR 0x3000->0x0000<br/>insn=1047
-    ClearIMR --> RelocIPTR : PMST-WR val=0x0038<br/>IPTR relocalisé PC=0xb38f insn=1874
-    RelocIPTR --> BootStack : PC=0xb382 SP 0x1100->0x5ac8
-    BootStack --> Trampoline : 0x71f4 LD *(0x3f6d),A ; BACC A<br/>soft-vector=0xa4df
-    Trampoline --> WaitLoop : 0xa4d4-0xa4e2<br/>teste data[0x3f70] bit1<br/>INTM=1  IMR=0x0000
+    BootInit --> ClearIMR : PC=0xb37e op=0x7700<br/>STM 0,IMR  IMR 0x3000 vers 0x0000<br/>insn=1047
+    ClearIMR --> RelocIPTR : PMST-WR val=0x0038<br/>IPTR relocalise PC=0xb38f insn=1874
+    RelocIPTR --> BootStack : PC=0xb382 SP 0x1100 vers 0x5ac8
+    BootStack --> Trampoline : 0x71f4 LD 0x3f6d,A puis BACC A<br/>soft-vector=0xa4df
+    Trampoline --> WaitLoop : 0xa4d4-0xa4e2<br/>teste data 0x3f70 bit1<br/>INTM=1  IMR=0x0000
 
-    WaitLoop --> WaitLoop : bit1=0 (lit 0x0000)<br/>BLOCAGE ICI
-    WaitLoop --> GoLive : bit1=1 (jamais atteint)
-    GoLive --> ArmIMR : 0xa4c7 ORM #,IMR / 0xa582<br/>IMR=0x52fd (bit12)
-    ArmIMR --> FBDispatch : vec28 scheduler<br/>corrélateur -> d_fb_det
+    WaitLoop --> WaitLoop : bit1=0 lit 0x0000<br/>BLOCAGE ICI
+    WaitLoop --> GoLive : bit1=1 jamais atteint
+    GoLive --> ArmIMR : 0xa4c7 ORM IMR puis 0xa582<br/>IMR=0x52fd bit12
+    ArmIMR --> FBDispatch : vec28 scheduler<br/>correlateur ecrit d_fb_det
     FBDispatch --> [*]
 
     note right of WaitLoop
-      BLOCAGE (audit finding #3)
-      bit1 setter ~0xde9c gaté TC sur
+      BLOCAGE (audit finding 3)
+      bit1 setter ~0xde9c gate TC sur
       cellules 0x0314/0x0318 (ARM API)
-      ARM n'écrit que val=0x0000 fn=0
-      (HS-ARM-GATE trx.c:3053-3070)
-      => DE-BR data[0x3f70]=0x0001 TC=0
-         jamais 0x0002 ; F70-SETBIT1 count=0
+      ARM n ecrit que val=0x0000 fn=0
+      HS-ARM-GATE trx.c:3053-3070
+      DE-BR data 0x3f70=0x0001 TC=0
+      jamais 0x0002  F70-SETBIT1 count=0
     end note
 ```
 
