@@ -28,12 +28,14 @@
 #include <fcntl.h>
 #include "qemu/timer.h"
 #include "hw/arm/calypso/calypso_bsp.h"
+#include "calypso_orch.h"
 #include "hw/arm/calypso/calypso_c54x.h"
+extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
 #include "hw/arm/calypso/calypso_iota.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
-#include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 #include "calypso_dsp_shunt.h"
 
 /* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
@@ -113,6 +115,10 @@ static struct {
     uint64_t   bursts_dropped_no_window;
     uint64_t   bursts_dropped_queue_full;
     uint64_t   bursts_dropped_stale;
+    /* DL FN-LOCK (revival dsp) : offset constant burst_fn(base osmo-trx ts/5000)
+     * vs current_fn(base g_wall_fn=0 au boot), auto-mesure 1x au 1er burst. */
+    int32_t    dl_fnoff;
+    int        dl_fnoff_done;
     uint8_t    inject_canary;     /* CALYPSO_BSP_INJECT_CANARY=1 :
                                       overwrite samples avec 0xCAFE pour
                                       identifier buffer cible via read trace */
@@ -143,7 +149,35 @@ static struct {
      * time domain. Previously on REALTIME → drift ~1300 fr in 6 s wall
      * vs ARM (BTS livré au rythme wall, ARM compté au rythme icount). */
     QEMUTimer *drain_timer;
+
+    /* === Real FB (FCCH tone) detection latch — wired to calypso_fbsb ===
+     * Filled when the host-side correlator classifies a delivered burst as
+     * TONAL_FB. calypso_fbsb reads these via calypso_bsp_get_fb_detection()
+     * instead of synthesising constants. */
+    int      fb_valid;        /* fresh real FB detection pending */
+    int16_t  fb_toa;          /* latched DL ToA (quarter-bits, TRXDv0 hdr) */
+    uint16_t fb_pm;           /* peak power proxy (from nmax) */
+    int16_t  fb_ang;          /* angle (0 — AFC handled in TRX path) */
+    uint16_t fb_snr;          /* tone quality (same_sign*10, 0..100) */
+    int16_t  last_dl_toa_q4;  /* most recent DL ToA seen at decode */
 } bsp;
+
+/* Expose the latest real host-measured FB detection to calypso_fbsb.
+ * Returns 1 and fills the out-params if a fresh TONAL_FB was latched
+ * (consuming it); 0 otherwise. */
+int calypso_bsp_get_fb_detection(int16_t *toa, uint16_t *pm,
+                                 int16_t *ang, uint16_t *snr)
+{
+    if (!bsp.fb_valid) {
+        return 0;
+    }
+    if (toa) *toa = bsp.fb_toa;
+    if (pm)  *pm  = bsp.fb_pm;
+    if (ang) *ang = bsp.fb_ang;
+    if (snr) *snr = bsp.fb_snr;
+    bsp.fb_valid = 0;
+    return 1;
+}
 
 #define BSP_DRAIN_PERIOD_MS  5
 
@@ -275,11 +309,33 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
     for (int i = 0; i < BSP_QUEUE_LEN; i++) {
         BspBurstSlot *s = &qq->slot[i];
         if (!s->valid) continue;
-        int32_t d = bsp_fn_delta(s->fn, current_fn);
+        /* DL FN-LOCK : auto-mesure l'offset d'epoque UNE FOIS (miroir cal_off UL /
+         * du shunt qui lit l1s.fn). dl_fnoff = current_fn - burst_fn ; on l'ajoute
+         * a burst_fn pour le match -> delta ~0 si offset constant. Override
+         * CALYPSO_DL_FN_OFFSET=<n>. Si dl_fnoff mesure ~0 -> pas un offset
+         * d'epoque (= back-pressure de drain), le flood stale persistera (auto-diag). */
+        if (!bsp.dl_fnoff_done) {
+            const char *e = getenv("CALYPSO_DL_FN_OFFSET");
+            bsp.dl_fnoff = (e && *e) ? (int32_t)strtol(e, NULL, 0)
+                                     : bsp_fn_delta(current_fn, s->fn);
+            bsp.dl_fnoff_done = 1;
+            fprintf(stderr, "[BSP] DL FN-LOCK dl_fnoff=%d (burst_fn=%u cur_fn=%u "
+                    "%s)\n", bsp.dl_fnoff, s->fn, current_fn,
+                    (e && *e) ? "env" : "auto");
+        }
+        int32_t d = bsp_fn_delta(s->fn + (uint32_t)bsp.dl_fnoff, current_fn);
         int32_t ad = d < 0 ? -d : d;
         if (d < -BSP_FN_MATCH_WINDOW) {
             s->valid = false;
             bsp.bursts_dropped_stale++;
+            /* sonde residuelle : si ca droppe ENCORE apres l'offset -> drift
+             * (back-pressure ou offset non constant). Logue raw vs ajuste. */
+            { static uint64_t pn = 0;
+              if (pn < 30 || (pn % 5000) == 0)
+                fprintf(stderr, "[BSP] DL-OFFSET-PROBE burst_fn=%u cur_fn=%u "
+                        "raw=%d adj=%d off=%d\n", s->fn, current_fn,
+                        bsp_fn_delta(s->fn, current_fn), d, bsp.dl_fnoff);
+              pn++; }
         } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
             match = s;
             best_abs = ad;
@@ -416,6 +472,23 @@ static void bsp_trxd_readable(void *opaque)
     uint32_t fn  = ((uint32_t)buf[1]<<24)|((uint32_t)buf[2]<<16)|
                    ((uint32_t)buf[3]<<8)|buf[4];
     bsp.last_att = (n > 5) ? buf[5] : 0;
+
+    /* DL-TOA probe (revival dsp 2026-06-22, read-only) : le ToA intra-slot du
+     * burst DL (header TRXDv0 buf[6..7], int16 q4 BE) = le "2e offset" (l'analogue
+     * DL de UL_SLOT_OFFSET), actuellement IGNORE par le BSP (qemu_wrap.c:98).
+     * On le MESURE pour savoir de combien decaler la position du burst en DARAM.
+     * Capé + periodique. q4 = quart-de-bit ; samples ~= toa_q4/4*SPS. */
+    {
+        int16_t dl_toa_q4 = (n >= 8) ? (int16_t)(((uint16_t)buf[6] << 8) | buf[7]) : 0;
+        bsp.last_dl_toa_q4 = dl_toa_q4;
+        static unsigned dltoa_n = 0;
+        if (dltoa_n < 40 || (dltoa_n % 4000) == 0) {
+            fprintf(stderr, "[BSP] DL-TOA tn=%u fn=%u rssi=%u toa_q4=%d "
+                    "(bits~%d) n=%zd\n", tn, fn, (unsigned)bsp.last_att,
+                    dl_toa_q4, dl_toa_q4 / 4, n);
+            dltoa_n++;
+        }
+    }
 
     int nbits = (int)n - 8;  /* TRXDv0 header is 8 bytes (TS+FN+RSSI+ToA) */
     if (nbits > 148) nbits = 148;
@@ -925,7 +998,8 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
     /* Gate INT3 fire : skip si IFR.bit3 déjà set = DSP pas encore servi
      * le précédent. Évite stacking d'IRQs quand DSP traite plus lentement
      * que BSP delivery rate. */
-    if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+    if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+        g_c54x_int3_src = 2;
         c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) — vec 19, IMR bit 3 */
         if (bsp.dsp->idle) bsp.dsp->idle = false;
     }
@@ -1066,7 +1140,8 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             }
         }
         /* Gate INT3 : skip si IFR.bit3 déjà set (cf rx_burst). */
-        if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+        if (!getenv("CALYPSO_BSP_INT3_OFF") && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 3))) {
+            g_c54x_int3_src = 2;
             c54x_interrupt_ex(bsp.dsp, 19, 3);  /* INT3 (frame) */
             if (bsp.dsp->idle) bsp.dsp->idle = false;
         }
@@ -1086,7 +1161,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
         {
             static unsigned db_log;
             const unsigned LIMIT = 600;
-            if (db_log < LIMIT) {
+            {
                 const int N = 22 < n / 2 ? 22 : n / 2;  /* N pairs ⇒ 2N samples */
                 int nmax = 0;
                 for (int i = 0; i < 2 * N && i < n; i++) {
@@ -1116,16 +1191,41 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
                 if (nmax < 64) cat = "SILENT";
                 else if (same_sign >= 8) cat = "TONAL_FB";
                 else cat = "MODULATED";
-                BSP_LOG("BURST-IN fn=%u tn=%u %s nmax=%d cross0=%d same=%d/10 "
-                        "signs=%d,%d,%d,%d,%d,%d,%d,%d",
-                        (unsigned)sl->fn, (unsigned)tn, cat,
-                        nmax, cross0, same_sign,
-                        cross_logged[0], cross_logged[1], cross_logged[2],
-                        cross_logged[3], cross_logged[4], cross_logged[5],
-                        cross_logged[6], cross_logged[7]);
-                db_log++;
-                if (db_log == LIMIT)
-                    BSP_LOG("BURST-IN log capped at %u", LIMIT);
+                if (db_log < LIMIT) {
+                    BSP_LOG("BURST-IN fn=%u tn=%u %s nmax=%d cross0=%d same=%d/10 "
+                            "signs=%d,%d,%d,%d,%d,%d,%d,%d",
+                            (unsigned)sl->fn, (unsigned)tn, cat,
+                            nmax, cross0, same_sign,
+                            cross_logged[0], cross_logged[1], cross_logged[2],
+                            cross_logged[3], cross_logged[4], cross_logged[5],
+                            cross_logged[6], cross_logged[7]);
+                    db_log++;
+                    if (db_log == LIMIT)
+                        BSP_LOG("BURST-IN log capped at %u", LIMIT);
+                }
+                /* Real FB detection (TONAL_FB == genuine FCCH tone, same_sign>=8)
+                 * -> write the DSP's OWN NDB cells directly: the REAL DSP path
+                 * the ARM reads via API RAM 0x01F0 (d_fb_det) / 0x01F4
+                 * (a_sync_demod). Scales per calypso_layer1.c reference:
+                 *   toa = 23 (on-time; ARM does toa-=23 -> 0)
+                 *   pm  = 0x7000 full-scale Q15 (ARM reads >>3)
+                 *   ang = 0 (residual ~0 for clean carrier-aligned IQ)
+                 *   snr proportional to coherence, > AFC_SNR_THRESHOLD(2560) locked
+                 * Runs EVERY burst (NOT gated by the log cap). */
+                if (calypso_orch() && bsp.dsp) {   /* ORCH only: exe = real DSP owns d_fb_det */
+                    calypso_pcb_daram_lock_acquire();
+                    if (same_sign >= 8 && nmax >= 64) {
+                        bsp.dsp->data[0x08FA] = (uint16_t)23;
+                        bsp.dsp->data[0x08FB] = (uint16_t)0x7000;
+                        bsp.dsp->data[0x08FC] = (uint16_t)0;
+                        bsp.dsp->data[0x08FD] =
+                            (uint16_t)((same_sign * 0x7000) / 10);
+                        bsp.dsp->data[0x08F8] = 1;   /* d_fb_det = FOUND */
+                    } else {
+                        bsp.dsp->data[0x08F8] = 0;   /* not found */
+                    }
+                    calypso_pcb_daram_lock_release();
+                }
             }
         }
 

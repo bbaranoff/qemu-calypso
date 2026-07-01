@@ -178,6 +178,7 @@ typedef struct C54xState {
     uint16_t rpt_count;  /* remaining RPT iterations */
     uint16_t rpt_pc;     /* PC of repeated instruction */
     bool     rpt_active;
+    bool     rpt_fresh;   /* RPT vient d'etre arme : 1ere lecture READA/MVPD repart de la base, pas du mvpd_src stale (fix 2026-06-24) */
     uint16_t par;        /* Program Address Register (for READA/WRITA/MACD/MACP) */
     bool     par_set;
     bool     lk_used;    /* resolve_smem consumed extra word for lk */

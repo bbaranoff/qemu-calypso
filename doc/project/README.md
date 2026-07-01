@@ -342,7 +342,7 @@ SI3 fallback hardcode) was eventually purged because each was hiding the
 real bug. The "no hacks" rule is enforced on commits.
 
 **Verify opcodes against tic54x-opc.c (binutils) before patching.** The
-`hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md` reference catches our
+`doc/opcodes/tic54x_hi8_map.md` reference catches our
 decoder where we previously had POPM misclassified as MVDK. Always cross-check.
 
 **QEMU is clock master.** The bridge is the slave, the BTS receives CLK IND
@@ -410,7 +410,7 @@ RETE count, then run pytest. The harness flags regressions immediately.
 | 4 | APTS misnomer fix (PMST bit 4 = AVIS, pas stack) | Stack leak 1.96M events → 0 |
 | 5 | `F3xx` complet (AND/OR/XOR/SFTL + #lk variants) | 364 sites, wedge PC=0x8eb9 |
 
-Sessions antérieures : voir `hw/arm/calypso/doc/SESSION_*.md`.
+Sessions antérieures : voir `doc/SESSION_*.md`.
 
 ---
 
@@ -435,11 +435,11 @@ sed -i 's|$| -lm|' /tmp/link.sh && bash /tmp/link.sh
 - **No stubs in critical paths.** No `#ifdef QEMU`. No "good enough"
   shortcuts that hide the real bug.
 - **Verify opcodes against `tic54x-opc.c`** before patching. See
-  [`hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md`](hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md).
+  [`doc/opcodes/tic54x_hi8_map.md`](doc/opcodes/tic54x_hi8_map.md).
 - **QEMU is clock master.** Bridge is slave. BTS gets CLK IND wall-paced.
 - **Test after every edit.** Build, run pytest, verify no regression on
   the 26 stable PASS milestones.
-- **Document workarounds** in [`hw/arm/calypso/doc/TODO.md`](hw/arm/calypso/doc/TODO.md)
+- **Document workarounds** in [`doc/TODO.md`](doc/TODO.md)
   with explicit removal criteria.
 
 ---

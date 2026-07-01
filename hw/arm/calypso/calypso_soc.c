@@ -90,6 +90,23 @@ static void calypso_cntl_write(void *opaque, hwaddr offset,
                                 uint64_t value, unsigned size)
 {
     CalypsoSoCState *s = CALYPSO_SOC(opaque);
+
+    /* CNTL_RST (offset 4) : registre reset firmware (RESET_DSP=bit1, RESET_ARM=bit0).
+     * L'ému l'IGNORE actuellement (return ci-dessous sur offset!=0). DIAG GAP-0 :
+     * logger les toggles assert/release du reset DSP → confirme que le firmware
+     * atteint dsp_pre_boot et tente de piloter le boot DSP par le hardware. */
+    if (offset == 4) {
+        static unsigned rstw = 0;
+        if (rstw < 40) { rstw++;
+            fprintf(stderr, "[SOC] CNTL_RST #%u write val=0x%02x (RESET_DSP=%d RESET_ARM=%d)\n",
+                    rstw, (unsigned)(value & 0xff),
+                    (int)((value >> 1) & 1), (int)(value & 1));
+        }
+        /* OPTION 2 : câbler le reset hardware du DSP (RESET_DSP = bit 1) au c54x.
+         * assert → tenir la ROM en reset ; release → boot frais synchronisé. */
+        calypso_trx_dsp_hw_reset((int)((value >> 1) & 1));
+    }
+
     if (offset != 0) return;
 
     s->extra_conf = (uint16_t)value;

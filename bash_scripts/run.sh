@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+# Fork/overlay root (relocatable) : parent du dossier de ce script (bash_scripts/).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 SESSION="calypso"
 
 # === HARD CLEANUP (2026-06-23) — slate 100% propre, même si un run.sh précédent
@@ -950,9 +953,9 @@ if false; then  # ancien bloc gen-doc-local, conserve desactive pour reference
         fi
         echo "Using pytest: $PYTEST_BIN"
         # Construit la commande pytest avec ses env + ignores
-        PYTEST_CMD="cd /opt/GSM/qemu-src/tests && \
+        PYTEST_CMD="cd $ROOT/tests && \
 CALYPSO_TEST_OUT=/tmp \
-CALYPSO_REPO=\"\${CALYPSO_REPO:-/opt/GSM/qemu-src}\" \
+CALYPSO_REPO=\"\${CALYPSO_REPO:-$ROOT}\" \
 CALYPSO_HOST_ROOT=\"\${CALYPSO_HOST_ROOT:-/root}\" \
 $PYTEST_BIN -v --tb=short --color=yes \
     --ignore=functional --ignore=guest-debug \
@@ -1004,7 +1007,7 @@ echo ; echo '[gen-doc done] Press <Enter> to keep this window open.' ; read -r _
     GEN_DOC_CMD=$(cat <<EOF
 echo '=== --gen-doc-local : pytest dans container $CONTAINER (pipeline pas requis) ==='
 docker exec -e CALYPSO_TEST_OUT=/tmp $CONTAINER bash -c '
-    cd /opt/GSM/qemu-src/tests && \
+    cd $ROOT/tests && \
     /tmp/calypso-venv/bin/pytest -v --tb=short --color=yes
 '
 rc=\$?
@@ -1042,7 +1045,7 @@ fi  # ancien bloc gen-doc-local -- desactive par `if false; then` plus haut
 # pour compal_e88. run_rssi.sh override these to lancer rssi.highram a la place.
 FW_ELF="${FW_ELF:-/opt/GSM/firmware/board/compal_e88/layer1.highram.elf}"
 FW_BIN="${FW_BIN:-/opt/GSM/firmware/board/compal_e88/layer1.highram.bin}"
-QEMU="/opt/GSM/qemu-src/build/qemu-system-arm"
+QEMU="$ROOT/build/qemu-system-arm"
 OSMOCON="/opt/GSM/osmocom-bb/src/host/osmocon/osmocon"
 BTS_CFG="/etc/osmocom/osmo-bts-trx.cfg"
 MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
@@ -1050,7 +1053,7 @@ MOBILE_CFG="/root/.osmocom/bb/mobile_group1.cfg"
 # Copie la cfg mobile versionnee dans /root/.osmocom/bb/. Elle contient
 # deja stick 1 + log stderr avec DMM/DRR/DCC/DSMS debug. Force a chaque
 # run pour eviter le drift entre runs.
-MOBILE_CFG_VERSIONED="${MOBILE_CFG_VERSIONED:-/opt/GSM/qemu-src/cfgs/mobile_group1.cfg}"
+MOBILE_CFG_VERSIONED="${MOBILE_CFG_VERSIONED:-$ROOT/cfgs/mobile_group1.cfg}"
 [ -f "$MOBILE_CFG_VERSIONED" ] || MOBILE_CFG_VERSIONED="/home/nirvana/qemu-src/cfgs/mobile_group1.cfg"
 if [ -f "$MOBILE_CFG_VERSIONED" ] && [ "${CALYPSO_SYNC_MOBILE_CFG:-1}" = "1" ]; then
     mkdir -p "$(dirname "$MOBILE_CFG")"
@@ -1074,13 +1077,13 @@ OSMO_TRX_IPC="${OSMO_TRX_IPC:-osmo-trx-ipc}"
 # Default cfg = versioned 1-chan cfg dans qemu-src/cfgs/. Le /etc/osmocom/
 # legacy declarait chan 0 + chan 1 : osmo-trx-ipc demande 2 chans, calypso
 # en a 1 : DDEV ERROR chan num mismatch. Le fichier versionne a juste chan 0.
-OSMO_TRX_IPC_CFG_DEFAULT="/opt/GSM/qemu-src/cfgs/osmo-trx-ipc.cfg"
+OSMO_TRX_IPC_CFG_DEFAULT="$ROOT/cfgs/osmo-trx-ipc.cfg"
 [ -f "$OSMO_TRX_IPC_CFG_DEFAULT" ] || OSMO_TRX_IPC_CFG_DEFAULT="/etc/osmocom/osmo-trx-ipc.cfg"
 OSMO_TRX_IPC_CFG="${OSMO_TRX_IPC_CFG:-$OSMO_TRX_IPC_CFG_DEFAULT}"
 # calypso-ipc-device = pont QEMU UDP 6702 <-> osmo-trx-ipc shm. Default :
 # le binaire compile dans tools/calypso-ipc-device/. Override via env si
 # tu veux pointer un autre path, ou vide pour skip (mode legacy debug).
-CALYPSO_IPC_DEVICE_DEFAULT="/opt/GSM/qemu-src/tools/calypso-ipc-device/calypso-ipc-device"
+CALYPSO_IPC_DEVICE_DEFAULT="$ROOT/tools/calypso-ipc-device/calypso-ipc-device"
 CALYPSO_IPC_DEVICE="${CALYPSO_IPC_DEVICE-$CALYPSO_IPC_DEVICE_DEFAULT}"
 IPC_MSOCK_PATH="${IPC_MSOCK_PATH:-/tmp/ipc_sock0}"
 
@@ -1585,7 +1588,7 @@ sleep 1
 # donc on ATTEND son VTY (4258) puis on injecte l'abonne. Idempotent, tache de fond.
 (
   _hlr_ip="${CALYPSO_HLR_VTY_IP:-127.0.0.1}"
-  _sim="$MOBILE_CFG"; [ -f "$_sim" ] || _sim=/opt/GSM/qemu-src/cfgs/mobile_group1.cfg
+  _sim="$MOBILE_CFG"; [ -f "$_sim" ] || _sim=$ROOT/cfgs/mobile_group1.cfg
   _imsi=$(grep -oP '^\s*imsi \K[0-9]{15}' "$_sim" 2>/dev/null | head -1)
   _ki=$(grep -oP '^\s*ki comp128 \K[0-9a-fA-F ]+' "$_sim" 2>/dev/null | head -1 | tr -d ' ')
   if [ -n "$_imsi" ] && [ -n "$_ki" ]; then
@@ -1652,7 +1655,7 @@ fi
 # → calypso_dsp.PROM0.bin, calypso_dsp.PROM1.bin, …
 #
 # All env vars are OFF by default. With nothing set, DSP runs with empty
-# prog[]/data[] (no implicit /opt/GSM/calypso_dsp.txt fallback anymore).
+# prog[]/data[] (no implicit $ROOT/calypso_dsp.txt fallback anymore).
 #
 # Mutually exclusive : dsp-blob is for DARAM-only fixtures, per-section is for
 # real ROM loads at silicon-correct addresses. Both at once = blob wins (no
@@ -1686,10 +1689,10 @@ if [ -n "${CALYPSO_DSP_BLOB:-}" ]; then
 fi
 
 # DSP txt source → auto-split to per-section .bins on demand.
-# Source path (override via CALYPSO_DSP_ROM_TXT). Defaults to /opt/GSM/calypso_dsp.txt.
+# Source path (override via CALYPSO_DSP_ROM_TXT). Defaults to $ROOT/calypso_dsp.txt.
 # The .bin files are generated next to the txt :
 #   <dir>/<base>.PROM0.bin, .PROM1.bin, ..., .DROM.bin, .PDROM.bin
-: "${CALYPSO_DSP_ROM_TXT:=/opt/GSM/calypso_dsp.txt}"
+: "${CALYPSO_DSP_ROM_TXT:=$ROOT/calypso_dsp.txt}"
 _DSP_TXT_DIR="$(dirname "$CALYPSO_DSP_ROM_TXT")"
 _DSP_TXT_BASE="$(basename "$CALYPSO_DSP_ROM_TXT" .txt)"
 
@@ -1736,7 +1739,7 @@ if [ "${CALYPSO_DSP_L1STUB:-0}" = "1" ]; then
     _L1STUB_IN="${CALYPSO_DSP_PROM0:-/opt/GSM/calypso_dsp.PROM0.bin}"
     _L1STUB_OUT="/tmp/calypso_dsp_L1stub.PROM0.bin"
     _L1STUB_SCRIPT="$(dirname "$0")/scripts/make_dsp_bin_L1.py"
-    [ -r "$_L1STUB_SCRIPT" ] || _L1STUB_SCRIPT="/opt/GSM/qemu-src/scripts/make_dsp_bin_L1.py"
+    [ -r "$_L1STUB_SCRIPT" ] || _L1STUB_SCRIPT="$ROOT/scripts/make_dsp_bin_L1.py"
     echo "[run.sh] CALYPSO_DSP_L1STUB=1 → patch $_L1STUB_IN → $_L1STUB_OUT"
     python3 "$_L1STUB_SCRIPT" "$_L1STUB_IN" "$_L1STUB_OUT" || {
         echo "[run.sh] make_dsp_bin_L1.py a échoué" >&2; exit 1; }
@@ -2000,7 +2003,7 @@ fi
 # Mode bridge : pont Python pur (UDP 5700-5702 <-> UDP 6702) au lieu d'osmo-trx-ipc.
 # Wall-clock-paced FN counter, sercomm soft:I/Q GMSK inline (BRIDGE_BSP_IQ=1).
 if [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ]; then
-    BRIDGE_PY="${BRIDGE_PY:-/opt/GSM/qemu-src/bridge.py}"
+    BRIDGE_PY="${BRIDGE_PY:-$ROOT/python_scripts/bridge.py}"
     BRIDGE_LOG="${BRIDGE_LOG:-$LOGDIR/bridge.py.log}"
     if [ -x "$BRIDGE_PY" ]; then
         tmux new-window -t "$SESSION" -n bridge-py
@@ -2112,14 +2115,14 @@ if [ "$CALYPSO_MODE" = "full-grgsm" ]; then
     # BSIC/FN REELS vers UDP 4731 (feed_sb -> shunt_dispatch_sb, remplace
     # SHUNT_CANNED_BSIC). Subsume le si_bridge (grgsm_decode sur fifo = SI seul,
     # pas de SCH). CALYPSO_GRGSM_DECODER=si-bridge pour revenir au SI-only legacy.
-    RELAY_DECODE=/opt/GSM/qemu-src/opt-gsm-scripts/grgsm_relay_decode.py
+    RELAY_DECODE=$ROOT/opt-gsm-scripts/grgsm_relay_decode.py
     # DEFAUT = si-bridge (PROUVE : grgsm_decode sur la FIFO /tmp/iq_grgsm.fifo,
     # SI OK). Le relay_decode lit UDP 5810 qui n'est PAS alimente ici -> SI mort
     # (regression 2026-06-04). CALYPSO_GRGSM_DECODER=relay seulement si 5810 est
     # reellement nourri. Le SCH/BSIC reel passe par un autre chemin (cf si_bridge).
     if [ "${CALYPSO_GRGSM_DECODER:-si-bridge}" = "si-bridge" ]; then
         tmux send-keys -t "$SESSION:grgsm-decode" \
-            "sleep 15; bash /opt/GSM/qemu-src/si_bridge_loop.sh 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
+            "sleep 15; bash $ROOT/bash_scripts/si_bridge_loop.sh 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
     else
         tmux send-keys -t "$SESSION:grgsm-decode" \
             "sleep 15; source /root/.env/bin/activate; python3 -u $RELAY_DECODE 2>&1 | $TSLOG | tee $LOGDIR/grgsm_decode.log" C-m
@@ -2217,10 +2220,10 @@ for spec in "${_ALL_SPECS[@]}"; do
     name="${spec%%|*}"; log="${spec##*|}"
     if [ "$log" = "__SI__" ]; then
         # decode SI live (type + FN + hexa L2) via sniff passif des GSMTAP 4729/4730.
-        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u /opt/GSM/qemu-src/gsm_sniff.py si"
+        cmd="clear; echo '=== SI decode (4729/4730) ==='; sleep 16; python3 -u $ROOT/python_scripts/gsm_sniff.py si"
     elif [ "$log" = "__BURST__" ]; then
         # decode BURST live (SCH 4731 + TRXD 5700-5702) via sniff passif.
-        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u /opt/GSM/qemu-src/gsm_sniff.py burst"
+        cmd="clear; echo '=== BURST decode (4731 + 5700-5702) ==='; sleep 16; python3 -u $ROOT/python_scripts/gsm_sniff.py burst"
     elif [ "$log" = "__GDB__" ]; then
         # gdb-multiarch attaché au QEMU gdb-stub. Sleep 3 pour laisser QEMU
         # finir son init et binder le port. Pas de script -x : prompt vide
@@ -2297,9 +2300,9 @@ if [ "$CALYPSO_AUTO_GEN_DOC" = "1" ]; then
     tmux send-keys -t "$SESSION:gen-doc" \
         "echo '[gen-doc] waiting 60s for pipeline to stabilize...'; sleep 60; \
          echo '[gen-doc] launching pytest in-container (verbosity=${CALYPSO_PYTEST_VERBOSITY:-v} scope=${CALYPSO_PYTEST_SCOPE:-default})'; \
-         cd /opt/GSM/qemu-src/tests && \
+         cd $ROOT/tests && \
          CALYPSO_TEST_OUT=/tmp \
-         CALYPSO_REPO=/opt/GSM/qemu-src \
+         CALYPSO_REPO=$ROOT \
          CALYPSO_HOST_ROOT=/root \
          CALYPSO_MODE_TAG=$CALYPSO_MODE \
          $GEN_DOC_PYTEST $PY_VERBOSITY $PY_IGNORES $PY_TARGET; \
@@ -2347,7 +2350,7 @@ echo "Pipeline launched. Attach with: tmux attach -t $SESSION"
 # Build identity dump (2026-05-25) -- attribution causale dans report.
 # Logged au stdout du wrapper + capture-able dans qemu.log via c54x_reset.
 echo "===== BUILD IDENTITY ====="
-QEMU_C54X_PATH="${QEMU_C54X_PATH:-/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c}"
+QEMU_C54X_PATH="${QEMU_C54X_PATH:-$ROOT/hw/arm/calypso/calypso_c54x.c}"
 if command -v git >/dev/null 2>&1 && [ -d "$(dirname "$QEMU_C54X_PATH")/../../../.git" ]; then
     cd "$(dirname "$QEMU_C54X_PATH")/../../.." 2>/dev/null && {
         echo "  git rev:         $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -2355,12 +2358,12 @@ if command -v git >/dev/null 2>&1 && [ -d "$(dirname "$QEMU_C54X_PATH")/../../..
         cd - >/dev/null
     }
 fi
-echo "  qemu binary mtime: $(stat -c %y "${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}" 2>/dev/null | cut -d. -f1)"
+echo "  qemu binary mtime: $(stat -c %y "${QEMU:-$ROOT/build/qemu-system-arm}" 2>/dev/null | cut -d. -f1)"
 echo "  c54x source mtime: $(stat -c %y "$QEMU_C54X_PATH" 2>/dev/null | cut -d. -f1)"
 # Marqueurs decoder fixes -- grep des strings reellement dans le binaire
 # (= dans le format string BUILD-IDENT compile en .rodata, pas dans les
 # commentaires C qui sont strippes). Si la string disparait = fix retire.
-QEMU_BIN="${QEMU:-/opt/GSM/qemu-src/build/qemu-system-arm}"
+QEMU_BIN="${QEMU:-$ROOT/build/qemu-system-arm}"
 if [ -x "$QEMU_BIN" ]; then
     BUILD_IDENT_LINE=$(strings "$QEMU_BIN" 2>/dev/null | grep 'BUILD-IDENT decoder-fixes:' | head -1)
     if [ -n "$BUILD_IDENT_LINE" ]; then
@@ -2423,7 +2426,7 @@ if [ "$CALYPSO_IRDA_PEER" = "1" ] && [ -n "${PTY_IRDA:-}" ]; then
 fi
 echo
 echo "Manual warm-start (debug, if BSC unavailable) :"
-echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
+echo "  $ROOT/scripts/populate-si.sh"
 echo
 
 tmux select-window -t "$SESSION:all" 2>/dev/null || tmux select-window -t "$SESSION:qemu"

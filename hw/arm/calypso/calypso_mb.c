@@ -255,6 +255,15 @@ static void calypso_machine_init(MachineState *machine)
      * calypso_trx.c pour stopper les écritures DMA vers DARAM.
      * Cf hw/arm/calypso/calypso_dsp_shunt.c. */
     calypso_dsp_shunt_init(sysmem, &address_space_memory);
+    /* CALYPSO_DSP=c54x : relier le VRAI DSP au shunt pour qu'il le pilote
+     * lui-meme depuis on_frame_tick (le trx skippe c54x_run quand le shunt
+     * est actif).
+     * FIX (verif report) : le `dsp` local (l.235) est block-scope dans
+     * `if (s->dsp_blob){...}` (l.234-250) et HORS PORTEE ici ; en run normal
+     * (dsp_blob NULL) il n'est meme jamais assigne. On appelle donc
+     * calypso_trx_get_dsp() directement (non-NULL : c54x_init a tourne dans
+     * le realize du SoC, bien avant ce point). Le shunt null-guard si NULL. */
+    calypso_dsp_shunt_set_c54x(calypso_trx_get_dsp());
 
     fprintf(stderr, "[MB] === Machine ready ===\n");
     fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",

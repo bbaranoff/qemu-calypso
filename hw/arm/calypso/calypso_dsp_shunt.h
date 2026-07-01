@@ -39,4 +39,11 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n);
 /* SONDE B : enregistre la FN TDMA reelle par RA lors dun RACH UL. */
 void calypso_dsp_shunt_record_rach(uint8_t ra);
 
+/* CALYPSO_DSP=c54x : relie le handle du VRAI DSP au shunt. Type opaque pour
+ * ne pas tirer calypso_c54x.h dans ce header. Appele depuis calypso_mb.c
+ * APRES calypso_dsp_shunt_init(), avec calypso_trx_get_dsp(). */
+struct C54xState;
+void calypso_dsp_shunt_set_c54x(struct C54xState *s);
+bool calypso_dsp_shunt_route_c54x_active(void);
+
 #endif /* CALYPSO_DSP_SHUNT_H */

@@ -43,6 +43,22 @@
 
 #define CALYPSO_BASE_CLK   13000000LL  /* 13 MHz */
 
+/* Domaine de temps du hwtimer. DOIT être le MÊME que le tdma_tick/frame-IRQ
+ * (calypso_trx.c calypso_tdma_clock()), sinon le firmware mesure les ticks
+ * hwtimer (une horloge) entre deux frame-IRQ (une AUTRE horloge) -> le ratio
+ * 1875 ticks/trame ne tient pas -> "LOST N!" en continu, et icount ne peut RIEN
+ * (le hwtimer sur REALTIME est immunisé à icount). Défaut VIRTUAL (single-domain,
+ * verrouillé sous icount=auto) ; opt-in wall via la MÊME gate que le tick. */
+static QEMUClockType calypso_timer_clock(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_TDMA_REALTIME");
+        cached = (e && *e == '1') ? 1 : 0;
+    }
+    return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
+}
+
 static bool calypso_timer_should_run(CalypsoTimerState *s)
 {
     return (s->ctrl & TIMER_CTRL_START) && (s->ctrl & TIMER_CTRL_CLOCK_ENABLE);
@@ -65,7 +81,7 @@ static void calypso_timer_recompute_tick(CalypsoTimerState *s)
 static uint16_t calypso_timer_current_count(CalypsoTimerState *s)
 {
     if (!s->running) return s->count;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t now = qemu_clock_get_ns(calypso_timer_clock());
     int64_t elapsed = now - s->epoch_ns;
     if (elapsed < 0) elapsed = 0;
     int64_t ticks = elapsed / s->tick_ns;
@@ -82,7 +98,7 @@ static void calypso_timer_schedule_wrap(CalypsoTimerState *s)
 {
     /* Schedule the next IRQ at the moment count would reach 0 from the
      * current virtual time. */
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t now = qemu_clock_get_ns(calypso_timer_clock());
     uint16_t cur = calypso_timer_current_count(s);
     int64_t ns_to_wrap = (int64_t)(cur + 1) * s->tick_ns;
     timer_mod(s->timer, now + ns_to_wrap);
@@ -98,7 +114,7 @@ static void calypso_timer_tick(void *opaque)
 
     if (s->ctrl & TIMER_CTRL_RELOAD) {
         /* Reanchor epoch to "now" so the next read sees count=load. */
-        s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock());
         s->count = s->load;
         timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
     } else {
@@ -113,7 +129,7 @@ static void calypso_timer_start(CalypsoTimerState *s)
     calypso_timer_recompute_tick(s);
     s->count = s->load;
     s->running = true;
-    s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock());
     timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
 }
 
@@ -128,7 +144,7 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
         static int64_t prev_t_virt = 0;
         if (rd_count < 0) {  /* DISABLED — re-enable by setting >0 */
             uint16_t live = calypso_timer_current_count(s);
-            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            int64_t now = qemu_clock_get_ns(calypso_timer_clock());
             int64_t dt = prev_t_virt ? (now - prev_t_virt) : 0;
             fprintf(stderr, "[timer] RD ts=%p off=0x%02x live=%u stored=%u "
                     "running=%d tick_ns=%" PRId64 " epoch=%" PRId64
@@ -166,7 +182,7 @@ static void calypso_timer_write(void *opaque, hwaddr offset, uint64_t value,
                 /* prescaler changed mid-run — re-anchor at current count */
                 s->count = calypso_timer_current_count(s);
                 calypso_timer_recompute_tick(s);
-                s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock()) -
                               (int64_t)(s->load - s->count) * s->tick_ns;
                 calypso_timer_schedule_wrap(s);
             }
@@ -202,7 +218,7 @@ static void calypso_timer_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
-    s->timer = timer_new_ns(QEMU_CLOCK_REALTIME, calypso_timer_tick, s);
+    s->timer = timer_new_ns(calypso_timer_clock(), calypso_timer_tick, s);
 }
 
 static void calypso_timer_reset(DeviceState *dev)

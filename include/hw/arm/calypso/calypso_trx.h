@@ -84,8 +84,11 @@
 #define ULPD_GAUGING_CTRL     0x24
 #define ULPD_GSM_TIMER        0x28
 
-/* GSM timing — real 4.615ms TDMA frame period */
-#define GSM_TDMA_NS           4615000
+/* GSM timing — vraie période trame TDMA = 60/13 ms = 4 615 384,6 ns.
+ * 4615384 matche EXACTEMENT osmo-trx (WALL_TDMA_NS, 1250 smpl / 270833,33 sps)
+ * -> zéro dérive FN QEMU↔radio. L'ancien 4615000 était 384 ns/trame TROP RAPIDE
+ * (~83 µs/s) = source des 'We were N FN faster than TRX'. */
+#define GSM_TDMA_NS           4615384
 #define GSM_HYPERFRAME        2715648
 
 /* DSP boot */
@@ -102,6 +105,9 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
 /* Test fixture: return the C54x DSP state pointer for `-M calypso,dsp-blob=`.
  * Returns NULL if calypso_trx_init() hasn't run or the DSP ROM load failed. */
 C54xState *calypso_trx_get_dsp(void);
+/* DSP hardware reset driven by ARM firmware CNTL_RST (RESET_DSP). assert!=0 → hold
+ * the c54x in reset ; assert==0 → fresh c54x_reset boot. Gated revival (SHUNT=0). */
+void calypso_trx_dsp_hw_reset(int assert_reset);
 
 /* Per-section ROM paths — called by mb.c machine_init BEFORE sysbus_realize
  * so trx_init can load each section at its silicon-correct DSP address

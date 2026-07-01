@@ -116,7 +116,7 @@ DEFAULTS (run_si.sh)
 > est gated par TPU→TSP→IOTA, le mobile passe par la PTY QEMU. Si une
 > instruction/opcode/registre semble cassé : **vérifier contre `tic54x-opc.c`
 > et SPRU172C avant de patcher**, jamais contourner. Tout contournement
-> temporaire jugé inévitable doit être documenté dans `hw/arm/calypso/doc/TODO.md`
+> temporaire jugé inévitable doit être documenté dans `doc/TODO.md`
 > avec un critère de retrait.
 >
 > **Disclosure obligatoire.** Si malgré tout un hack/synth/bypass est

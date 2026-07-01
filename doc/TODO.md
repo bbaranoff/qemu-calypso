@@ -1,3 +1,29 @@
+# TODO — POLE POSITION 2026-06-25 (reprise à chaud)
+
+## Acquis cette nuit (gravés, commit `4504dec` sur main nirvana)
+- ✅ **GAP-1 (derail) RÉSOLU** — fix MVKD 0x70 (longueur 2-mot + lk) : plus de POST-BOOTSTUB-RET storm, DSP exécute son L1 réel stable.
+- ✅ **READA sous RPT** — fix `rpt_fresh` (1ère lecture repart de A_low, pas du mvpd_src stale) : table de dispatch désormais FIDÈLE au ROM (data[0x4387]=0xab38, plus 0xf074).
+- Les deux ISA-correct. NE PAS revert READA (le 0→7,3M POST-BOOTSTUB-RET = masque qui tombe, pas régression).
+
+## PREMIER MOVE DEMAIN (sonde déjà armée/buildée/syncée — juste lancer + lire)
+1. `start-clean.sh` (canary=0, FBDET_SENTINEL=2)
+2. `grep -a "DISP-ENTRY" /root/qemu.log | head -20`
+3. `grep -a "SEED-WR"    /root/qemu.log | head -20`
+
+## TRISECTION (lecture du résultat — ferme la fourche en 1 run)
+Contexte : dispatcher 0xb400 fait `STM #0x5ac8,SP` (reset pile DÉLIBÉRÉ) → `STLM A,AR7` (AR7=0x4387) → `LD *AR7,A ; BACC A` → data[0x4387]=0xab38=RET no-op → RET dépile data[0x5ac8]=0 → storm. Question = provenance AR7 + seed data[0x5ac8].
+- **(a) data[0x5ac8] jamais écrit + AR7=immédiat littéral** → idle-path réel, seed retour-scheduler jamais posé → **la dispatch FB est AILLEURS** → trouver le vrai chemin FB (élargir BACC-DISP / tracer les autres bacc/cala).
+- **(b) data[0x5ac8] écrit mais mauvaise addr / SP décalé** → vrai **bug pile émulateur** (CALL/RET ou mirror) → fixer.
+- **(c) AR7 calculé depuis un registre d'index/événement gelé à 0** → dispatcher correct, index mort → **remonter au fil IPTR/IRQ-delivery** ; le 7,3M no-op-RET = famine d'événement amont (cohérent AR3=AR4 gelés).
+
+## Frontière = Phase B (FB detect)
+But : le vrai détecteur FB tourne et écrit d_fb_det. I/Q confirmée livrée à 0x2a00 (canary). Une fois la dispatch FB atteinte → retarget DETTRACE sur son handler.
+
+## Nettoyage (plus tard, follow-up commit)
+Stripper les sondes diag de calypso_c54x.c/.h : MVKD/READA = keepers ; DETTRACE, BACC-DISP, DISPVAL-WR, DISP-ENTRY, SEED-WR, AR3-TRIP, AR0-TRACE, B3D1-CTX, DERAIL-* = jetables.
+
+---
+
 ---
 name: TODO — temporary hacks with retraction criteria
 description: Per CLAUDE.md rule #1, all env-gated hacks listed here with explicit removal criterion.

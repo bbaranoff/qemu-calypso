@@ -1,8 +1,9 @@
 #!/bin/bash
-# start-clean.sh -- lance le pipeline Calypso avec les overrides de calypso.env
+# start-clean.sh -- lance le pipeline Calypso avec les overrides de calypso.env.
+# Layout overlay/fork : ce script vit dans bash_scripts/, calypso.env à la racine.
 set -euo pipefail
-cd "$(dirname "$0")"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -a
-. ./calypso.env
+. "$ROOT/calypso.env"
 set +a
-exec ./run.sh "$@"
+exec "$ROOT/bash_scripts/run.sh" "$@"

@@ -185,4 +185,4 @@ l1s_fbdet_resp (ligne 399)
 > 2. Référence datasheet (SPRU172C) ou binutils (tic54x-opc.c)
 > 3. Test sur ≥ 5 runs avant et après
 >
-> Tout hack doit vivre exclusivement dans `hack.py` / `hack_gdb.py`.
+> Tout hack doit vivre exclusivement dans `hack_gdb.py`.
