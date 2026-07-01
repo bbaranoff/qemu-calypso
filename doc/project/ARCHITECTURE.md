@@ -1,8 +1,18 @@
 # Calypso QEMU — Architecture & Flow
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Portée du décalage sur CE doc : le **bus publish/subscribe UDP `calypso_orch` (6920), le path « steal » (6921) et toute la « Section 5 · API publiques (calypso_orch.h) » sont FABRIQUÉS** — ils n'existent nulle part dans l'arbre.
+> - `calypso_orch.h` (dans `hw/arm/calypso/`, PAS `include/`) contient **uniquement** `static inline int calypso_orch(void)`, un simple flag d'env `CALYPSO_ORCH` — ce n'est PAS un header d'API pub/sub.
+> - Aucun fichier `calypso_orch.c` n'existe ; aucun port `6920`/`6921` (`grep -rn '6920\|6921' hw/arm/calypso/` = 0).
+> - Aucune des 9 fonctions déclarées en §5 (`calypso_orch_init/publish`, `l1ctl_sock_steal_init/inject_dlci/send_to_mobile_synth`, `calypso_trx_dsp_init_done/on_l1ctl_fw/on_ul_burst_raw/redirect_ul_to_bsp`) n'existe (`grep -rl` = 0 sur tout l'arbre).
+> - Le flux « DSP publie `d_fb_det=1` via `api_write_cb` » ne se produit JAMAIS : `api_write_cb` n'est **jamais assigné** (`grep -rn 'api_write_cb *=' hw/arm/calypso/` = 0). Le seul point de tir est `calypso_c54x.c:3357-3358` (`if (s->api_write_cb) s->api_write_cb(...)`), gardé et jamais atteint. `d_fb_det` reste 0.
+> - Les « publish » réels du code (`calypso_rach_publish`, `calypso_fbsb_publish_fb_found`, `calypso_sdcch_ul_publish`) sont des helpers locaux SANS rapport avec un bus UDP.
+
 État post-merge orchestrator. Mobile L23 ↔ QEMU baseband ↔ osmo-bts-trx,
 avec calypso_trx comme orchestrateur central et un bus publish/subscribe
 UDP pour les bridges Python user-space.
+<!-- FAUX (bus pub/sub UDP): calypso_trx n'est pas relié à un bus ORCH; aucun bus UDP 6920 n'existe. Voir bannière. -->
 
 ---
 
@@ -72,6 +82,10 @@ flowchart TB
     BSC <-->|BSSAP/SCCP| MSC
 ```
 
+> **FAUX dans le diagramme ci-dessus** — nœuds/arêtes inexistants dans le code :
+> - `ORCH[calypso_orch.c UDP 6920 pub/sub]` et `STEAL[l1ctl steal UDP 6921]` : aucun fichier/port correspondant.
+> - arêtes `TRX/BSP/SOCK -->|publish| ORCH`, `DSP -->|publish via api_write_cb| ORCH`, `ORCH -.subscribe.-> BURSTS/OPTY`, `BURSTS -->|UDP 6921| STEAL`, `STEAL -->|sercomm inject| UART` : toutes fabriquées.
+
 ---
 
 ## 2. Sequence — L1CTL boot + FBSB cycle
@@ -117,7 +131,7 @@ sequenceDiagram
     ARM-->>SOCK: PM_CONF
     SOCK-->>L23: PM_CONF
     SOCK->>TRX: on_l1ctl_fw(0x09)
-    TRX->>ARM: qemu_irq_pulse(IRQ_API)
+    TRX->>ARM: qemu_irq_raise(irqs[CALYPSO_IRQ_API])
 
     Note over L23,BTS: FBSB sync (cell acquisition)
     L23->>ARM: FBSB_REQ
@@ -128,7 +142,7 @@ sequenceDiagram
     BSP->>BSP: parse TRXDv0, DMA → DARAM 0x2e80
     BSP->>DSP: BRINT0 wake [gated dsp_init_done]
     DSP->>TRX: api_write_cb(d_fb_det=1) → mirror dsp_ram
-    TRX->>ARM: qemu_irq_pulse(IRQ_API)
+    TRX->>ARM: qemu_irq_raise(irqs[CALYPSO_IRQ_API])
     ARM-->>SOCK: FBSB_CONF
     SOCK-->>L23: FBSB_CONF
 
@@ -141,9 +155,16 @@ sequenceDiagram
     BR->>BTS: UDP 5802 (burst_ind → modulate → sendto)
 ```
 
+> **Corrections sur la séquence ci-dessus :**
+> - `qemu_irq_pulse(IRQ_API)` corrigé en `qemu_irq_raise(irqs[CALYPSO_IRQ_API])` — le code utilise `qemu_irq_raise` sur `s->irqs[CALYPSO_IRQ_API]` (`calypso_trx.c:1060` et `:1809`), il n'y a pas de `qemu_irq_pulse`.
+> - Steps FABRIQUÉS (participant `ORCH`, `bind UDP 6920`, `calypso_orch_init + l1ctl_sock_steal_init(6921)`, tous les `publish(...)`) : aucun bus ORCH n'existe.
+> - `DSP->>TRX: api_write_cb(d_fb_det=1)` **ne se produit jamais** — `api_write_cb` n'est jamais câblé (`grep -rn 'api_write_cb *=' hw/arm/calypso/` = 0), `d_fb_det` reste 0, le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000) et l'IMR reste 0x0000. Le `FBSB_CONF` qui suit n'est donc jamais émis par cette voie.
+
 ---
 
 ## 3. Bus orchestrateur — layers & publishers
+
+> **FAUX — section entièrement fabriquée.** La classe `calypso_orch` (init/publish/subs/fd), l'enum `Layer`, et les méthodes `l1ctl_sock.steal_init/inject_dlci/send_to_mobile_synth`, `calypso_trx.dsp_init_done/on_l1ctl_fw/on_ul_burst_raw/redirect_ul_to_bsp`, `calypso_fbsb.on_dsp_task_change/publish_sb_found` n'existent pas (`grep -rl` = 0). Diagramme conservé pour historique uniquement.
 
 ```mermaid
 classDiagram
@@ -214,8 +235,8 @@ classDiagram
 | Endpoint | Type | Owner | Rôle |
 |---|---|---|---|
 | `/tmp/osmocom_l2_1` | unix server | `l1ctl_sock.c` | L1CTL direct mobile↔QEMU |
-| UDP `127.0.0.1:6920` | server | `calypso_orch.c` | bus publish/subscribe |
-| UDP `127.0.0.1:6921` | server | `l1ctl_sock_steal_init` | inject L1CTL → UART |
+| ~~UDP `127.0.0.1:6920`~~ | ~~server~~ | ~~`calypso_orch.c`~~ | **FAUX** — pas de `calypso_orch.c`, aucun bind 6920 (grep=0) |
+| ~~UDP `127.0.0.1:6921`~~ | ~~server~~ | ~~`l1ctl_sock_steal_init`~~ | **FAUX** — `steal_init` inexistant, aucun bind 6921 (grep=0) |
 | UDP `127.0.0.1:6702` | bind | `calypso_bsp.c` | DL burst recv from bridge |
 | UDP → `127.0.0.1:6802` | sendto | `calypso_bsp.c` | UL burst to bridge |
 | UDP `127.0.0.1:5700` | sendto | `bridge_clk.py` | CLK IND → BTS |
@@ -228,6 +249,12 @@ classDiagram
 ---
 
 ## 5. API publiques (calypso_orch.h)
+
+> ⚠️ **SECTION ENTIÈREMENT FABRIQUÉE — FAUX.** Le vrai `hw/arm/calypso/calypso_orch.h` ne contient qu'un flag d'env :
+> ```c
+> static inline int calypso_orch(void); /* lit getenv("CALYPSO_ORCH") */
+> ```
+> Aucune des 9 fonctions ci-dessous n'existe dans l'arbre (`grep -rl` = 0 pour chacune). Bloc conservé pour historique, à ne PAS réimplémenter tel quel.
 
 ```c
 /* Orchestrator bus */
@@ -293,6 +320,8 @@ flowchart LR
 ---
 
 ## 8. Bridges Python — rôle résumé
+
+> Note : les colonnes « Subscribe » et les ports `6920`/`6921` (steal L1CTL) ci-dessous supposent le bus ORCH et le path steal côté QEMU — **inexistants** (voir bannière). Côté QEMU rien ne publie/écoute sur ces ports.
 
 | Bridge | Bind | Send | Subscribe | Rôle |
 |---|---|---|---|---|

@@ -41,7 +41,8 @@ hw/arm/calypso/
 
 4. **calypso_trx.c does too much**
    - Currently handles: DSP API, TPU regs, TSP regs, ULPD regs, SIM regs, bootloader protocol, burst I/O, frame processing
-   - Could split: calypso_tpu.c, calypso_sim.c, calypso_dsp_api.c
+   - Could split: calypso_tpu.c, ~~calypso_sim.c~~, calypso_dsp_api.c
+   - ✅ FIXÉ (partiellement) : `calypso_sim.c` déjà extrait (calypso_sim.c:1, « ISO 7816 / GSM 11.11 SIM emulator », 794 lignes, référencé dans meson.build:24). calypso_trx.c ne conserve plus que ~20 refs SIM résiduelles. Restent à extraire : calypso_tpu.c et calypso_dsp_api.c (non créés à ce jour).
 
 5. **Normalize header includes**
    - Some files use `#include "hw/arm/calypso/foo.h"`, others use `#include "foo.h"`

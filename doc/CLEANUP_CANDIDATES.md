@@ -15,21 +15,25 @@ Tags : `SAFE-DELETE` / `ARCHIVE` / `NEEDS-REVIEW` / `KEEP`.
 
 ## 1) Fichiers source morts / doublons dans hw/arm/calypso
 
-### 1a. `calypso_dbg.c` (2832 o) — SAFE-DELETE (avec la ligne meson associée)
-Système de debug **superseded**, distinct et non branché.
-- Preuve non-atteignabilité : `calypso_dbg_init` et `calypso_dbg_mask` ne sont
-  référencés **que dans `calypso_dbg.c`** lui-même (grep tous `.c` hors `.bak`/`.tmp`
-  = 1 fichier). Le header `include/hw/arm/calypso/calypso_dbg.h` n'est inclus
-  **que par `calypso_dbg.c`**. La macro `DBG()` de ce système n'a **aucun appelant**.
+### 1a. `calypso_dbg.c` — ✅ FAIT (SAFE-DELETE effectué 2026-07-01)
+**Ce candidat a été traité.** Le fichier `calypso_dbg.c`, son header et toute
+trace build ont été retirés cette session (SAFE-DELETE réalisé). Vérification :
+`find /opt/GSM/qemu-calypso -name 'calypso_dbg*'` = **aucun résultat** ;
+`grep calypso_dbg_init|calypso_dbg_mask` sur `hw/…` + `include/…` = **0 hit** ;
+`meson.build` ne liste plus que `fw_console.c` (:23) et `calypso_debug.c` (:26),
+**aucune ligne `calypso_dbg.c`**. Rien d'autre ne casse (confirmé).
+
+Historique (raison de la suppression, conservée pour mémoire) :
+- Système de debug **superseded**, distinct et non branché. `calypso_dbg_init`
+  et `calypso_dbg_mask` n'étaient référencés que dans `calypso_dbg.c` lui-même ;
+  le header n'était inclus que par lui ; la macro `DBG()` n'avait aucun appelant.
 - Le vrai système de debug actif est `calypso_debug.c` (voir 1c) via
   `calypso_debug_enabled()` / macro `C54_DBG(...)` : 80 sites `calypso_debug_enabled`
   et 19 `C54_DBG` rien que dans `calypso_c54x.c`.
-- **`calypso_dbg.c` n'est donc PAS un doublon fonctionnel de `calypso_debug.c`** :
-  c'est un ancêtre mort (catégories `DBG_BSP`/`DBG_FB`/… via `CALYPSO_DBG`) que
-  le système `CALYPSO_DEBUG` a remplacé. Compilé à vide (meson.build ligne
-  `'calypso_dbg.c'`), zéro effet runtime.
-- Retrait = supprimer le `.c`, le header `include/.../calypso_dbg.h`, et la ligne
-  `files('calypso_dbg.c')` de meson.build. Aucun autre TU ne casse.
+- `calypso_dbg.c` n'était PAS un doublon fonctionnel de `calypso_debug.c` :
+  c'était un ancêtre mort (catégories `DBG_BSP`/`DBG_FB`/… via `CALYPSO_DBG`) que
+  le système `CALYPSO_DEBUG` avait remplacé — zéro effet runtime.
+- ~~À faire : supprimer le `.c`, le header et la ligne meson.~~ **DONE.**
 
 ### 1b. `fw_console.c` (2738 o) — NEEDS-REVIEW (mort, diagnostic uniquement)
 Poller diagnostique du printf_buffer firmware, **jamais initialisé**.
@@ -45,9 +49,9 @@ Poller diagnostique du printf_buffer firmware, **jamais initialisé**.
 Preuves de câblage réel (grep symboles hors fichier d'origine) :
 - `calypso_debug.c` — **système debug ACTIF**. `calypso_debug_enabled()` utilisé
   partout (80× dans `calypso_c54x.c`). KEEP.
-- `calypso_fbsb.c` (5555 o) — `calypso_fbsb_init` / `calypso_fbsb_on_dsp_task_change`
+- `calypso_fbsb.c` (5570 o) — `calypso_fbsb_init` / `calypso_fbsb_on_dsp_task_change`
   appelés `calypso_trx.c:881,889`. KEEP.
-- `calypso_full_pcb.c` (6622 o) — symbole `calypso_full_pcb` référencé par 7
+- `calypso_full_pcb.c` (6637 o) — symbole `calypso_full_pcb` référencé par 8
   fichiers (c54x, trx, fbsb, soc, bsp, .h). KEEP.
 - `calypso_sim.c` (31129 o) — `calypso_sim_new` appelé depuis `calypso_trx.c`. KEEP.
 - `calypso_iota.c` — `calypso_iota_take_bdl_pulse` appelé `calypso_bsp.c`. KEEP.
@@ -167,7 +171,7 @@ Logs runtime hors-source (SAFE-DELETE, régénérés) :
 
 ## Récapitulatif par tag
 
-- **SAFE-DELETE** : `calypso_dbg.c`(+header+ligne meson) ; 13 `.bak` + 1 `.tmp`
+- **SAFE-DELETE** : ~~`calypso_dbg.c`(+header+ligne meson)~~ **✅ FAIT 2026-07-01** ; 13 `.bak` + 1 `.tmp`
   calypso ; bloc sondes jetables (9 familles : DETTRACE/BACC-DISP/DISPVAL-WR/
   DISP-ENTRY/SEED-WR/AR3-TRIP/AR0-TRACE/B3D1-CTX/DERAIL-*) — **après le vert** ;
   dumps `/tmp/iq_*.bin` + logs `/tmp/*.log` ; logs runtime `/root/*.log` et
@@ -192,9 +196,9 @@ En particulier :
    `calypso_c54x.c:13593`, IRQ frame masquée `calypso_trx.c:1786`). Les retirer
    avant d'atteindre le « vert » (d_fb_det!=0) aveuglerait le diagnostic —
    ordre imposé par `TODO.md` : fix d'abord, strip ensuite.
-2. **`fw_console.c` et `calypso_dbg.c`** sont morts mais compilent proprement ;
-   confirmer qu'aucun câblage futur planifié ne les vise avant retrait, et
-   ajuster meson.build dans le même commit.
+2. **`fw_console.c`** est mort mais compile proprement ; confirmer qu'aucun
+   câblage futur planifié ne le vise avant retrait, et ajuster meson.build dans
+   le même commit. (`calypso_dbg.c` : déjà retiré cette session, voir §1a.)
 3. **Les `.md` de session/STATUS** contiennent le savoir historique
    (SP/wedge/reverts) : **ARCHIVE, jamais DELETE**.
 4. **Le balayage complet de qemu-src** (hors `hw/arm/calypso`) est un chantier

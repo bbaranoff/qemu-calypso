@@ -134,7 +134,10 @@ Bridge.py côté hôte est **déjà threadé** (commit 2026-05-24) :
 #### [ ] 2.a. DSP TMS320C54x thread
 - **Pourquoi maintenant** : root cause des 300 bugs apparents, max impact
 - **État courant** : `c54x_run(BUDGET)` appelé 2× depuis `calypso_tdma_tick`
-  (calypso_trx.c L730 + L777), sérialisé dans le main TCG ARM thread
+  (défini `calypso_trx.c:1618`) — appels `c54x_run` à `calypso_trx.c:1713`
+  (dsp_n_exec_2) et `calypso_trx.c:1799` (dsp_n_exec_5), sérialisés dans le
+  main TCG ARM thread. *(Deux autres appels `c54x_run` existent à `L195` et
+  `L637` mais dans d'autres fonctions, hors tick TDMA.)*
 - **Refactor** :
   - `QemuThread dsp_thread` qui boucle `c54x_run(SMALL_BUDGET)`
   - tdma_tick retire les 2 appels c54x_run inline

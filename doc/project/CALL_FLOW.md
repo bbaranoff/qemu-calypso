@@ -1,5 +1,9 @@
 # Calypso QEMU — Full call flow (2026-04-08)
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Concrètement pour la section 3 (FBSB) : la synthèse FB côté hôte a été retirée le 2026-05-28 (`calypso_fbsb.c:3-11`). Le callback défensif `dsp_api_write_cb`/`trx_dsp_api_write_cb` (étapes 6-7, diagramme §7) **n'existe pas** dans le code ; le hook générique `api_write_cb` est déclaré (`calypso_c54x.h:204`, invoqué `calypso_c54x.c:3357-3358`) mais **jamais assigné** (`grep 'api_write_cb =' → 0`). La publication FB (`calypso_fbsb_publish_fb_found`) n'est ni immédiate ni inconditionnelle : elle n'a lieu que si `calypso_orch() && fbsb_synth_enabled()` ET que le corrélateur BSP renvoie une détection réelle (`calypso_fbsb.c:113-119`). Les constantes `pm=80/snr=100` et le PC `0xe26e` n'apparaissent nulle part.
+
 End-to-end ordering across all layers, top→bottom, for the mobile↔BTS path.
 Use this as a single source of truth when something hangs and you need to
 locate which layer dropped the ball.
@@ -66,10 +70,10 @@ DSP (TMS320C54x emulator)          — PROM0+PROM1, NDB mailbox at 0x0800
 | 1    | bridge → fw          | DLCI 5 forward of `L1CTL_FBSB_REQ`                            |
 | 2    | firmware L1S         | enqueues FB-det task, writes `d_task_md = DSP_TASK_FB` (1) into NDB at `0xFFD00008` (page 0) or `0xFFD00030` (page 1) |
 | 3    | calypso_trx.c::dsp_ram_write | sees `offset==0x08\|0x30` and `value!=0` → lazy-init `g_fbsb` and call `calypso_fbsb_on_dsp_task_change(&g_fbsb, value, fn)` |
-| 4    | calypso_fbsb.c       | enters `FBSB_FB0_SEARCH` → immediately calls `calypso_fbsb_publish_fb_found(toa=0, pm=80, ang=0, snr=100)` → writes `d_fb_det=1`, `a_sync_demod_toa/pm/ang/snr` into NDB |
-| 5    | calypso_fbsb.c       | transitions to `FBSB_FB0_FOUND` and dumps state               |
-| 6    | DSP                  | (still running its bogus 0xb3c5 loop, harmless — our publish overrides) |
-| 7    | calypso_trx.c::dsp_api_write_cb | if DSP scribbles `d_fb_det != 0` from PC 0xe26e → re-publish clean FB found (defensive) |
+| 4    | calypso_fbsb.c       | ~~enters `FBSB_FB0_SEARCH` → immediately calls `calypso_fbsb_publish_fb_found(toa=0, pm=80, ang=0, snr=100)` → writes `d_fb_det=1`~~ — **FAUX** : le passage à `FBSB_FB0_SEARCH` ne fait que logger (`calypso_fbsb.c:107-121`). La publication n'a lieu QUE si `calypso_orch() && fbsb_synth_enabled()` (env `CALYPSO_SYNTH_FBSB`/`CALYPSO_DSP_L1_STUB`) ET que `calypso_bsp_get_fb_detection()` renvoie une vraie détection ; les valeurs viennent du corrélateur BSP, **pas** de constantes (`pm=80/snr=100` absents du code). En pratique **d_fb_det reste 0**. |
+| 5    | calypso_fbsb.c       | ~~transitions to `FBSB_FB0_FOUND` and dumps state~~ — n'a lieu que si l'étape 4 a réellement publié (jamais sur le run réel) |
+| 6    | DSP                  | (DSP déraille : POST-BOOTSTUB-RET, PC=0x0000 ; aucune publication hôte ne l'écrase — la synthèse hôte a été retirée le 2026-05-28) |
+| 7    | ~~calypso_trx.c::dsp_api_write_cb~~ | **FAUX** : aucun `dsp_api_write_cb`/`trx_dsp_api_write_cb` n'existe (`grep → 0`), le PC `0xe26e` n'apparaît nulle part. Le hook générique `api_write_cb` (`calypso_c54x.h:204`, invoqué `calypso_c54x.c:3357-3358`) n'est **jamais assigné**. |
 | 8    | firmware L1S         | next frame poll: reads `d_fb_det == 1` and clean a_sync_demod → builds `L1CTL_FBSB_CONF` with `result=0, bsic=0` |
 | 9    | firmware → bridge    | DLCI 5 → `L1CTL_FBSB_CONF`                                    |
 | 10   | bridge → mobile      | length-prefix forward → mobile receives confirm               |
@@ -88,7 +92,7 @@ DSP (TMS320C54x emulator)          — PROM0+PROM1, NDB mailbox at 0x0800
 | 7    | mobile               | parses SI1/SI2/SI3/SI4 → "cell found / cell info OK"          |
 
 The DSP/BSP path is **bypassed** for DL CCCH — we don't try to make the
-DSP correlate real samples. Only `calypso_fbsb` synthesizes FBSB into NDB.
+DSP correlate real samples. ~~Only `calypso_fbsb` synthesizes FBSB into NDB.~~ — **FAUX** : la synthèse FBSB côté hôte a été retirée le 2026-05-28 (`calypso_fbsb.c:3-11`) ; `calypso_fbsb.c` ne fait plus que logger les changements de tâche DSP. Sur le run réel, personne n'écrit `d_fb_det` et il **reste 0**.
 
 ## 5. UL — burst from DSP/L1 to BTS
 
@@ -137,10 +141,11 @@ QEMU
 │       └── calypso_bsp_tx_burst        ──► bsp_udp_ul_send → 127.0.0.1:6802
 ├── calypso_trx.c
 │       ├── dsp_ram_write    (intercept ARM writes to NDB mailbox)
-│       │     └─ d_task_md   ──► calypso_fbsb_on_dsp_task_change
-│       └── trx_dsp_api_write_cb (intercept DSP writes)
-│             └─ d_fb_det    ──► calypso_fbsb_publish_fb_found (defensive)
-├── calypso_fbsb.c   (state machine: IDLE→FB0_SEARCH→FB0_FOUND→…)
+│       │     └─ d_task_md   ──► calypso_fbsb_on_dsp_task_change (log-only)
+│       └── (INEXISTANT) trx_dsp_api_write_cb  — FAUX: aucun tel callback dans le code.
+│             Le hook générique api_write_cb (calypso_c54x.h:204, appel .c:3357-3358)
+│             n'est JAMAIS assigné → aucune interception des écritures DSP.
+├── calypso_fbsb.c   (log-only depuis 2026-05-28 ; ne synthétise plus rien dans la NDB)
 └── c54x DSP emulator
-        └── runs PROM0/PROM1, periodically scribbles 0xb3c5 — harmless
+        └── runs PROM0/PROM1 puis DÉRAILLE (POST-BOOTSTUB-RET, PC=0x0000) ; d_fb_det reste 0
 ```

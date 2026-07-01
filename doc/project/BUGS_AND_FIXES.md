@@ -85,7 +85,7 @@
 ### Bug 17: Duplicate F0/F1 handler blocks
 - **Symptom**: Second F0/F1 handler block is dead code, never reached
 - **Root cause**: First `if (hi8 == 0xF0 || hi8 == 0xF1)` block catches everything
-- **Status**: Identified, not yet cleaned up
+- **Status**: ✅ FIXÉ — le bloc dupliqué a été supprimé ; il ne reste qu'un seul handler `if (hi8 == 0xF0 || hi8 == 0xF1)` (calypso_c54x.c:5807). Nettoyage effectué.
 
 ### Bug 18: TINT0 timer scattered across files
 - **Symptom**: Timer logic in calypso_trx.c mixed with DSP/ARM glue code

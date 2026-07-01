@@ -1,3 +1,5 @@
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce plan de chasse suppose que les cycles INT3 tournent et qu'un fix « F1 RETE manquant » débloque la cascade jusqu'au FB-lock. Vérité-terrain : `d_fb_det` reste 0, le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), IMR=0x0000 jamais ré-armé après le clear boot (@0xb37e), `api_write_cb` jamais câblé, pas de bus ORCH. Le vrai verrou n'est pas RETE/correlator mais le handshake ARM→DSP go-live qui ne s'arme jamais (ARM n'écrit que 0x0000 dans l'API 0x0314/0x0318). Les « Attendu » de la section 3 ne se produisent PAS en l'état. Corrections ci-dessous.
+
 # TODO next session — DSP correlator lock
 
 > Méthodo c web : **un seul front à la fois**. F1 RETE manquant d'abord.
@@ -38,7 +40,7 @@ Selon la branche divergente :
 
 Re-run avec `CALYPSO_INT3_CYCLE_TRACE=1` + `BRIDGE_BURST_SOURCE=internal` :
 
-**Attendu** :
+**Attendu** (⚠️ audit 2026-07-01 : NON atteint en l'état — `d_fb_det` reste 0, DSP déraille, IMR jamais ré-armé ; ces attendus restent hypothétiques) :
 - INTM-TRANS multi-cycles (= ISR RETE naturellement à chaque entry)
 - CORR-ENTRY > 3 (= correlator entered post-init)
 - `D_FB_DET SET val=0x0001` (= FB found, real lock)
@@ -55,7 +57,7 @@ Per c web's méthodo "séquentiel, pas parallèle" :
 - **DSP param area init** : ARM appelle dsp_set_params() (vu via osmocon "Setting API NDB parameters"). Effectif MMIO non-vérifié (= 0 reads DSP-side à 0x0C31-0x0C6A dans tout run = peut pas savoir).
 - **0xfc50 entry mystery** : fc50 hot mais aucune CALL/B y mène (grep exhaustif). XPC paging suspect. fc50 lui-même = compute kernel (= MVMM AR4,AR5 + MAR setup + LD/SFTA/SUB/ABS + BANZ outer + RET fc6f). Pas un polling.
 - **BSP DMA fn=0 stats** : 96% drop ARM-side per parse_summary. Slot mismatch entre bridge feeder et BSP DMA window.
-- **BRINT0 edge-trigger gate** dans calypso_bsp.c L638 (`if (!(ifr & bit5))`) : empêche subsequent BRINT0 fires. Sur silicon level-trigger. **À fixer APRÈS F1**.
+- **BRINT0 edge-trigger gate** dans calypso_bsp.c ~~L638~~ — FAUX: L638 est un commentaire (« No immediate delivery »), pas le gate. Le gate réel `if (bsp.dsp && !(bsp.dsp->ifr & (1 << 5)))` est à **calypso_bsp.c:1097, 1304, 1367** : empêche subsequent BRINT0 fires. Sur silicon level-trigger. **À fixer APRÈS F1**.
 
 ## 5️⃣ Outils refusés par c web (NE PAS reactiver sans raison)
 

@@ -83,17 +83,30 @@ puis 777 après changement de conf) → décode e2e DL **correct**, pas truqué.
 DANS le hot-path de lecture DL du device causait des **underruns** (tmpfs RAM +
 `fseek` wrap bloquants).
 
-**Solution** : le device pousse **chaque "trame cfile"** (le chunk continu =
-`ns*2` floats fc32, **1 `write()` = 1 trame**) en **NON-BLOQUANT**
-(`O_WRONLY|O_NONBLOCK`, `F_SETPIPE_SZ` 1MB) vers **4 FIFOs**, un par consommateur.
-Si un lecteur est lent/absent → la trame est **droppée** (jamais de stall →
-**plus d'underrun**). Liste : `CALYPSO_RELAY_FIFOS` (passé **inline** au launch
-device car tmux bake l'env, pas d'héritage shell).
+**Solution** (`qemu_wrap.c:1063-1140`) : **1 thread writer DÉDIÉ par FIFO + un
+ring de TRAMES** (`RELAY_RING=64`, `qemu_wrap.c:1074`). Le hot-path DL pousse
+**chaque "trame cfile"** (le chunk continu = `ns*2` floats fc32, **1 trame**)
+dans le ring sous lock court (memcpy ~20 KB) et **DROP la trame ENTIÈRE si le
+ring est plein** (drop au niveau **ring**, jamais de stall → **plus d'underrun**).
+Le writer fait ensuite des `write()` **BLOQUANTS COMPLETS** (jamais partiels →
+alignement byte fc32 toujours correct). Il ouvre la FIFO en `O_WRONLY|O_NONBLOCK`
+(pour survivre au churn de lecteur : kill/respawn grgsm au passage cipher) puis
+**RETIRE O_NONBLOCK** (`fcntl F_SETFL fl & ~O_NONBLOCK`, `qemu_wrap.c:1118`) +
+`F_SETPIPE_SZ` 1 MB.
+⚠️ **CORRECTIF (ancienne desc. périmée)** : l'écriture directe `write(O_NONBLOCK)`
+sur le pipe qui **droppait la trame en non-bloquant** est le **BUG CORRIGÉ**
+(`qemu_wrap.c:1064-1072`) — elle laissait passer des writes PARTIELS
+(désalignement byte permanent du flux fc32 → grgsm en garbage) et droppait sur
+EAGAIN (trous temporels → SACCH SI5/SI6 jamais décodée). Le drop se fait
+désormais au niveau **ring** (trame entière), pas au `write()`.
+Liste : `CALYPSO_RELAY_FIFOS` (`calypso.env:35`, **5 FIFOs**, `RELAY_NFIFO_MAX=8`),
+passée **inline** au launch device car tmux bake l'env, pas d'héritage shell.
 
 | FIFO | Consommateur | Rôle |
 |------|-------------|------|
 | `/tmp/iq_fft.fifo` | `osmo_egprs/fft.sh` (host, X `:0`) | FFT live matplotlib (PSD+waterfall) |
-| `/tmp/iq_grgsm.fifo` | `si_bridge.py` → `grgsm_decode` | **décode SI → feed_si → a_cd → mobile (l'e2e)** |
+| `/tmp/iq_grgsm.fifo` | `si_bridge.py` → `grgsm_decode` (CLAIR) | **décode SI → feed_si → a_cd → mobile (l'e2e)** |
+| `/tmp/iq_grgsm_ciph.fifo` | `si_bridge.py` → `grgsm_decode` (CIPHER) | decipher DL chiffré (2ᵉ instance grgsm, respawn au cipher) |
 | `/tmp/iq_record.fifo` | `record_drain.py` | ring 128MB externe → `/tmp/record.cfile` (le "record", HORS hot-path) |
 | `/tmp/iq_asciifft.fifo` | `grgsm_fft_live.py` (fenêtre run.sh) | FFT ASCII |
 

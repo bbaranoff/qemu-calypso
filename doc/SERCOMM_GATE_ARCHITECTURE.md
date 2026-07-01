@@ -1,5 +1,7 @@
 # Sercomm Gate Architecture — QEMU Calypso
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. En conséquence, même quand `calypso_bsp.c` fait `c54x_interrupt_ex(bsp.dsp, 21, 5)` (BRINT0), l'IRQ n'est **jamais délivré** (IMR=0). Deux corrections principales ci-dessous : (a) le chargement BSP + BRINT0 vit dans **`calypso_bsp.c`**, PAS dans `calypso_trx.c::rx_burst()` (qui est un no-op) ; (b) DLCI 4 = **TRXC intercepté** par le gate, PAS `SC_DLCI_DEBUG` non-utilisé.
+
 ## 1. Le vrai hardware Calypso
 
 Le Calypso a deux chemins de données complètement séparés :
@@ -42,7 +44,7 @@ Les octets 0x7E, 0x7D et 0x00 sont échappés :
 ### DLCIs enregistrés par le firmware layer1
 | DLCI | Constante | Callback | Usage |
 |------|-----------|----------|-------|
-| 4 | SC_DLCI_DEBUG | **aucun** dans layer1 | Debug (non utilisé) |
+| 4 | SC_DLCI_DEBUG (côté firmware) | **aucun** dans layer1 | Debug côté firmware ; ~~non utilisé~~ — **FAUX côté QEMU** : réaffecté en **TRXC**, intercepté par le gate (`sercomm_gate.c:99` `#define SERCOMM_DLCI_TRXC 4`, `:209` interception → `gate_trxc_handle()` → réponse stub, PAS de push FIFO) |
 | 5 | SC_DLCI_L1A_L23 | `l1a_l23_rx` | **L1CTL** — commandes mobile↔firmware |
 | 9 | SC_DLCI_LOADER | `cmd_handler` (loader only) | Chargement firmware |
 | 10 | SC_DLCI_CONSOLE | non enregistré dans layer1 | Console texte |
@@ -170,13 +172,15 @@ Vrai hardware :
   → DSP traite : dérotation, FIR, equalizer, Viterbi decode
   → Résultats dans API RAM
 
-QEMU émulation :
+QEMU émulation (RÉEL — le chargement BSP vit dans calypso_bsp.c, PAS dans rx_burst) :
   osmo-bts-trx → TRXD UDP (soft bits)
   → bridge (sercomm_udp.py) GMSK modulation → int16 I/Q
-  → calypso_trx_rx_burst()
-  → c54x_bsp_load(dsp, samples, n)  // charge bsp_buf[]
-  → c54x_interrupt_ex(dsp, 21, 5)   // BRINT0
-  → DSP lit via PORTR PA=0xF430     // bsp_buf[bsp_pos++]
+  → ~~calypso_trx_rx_burst()~~  // FAUX : calypso_trx.c:2166 rx_burst() est un no-op
+                                //   ("No stubs — bursts go to BSP via UDP (calypso_bsp.c), not here")
+  → c54x_bsp_load(bsp.dsp, samples, n)  // calypso_bsp.c:1023 / :1248 — charge bsp_buf[]
+  → c54x_interrupt_ex(bsp.dsp, 21, 5)   // calypso_bsp.c:1098 / :1305 — BRINT0
+                                        //   ⚠️ jamais délivré : IMR=0x0000 tout le run
+  → DSP lit via PORTR PA=0xF430         // bsp_buf[bsp_pos++]
 ```
 
 ### C54x BSP implementation (calypso_c54x.c)
@@ -186,7 +190,7 @@ uint16_t bsp_buf[160];  // burst samples
 int      bsp_len;       // number of samples
 int      bsp_pos;       // read position
 
-// Load (called by calypso_trx.c)
+// Load (appelé par calypso_bsp.c:1023/:1248 — PAS par calypso_trx.c/rx_burst)
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n);
 
 // Read (called by PORTR instruction)
@@ -224,9 +228,9 @@ if (op2 == 0xF430 && s->bsp_pos < s->bsp_len)
 
 ### sercomm_gate.c — Rôle exact
 Le gate parse le flux sercomm entrant sur l'UART modem et route par DLCI :
-- **Tous les DLCIs** → re-wrap et push dans le FIFO UART (firmware ARM les traite)
-- **Pas de routage spécial** pour DLCI 4 — le firmware n'a pas de handler pour DLCI 4
-- Le gate ne touche PAS aux bursts — ils arrivent par un autre chemin (TRXD → BSP)
+- **DLCI 5 (L1CTL)** et autres → re-wrap et push dans le FIFO UART (firmware ARM les traite) via `gate_push_to_fifo()` (`sercomm_gate.c:73`, appelé `:230`)
+- ~~**Pas de routage spécial** pour DLCI 4~~ — **FAUX** : DLCI 4 = **TRXC** (`#define SERCOMM_DLCI_TRXC 4`, `sercomm_gate.c:99`). Il EST intercepté (`sercomm_gate.c:209`) : appel `gate_trxc_handle()` (`:137`) → réponse stub `gate_send_trxc_rsp()`, puis `break` — DLCI 4 ne tombe **jamais** dans le FIFO.
+- Le gate ne touche PAS aux bursts radio — ils arrivent par un autre chemin (TRXD → BSP)
 
 Le gate remplace le parser sercomm inline qui était dans calypso_uart.c.
 C'est un simple parser HDLC qui re-injecte les trames dans le FIFO.
@@ -241,12 +245,14 @@ C'est un simple parser HDLC qui re-injecte les trames dans le FIFO.
 ### Problème actuel du bridge
 Le bridge envoie les bursts DL via le PTY en sercomm DLCI 4. C'est incorrect :
 - Sur le vrai hardware, les bursts DL arrivent par le BSP, pas l'UART
-- Le firmware n'a pas de handler pour DLCI 4 (SC_DLCI_DEBUG)
+- ~~Le firmware n'a pas de handler pour DLCI 4 (SC_DLCI_DEBUG)~~ — **FAUX côté QEMU** : DLCI 4 = TRXC, intercepté par le gate (`sercomm_gate.c:99/:209`) et ne pollue donc pas le FIFO firmware
 - Les bursts DL dans le FIFO UART polluent le firmware
 
-**Solution** : le bridge doit envoyer les bursts DL par un canal séparé
-(UDP socket, pipe, ou shared memory) directement à calypso_trx_rx_burst(),
-qui charge le BSP via c54x_bsp_load() et fire BRINT0.
+**Solution (partiellement en place)** : les bursts DL passent par un canal séparé (UDP `calypso_bsp.c`)
+qui charge le BSP via `c54x_bsp_load()` (`calypso_bsp.c:1023/:1248`) et fire BRINT0
+(`c54x_interrupt_ex(bsp.dsp, 21, 5)`, `:1098/:1305`). ⚠️ Note : `calypso_trx_rx_burst()`
+n'est **PAS** ce chemin (c'est un no-op, `calypso_trx.c:2166`) ; et BRINT0 n'est jamais délivré
+tant que IMR=0x0000.
 
 ### NDB d_dsp_page — Mapping mémoire
 ```
@@ -263,9 +269,10 @@ ARM offset 0x01C4 = DSP addr 0x08E2 = d_dsp_state
 
 | Fichier | Rôle | Touche aux bursts ? |
 |---------|------|---------------------|
-| sercomm_gate.c | Parse sercomm UART → FIFO (L1CTL) | **Non** |
+| sercomm_gate.c | Parse sercomm UART → FIFO (L1CTL DLCI 5) + intercepte TRXC (DLCI 4) | **Non** |
 | calypso_uart.c | Hardware UART, appelle sercomm_gate | **Non** |
-| calypso_trx.c | TDMA tick, BSP load, SINT17, TPU | **Oui** (rx_burst → bsp_load) |
+| calypso_trx.c | TDMA tick, SINT17, TPU | **Non** — `rx_burst()` (`:2166`) est un **no-op** ; le BSP load ne vit **pas** ici |
+| calypso_bsp.c | Réception bursts UDP, `c54x_bsp_load` (`:1023/:1248`) + BRINT0 vec21/bit5 (`:1098/:1305`) | **Oui** (chemin BSP réel ; IRQ non délivré car IMR=0) |
 | calypso_c54x.c | DSP emulation, PORTR 0xF430 | **Oui** (bsp_buf read) |
-| sercomm_udp.py | Bridge BTS↔QEMU | **Oui** (TRXD → GMSK → PTY/BSP) |
+| sercomm_udp.py | Bridge BTS↔QEMU | **Oui** (TRXD → GMSK → BSP UDP) |
 | l1ctl_sock.c | L1CTL socket ↔ mobile | **Non** |

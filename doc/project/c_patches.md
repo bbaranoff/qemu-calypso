@@ -1,5 +1,14 @@
 # C patches for calypso QEMU emulation (2026-04-07)
 
+> ⚠️ **CORRIGÉ (audit doc↔code 2026-07-01, voir [../DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).**
+> La prémisse des patches CONFIRMED (« deux/cinq handlers byte-identiques à
+> dédupliquer ») ne correspond plus au code : il n'existe **qu'un seul handler
+> exec** pour chacun de F272/F273/F274, et les vrais bugs (delay-slots) ont déjà
+> été corrigés le 2026-05-30. De plus F273 = **BD** (branche retardée), PAS RETD
+> (le vrai RETD = 0xFE00). Les numéros de ligne cités ci-dessous étaient périmés
+> et ont été recalés sur le code actuel. Rappel vérité-terrain : d_fb_det reste 0,
+> le DSP déraille, IMR=0x0000 jamais ré-armé — aucun de ces patches n'y change rien.
+
 Application des découvertes faites pendant la session de debug FBSB. Chaque
 patch est classé:
 
@@ -9,52 +18,52 @@ patch est classé:
 
 ## Patches CONFIRMED (à appliquer)
 
-### C-1. Dédup `RETD` handler (F273)
+### C-1. ✅ FIXÉ — handler `BD` (F273), delay-slots (`calypso_c54x.c:6032`, 2026-05-30)
 
 **Fichier**: `hw/arm/calypso/calypso_c54x.c`
 
-**Bug**: deux implémentations byte-identiques de `0xF273` (RETD):
-- Lignes 1483-1487 (dans le bloc F2xx interne)
-- Lignes 1701-1705 (dans le bloc F2xx du dispatch hi8=0xF2)
+**FAUX (prémisse périmée)**: ~~deux implémentations byte-identiques de `0xF273`
+(RETD) aux lignes 1483-1487 et 1701-1705, la 2e étant dead code~~ — il n'y a
+**qu'un seul handler exec** (`calypso_c54x.c:6032`, plus le name-lookup de classify
+à `:1503`). Aucun doublon à dédupliquer.
 
-La 2e (1701-1705) est **dead code** — la 1ère gagne toujours.
+**FAUX (encodage)**: ~~F273 = RETD~~ — F273 = **BD** (branche retardée, 2 mots,
+2 delay-slots, AUCUNE pile). Le vrai **RETD = 0xFE00** (traité dans le bloc
+`hi8 == 0xFE`, `calypso_c54x.c:7057`, cf. commentaire `:7055`).
 
-**Action**: supprimer le bloc 1701-1705 (en gardant un commentaire de référence).
+**Bug réel (déjà corrigé)**: BD était d'abord traité comme RETD (pop parasite →
+SP désaligné), puis en saut immédiat (les 2 delay-slots étaient skippés). Corrigé
+le **2026-05-30** (`calypso_c54x.c:6032`) : arme `delayed_pc`/`delay_slots = 2`,
+pas de pile.
 
-**Risque**: nul. Code mort.
+**Statut**: DONE, rien à appliquer.
 
-### C-2. Dédup `CALLD` handler (F274)
-
-**Fichier**: `hw/arm/calypso/calypso_c54x.c`
-
-**Bug**: deux implémentations byte-identiques de `0xF274` (CALLD):
-- Lignes 1473-1481 (premier bloc)
-- Lignes 1691-1699 (deuxième bloc)
-
-La 2e est dead code.
-
-**Action**: supprimer le bloc 1691-1699.
-
-**Risque**: nul.
-
-### C-3. Dédup `RPTBD` handler (F272)
+### C-2. ✅ FIXÉ — handler `CALLD` (F274), delay-slots (`calypso_c54x.c:6015`, 2026-05-30)
 
 **Fichier**: `hw/arm/calypso/calypso_c54x.c`
 
-**Bug**: cinq (!) implémentations de F272 (RPTBD):
-- Lignes 1461-1471 (premier)
-- Lignes 1680-1689 (deuxième dans hi8=0xF2)
-- Lignes 2258-2280 (RPTBD générique)
-- Lignes 3408-3420
-- Lignes 3469-3477
+**FAUX (prémisse périmée)**: ~~deux implémentations byte-identiques de `0xF274`
+(CALLD) aux lignes 1473-1481 et 1691-1699, la 2e étant dead code~~ — il n'y a
+**qu'un seul handler exec** (`calypso_c54x.c:6015`, plus le name-lookup à `:1505`).
+Les lignes citées sont désormais du code sans rapport.
 
-D'après l'agent Explore, les 4 dernières sont des doublons potentiellement
-divergents. À vérifier au cas par cas avant suppression.
+**Bug réel (déjà corrigé)**: CALLD était un saut immédiat qui skippait les 2
+delay-slots → si un slot contient un push/pop, pile désalignée. Corrigé le
+**2026-05-30** (`calypso_c54x.c:6015`) : push PC+4 puis `delayed_pc`/`delay_slots = 2`.
 
-**Action**: lire les 5 implémentations et garder la première (ligne 1461) si
-toutes équivalentes. Sinon, fusionner.
+**Statut**: DONE, rien à appliquer.
 
-**Risque**: faible si toutes équivalentes, moyen si divergence (à investiguer).
+### C-3. ✅ FIXÉ — handler `RPTBD` (F272) unique (`calypso_c54x.c:6002`)
+
+**Fichier**: `hw/arm/calypso/calypso_c54x.c`
+
+**FAUX (prémisse périmée)**: ~~cinq implémentations de F272 (RPTBD) aux lignes
+1461-1471, 1680-1689, 2258-2280, 3408-3420, 3469-3477~~ — il n'existe plus
+**qu'un seul handler exec** (`calypso_c54x.c:6002`). La ligne 1461 est un
+`typedef struct`, pas un handler RPTBD ; les autres régions sont du code sans
+rapport. Consolidation déjà faite.
+
+**Statut**: DONE, rien à dédupliquer.
 
 ### C-4. Fix initial value du SP-OOR tracer
 
@@ -81,8 +90,9 @@ tous à `prev_PC=0xb906 prev_op=0xf074`. SP descend de 0x5AC8 vers 0x0000, attei
 **Hypothèses (toutes non confirmées)**:
 1. **Self-loop firmware**: `prog[0xb907] == 0xb906` — CALL à soi-même.
 2. **CALL à l'intérieur d'un RPTB**: F074 à PC=REA d'un bloc RPTB. Le wrap
-   check (ligne 3842 `if (s->pc == s->rea + 1)`) ne déclenche jamais car le
-   CALL met PC=target. Le bloc s'exécute en boucle infinie via le wrap RPTB,
+   check (`calypso_c54x.c:13022` `if (s->rptb_active && !s->rpt_active && s->pc >= s->rea + 1)`)
+   ne déclenche jamais car le CALL met PC=target. Le bloc s'exécute en boucle
+   infinie via le wrap RPTB,
    chaque tour pousse une nouvelle return address sans jamais RET.
 3. **Bug prog_fetch sur PROM0 0xB000+**: 0xb907 mal lu (mais le fix XPC est OK).
 

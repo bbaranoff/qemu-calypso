@@ -1,6 +1,15 @@
 # Step 2 — BC group 1 conditions
 
-## Symptôme
+> ✅ **FIXÉ (`calypso_c54x.c:6308-6337`, FIX 2026-06-23).** Le décodage des
+> conditions BC groupe 1 (acc-test) décrit ci-dessous comme « à faire » est
+> **déjà implémenté**. Ce document est conservé comme historique ; ne pas
+> re-proposer le patch. Voir aussi [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md).
+>
+> Rappel vérité-terrain : ce fix corrige bien le décodage des branchements,
+> mais il **ne débloque pas** la détection FB — `d_fb_det` reste 0 et le DSP
+> déraille par ailleurs.
+
+## Symptôme (historique — comportement AVANT le fix)
 
 Trace au runtime :
 ```
@@ -10,9 +19,13 @@ Trace au runtime :
 [c54x] BC unknown cond=0x45 PC=0xc010 op=0xf845 → FALL (default)
 ```
 
-Le dispatch BC `0xF8xx` ne gère que `0x00` (UNC), `0x20` (NTC), `0x30`
+~~Le dispatch BC `0xF8xx` ne gère que `0x00` (UNC), `0x20` (NTC), `0x30`
 (TC). Toutes les autres conditions tombent dans `take = false` (default
-fall-through). Branchements ratés systématiquement.
+fall-through). Branchements ratés systématiquement.~~ — **CORRIGÉ** : le
+dispatch décode désormais les conditions groupe 1 (voir `calypso_c54x.c`
+lignes 6308-6337). Les opcodes `F842`/`F844`/`F845`/`F84D` ont
+`sub = (op>>4)&0xF = 0x4` et sont traités par la branche `if (sub == 0x4 ||
+sub == 0x5)`.
 
 ## Encodage tic54x
 
@@ -47,13 +60,27 @@ et `0x4A..0x4F` (avec CCB) sont :
 - `0x4A..0x4F` = même chose mais B (avec `CCB=0x08`)
 - `0x4D` = `CC1 | CCB | CCEQ` → `B == 0`
 
-## Fix
+## Fix — ✅ FIXÉ (`calypso_c54x.c:6308-6337`, FIX 2026-06-23)
 
-Ajouter le décodage group 1 dans le `switch (cond)` du dispatch BC.
-Sélection acc selon `CCB`, comparaison selon les bits 0..2 (CCxx).
+~~Ajouter le décodage group 1 dans le `switch (cond)` du dispatch BC.
+Sélection acc selon `CCB`, comparaison selon les bits 0..2 (CCxx).~~
 
-## Impact attendu
+**DÉJÀ FAIT.** Implémenté tel que décrit :
 
-- BC pmad,A>=0 / A<0 / A==0 / A!=0 / B==0 etc. branchent correctement.
-- Les chemins d'erreur du FB-det handler (qui testent l'accu après
-  une corrélation) prennent enfin la bonne branche.
+- Sélection acc selon `CCB` : `int64_t acc = (cc & 0x08) ? s->b : s->a;`
+  (`calypso_c54x.c:6312`).
+- Comparaison selon les bits 0..2 (CCxx) : `switch (cc & 0x07)` avec les cas
+  `0x2 AGEQ / 0x3 ALT / 0x4 ANEQ / 0x5 AEQ / 0x6 AGT / 0x7 ALEQ`
+  (`calypso_c54x.c:6314-6321`).
+
+Ne pas re-proposer ce patch.
+
+## Impact (constaté)
+
+- BC pmad,A>=0 / A<0 / A==0 / A!=0 / B==0 etc. branchent désormais
+  correctement (décodage acc-test correct).
+- Les chemins de branchement testant l'accu après corrélation prennent la
+  bonne branche. **MAIS** cela ne suffit pas à débloquer la détection FB :
+  vérité-terrain, `d_fb_det` reste 0 et le DSP déraille (le vrai verrou est
+  le handshake go-live ARM→DSP, `api_write_cb` jamais câblé — voir
+  [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).

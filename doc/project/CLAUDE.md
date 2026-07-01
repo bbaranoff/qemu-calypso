@@ -1,5 +1,7 @@
 # QEMU Calypso — Claude Code Context
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), IMR=0x0000 tout le run (jamais ré-armé après le clear boot @0xb37e), api_write_cb jamais câblé, pas de bus ORCH. Le handshake ARM→DSP go-live ne s'arme jamais (l'ARM n'écrit que 0x0000 dans API 0x0314/0x0318). Corrections ci-dessous.
+
 ## 🔄 SYNC MIROIRS — À FAIRE À CHAQUE ÉDITION
 
 Le **latest / autoritaire** = `trying:/opt/GSM/qemu-src` (conteneur, où on build).
@@ -134,7 +136,7 @@ Dual-core GSM baseband emulator:
 - **ARM7TDMI** runs osmocom-bb `layer1.highram.elf` firmware
 - **TMS320C54x DSP** runs real Calypso ROM (`calypso_dsp.txt`)
 - **API RAM** shared memory at DSP 0x0800 (ARM 0xFFD00000), 8K words
-- **BSP** receives I/Q via UDP 6702, serves to DSP via PORTR PA=0x0034
+- **BSP** receives I/Q via UDP 6702, serves to DSP via PORTR PA=0xF430 (opcode 0x74 ; 0x0034 = alias legacy accepté) — cf. `calypso_c54x.c:7508`
 - **TPU→TSP→IOTA** chain gates BDLENA for RX windows
 - **Bridge** (Python) relays BTS UDP (5700-5702) ↔ BSP, clock-slave of QEMU
 
@@ -158,7 +160,7 @@ Dual-core GSM baseband emulator:
 - Read Page 1: 0x0078
 - NDB: 0x01A8 (d_dsp_page, d_error_status, d_spcx_rif, ...)
 - d_fb_det: NDB + 0x48 = 0x01F0
-- a_cd[15]: NDB + 0x1DC = 0x0384  (DWARF-validated 2026-05-26 — was 0x1F8/0x03A0 in older doc, WRONG)
+- a_cd[15]: NDB + 0x1FC = 0x03A4  (offsetof DWARF autoritaire, `calypso_dsp_shunt.c:94` `NDB_A_CD 0x1FC`). ~~NDB + 0x1DC = 0x0384~~ — FAUX : le « FIX 2026-05-28 0x1FC→0x1DC » a été reverté le 2026-06-02 (0x1DC écrivait a_cd à côté → num_biterr=0xff + CRC fail). Note drift code↔code : le watch de `calypso_c54x.c:2731` utilise encore 0x1F8/0x03A0 (à réaligner sur 0x1FC).
 
 ## Interrupt Vectors (IPTR=0x1FF → base 0xFF80)
 
@@ -179,7 +181,7 @@ Always verify against `tic54x-opc.c` (binutils) before changing any opcode:
 | 0x56xx | MVPD (2w) | SFTL shift (1w) | Wrote to SP via MMR |
 | 0xF7Bx | SSBX (1w) | LD #k8,AR7 (1w) | Corrupted ST1 |
 | MMR mask | & 0x1F | & 0x7F | STLM/POPM/PSHM wrong address |
-| PORTR PA | 0xF430 | 0x0034 | DSP read wrong BSP port |
+| PORTR PA | 0x0034 (alias legacy) | 0xF430 (vrai port RX BSP, 64 sites PROM0) | ~~DSP read wrong BSP port~~ — INVERSÉ : 0xF430 est le VRAI port. Handler déplacé à l'opcode 0x74 (`calypso_c54x.c:7508`) ; l'ancien chemin 0x8F est dead-code `if(0)` (`calypso_c54x.c:8603`). |
 | 0xF4EB | — | RETE (correct) | The REAL rete opcode |
 | 0xF9xx | BC branch (no push) | CC conditional call (push) | Lost return addresses |
 | 0xFBxx | LD #k,16,A | CCD conditional call delayed (push) | Lost return addresses |
@@ -220,7 +222,11 @@ IMM_ASS visible on air → (b). Absent + osmo-bts-trx RACH counter at 0
   - `d_burst_u` (write-page word 3) — TN selector
 
 RACH path uses `gsm0503_rach_ext_encode` (libosmocoding) reading
-`d_rach` from NDB. The d_rach offset defaults to word 0x01CB from API
+`d_rach` from NDB. **MAJ 2026-07-01 :** l'encodage RACH vit désormais
+dans le chemin UL BSP (`calypso_bsp.c:1550`
+`gsm0503_rach_ext_encode(bits, ra, uic_or_bsic, false)`) ; `calypso_trx.c:1888`
+ne fait plus que dispatcher (commentaire « Burst encoding … belongs in the BSP »).
+The d_rach offset defaults to word 0x01CB from API
 base (DSP==33 layout walk); override via `CALYPSO_NDB_D_RACH_OFFSET=0xNNN`
 if the firmware uses a different DSP version.
 
@@ -302,12 +308,22 @@ is fixed.
 # par PC=0x93a5 AR3=0x2a00+offset.
 ```
 
-### Old blockers (resolved)
+### Old blockers (⚠️ PAS résolu — voir correction)
 
 **INTM=1 forever / DSP INT3 never serviced** — was the 2026-04 blocker.
-Resolved naturally once DSP frame interrupt wiring + BSP RX delivery
-converged. Does not require the diagnostic INTM bypass that previously
-caused NDB corruption (commit 306d6ec, reverted in f0dec53).
+~~Resolved naturally once DSP frame interrupt wiring + BSP RX delivery
+converged.~~ — **FAUX (audit 2026-07-01).** Le wiring N'A PAS convergé.
+Vérité-terrain : `IMR=0x0000` tout le run (jamais ré-armé après le clear
+boot @0xb37e), le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000). L'IT frame
+du modèle tape sur vec19/bit3 = stub RETE ; le vrai scheduler per-frame
+est vec28/bit12 mais n'est jamais vectorisé sans le levier expérimental
+`CALYPSO_DSP_FRAME_VEC28` — et ce levier est un **CUL-DE-SAC** : il force la
+vectorisation mais atterrit dans l'épilogue ISR → dérail vers le boot-stub,
+IMR reste 0x0000 (voir `calypso_c54x.c:13537`). Le vrai trou est le handshake
+go-live ARM→DSP : `api_write_cb` est déclaré (`calypso_c54x.h`) mais JAMAIS
+câblé (`grep 'api_write_cb *=' = 0`), et l'ARM n'écrit que 0x0000 dans API
+0x0314/0x0318. Le bypass diagnostic INTM (commit 306d6ec, reverté f0dec53)
+reste à proscrire (corruption NDB).
 
 ## Old bugs (resolved)
 
@@ -332,7 +348,7 @@ docker exec CONTAINER bash -c "cd /opt/GSM/qemu-src/build && ninja qemu-system-a
 
 ## Key Files
 
-- `hw/arm/calypso/calypso_c54x.c` — DSP emulator (3500+ lines, opcode switch)
+- `hw/arm/calypso/calypso_c54x.c` — DSP emulator (~13697 lines, opcode switch)
 - `hw/arm/calypso/calypso_trx.c` — TRX/TPU/TSP/ULPD/SIM + TDMA tick + DMA
 - `hw/arm/calypso/calypso_bsp.c` — BSP DMA + PORTR buffer + UDP 6702
 - `hw/arm/calypso/calypso_iota.c` — IOTA BDLENA gate

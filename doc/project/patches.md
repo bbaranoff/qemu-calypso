@@ -1,5 +1,12 @@
 # Calypso QEMU — Patches & TODO (2026-04-07)
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Précisions spécifiques à ce doc (session 2026-04-07) :
+> - La cascade « d_fb_det écrit avec du garbage → l'ARM croit avoir trouvé un FB » (§1.1/§1.2) **ne tient plus** : vérité-terrain **d_fb_det reste 0** sur tout le run. Le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000) avant d'atteindre un quelconque site d'écriture non-nul.
+> - L'affirmation « F074 ET F274 sont codés correctement (push return, set PC=target, return 0) » est **FAUSSE pour F274** : le refactor 2026-05-30 a précisément corrigé ce comportement (voir §1.2).
+> - Les numéros de ligne cités (1311-1317, 1473-1481, 3842…) sont **périmés** (`calypso_c54x.c` fait ~13697 lignes) ; valeurs vérifiées corrigées inline.
+
 Session de debug FBSB/FB-detect côté DSP/ARM. 27 runs exécutés, agents Explore
 sur calypso C + osmocom firmware. Findings consolidés ci-dessous.
 
@@ -43,14 +50,26 @@ Cascade :
 5. ARM lit `d_fb_det != 0` → croit avoir trouvé un FB
 6. Lit snr/freq depuis NDB pourrie → `FBSB_CONF result=255`
 
-**Implémentation actuelle (calypso_c54x.c)** : F074 et F274 sont **codés correctement**
-en isolation (push return, set PC=target, return 0 = "PC déjà set, ne pas avancer"). Lignes 1311-1317
-et 1473-1481.
+**Implémentation actuelle (calypso_c54x.c)** :
+- **F074** (`if (op == 0xF074)`, `calypso_c54x.c:5842`) : ✅ correct — push PC+2 (return address),
+  `s->pc = op2; return 0` (« PC déjà set, ne pas avancer »).
+- **F274** (`if (op == 0xF274)`, `calypso_c54x.c:6015`) : ~~codé comme F074 (push return, set PC=target, return 0)~~ —
+  **FAUX** : depuis le **refactor 2026-05-30**, F274 (CALLD, appel *retardé*) push PC+4 puis arme
+  `s->delayed_pc = op2; s->delay_slots = 2` et `return consumed + s->lk_used` afin d'exécuter les 2 delay-slots
+  AVANT de brancher. Le commentaire du handler (`calypso_c54x.c:6015-6029`) documente que l'ancien saut immédiat
+  (`s->pc = op2; return 0`) était **le bug corrigé** (skip des delay-slots → désalignement pile → POPM ST0 ramasse
+  un PC orphelin). ⚠️ Le comportement décrit ci-dessus par ce doc (daté 2026-04-07) EST l'ancien bug, pas le code actuel.
+
+> Numéros de ligne d'origine (1311-1317 / 1473-1481) **périmés** : `calypso_c54x.c:1483-1487` est aujourd'hui
+> `static AWriteLog g_awrite_ring[…]` (défs de struct/globales, sans rapport avec l'exécution d'opcode).
+> Handlers d'exécution réels : F074 → `calypso_c54x.c:5842`, F274 → `calypso_c54x.c:6015`.
 
 **Hypothèses pour le mécanisme exact (non confirmées)** :
 - a. **Self-loop firmware** : `prog[0xb907] == 0xb906` (call à soi-même). → vérifier en dumpant PROM[0xb906..0xb910]
-- b. **Bug RPTB+CALL** : CALL à PC=REA d'un bloc RPTB. Le wrap check (ligne 3842 :
-  `if (s->pc == s->rea + 1)`) ne déclenche jamais car le CALL met PC=target (≠ REA+1)
+- b. **Bug RPTB+CALL** : CALL à PC=REA d'un bloc RPTB. Le wrap check (`calypso_c54x.c:13022` :
+  `if (s->rptb_active && !s->rpt_active && s->pc >= s->rea + 1)`) — ⚠️ l'opérateur est `>=`, **pas** `==` :
+  le redirect se déclenche dès que PC dépasse REA, ce qui affaiblit cette hypothèse (l'ancienne ligne 3842 citée
+  n'est plus qu'un `break;`).
 - c. **Bug prog_fetch** : 0xb907 lu mal (mais XPC fix vérifié OK)
 
 ### 1.3 Bug DSP secondaire — opcode 0xF5E3
@@ -155,9 +174,13 @@ l1s_fbdet_resp (ligne 399)
 - [ ] Localiser le handler actuel dans calypso_c54x.c (peut-être traité comme NOP)
 
 ### 3.4 Cleanup safe (calypso_c54x.c)
-- [ ] **RETD dupliqué** : lignes 1483-1487 et 1701-1705 sont **byte-identiques**. La 2e est dead code (jamais atteinte). Supprimer la 2e.
-- [ ] **RPTBD dupliqué** : lignes 1461 et 1680 sont **byte-identiques** pour F272. Supprimer la 2e.
-- [ ] **CALLD dupliqué** : lignes 1473 et 1691 idem F274. Supprimer la 2e.
+> ⚠️ Numéros de ligne **périmés** (audit 2026-07-01) : `calypso_c54x.c:1483-1487` est aujourd'hui
+> `static AWriteLog g_awrite_ring[…]` (défs de struct), pas un handler RETD. Il n'existe qu'**un seul**
+> handler d'exécution par opcode (F074 → 5842, F274 → 6015, aucun doublon retrouvé). Ces items de cleanup
+> semblent déjà **résolus / caducs** ; à re-vérifier sur le code courant avant toute suppression.
+- [ ] ~~**RETD dupliqué** : lignes 1483-1487 et 1701-1705 byte-identiques~~ — références caduques (voir ci-dessus).
+- [ ] ~~**RPTBD dupliqué** : lignes 1461 et 1680 pour F272~~ — références caduques.
+- [ ] ~~**CALLD dupliqué** : lignes 1473 et 1691 pour F274~~ — références caduques.
 - [ ] (Cleanup ≠ bugfix : ne change pas le comportement, juste le code mort.)
 
 ### 3.5 Tracer fixes

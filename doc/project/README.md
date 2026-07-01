@@ -1,5 +1,9 @@
 # qemu-calypso
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> En particulier, le récit « bug racine DSP→ARM mirror corrigé le 2026-05-15, cascade débloquée, FBSB real-path réussi » est **contredit par le runtime** : le DSP déraille (`POST-BOOTSTUB-RET`, PC=0x0000), ne lance jamais le corrélateur, `d_fb_det` reste vu à 0 tout le run, et le handshake go-live ARM→DSP ne s'arme jamais (`api_write_cb` déclaré en `calypso_c54x.h:204` mais JAMAIS assigné — `grep 'api_write_cb =' = 0`, donc le hook DSP→ARM en `calypso_c54x.c:3357` ne fire jamais). Le hack CO-RUN daté `calypso_trx.c:184-195 (2026-06-23)` — un mois APRÈS la « percée » du 05-15 — existe précisément parce que le handshake de boot pend toujours.
+
 **QEMU emulation of the TI Calypso GSM baseband chipset** — the dual-core SoC
 (ARM7TDMI + TMS320C54x DSP) used in the OpenMoko Neo, Compal e88 family, and
 arguably the most reverse-engineered cellular modem in open-source history.
@@ -58,12 +62,12 @@ correlation work on actual I/Q bursts coming from an actual GSM core network.
 | TPU → TSP → IOTA → BSP gating                      | ✅ stable                                       |
 | Bridge BTS↔BSP (UDP 5700-5702 / 6702)              | ✅ 24 997 DL bursts forwarded/run               |
 | DSP boot + DARAM overlay + interrupt vectoring     | ✅ POPM fixed (05-08), INTM transitions clean   |
-| DSP FB-det compute (Goertzel/DFT)                  | ✅ converges (~3 min uptime)                    |
-| **DSP→ARM API RAM mirror**                         | **✅ fixed 2026-05-15 (5-line patch)**          |
-| FBSB success on real path (no synth)               | ✅ achieved at least once                       |
-| `task_md=24` (DSP_TASK_ALLC) firing                | ✅ 73× in deterministic bench                   |
-| DSP writes `a_cd[]` (CCCH demod result buffer)     | ✅ 251 writes/run observed                      |
-| ARM L1 `prim_rx_nb::l1s_nb_resp` invoked           | ✅ 60+ calls/run (was zero before fix)          |
+| DSP FB-det compute (Goertzel/DFT)                  | ❌ FAUX — DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), corrélateur jamais lancé |
+| **DSP→ARM API RAM mirror**                         | ~~✅ fixed 2026-05-15~~ — le mirror read existe (`calypso_trx.c:229-257`) mais ne débloque RIEN : DSP ne produit pas de résultat, `d_fb_det` reste 0 |
+| FBSB success on real path (no synth)               | ❌ FAUX — jamais réussi sur le vrai path ; `d_fb_det` reste 0 |
+| `task_md=24` (DSP_TASK_ALLC) firing                | ❌ FAUX — non observé (DSP déraillé)            |
+| DSP writes `a_cd[]` (CCCH demod result buffer)     | ❌ FAUX — non observé                           |
+| ARM L1 `prim_rx_nb::l1s_nb_resp` invoked           | ❌ FAUX — handshake go-live jamais armé (`api_write_cb` jamais câblé) |
 | `d_task_d` set to `DSP_TASK_ALLC` (24) at task end | ❌ never observed → **current wall**            |
 | `L1CTL_DATA_IND` forwarded to mobile               | ❌ 0 (blocked by above)                         |
 | Mobile decodes SI1-SI4                             | ⏭ pending DATA_IND                              |
@@ -75,7 +79,9 @@ point — they flip from XFAIL → PASS one at a time as the pipeline unlocks.
 
 ---
 
-## The 2026-05-15 breakthrough — DSP↔ARM mirror
+## ~~The 2026-05-15 breakthrough — DSP↔ARM mirror~~ — PÉRIMÉ, voir banner
+
+> ⚠️ **Cette section décrit une « percée » qui ne tient pas au runtime.** Le mirror read a bien été ajouté (aujourd'hui `calypso_trx.c:229-257`, sous `calypso_pcb_daram_lock`), mais il ne débloque pas la cascade : le DSP déraille avant de produire un résultat, `d_fb_det` reste vu à 0 tout le run, le FBSB real-path n'a jamais réussi, et `task_md=24` n'est jamais observé. Le vrai verrou est le handshake go-live ARM→DSP (`api_write_cb` jamais enregistré). Texte d'origine conservé ci-dessous à titre d'historique.
 
 A bug that had silently blocked the project for ~6 months was localized and
 fixed in **5 lines**.
@@ -107,25 +113,31 @@ onward.
 
 ### Fix
 
-`hw/arm/calypso/calypso_trx.c:163`:
+`hw/arm/calypso/calypso_trx.c:229-257` (bloc `FIX 2026-05-15`, if/else sous `calypso_pcb_daram_lock_acquire` — PAS le ternaire cité ci-dessous, qui est une approximation d'origine ; le code réel prend un lock daram autour de la lecture) :
 
 ```c
-/* === FIX 2026-05-15 : DSP→ARM mirror was missing ===
- *
- * s->dsp_ram[] et s->dsp->data[] sont deux arrays distincts.
- * Le write path (calypso_dsp_write) mirror ARM→DSP, mais le read path
- * lisait seulement dsp_ram[] → toutes les écritures DSP étaient invisibles
- * pour ARM. Verrouille tout le projet depuis ~6 mois.
- */
-uint16_t *src = (s->dsp && s->dsp->data)
-                ? &s->dsp->data[offset/2 + 0x0800]
-                : &s->dsp_ram[offset/2];
-uint64_t val = (size == 2) ? src[0] :
-               (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
-               ((uint8_t *)src)[offset & 1];
+/* === FIX 2026-05-15 : DSP→ARM mirror was missing === (calypso_trx.c:229) */
+uint64_t val;
+if (s->dsp && s->dsp->data) {
+    calypso_pcb_daram_lock_acquire();
+    uint16_t *src = &s->dsp->data[offset/2 + 0x0800];
+    val = (size == 2) ? src[0] :
+          (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
+          ((uint8_t *)src)[offset & 1];
+    calypso_pcb_daram_lock_release();
+} else {
+    uint16_t *src = &s->dsp_ram[offset/2];
+    val = (size == 2) ? src[0] :
+          (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
+          ((uint8_t *)src)[offset & 1];
+}
 ```
 
+> Note d'audit : `calypso_trx.c:163` (cité dans une version antérieure de ce doc) est en fait dans `dsp_real_rom_mode()` (`static int v = -1;`), pas le bloc du fix.
+
 ### Effect
+
+> ⚠️ **FAUX au runtime.** Le tableau ci-dessous n'est plus vérifié : `d_fb_det` reste 0 (ratio 0 %), le FBSB real-path ne réussit jamais, `task_md=24` n'est pas observé. Le DSP déraille (`POST-BOOTSTUB-RET`) avant de produire quoi que ce soit. Conservé à titre d'historique.
 
 Immediate, measurable on the same build:
 
@@ -136,8 +148,8 @@ Immediate, measurable on the same build:
 | `task_md=24` (DSP_TASK_ALLC)      | 0               | 20+                        |
 | FBSB success on real path         | never           | yes, deterministic w/synth |
 
-Real-path FBSB worked **for the first time in the history of the project**.
-Mobile transitioned from "blocked pre-FBSB" to "demanding CCCH mode".
+~~Real-path FBSB worked **for the first time in the history of the project**.
+Mobile transitioned from "blocked pre-FBSB" to "demanding CCCH mode".~~ — **FAUX** : le FBSB real-path n'a jamais réussi ; `d_fb_det` reste 0.
 
 ---
 
@@ -212,7 +224,7 @@ plus the QEMU build tree at `/opt/GSM/qemu-src/build/`.
 ```
 qemu-calypso/
 ├── hw/arm/calypso/                ← Calypso SoC + DSP emulator
-│   ├── calypso_c54x.c             ← C54x DSP core (~6000 lines)
+│   ├── calypso_c54x.c             ← C54x DSP core (~13700 lines)
 │   ├── calypso_trx.c              ← TRX/TPU/TSP/TDMA + DSP↔ARM mirror
 │   ├── calypso_bsp.c              ← BSP DMA + UDP 6702
 │   ├── calypso_iota.c             ← IOTA BDLENA gating
@@ -301,9 +313,11 @@ bytes in `qemu.log` (STATE-DUMP raw memory dumps).
 
 ---
 
-## The current wall — DATA_IND
+## ~~The current wall — DATA_IND~~ — PÉRIMÉ
 
-After the 2026-05-15 mirror fix, the pipeline runs end-to-end up to here:
+> ⚠️ **FAUX.** La cascade ne « tourne end-to-end » nulle part : le DSP déraille (`POST-BOOTSTUB-RET`, PC=0x0000), `task_md=24` / écritures `a_cd[]` / `l1s_nb_resp` ne sont pas observés. Le vrai mur est en amont : le handshake go-live ARM→DSP ne s'arme jamais (`api_write_cb` déclaré `calypso_c54x.h:204`, jamais assigné), IMR=0x0000 tout le run (jamais ré-armé après le clear de boot @0xb37e). Section conservée à titre d'historique.
+
+~~After the 2026-05-15 mirror fix, the pipeline runs end-to-end up to here:~~
 
 ```
 DSP CCCH demod fires (task_md=24)              ✓  73× / run
@@ -369,12 +383,14 @@ RETE count, then run pytest. The harness flags regressions immediately.
 
 ### 2026-05-15 — Bug racine DSP→ARM mirror identifié et corrigé
 
+> ⚠️ Correctif d'audit (2026-07-01) : le mirror read a bien été ajouté (`calypso_trx.c:229-257`) mais n'a PAS débloqué la cascade. Runtime : `d_fb_det` reste 0, FBSB real-path jamais réussi, `task_md=24` jamais observé, DSP déraillé. Le vrai verrou reste le handshake go-live ARM→DSP (`api_write_cb` jamais câblé). Entrée conservée telle quelle ci-dessous.
+
 - `calypso_dsp_read()` lisait `s->dsp_ram[]` (array séparé) au lieu de
   `s->dsp->data[]`. Toutes les écritures DSP étaient invisibles côté ARM
   pour la zone API RAM. Bug en place depuis l'introduction du dual-buffer.
-- Fix : 5 lignes dans `calypso_trx.c:163`
-- Effet : FBSB success real path pour la première fois ; `task_md=24` passe
-  de 0 à 20+ ; cascade débloquée jusqu'au mur `d_task_d`
+- Fix : bloc dans `calypso_trx.c:229-257` (l'ancienne référence `:163` était erronée)
+- ~~Effet : FBSB success real path pour la première fois ; `task_md=24` passe
+  de 0 à 20+ ; cascade débloquée jusqu'au mur `d_task_d`~~ — FAUX au runtime (voir note ci-dessus)
 - Pytest harnais étendu à 49 milestones, 26 PASS stables
 - Test `icount=auto` exploratoire : architecture viable mais expose un
   bug INTM dwell systématique (à attaquer en session dédiée)

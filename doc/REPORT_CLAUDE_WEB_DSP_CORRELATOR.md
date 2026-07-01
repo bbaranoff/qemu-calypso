@@ -1,5 +1,9 @@
 # Rapport pour Claude web — Mur corrélateur c54x (MVDM / AR3 / MAC=0)
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Précisions propres à ce rapport : la prémisse « le corrélateur tourne, lit la vraie I/Q à PC=0xee38 (insn 3.2e9+), il ne reste QUE le mur MAC=0 » ne tient plus. Vérité-terrain : le DSP **déraille** (POST-BOOTSTUB-RET, PC=0x0000) et n'atteint jamais un go-live corrélateur stable ; `d_fb_det` reste 0 sur toute la run. Le vrai verrou amont n'est pas le décode MAC/MVDM mais le **handshake ARM→DSP go-live** qui ne s'arme jamais (ARM n'écrit que 0x0000 aux API 0x0314/0x0318 ; `api_write_cb` déclaré mais jamais assigné). Les numéros de ligne cités ci-dessous ont aussi dérivé (voir corrections inline).
+
 **Contexte** : branche `dsp_revival`, faire tourner le VRAI DSP c54x émulé
 (`hw/arm/calypso/calypso_c54x.c`) en mode full (`CALYPSO_MODE=full SHUNT=0
 REG_MODE=c54x`). On a remonté toute la chaîne ; il reste UN mur, profond, qui
@@ -9,13 +13,13 @@ recoupe un landmine déjà documenté dans le code (MVDM revert). J'ai besoin d'
 ## Ce qui est DÉJÀ résolu cette session (3 racines, sans hack)
 1. **`binutils-arm-none-eabi`/`nm`** manquait → run.sh ne nm-dérivait pas les
    adresses firmware. Étendu pour nm-dériver la fenêtre cpu-idle c54x
-   (`CALYPSO_IDLE_PC_LO/HI` = `l1a_l23_handler`/`l1a_compl_execute`). → FB→SB
-   débloqué (le firmware atteint `read_sb_result`).
+   (`CALYPSO_IDLE_PC_LO/HI` = `l1a_l23_handler`/`l1a_compl_execute`). → ~~FB→SB
+   débloqué (le firmware atteint `read_sb_result`)~~ — FAUX (vérité-terrain 2026-07-01) : `d_fb_det` reste 0 sur toute la run, le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000). La FB n'est jamais détectée.
 2. **Offset FN d'époque BSP** : `burst_fn=ts/5000` (osmo-trx) vs
    `current_fn=g_wall_fn` (base 0 boot) → tous les bursts droppés "stale"
    (delivered=0). Fix `calypso_bsp.c bsp_take_for_fn` : auto-mesure
    `dl_fnoff=current_fn-burst_fn` au 1er burst, appliqué au match. → `delivered`
-   monte, `stale=0`. **Le BSP livre maintenant les vrais samples I/Q au DSP.**
+   monte, `stale=0`. ~~**Le BSP livre maintenant les vrais samples I/Q au DSP.**~~ — À NUANCER : même si le BSP présente des samples, le DSP déraille avant tout go-live corrélateur stable et `d_fb_det` reste 0 ; le verrou réel est le handshake ARM→DSP go-live jamais armé (`api_write_cb` jamais câblé), pas la livraison BSP.
 3. **Mécanique du TOA garbage PROUVÉE** (sonde SBSLOT-WR) : une boucle
    `PC=0xa1d6 op=0x7193 (STL A,*AR3+)` balaie le bloc résultat db_r
    (`data[0x830/0x83a/0x844/0x84e]`) et y dépose `A.low` partout → le slot SB
@@ -55,8 +59,8 @@ porte sur des échantillons incohérents → somme nulle.
 
 ## Le landmine documenté dans le code (à recouper)
 
-`calypso_c54x.c:7216-7256` documente que **MVDM/MVMD (0x72/0x73) est REVERTÉ**
-(fallthrough STL 1-mot) :
+`calypso_c54x.c:7464` documente que **MVDM/MVMD (0x72/0x73) RESTENT REVERTÉS**
+(fallthrough STL générique 1-mot ; handler gaté `CALYPSO_FIX_MVDM` à 7620-7645) :
 - À `PC=0xf564 op=0x7215` = `MVDM data[0x14]→AR5` (cœur de la boucle dispatch FB
   0xf561-0xf588) : décodé **1-mot** alors que MVDM = **2-mots** → l'opérande
   exécutée comme opcode → desync → AR5 (ptr handler tâche) jamais chargé.
@@ -65,7 +69,7 @@ porte sur des échantillons incohérents → somme nulle.
   plus → deadlock". = "bug compensateur upstream". Critère de ré-application :
   "fixer d'abord le deadlock 0xee38 (AR3 hors-buffer)".
 - Histoire liée : `0x86/0x87` était AUSSI mis-décodé MVDM 2-mots ; corrigé
-  2026-06-02 en STH 1-mot (`c54x.c:8220-8234`) — l'ancien 2-mots "ne touchait
+  2026-06-02 en STH 1-mot (`c54x.c:8713-8741`, commentaire FIX 8717, handler 8733-8741) — l'ancien 2-mots "ne touchait
   jamais l'AR du Smem → AR3 figé/0 dans la boucle corrélateur".
 - Réf : `doc/REVERT_MVMD_KNOWLEDGE.md`, `project_state_20260602`.
 
@@ -79,7 +83,7 @@ adresses **dispersées**. Donc :
    mode d'adressage Smem ? (à désassembler depuis PROM0 ; `0xee37` ∈
    prog[0x07000+]). Est-ce un `MAC/MAS/MACP` avec adressage circulaire
    (`*ARx+0%`, BK) ou indexé (`*ARx+0`, AR0) que `resolve_smem`
-   (`calypso_c54x.c` ~l.3585+) résout en adresses dispersées ?
+   (`calypso_c54x.c:3728`) résout en adresses dispersées ?
 2. **Pourquoi les adresses lues sont-elles dispersées** (0x2a41,0x2aa2,0x2a1c…)
    et non séquentielles ? → buffer circulaire BK mal géré ? AR0/index faux ?
 3. **Pourquoi A reste 0** alors que `val` lus sont non-nuls ? La MAC
@@ -101,8 +105,8 @@ endroit → coeff≠0 → MAC accumule → TOA réel. Le "reverted MVDM" cassait
 justement ce chargement d'AR.
 
 ## Fichiers / ancres
-- `hw/arm/calypso/calypso_c54x.c` : MVDM revert 7216-7256 + 8220-8234 ;
-  `resolve_smem` ~3585+ (modes d'adressage) ; `c54x_exec_one` 3844+ ;
+- `hw/arm/calypso/calypso_c54x.c` : MVDM revert 7464 (+ handler gaté 7620-7645) ; STH 0x86/0x87 8713-8741 ;
+  `resolve_smem` 3728 (modes d'adressage) ; `c54x_exec_one` 4052 ;
   corrélateur PC=0xee37/0xee38 (PROM0).
 - `hw/arm/calypso/calypso_bsp.c` : buffer I/Q `daram_addr=0x2a00 len=296`.
 - Sondes read-only en place : IQ-READ (c54x:~1599), SBSLOT-WR (c54x, data_write),

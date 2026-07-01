@@ -95,7 +95,7 @@ chaque entrée tic54x doit être respecté.
 | 0x86..0x87 | `sth` | 0x8600 / 0xFE00 (variante avec ASM) |
 | 0x88..0x89 | `stlm` | 0x8800 / 0xFE00 |
 | **0x8A** | **`popm`** | **0x8A00 / 0xFF00** ← fixé 2026-05-08 |
-| **0x8B** | **`popd`** | **0x8B00 / 0xFF00** ← TODO : qemu-calypso le décode en MVDK |
+| **0x8B** | **`popd`** | **0x8B00 / 0xFF00** ← ✅ FIXÉ (`calypso_c54x.c:8777`) : ancien décodage MVDK long-addr neutralisé en STUB-NOP 1-mot |
 | 0x8C | `st` (T, Smem) | 0x8C00 / 0xFF00 |
 | 0x8D | `st` (TRN, Smem) | 0x8D00 / 0xFF00 |
 | 0x8E..0x8F | `cmps` | 0x8E00 / 0xFE00 |
@@ -112,19 +112,19 @@ chaque entrée tic54x doit être respecté.
 | 0xA2..0xA3 | `sub` | 0xA200 / 0xFE00 |
 | 0xA4..0xA5 | `mpy` | 0xA400 / 0xFE00 |
 | 0xA6..0xA7 | `macsu` | 0xA600 / 0xFE00 |
-| **0xA8..0xAF** | **`ld`** (variantes) | **0xA800-0xAE00 / 0xFE00** ← TODO : qemu code 0xAA/AB en STLM (ce devrait être 0x88) |
+| **0xA8..0xAF** | **`ld`** (variantes) | **0xA800-0xAE00 / 0xFE00** ← ✅ FIXÉ (`calypso_c54x.c:8984`) : ancien décodage 0xAA/AB en STLM (STLM est bien en 0x88) neutralisé en STUB-NOP |
 | 0xB0..0xB3 | `mac` | 0xB000 / 0xFC00 |
 | 0xB4..0xB7 | `macr` | 0xB400 / 0xFC00 |
 | 0xB8..0xBB | `mas` | 0xB800 / 0xFC00 |
 | 0xBC..0xBF | `masr` | 0xBC00 / 0xFC00 |
 | **0xC0..0xC3** | **`st` (parallel)** | **0xC000 / 0xFC00** — ST src,Ymem `\|\|` ADD/SUB/etc Xmem,dst |
 | 0xC4..0xC7 | `st` (parallel) | 0xC400 / 0xFC00 |
-| 0xC8..0xCB | `st` (parallel) | 0xC800 / 0xFC00 — ST `\|\|` LD (correctement décodé qemu ligne 4773) |
+| 0xC8..0xCB | `st` (parallel) | 0xC800 / 0xFC00 — ST `\|\|` LD (correctement décodé qemu `calypso_c54x.c:9404`, cf. commentaire encodage ligne 9376) |
 | 0xCC..0xCF | `st` (parallel) | 0xCC00 / 0xFC00 |
 | 0xD0..0xD3 | `st` (parallel) | 0xD000 / 0xFC00 |
 | 0xD4..0xD7 | `st` (parallel) | 0xD400 / 0xFC00 |
 | 0xD8..0xDB | `st` (parallel) | 0xD800 / 0xFC00 |
-| **0xDC..0xDF** | **`st` (parallel)** | **0xDC00 / 0xFC00** ← TODO : qemu décode 0xDD en POPD (cause SP runaway) |
+| **0xDC..0xDF** | **`st` (parallel)** | **0xDC00 / 0xFC00** ← ✅ FIXÉ (`calypso_c54x.c:9354`) : ancien décodage 0xDD en POPD (SP runaway) neutralisé en STUB-NOP |
 | 0xE0 | `firs` | 0xE000 / 0xFF00 |
 | 0xE1 | `lms` | 0xE100 / 0xFF00 |
 | 0xE2 | `sqdst` | 0xE200 / 0xFF00 |
@@ -202,18 +202,20 @@ chaque entrée tic54x doit être respecté.
 
 ## Cas connus de misclassification dans qemu-calypso
 
-| Opcode | tic54x | qemu-calypso | Statut |
+> Note (audit doc↔code 2026-07-01) : toutes les misclassifications ci-dessous sont **déjà corrigées** dans le code. Les anciens numéros de ligne cités (4220/4745/4753/4704/4660/4353) étaient périmés — ce sont aujourd'hui des lignes de traceur (DISP-TRACE fprintf, MAC-7700, RCD-75e8…), pas les décodeurs. Les vraies lignes des décodeurs/stubs sont mises à jour ci-dessous.
+
+| Opcode | tic54x | qemu-calypso (ancien bug) | Statut |
 |--------|--------|--------------|--------|
-| 0x8A | popm MMR | (était MVDK Smem,dmad — 2-mot) | **fixé 2026-05-08** |
-| 0x8B | popd Smem | "MVDK with long address" (ligne 4220) | TODO |
-| 0xDD | st (parallel) | POPD Smem (ligne 4745) | TODO — cause SP runaway |
-| 0xDE | st (parallel) | POPD dmad (2-mot, ligne 4753) | TODO |
-| 0xCD | st (parallel) | POPM MMR (ligne ~4704) | TODO |
-| 0xC5 | st (parallel) | PSHM MMR (ligne 4660) | TODO |
-| 0xCE | st (parallel) | FRAME #k | TODO (FRAME est en 0xEE per tic54x) |
-| 0xAA-0xAB | ld (long-addr variants) | STLM src,MMR (ligne 4353) | TODO (STLM est en 0x88 per tic54x) |
-| 0x80 | stl src, Smem | "MVDD Smem,Smem" | TODO |
-| 0x71 | mvdk Smem,dmad | (vérifier) | TODO |
+| 0x8A | popm MMR | (était MVDK Smem,dmad — 2-mot) | ✅ FIXÉ 2026-05-08 |
+| 0x8B | popd Smem | ~~"MVDK with long address" (ligne 4220)~~ — FAUX : ligne 4220 = fprintf DISP-TRACE | ✅ FIXÉ (`calypso_c54x.c:8777`, STUB-NOP 1-mot) |
+| 0xDD | st (parallel) | ~~POPD Smem (ligne 4745)~~ — FAUX : ligne 4745 = traceur MAC-7700 ; cause du SP runaway | ✅ FIXÉ (`calypso_c54x.c:9354`, STUB-NOP) |
+| 0xDE | st (parallel) | ~~POPD dmad (2-mot, ligne 4753)~~ | ✅ FIXÉ (`calypso_c54x.c:9362`, STUB-NOP) |
+| 0xCD | st (parallel) | ~~POPM MMR (ligne ~4704)~~ | ✅ FIXÉ (`calypso_c54x.c:9298`, STUB-NOP ; vrai POPM en 0x8A) |
+| 0xC5 | st (parallel) | ~~PSHM MMR (ligne 4660)~~ | ✅ FIXÉ (`calypso_c54x.c:9291`, STUB-NOP ; vrai PSHM en 0x4A) |
+| 0xCE | st (parallel) | ~~FRAME #k~~ | ✅ FIXÉ (`calypso_c54x.c:9305`, STUB-NOP) |
+| 0xAA-0xAB | ld (long-addr variants) | ~~STLM src,MMR (ligne 4353)~~ (STLM est en 0x88) | ✅ FIXÉ (`calypso_c54x.c:8984`, STUB-NOP) |
+| 0x80 | stl src, Smem | ~~"MVDD Smem,Smem"~~ | ✅ FIXÉ (`calypso_c54x.c:8533`, STL src,Smem — AUDIT FIX 2026-05-08) |
+| 0x71 | mvdk Smem,dmad | (à vérifier) | ✅ FIXÉ / décodé correctement (`calypso_c54x.c:7578`, FINDING 2026-06-24) |
 
 ## Référence
 

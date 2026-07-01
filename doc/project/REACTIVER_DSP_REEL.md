@@ -13,9 +13,9 @@
 
 - Le **toggle existe** : `CALYPSO_DSP_SHUNT=0` → le C54x émulé tourne (au lieu du shunt). `=1` → shunt canned.
 - La **vraie ROM DSP est présente** : `/opt/GSM/calypso_dsp.txt` (→ `qemu-src/calypso_dsp.txt`), dump réel
-  « OsmocomBB Compal DSP Dumper », cDSP ID `0x0128`, 8222 lignes / 722 Ko, sections
+  « OsmocomBB Compal DSP Dumper », cDSP ID `0x0128`, 8216 lignes / ~722 Ko, sections
   `Registers / PROM0..3 / DROM / PDROM`. Elle contient le L1 DSP **et le vocoder**.
-- L'**émulateur C54x existe** (`calypso_c54x.c`, ~12 442 lignes : exécute les opcodes, charge la ROM,
+- L'**émulateur C54x existe** (`calypso_c54x.c`, ~13 697 lignes : exécute les opcodes, charge la ROM,
   Viterbi/deinterleave/burst decode) mais il est **incomplet** — son bring-up est en cours
   (docs `STEP1_PROM_LOADER.md`, `STEP2_BC_CONDS.md`, `STEP3_F2_F5_STUBS.md`). C'est précisément
   pour contourner ce DSP pas-encore-fini que le **shunt** a été créé (canned FB/SB → débloque la
@@ -81,7 +81,9 @@ ces résultats.
    - Cœur C54x : fetch/exec opcodes (`prog_fetch`, `c54x_exec_one`, `c54x_run`), accumulateurs 40 bits,
      OVM, MMR, AR, pile. En-tête : « Minimal C54x core: enough to run the Calypso DSP ROM for GSM
      signal processing (Viterbi, deinterleaving, burst decode) ».
-   - Chargement ROM : `c54x_load_rom` (cf table dans `docs/STEP1_PROM_LOADER.md`).
+   - Chargement ROM : `c54x_load_section` (`calypso_c54x.c:13183`) et `c54x_load_blob_daram`
+     (`calypso_c54x.c:13158`) — cf table dans `docs/STEP1_PROM_LOADER.md`. (Il n'existe **pas** de
+     symbole `c54x_load_rom` dans le code : `grep` = 0 hit hors docs/python.)
 
 2. **La vraie ROM DSP** — `calypso_dsp.txt` (symlink `/opt/GSM/` → `qemu-src/`)
    - Dump réel du combiné (Device ID `0xb4fb`, cDSP `0x0128`). Sections :
@@ -96,11 +98,13 @@ ces résultats.
      (et `dsp-blob=<p>` pour une fixture DARAM seule). `calypso_trx_set_section_paths(...)` les pousse au C54x.
 
 4. **Toggle & sélection de mode** — `run.sh`
-   - `CALYPSO_DSP_SHUNT=0|1` (run.sh:85). Défauts par mode (run.sh ~1122-1212) : certains modes posent
-     déjà `:=0` (DSP réel), d'autres `:=1` (shunt). Label `_dsp_label` : `(c54x emule)` vs `(canned FB+SB)`.
+   - `CALYPSO_DSP_SHUNT=0|1` (aide run.sh:105). Défauts par mode (run.sh:1142 `:=0`, :1156/:1186 `:=1`) :
+     certains modes posent déjà `:=0` (DSP réel), d'autres `:=1` (shunt). Label `_dsp_label` (run.sh:855) :
+     `(c54x emule)` vs `(canned FB+SB)`.
 
 5. **Pont I/Q vers le DSP** — `hw/arm/calypso/calypso_bsp.c`
-   - `c54x_bsp_load(bsp.dsp, samples, ns)` (calypso_bsp.c:949, 1148) : le BSP peut DMA-feeder
+   - `c54x_bsp_load(bsp.dsp, samples, ns)` (appels : `calypso_bsp.c:1023, :1248` ; définition :
+     `calypso_c54x.c:13676`) : le BSP peut DMA-feeder
      des échantillons I/Q dans la DARAM du C54x (entrée du corrélateur). Transport TRXDv0:6702
      channel-agnostic.
 
@@ -177,7 +181,7 @@ entendre/parler avec le DSP réel il faut :
   l'audio est du **PCM** → pont ABB requis.
 
 ### V5 — Performance / temps réel
-ARM émulé + C54x émulé (12k+ lignes, par-opcode) sous `-icount` = lourd. Tenir la cadence TDMA
+ARM émulé + C54x émulé (~13,7k lignes, par-opcode) sous `-icount` = lourd. Tenir la cadence TDMA
 (4.615 ms/trame) avec les deux cœurs émulés est un risque (cf déjà les `LOST`/dérive FN côté ARM).
 Le shunt évitait tout ce coût.
 
@@ -251,12 +255,15 @@ ROM TI propriétaire de bout en bout** — l'artefact citable. Et il se débloqu
 
 ## 7. Références fichiers
 
-- Toggle / skip : `hw/arm/calypso/calypso_dsp_shunt.c:4, :121, :1485-1535` ; `run.sh:85, ~1122-1212, :835`.
-- Émulateur C54x : `hw/arm/calypso/calypso_c54x.c` (cœur, `c54x_run`, `c54x_load_rom`, `c54x_bsp_load`).
+- Toggle / skip : `hw/arm/calypso/calypso_dsp_shunt.c:4` (« c54x emulator is skipped entirely » —
+  seule cite fiable ; `:121` = `#define TCHT_DSP_TASK 13` et `:1485-1535` = setup SHM/`.cfile`, PAS la
+  logique de toggle) ; `run.sh:105` (aide), défauts par mode `run.sh:1142/:1156/:1186`, label `run.sh:855`.
+- Émulateur C54x : `hw/arm/calypso/calypso_c54x.c` (cœur, `c54x_run`, `c54x_load_section`/`c54x_load_blob_daram`,
+  `c54x_bsp_load`). (Pas de symbole `c54x_load_rom`.)
 - Chargement ROM (props) : `hw/arm/calypso/calypso_mb.c:47-52, :241, :286-328`.
 - ROM réelle : `/opt/GSM/calypso_dsp.txt` (→ `qemu-src/calypso_dsp.txt`) ; outil `qemu-src/dsp_txt2bin.py` ;
   auto-split `run.sh:~1672-1709` (`CALYPSO_DSP_ROM_TXT`, `CALYPSO_DSP_BLOB`).
-- I/Q vers DSP : `hw/arm/calypso/calypso_bsp.c:949, :1148`.
+- I/Q vers DSP : `hw/arm/calypso/calypso_bsp.c:1023, :1248` (déf. `calypso_c54x.c:13676`).
 - Convergence/AFC (pourquoi canned) : `hw/arm/calypso/calypso_trx.c:104-110`.
 - Bring-up en cours : `qemu-src/docs/STEP1_PROM_LOADER.md`, `STEP2_BC_CONDS.md`, `STEP3_F2_F5_STUBS.md`.
 - Contrat voix côté firmware (pour comprendre la sortie PCM vs trame) :

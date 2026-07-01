@@ -30,10 +30,12 @@ TI Calypso (TWL3014/DBB) — GSM baseband processor
 
 ## TPU
 - Controls radio timing sequences
-- TPU_CTRL register:
-  - Bit 0: TPU_CTRL_EN (enable scenario execution)
-  - Bit 2: TPU_CTRL_IDLE (idle status)
+- TPU_CTRL register (bits corrigés d'après include/hw/arm/calypso/calypso_trx.h:60-66):
+  - Bit 0: TPU_CTRL_RESET
+  - Bit 1: TPU_CTRL_PAGE
+  - Bit 2: TPU_CTRL_EN (enable scenario execution) — code: `TPU_CTRL_EN (1 << 2)`
   - Bit 4: TPU_CTRL_DSP_EN (enable DSP frame interrupt)
+  - Bit 8: TPU_CTRL_IDLE (idle status) — FAUX précédemment "Bit 2"
 - Firmware writes TPU scenarios then sets EN
 - When scenario completes: clears EN, fires FRAME interrupt
 - DSP_EN causes FRAME interrupt to also wake DSP
@@ -56,7 +58,7 @@ TI Calypso (TWL3014/DBB) — GSM baseband processor
 - ARM signals DSP via:
   - Writing d_dsp_page in NDB
   - Setting TPU_CTRL_DSP_EN
-  - TPU generates FRAME interrupt to DSP (SINT17, vec 2)
+  - TPU generates FRAME interrupt to DSP (~~SINT17, vec 2~~ — FAUX: INT3, vec 19, `C54X_INT_FRAME_VEC 19` calypso_c54x.h:126 ; câblé via calypso_dsp_shunt.c:1043 `c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT)`)
 - DSP signals ARM by writing results in Read page
 
 ## OsmocomBB Layer1 Flow

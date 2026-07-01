@@ -1,10 +1,14 @@
 # C54x Decoder Audit — `calypso_c54x.c` (emulated TMS320C54x DSP)
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> **Portée du périmé :** la thèse de la §2 / headline #4 (« IRQ prise avec IPTR=0x1FF, stub RET laisse INTM collé à 1 ») est **FAUSSE**. Vérité-terrain : `IMR=0x0000` pendant tout le run (jamais ré-armé après le clear boot @0xb37e), donc `unmasked = (s->imr & (1<<imr_bit)) != 0` (`c54x.c:13593`) est **toujours faux** et le garde de dispatch (`c54x.c:13624`) ne se déclenche jamais : `c54x_interrupt_ex` positionne IFR mais **ne vectorise JAMAIS** — aucune IRQ n'est prise, donc INTM ne peut pas « rester collé ». Le vrai blocage est le **handshake go-live ARM→DSP** (l'ARM n'écrit que 0x0000 dans l'API 0x0314/0x0318 ; `api_write_cb` jamais câblé). Le levier `CALYPSO_DSP_FRAME_VEC28` est un **cul-de-sac** (force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub, IMR reste 0). Le décodeur (§1/§3/§4) reste un audit d'opcodes valable, mais **les numéros de ligne sont périmés** (fichier passé de ~12646 à **13697** lignes) — les ancres vérifiées 2026-07-01 sont corrigées inline.
+>
 > **Cross-link:** [`doc/FB_CORRELATOR_PIPELINE.md`](FB_CORRELATOR_PIPELINE.md) — the FB/FCCH
 > correlator pipeline schema. This audit is the opcode-decoder companion to that pipeline doc;
 > the headline correlator wall (`d_fb_det=0`) traces to a decode root described in §1 and §4.
 >
-> **Scope:** `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (~12646 lines). READ-ONLY audit.
+> **Scope:** `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (~13697 lignes au 2026-07-01 ; ~12646 lors de l'audit d'origine). READ-ONLY audit.
 > **ISA authorities:** SPRU131G, SPRU172C (`/root/spru131g.txt`, `/root/spru172c.txt`),
 > `doc/opcodes/tic54x_hi8_map.md`, binutils `tic54x-opc.c`.
 > **Method:** every claim cites `c54x.c:line`. Findings are tagged **CONFIRMED** (checked against
@@ -18,28 +22,32 @@ Date: 2026-06-22. Branch `dsp_revival`.
 ## 1. TL;DR — decoder health
 
 - **Foundation is solid.** The data-bus map, MMR/peripheral MMIO, XPC program banking, and the four
-  operand resolvers (`resolve_smem` `c54x.c:3578`, `resolve_lmem` `c54x.c:3778`, `resolve_xmem`
-  `c54x.c:3842`, `c54x_cond_true` `c54x.c:3876`) are ISA-faithful field-for-field. ~70% of the file
+  operand resolvers (`resolve_smem` `c54x.c:3728`, `resolve_lmem` `c54x.c:3928`, `resolve_xmem`
+  `c54x.c:3992`, `c54x_cond_true` `c54x.c:4026`) are ISA-faithful field-for-field. ~70% of the file
   is env/PC-gated read-only diagnostic probes with **no** effect on execution.
 - **~120 opcode handler blocks audited.** **~30 CONFIRMED bugs** (wrong identity, dead code, or wrong
   semantics), of which **~14 are HIGH/CRITICAL**. Two adversarially-checked "bugs" were down-graded to
   *inert dead code* (no runtime effect) — flagged honestly in §4.
 - **THE worst, by impact (headline #1, correlator):** an **entire 0x30–0x37 MAC/LD/BITT cluster is
   dead code mislocated under `case 0xF:`** (`c54x.c:5056–5191`), while the *reachable* `case 0x3:`
-  (`c54x.c:7698`) blindly runs **every** `0x3xxx` as a generic MAC (`acc += T*Smem`) — so `LD Smem,T`,
+  (`c54x.c:8052`) blindly runs **every** `0x3xxx` as a generic MAC (`acc += T*Smem`) — so `LD Smem,T`,
   `BITT`, `MACA`, `MPYA`, `POLY` are all silently mis-executed. This directly starves the FCCH
   correlator's coefficient/TC path. **CONFIRMED.**
-- **Headline #2 (correlator, partially fixed):** `case 0x5` (`c54x.c:7856`) — DADST/DSADT
+- **Headline #2 (correlator, partially fixed):** `case 0x5` (`c54x.c:8226`) — DADST/DSADT
   (`0x5A/5B/5E/5F`) were fixed this session (`c54x.c:7878`, proper Lmem + C16 branch) but
   `0x50–0x59` and `0x5C–0x5D` **still fall through to SFTA/SFTL** (`c54x.c:7902+`) → any remaining
   dual long-word form is flattened to `dst>>=ASM`. **CONFIRMED.**
 - **Headline #3 (control flow):** `hi8==0xF8` (`c54x.c:6062`) decodes the BC/FB branch family by
   *nibble* into fabricated BANZ/CALL/RPT/ACC-heuristic handlers, **never reading the 8-bit cond
   field**, and *decrements an arbitrary AR* on taken "BANZ" branches (`c54x.c:6127/6138`). **CONFIRMED HIGH.**
-- **Headline #4 (IRQ deadlock, §2):** an interrupt taken with `IPTR=0x1FF` vectors into a RET-
-  terminated ROM stub; the `FCxx RET` handler (`c54x.c:6866`) correctly does **not** clear INTM,
-  so INTM sticks at 1 forever and no further IRQ is serviced. **Root cause is upstream IPTR, not the
-  RET handler.** **CONFIRMED.**
+- ~~**Headline #4 (IRQ deadlock, §2):** an interrupt taken with `IPTR=0x1FF` vectors into a RET-
+  terminated ROM stub; the `FCxx RET` handler correctly does not clear INTM, so INTM sticks at 1
+  forever and no further IRQ is serviced.~~ — **FAUX (vérité-terrain 2026-07-01).** `IMR=0x0000`
+  tout le run : `unmasked` (`c54x.c:13593`) est toujours faux, le garde de dispatch (`c54x.c:13624`)
+  ne se déclenche jamais, donc **aucune IRQ n'est prise** — l'histoire « stub RET laisse INTM
+  collé » ne peut pas se produire. Le vrai blocage : handshake go-live ARM→DSP jamais asserté /
+  IMR jamais ré-armé. Le `FCxx RET` (`s->pc=ra` à `c54x.c:7043`) est correct mais **n'est pas le
+  culprit**. Voir §2 (annotée périmée).
 - **Catch-all hazards:** `0xE000–0xE3FF` mask `0xFC00` mis-runs FIRS/LMS/SQDST/ABDST as a 1-word
   "CMPS" (`c54x.c:6945`) — and FIRS is 2-word, so PC desyncs. `0xFD` decoded as fictional `LD #k,A`
   (`c54x.c:6870`, *but inert* — real XC handled at `c54x.c:4667`). `0xF6/0xF7` fabricated
@@ -49,11 +57,27 @@ Date: 2026-06-22. Branch `dsp_revival`.
 
 ## 2. THE BOOTSTUB / IRQ LEAD (headline writeup)
 
+> ⚠️ **SECTION PÉRIMÉE (2026-07-01).** Le mécanisme décrit ci-dessous (« IRQ prise → stub RET →
+> INTM collé à 1 ») **ne correspond plus à la vérité-terrain**. `IMR=0x0000` pendant tout le run
+> (jamais ré-armé après le clear boot @0xb37e) ⇒ `unmasked = (s->imr & (1<<imr_bit)) != 0`
+> (`c54x.c:13593`) est **toujours faux** ⇒ le garde de dispatch `!(s->st1 & ST1_INTM) && unmasked
+> && s->delay_slots == 0` (`c54x.c:13624`) ne s'arme **jamais**. `c54x_interrupt_ex` (`c54x.c:13533`)
+> positionne IFR mais **ne vectorise JAMAIS** : **aucune IRQ n'est prise**, donc INTM ne peut pas
+> « rester collé » et le `RET` des stubs ROM n'a aucune part dans le blocage. Les citations
+> `qemu.log` ci-dessous décrivent un run plus ancien où les IRQ étaient encore dispatchées.
+> **Vrai blocage :** le handshake go-live ARM→DSP n'est jamais asserté (l'ARM n'écrit que 0x0000
+> dans l'API 0x0314/0x0318 ; `api_write_cb` déclaré mais jamais câblé) et l'IMR n'est jamais
+> ré-armé — pas une IRQ INTM-collée. Le levier `CALYPSO_DSP_FRAME_VEC28` est un **cul-de-sac**
+> (force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub, IMR reste 0).
+> Le reste de la §2 est conservé comme historique ; lire avec cette correction en tête.
+
 **User hypothesis:** an interrupt path leaves the DSP stuck in the boot stub with interrupts masked,
 which is why the ARs are frozen in low memory (AR5=0x80, AR3=0x000b) and the real FRAME handler never
-runs. **VERDICT: CONFIRMED.** The decoder is *not* the bug — the bug is the **wrong vector base
-(`IPTR=0x1FF`)** combined with **ROM interrupt stubs that terminate in `RET` (0xFC00) instead of
-`RETE`**, which the (correct) RET handler faithfully refuses to lift INTM on.
+runs. ~~**VERDICT: CONFIRMED.** … the bug is the wrong vector base (`IPTR=0x1FF`) combined with ROM
+interrupt stubs that terminate in `RET` (0xFC00) instead of `RETE`.~~ — **FAUX (2026-07-01) :** avec
+`IMR=0x0000` aucune IRQ n'est dispatchée (`unmasked` toujours faux, `c54x.c:13593/13624`), donc le
+scénario « stub RET → INTM collé » ne se déclenche jamais. Le décodeur n'est effectivement pas le
+bug, mais la cause réelle est le **handshake go-live ARM→DSP jamais asserté / IMR jamais ré-armé**.
 
 ### 2.1 The "boot stub" is a PC-region state, not a flag
 There is no `post_bootstub` variable. The boot stub is ROM at `PC 0x0000–0x007F`:
@@ -63,39 +87,45 @@ There is no `post_bootstub` variable. The boot stub is ROM at `PC 0x0000–0x007
 `BOOTSTUB-ENTRY` on `s->pc==0x0000` (`c54x.c:4328`),
 `POST-BOOTSTUB-RET` on `s->pc<=0x0008` inside the FCxx RET handler (`c54x.c:6820`).
 
-### 2.2 Reset leaves the ROM vector page active with INTM masked  — **CONFIRMED**
-`c54x_reset` (`c54x.c:12243`) sets `PMST=0xFFA8` → `IPTR=0x1FF`, and `ST1` with `INTM=1`
+### 2.2 Reset leaves the ROM vector page active with INTM masked  — *(constat de reset exact ; conclusion de blocage périmée — voir bandeau §2)*
+`c54x_reset` (`c54x.c:13240`) sets `PMST=0xFFA8` → `IPTR=0x1FF`, and `ST1` with `INTM=1`
 (`ST1_INTM|ST1_SXM|ST1_XF`). No later code ever writes `IPTR=0x140`. Live `PMST` transitions only ever
 show IPTR `0x1ff / 0x0ee / 0x0f2 / 0x000` — **never `0x140`**, so the firmware's RAM vector table at
 `0xA04C` is never selected.
 
-### 2.3 The fatal vector formula  — **CONFIRMED at `c54x.c:12591`** (replay at `c54x.c:10452`)
+### 2.3 The fatal vector formula  — formule à `c54x.c:13618` (replay à `c54x.c:10860`) *(mais jamais atteinte : dispatch jamais armé, voir bandeau §2)*
 ```
-s->pc = (iptr * 0x80) + vec * 4;     // c54x.c:12591
+s->pc = (iptr * 0x80) + vec * 4;     // c54x.c:13618
 ```
 With `IPTR=0x1FF` → base `0xFF80`: **vec19 (INT3 FRAME) → 0xFFCC**, **vec21 → 0xFFD4** — the ROM/boot-
-stub vector page, **not** the firmware handler at `0xA04C`. The code's own comment says exactly this
-(`c54x.c:12606`: "INT3 at IPTR=0x1ff (vec=0xffcc) hits a garbage ROM stub; … 0x140 (vec=0xa04c) hits
-the firmware real handler"). Dispatch sets `ST1_INTM` on entry (`c54x.c:12591`) — correct per ISA.
+stub vector page, **not** the firmware handler at `0xA04C`. Dispatch sets `ST1_INTM` on entry
+(`c54x.c:13618`) — correct per ISA, **mais ce chemin n'est jamais emprunté** puisque le garde de
+dispatch (`c54x.c:13624`) ne s'arme jamais avec `IMR=0x0000` (voir bandeau §2).
 
-### 2.4 The culprit handler: `FCxx RC/RET` at `c54x.c:6779–6867`  — **CONFIRMED**
+### 2.4 ~~The culprit handler: `FCxx RC/RET`~~ — **PÉRIMÉ : pas le culprit (voir bandeau §2)**
 The terminating instruction of those `IPTR=0x1FF` ROM stubs is `0xFC00` (RET). The handler pops the
-return address and does `s->pc = ra; return 0;` at **`c54x.c:6866`** with **no `ST1_INTM` clear**.
-The popped `ra` is `0x0000`, dropping the DSP into the boot stub with **INTM permanently = 1**.
+return address and does `s->pc = ra; return 0;` at **`c54x.c:7043`** with **no `ST1_INTM` clear** —
+ce qui est **ISA-correct** (un `RET` simple ne doit pas lever INTM). ~~The popped `ra` is `0x0000`,
+dropping the DSP into the boot stub with INTM permanently = 1.~~ — **FAUX comme cause du blocage :**
+comme aucune IRQ n'est dispatchée (`IMR=0x0000`, `c54x.c:13593/13624`), INTM n'est jamais mis par un
+dispatch et ne peut donc pas rester collé via un `RET`.
 
-- This is **ISA-correct**: plain `RET` must *not* clear INTM. Contrast the INTM-clearing returns that a
-  real ISR uses: `RETE` `c54x.c:4888` (`st1 &= ~ST1_INTM`), `RETED` `c54x.c:6389`, `FRETED`
-  `c54x.c:6480`. The ROM stubs simply aren't ISRs — they end in `RET`, not `RETE`.
-- Once INTM is stuck high, **both** servicing guards stop firing: the non-IDLE dispatch guard
-  `!(ST1_INTM) && unmasked && delay_slots==0` (`c54x.c:12574`) and the in-loop pending replay guard
-  `!(ST1_INTM)` (`c54x.c:10437`). No further interrupt is ever taken.
+- Contrast the INTM-clearing returns that a real ISR uses: `RETE` `c54x.c:5038` (`st1 &= ~ST1_INTM`).
+  The ROM stubs simply aren't ISRs — they end in `RET`, not `RETE`.
+- ~~Once INTM is stuck high, both servicing guards stop firing.~~ — **INTM n'est jamais mis :** le
+  garde de dispatch `!(s->st1 & ST1_INTM) && unmasked && s->delay_slots == 0` (`c54x.c:13624`)
+  échoue sur `unmasked==false` (IMR=0), pas sur INTM. Aucune IRQ n'est jamais prise, pour une raison
+  **en amont** (handshake go-live / IMR jamais ré-armé), pas à cause d'un INTM collé.
 
 ### 2.5 Why the ARs are stuck in low memory
 The **real INT3/FRAME handler at `0xA04C` is the code that sets up the AR pointers** for the frame/
 correlator buffers (AR5→I/Q buffer, AR3/AR4→ref taps, per `FB_CORRELATOR_PIPELINE.md` §2). Because
 IRQs vector to the RET-terminated ROM stubs at `0xFF80+` instead, that handler **never runs even
-once**, so the ARs are never initialized off their reset/garbage values (AR5=0x80, AR3=0x000b). After
-the first ROM-ISR `RET`, INTM is stuck and the situation is permanent. Live log corroboration:
+once**, so the ARs are never initialized off their reset/garbage values (AR5=0x80, AR3=0x000b).
+*(Le constat « le handler FRAME ne tourne jamais » reste vrai ; mais la raison « INTM collé après le
+RET du ROM-ISR » est **périmée** : avec `IMR=0x0000` aucune IRQ n'est prise, le handler ne tourne pas
+parce que le go-live ARM→DSP n'est jamais asserté — voir bandeau §2.)* Live log corroboration
+(run plus ancien, IRQ encore dispatchées) :
 
 - `qemu.log:610-612` — `IRQ vec=21 … PC=0xffd4` → `IRQ vec=19 … INTM=1 … PC=0xffd4` → `BOOT[2.0]
   PC=0xffd4 op=0x007f`: the IRQ vectored into the ROM page.
@@ -105,17 +135,21 @@ the first ROM-ISR `RET`, INTM is stuck and the situation is permanent. Live log 
 - `qemu.log:2782` — `RC/RET PC=0xf323 … ra=0x0003` and `:2757` `RC/RET PC=0xffcd … ra=0x770d`: the ROM
   page returns land at the boot stub / post-IDLE, **always via plain RC, never RETE**.
 
-### 2.6 Recommendation (do NOT patch the RET handler)
-The divergence is **upstream of `c54x_interrupt_ex`**, which itself is correct. Two correct-target
-options:
-1. **Primary:** ensure `IPTR` is relocated to the firmware RAM vector page (`0x140` → base `0xA000`,
-   INT3 at `0xA04C`) *before* the first IRQ is serviced — trace the PMST/IPTR write path and the API
-   handshake, not the DSP core. The bootloader PMST write that should set `IPTR=0x140` is being lost
-   or never issued.
-2. **Defensive:** treat dispatching an IRQ into `IPTR=0x1FF` (PC `0xFF80..0xFFFF`) as a dead end
-   (RET-terminated stub) — refuse to dispatch there, or assert.
+### 2.6 Recommendation — **corrigée 2026-07-01**
+La divergence est **en amont de `c54x_interrupt_ex`** (qui est correct). ~~La priorité serait de
+relocaliser IPTR vers 0x140.~~ — **Reclassé :** le vrai manque est le **handshake go-live ARM→DSP**,
+jamais asserté (l'ARM n'écrit que `0x0000` dans l'API 0x0314/0x0318 ; `api_write_cb` déclaré mais
+**jamais câblé** — `grep 'api_write_cb *=' = 0`) **et l'IMR jamais ré-armé** (`IMR=0x0000` tout le
+run après le clear boot @0xb37e). Tant qu'aucune IRQ n'est démasquée (`unmasked==false`,
+`c54x.c:13593`), aucune vectorisation n'a lieu, IPTR/0x140 est hors-sujet.
 
-**Do NOT** make `FCxx` clear INTM — that would violate ISA semantics and merely mask the real bug.
+- **Ne PAS** compter sur le levier `CALYPSO_DSP_FRAME_VEC28` : c'est un **cul-de-sac** — il
+  force-vectorise vers vec28 mais atterrit dans un épilogue ISR/stub → déraille vers le boot-stub,
+  IMR reste 0. Il n'atteint **pas** le go-live 0xa582 qui armerait `IMR=0x52fd`.
+- **Ne PAS** faire clairer INTM par `FCxx` — cela violerait l'ISA et masquerait le vrai bug (qui
+  n'est de toute façon **pas** un INTM collé).
+- **Cible réelle :** câbler/asserter le handshake go-live ARM→DSP (API 0x0314/0x0318) et le ré-armage
+  IMR côté DSP ; c'est ce chemin, pas le cœur DSP ni la table de vecteurs, qui bloque `d_fb_det`.
 
 ---
 
@@ -250,7 +284,7 @@ Each was checked by a second pass that *attempted to refute* it. Severity orderi
 and control-flow impact.
 
 ### 4-A. [CRITICAL, correlator] `0x3xxx` runs as blind MAC; correct decode is dead code
-- **Where:** reachable handler `case 0x3:` `c54x.c:7698-7708`; dead "correct" cluster
+- **Where:** reachable handler `case 0x3:` `c54x.c:8052-7708`; dead "correct" cluster
   `c54x.c:5056–5191` (inside `case 0xF:`).
 - **What:** the `switch(hi4)` dispatches on `(op>>12)&0xF` (`c54x.c:3988`). The well-formed handlers
   for `0x30 LD Smem,T`, `0x31 MPYA`, `0x32 LD Smem,ASM`, `0x33 MASA`, `0x34 BITT`, `0x35 MACA`,
@@ -294,7 +328,7 @@ and control-flow impact.
   maintenance hazard, not a runtime bug. **CONFIRMED dead / inert.**
 
 ### 4-E. [HIGH, correlator] `0x50-0x59 / 0x5C-0x5D` long-word ops still fall to SFTA/SFTL
-- **Where:** `case 0x5` `c54x.c:7856`; dual long-word fix at `c54x.c:7878`; fallthrough at
+- **Where:** `case 0x5` `c54x.c:8226`; dual long-word fix at `c54x.c:7878`; fallthrough at
   `c54x.c:7902+`.
 - **What:** the session fix correctly routes **DADST/DSADT (0x5A/5B/5E/5F)** through `resolve_lmem` +
   C16 branch — verified against the SPRU172C worked examples (C16=1 dual-16; C16=0 double-precision).
@@ -357,8 +391,8 @@ and control-flow impact.
 | 0x90-93 MAC, SQDST 0xA1, POLY 0xBC-BF, MAS 0xB8-BB | `c54x.c:7939/8499/8520/8540` | **CONFIRMED** — raw → 2-bit dual-operand decode |
 | ST‖LD MOD 1/2 inversion | `c54x.c:8768/9034` | **CONFIRMED** — now 1=dec 2=inc per SPRU131G |
 | `c54x_prog_xlate` XPC banking | `c54x.c:3513` | **CONFIRMED** — `0x8000-0xDFFF` banked, `0xE000+` fixed PROM1 (Calypso layout) |
-| `resolve_lmem` ±2 step | `c54x.c:3778` | **CONFIRMED** — long-operand step verified vs SPRU172C footnote |
-| `resolve_xmem` xmod 3 circular | `c54x.c:3842` | **CONFIRMED** — `*AR+0%` now routes through `c54x_circ_ref` |
+| `resolve_lmem` ±2 step | `c54x.c:3928` | **CONFIRMED** — long-operand step verified vs SPRU172C footnote |
+| `resolve_xmem` xmod 3 circular | `c54x.c:3992` | **CONFIRMED** — `*AR+0%` now routes through `c54x_circ_ref` |
 | MVDD at 0xE5 | `c54x.c:6995` | **CONFIRMED** — proper `(n&3)+2` dual-operand + BK circular (replaces wrong 0xF6 decode) |
 | MAX F486 / MIN F487 / ROLTC F492 / CMPL F493 / RND F49F | `c54x.c:5024/5035/5196/5267/5277` | **CONFIRMED** — identities moved to correct SPRU172C opcode rows |
 | SFTC F494 | `c54x.c:5359/5642` | **CONFIRMED** — `src(31)==src(30)→<<1` |
@@ -376,7 +410,7 @@ and control-flow impact.
 - **`0x50-0x59`, `0x5C-0x5D` (DADD/DSUB/DLD/DRSUB/DSUBT) still fall through to SFTA/SFTL**
   (`c54x.c:7902+`) — the remaining half of the dual long-word family. **Highest-value TODO** after the
   DADST/DSADT fix; same correlator path. (§4-E)
-- **`case 0x3` blind-MAC** (`c54x.c:7698`) — needs per-sub-opcode decode for 0x30-0x37; the correct
+- **`case 0x3` blind-MAC** (`c54x.c:8052`) — needs per-sub-opcode decode for 0x30-0x37; the correct
   bodies already exist (dead) at `c54x.c:5056-5191` and can be relocated into `case 0x3`. (§4-A)
 - **`0xE000-0xE3FF` CMPS catch-all** (`c54x.c:6945`) — split into FIRS(2-word)/LMS/SQDST/ABDST; fix the
   FIRS PC-desync. Real CMPS belongs at `0x8C/0x8E`. (§4-F)

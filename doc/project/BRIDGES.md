@@ -1,5 +1,9 @@
 # Bridges & Communication Map — Calypso QEMU
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Concrètement pour ce doc : le miroir DSP→ARM `trx_dsp_api_write_cb` **n'existe pas** (aucun symbole dans l'arbre) et le pointeur `s->api_write_cb` de `calypso_c54x.c` n'est **jamais** assigné (`grep 'api_write_cb *=' hw/arm/calypso/` = 0 résultat ; seul consommateur inerte : `calypso_c54x.c:3357-3358`). Le handshake go-live ARM→DSP ne s'arme donc jamais.
+
 État après merge `l1ctl_sock_init` (2026-04-08).
 
 ## 1. Vue d'ensemble
@@ -47,7 +51,7 @@
 │  ┌─────────────────────────┐    ┌─────────────┴──────┐                 │
 │  │ calypso_trx.c           │◄──►│ calypso_tint0.c    │                 │
 │  │ • dsp_ram_write hook    │    │ 4.615 ms TINT0     │                 │
-│  │ • api_write_cb mirror   │    └────────────────────┘                 │
+│  │ • api_write_cb ABSENT   │    └────────────────────┘                 │
 │  │ • PM-STUB / FBSB-PUB    │                                           │
 │  │ • SINT17 wake (gated)   │                                           │
 │  └────────┬────────────────┘                                           │
@@ -83,10 +87,10 @@
 
 ### `hw/char/calypso_uart.c`
 - `calypso_uart_inject_raw(s, buf, len)` — push FIFO + raise `IRQ_UART_MODEM`
-- DR write callback → `l1ctl_sock_uart_tx_byte(ch)` (ligne 477)
+- DR write callback → `l1ctl_sock_uart_tx_byte(ch)` (`calypso_uart.c:703`)
 
 ### `hw/arm/calypso/calypso_soc.c`
-- ligne 234 : `l1ctl_sock_init(&s->uart_modem, getenv("L1CTL_SOCK_PATH") ?: "/tmp/osmocom_l2_1")`
+- `calypso_soc.c:334` : `l1ctl_sock_init(&s->uart_modem, getenv("L1CTL_SOCK") ?: "/tmp/osmocom_l2")` (var d'env `L1CTL_SOCK`, défaut `/tmp/osmocom_l2` — pas `L1CTL_SOCK_PATH`/`..._l2_1`)
 - branche IRQ_UART_MODEM via `INTH_IRQ(IRQ_UART_MODEM)`
 
 ### `hw/arm/calypso/calypso_trx.c`
@@ -94,7 +98,7 @@
 - `dsp_ram_write` — hook ARM writes :
   - `0x01A8/2` : mirror `d_dsp_page` vers `dsp->api_ram[0x08D4 - C54X_API_BASE]`
   - `0x0008` / `0x0030` : `d_task_md[p0/p1]` — log + PM-STUB (a_pm[0..2]=110 dans db_r p0/p1) + `IRQ_API` pulse + `calypso_fbsb_on_dsp_task_change`
-- `trx_dsp_api_write_cb(woff, val)` — DSP→ARM mirror : `s->dsp_ram[woff]=val`, `qemu_irq_pulse(IRQ_API)`, hook `woff==NDB_OFF_D_FB_DET`
+- ~~`trx_dsp_api_write_cb(woff, val)` — DSP→ARM mirror : `s->dsp_ram[woff]=val`, `qemu_irq_pulse(IRQ_API)`, hook `woff==NDB_OFF_D_FB_DET`~~ — **FAUX** : ni `trx_dsp_api_write_cb` ni `NDB_OFF_D_FB_DET` n'existent dans l'arbre. Le pointeur `s->api_write_cb` de `calypso_c54x.c` (consommateur `calypso_c54x.c:3357-3358`) n'est **jamais** câblé (`grep 'api_write_cb *=' hw/arm/calypso/` = 0). Ce miroir DSP→ARM ne tourne donc pas : le handshake go-live ne s'assert jamais, `d_fb_det` reste 0.
 - `calypso_tint0_do_tick(fn)` — DMA wp[], SINT17 wake **gated `dsp_init_done && idle`** (vec 19, bit 3), DSP run budget, `qemu_irq_raise(IRQ_TPU_FRAME)`
 - BRINT0 trx path (l702-703) : `if (s->dsp_init_done) c54x_interrupt_ex(s->dsp, 21, 5)`
 

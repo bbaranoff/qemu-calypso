@@ -15,7 +15,11 @@
 
 ## Cause analysée
 
-`calypso_c54x.c:4248-4324` (`c54x_load_rom`) :
+Le loader réel est `c54x_load_section()` (`calypso_c54x.c:13183`), appelé
+avec les adresses de section depuis `calypso_trx.c:2394-2417`.
+(NB: `calypso_c54x.c:4248-4324` n'est PAS un loader — c'est la zone de
+traceurs debug INTM/DARAM dans `c54x_exec_one()` (`calypso_c54x.c:4052`) ;
+le symbole `c54x_load_rom` n'existe pas.)
 
 | Section dump   | Plage word addr | Loaded into | Contenu              |
 |----------------|-----------------|-------------|----------------------|

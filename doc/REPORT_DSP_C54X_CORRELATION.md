@@ -1,4 +1,6 @@
-The JSON data was truncated mid-stream (cut off at the last `verified` entry for 0x7706+0x7707), but I have the complete decode tables and verdicts for all four regions plus the verified arrays. I have enough to synthesize the exhaustive report.
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> **Correction majeure — la thèse « racine = PORTW 0x75 sous-décodé » (§1 réécrit + §9 ADDENDUM) est CADUQUE.** Le handler PORTW 0x75 3-mots (Smem abs) que l'ADDENDUM présentait comme le « kill-shot » **a déjà atterri** dans le tree : `calypso_c54x.c:7501` (`if ((op & 0xFF00) == 0x7500)`, revival 2026-06-23), **inconditionnel** (contrairement à PORTR 0x74 qui reste gardé `CALYPSO_FIX_PORTR`). Le commentaire @7485-7500 reprend mot pour mot le récit de ce doc (CC fantôme @0xb418, entrée nue dans 0x76f8). **Or ce fix N'A PAS débloqué d_fb_det** : per vérité-terrain, le DSP déraille toujours (POST-BOOTSTUB-RET, PC=0x0000), l'IMR reste 0x0000 (jamais ré-armé après le clear boot @0xb37e), et le handshake go-live ARM→DSP n'est jamais asserté (l'ARM n'écrit que 0x0000 vers les API 0x0314/0x0318). **La chaîne PORTW→CC fantôme→sur-pop→collapse est donc RÉFUTÉE comme cause opérante** : le vrai blocage terminal est le **handshake go-live ARM→DSP jamais câblé** (`api_write_cb` déclaré dans `calypso_c54x.h` mais JAMAIS assigné — `grep 'api_write_cb *=' = 0`) et l'**IMR jamais ré-armé**. Le lever `CALYPSO_DSP_FRAME_VEC28` est un cul-de-sac (force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub, IMR reste 0). Voir §9 pour le détail.
 
 # Corrélation firmware calypso_dsp.txt ↔ décodeur calypso_c54x.c
 
@@ -27,8 +29,8 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 | 0xff80 | f880 b410 | FB 0xb410 (far, XPC=0) | 2 | none | FB far, XPC=0, pc=0xb410 (L6124-6138) | ✓ | none |
 | 0xb410 | 69f8 001d 0028 | ORM #0x0028,*(0x001d) → PMST | 3 | none | ORM abs-Smem, write MMR 0x1D (L7458-7465) | ✓ | none |
 | 0xb413 | 76f8 000e 0000 | ST #0,*(0x000e) → T | 3 | none | ST #lk,Smem abs (L7273-7285) | ✓ | none |
-| 0xb416 | 75f8 000e | **PORTW *(0x000e),PA (3w)** | **3 ISA / 2 ému** | none | mis-routé STL A,*(lk) 2w (L7336-7342) | **✗** | low (gate-keeping) |
-| 0xb418 | f900 76f8 | CC 0x76f8, UNC (near) | 2 | **push1 (PC+2=0xb41a)** | CC cond UNC, push PC+2, SP 0x1100→0x10ff (L6685-6739) | ✓ | none |
+| 0xb416 | 75f8 000e | **PORTW *(0x000e),PA (3w)** | ✅ **3 ISA / 3 ému (FIXÉ)** | none | ✅ FIXÉ : handler PORTW 0x75 3-mots abs (L7501, revival 2026-06-23, inconditionnel) — consomme opcode+PA+lk, ne glisse plus | ✓ | none (fixé, mais SANS effet sur d_fb_det — voir bannière) |
+| 0xb418 | f900 76f8 | CC 0x76f8, UNC (near) | 2 | **push1 (PC+2=0xb41a)** | CC cond UNC, push PC+2, SP 0x1100→0x10ff (L6824) | ✓ | none |
 | → 0x76f8 | 0014 | ADD dma(0x14),A | 1 | none | case 0x0 ADD direct (L3599) | ✓ | none |
 | 0x76f9 | 771a 003f | STM #0x3F,BRC | 2 | none | STM MMR BRC=63 (L7287-7313) | ✓ | none |
 | 0x76fb | f272 7700 | RPTBD 0x7700 (RSA=0x76ff) | 2 | none | F272 RPTBD, REA=0x7700, RSA=pc+4=0x76ff (L5873-5885) | ✓ | none |
@@ -37,10 +39,10 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 | 0x76ff | 3892 | SQURA *AR2+,A | 1 | none | case 0x3 SQURA (fix 06-23, L7751-7757) | ✓ | none |
 | 0x7700 | 3892 | SQURA *AR2+,A (REA) | 1 | none | SQURA + redirect boucle (L12260-12281) | ✓ | none |
 | 0x7701 | f7b9 | SSBX 9 | 1 | none | F7Bx SSBX (L6613-6620) | ✓ | none |
-| 0x7702 | f274 75e8 | CALLD 0x75e8 (retardé) | 2 | **push1 (PC+4=0x7706)** | F274 CALLD, push pc+4=0x7706, delay 2 (L5886-5901) | ✓ | none |
+| 0x7702 | f274 75e8 | CALLD 0x75e8 (retardé) | 2 | **push1 (PC+4=0x7706)** | F274 CALLD, push pc+4=0x7706, delay 2 (L6015) | ✓ | none |
 | 0x7704 | f478 | SFTA A,-8,A (slot 1) | 1 | none | F460 SFTA (L5367-5375) | ✓ | none |
 | 0x7705 | f483 | SAT A (slot 2) | 1 | none | F483 SAT (L5431-5438) | ✓ | none |
-| → 0x75e8 | fe47 | RCD LEQ (retour cond. retardé, A≤0) | 1 | pop1 si pris | FE cc=0x47 ALEQ, pop si pris (L6918-6974) | ✓ | none |
+| → 0x75e8 | fe47 | RCD LEQ (retour cond. retardé, A≤0) | 1 | pop1 si pris | FE cc=0x47 ALEQ, pop si pris (L7057-7112) | ✓ | none |
 | 0x75e9 | f48e | EXP A | 1 | none | F48E EXP (L5475-5491) | ✓ | none |
 | 0x75ea | e900 | LD #0,B | 1 | none | E9 LD #k8u dst B (L7093) | ✓ | none |
 | 0x75eb | f48f | NORM A | 1 | none | F48F NORM (L5523-5539) | ✓ | none |
@@ -56,16 +58,16 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 | 0x75f9 | 7e82 | READA *AR2 | 1 | none | 0x7E READA (L7230-7239) | ✓ | none |
 | 0x75fa | e91e | LD #0x1E,B | 1 | none | E9 LD #k8u (L7093) | ✓ | none |
 | 0x75fb | 10f8 000e | LD *(0x000E),A | 2 | none | case 0x1 LD abs-Smem (L7611/L3731) | ✓ | none |
-| 0x75fd | f520 | F5xx arith-mirror | 1 | none | **mis-décodé RPT #0x20** (L6590) | **✗** | low |
+| 0x75fd | f520 | F5xx arith-mirror | 1 | none | **mis-décodé RPT #0x20** (bloc F5xx L6717-6719) | **✗** | low |
 | 0x75fe | f661 | SFTA A,1,B | 1 | none | F460 SFTA correct (L5367) [claim B=A réfutée] | ✓ | none |
-| 0x75ff | f500 | ADD A,0,B | 1 | none | **mis-décodé RPT #0x00** (L6590) | **✗** | low |
-| 0x7600 | fe00 | RETD UNC (retour retardé) | 1 | pop1 | FE cc=0x00 UNC, pop1 (L6918-6974) — **POP confirmé trace** | ✓ | none |
-| → 0x7706 | 8a07 | **POPM ST1** | 1 | **pop1** | 0x8A00 POPM mmr=0x07, pop1 (L8170-8184) — pop 0xb41a | ✓ décode | **high (site)** |
-| 0x7707 | fe00 | **RETD UNC** | 1 | **pop1 (vierge)** | FE cc=0x00 UNC, pop1, ret_tgt=0x7712 (L6918) — **ORPHAN-RETURN net_words=−1** | ✓ décode | **high (site)** |
+| 0x75ff | f500 | ADD A,0,B | 1 | none | **mis-décodé RPT #0x00** (bloc F5xx L6717-6719) | **✗** | low |
+| 0x7600 | fe00 | RETD UNC (retour retardé) | 1 | pop1 | FE cc=0x00 UNC, pop1 (L7057-7112) — **POP confirmé trace** | ✓ | none |
+| → 0x7706 | 8a07 | **POPM ST1** | 1 | **pop1** | 0x8A00 POPM mmr=0x07, pop1 (L8484) — pop 0xb41a | ✓ décode | **high (site)** |
+| 0x7707 | fe00 | **RETD UNC** | 1 | **pop1 (vierge)** | FE cc=0x00 UNC, pop1, ret_tgt=0x7712 (L7057) — **ORPHAN-RETURN net_words=−1** | ✓ décode | **high (site)** |
 | 0x7708 | 81f8 3fb2 | STL A,*(0x3fb2) | 2 | none | case 0x8 STL abs (L3825) | ✓ | none |
 | 0x770a | f074 770d | CALL 0x770d (firmware near CALL) | 2 | push1 | F0xx legacy CALL-like push1 (L5678+) | ✓* | low (PC+2/+4 non vérifié) |
 | 0x770c | f4e4 | FRET (far return) | 1 | **pop2 (PC+XPC)** | F4E4 FRET pop2 (L4923-4948) | ✓ | med (amplifie runaway) |
-| 0x770d | 4a06 | PSHM ST0 (≠ ST1) | 1 | push1 | 0x4A PSHM mmr=0x06 (L7869-7877) | ✓ | low |
+| 0x770d | 4a06 | PSHM ST0 (≠ ST1) | 1 | push1 | 0x4A PSHM mmr=0x06 (L8182) | ✓ | low |
 | 0x7712 | f6b7 | RSBX C16 (landing du ret_tgt corrompu) | 1 | none | F6Bx RSBX (L6406) | ✓ | med (landing) |
 | 0x7713 | 7212 3fb5 | MVDM 0x3fb5,AR2 | 2 | none | hi8 0x72 MVDM (case 0x7) | ✓ | none |
 | 0x771c | f945 777a | CC 0x777a, AEQ | 2 | push1 (PC+2) si pris | F9 near CC push PC+2 (L6685) — SP-RING `771c:f945-1` | ✓ | med |
@@ -78,7 +80,9 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 
 ## 3. Mismatches confirmés
 
-### 3.1 — 0xb416 `75f8 000e` : PORTW décodé comme STL (longueur 3w vs 2w) — VERDICT UNCERTAIN
+### 3.1 — 0xb416 `75f8 000e` : PORTW décodé comme STL (longueur 3w vs 2w) — ✅ FIXÉ (`calypso_c54x.c:7501`, 2026-06-23) — SANS effet sur d_fb_det
+
+> ⚠️ **PÉRIMÉ (audit 2026-07-01).** Le verdict « UNCERTAIN » et le « ne pas ajouter de handler PORTW » ci-dessous sont dépassés : un handler PORTW 0x75 3-mots (Smem abs) **a été ajouté et est inconditionnel** (`L7501`, `if ((op & 0xFF00) == 0x7500)`). Le décode est désormais 3-mots, le CC fantôme @0xb418 ne se produit plus. **MAIS** d_fb_det reste 0 et le DSP déraille toujours (vérité-terrain) : ce site n'était donc **pas** la cause opérante. Le texte historique est conservé ci-dessous.
 
 - **ISA** : `PORTW *(0x000e),PA` — hi8 0x75 = portw (tic54x_hi8_map.md:83 ; SPRU172C:1769 ; détail cycles SPRU172C:21006-21024). Avec Smem absolu/long-offset (0xF8) = **3 mots** : word0=0x75f8, word1=0x000e (adresse data lk), word2=0xf900 (port PA). Même structure abs-Smem que le 0x76f8 précédent @0xb413 que l'ému traite, lui, comme 3 mots.
 - **Émulateur** : `STL A,*(0x000e)` — **2 mots**. Aucun handler 0x75 dédié n'existe ; hi8==0x76 (L7273) est FALSE pour 0x75, hi8==0x77 (L7288) FALSE → chute dans le STL générique `(op&0xF800)==0x7000` (L7336-7342). resolve_smem case 0xF (L3731-3734) met lk_used=true, addr=0x000e ; consumed(1)+lk_used(1)=2.
@@ -96,14 +100,14 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 ### 3.3 — 0x75fd `f520` / 0x75ff `f500` : arith F5xx décodé comme RPT #k — VERDICT REFUTED
 
 - **ISA** : famille arithmétique 1-mot F4-F7 (base 0xF400, masque 0xFC60/0xFCE0). f520 = miroir src=A/dst=B d'une op F48x-class ; f500 = `ADD A,0,B` (B=B+A, SPRU172C:15660-15663, base 0xF400 masque 0xFC60). PAS un repeat (le vrai RPT court est 0xEC00, hi8 map L137 ; RPT #lk 2-mots = F070).
-- **Émulateur** : `RPT #k`. Bloc F5xx (L6578-6593) : échec test SSBX (≠0xF5B0) → chute dans le fallback RPT-#k (L6589-6593) : rpt_count=op&0xFF, rpt_active=true, pc+=1. f520→RPT #0x20, f500→RPT #0x00. Le bloc arith F4 est gardé `if(hi8==0xF4)` (L5404), donc les miroirs F5/F6/F7 ne l'atteignent jamais.
+- **Émulateur** : `RPT #k`. Bloc F5xx (L6717-6719 `/* F5xx: SSBX or RPT #k */`) : échec test SSBX (≠0xF5B0) → chute dans le fallback RPT-#k : rpt_count=op&0xFF, rpt_active=true, pc+=1. f520→RPT #0x20, f500→RPT #0x00. Le bloc arith F4 est gardé `if(hi8==0xF4)`, donc les miroirs F5/F6/F7 ne l'atteignent jamais.
 - **Impact** : **dataflow/mode-repeat uniquement, stack-neutre** (1 mot, ni push ni pop dans les deux décodes). Réfuté comme hunt-relevant : (a) aucun effet SP ; (b) **pas sur le chemin** — grep '75fd'/'75ff'/'f520'/'f500' = 0 hit dans qemu.log ; atteignabilité comme frontière d'instruction non prouvée (ces mots suivent des F0xx 2-mots dont le comportement de branche peut les sauter) ; (c) mis-armerait au pire un RPT mono-instruction, pas une borne RPTB. Confirmé aussi par l'audit antérieur (C54X_DECODER_AUDIT.md:210 « RPT #k fallback for other F5xx is fabricated — SUSP/M »).
-- **Fix proposé** (hygiène) : hisser le bloc arith F4-family (gardé `hi8==0xF4` à L5404) pour couvrir aussi F5/F6/F7 en matchant sur base/masque famille (F400/FC60, bits 9-8=src/dst, bits 4-0=SHIFT signé) AVANT le fallback RPT-#k (L6589-6593). Vérifier sur le chemin exécuté avant tout changement.
+- **Fix proposé** (hygiène) : hisser le bloc arith F4-family (gardé `hi8==0xF4`) pour couvrir aussi F5/F6/F7 en matchant sur base/masque famille (F400/FC60, bits 9-8=src/dst, bits 4-0=SHIFT signé) AVANT le fallback RPT-#k (bloc F5xx L6717-6719). Vérifier sur le chemin exécuté avant tout changement.
 
 ### 3.4 — 0x76f8 épilogue (0x7706 POPM ST1 + 0x7707 RETD) : le sur-pop — VERDICT NON-DÉCODEUR
 
 - **ISA** : POPM ST1 (pop1, 1 mot, hi8 map L97) ; RETD UNC (pop1, near retardé 2-slots, hi8 map L156). Total pop de la paire = 2 mots. Épilogue de restauration de contexte structurellement valide UNIQUEMENT entré avec ST1 préalablement empilé.
-- **Émulateur** : décode les DEUX ops 100% correctement. POPM (L8170-8184) : mmr=op&0x7F=0x07=ST1, pop1. RETD (L6918-6974) : cc=0x00 UNC, pop1, delayed_pc=ra, delay_slots=2. AUCUNE erreur de décode/longueur/direction/arithmétique de retour.
+- **Émulateur** : décode les DEUX ops 100% correctement. POPM (L8484) : mmr=op&0x7F=0x07=ST1, pop1. RETD (L7057-7112) : cc=0x00 UNC, pop1, delayed_pc=ra, delay_slots=2. AUCUNE erreur de décode/longueur/direction/arithmétique de retour.
 - **Impact** : **−1 mot net/passe** (2 pops vs le seul push du CC@0xb418). Trace : net_words = −1, −12, −16, −21, −39, −55… ; SP grimpe 0x10ff→0x1144 puis STM-collapse. Preuve runtime : qemu.log L195 (POPM ST1 ← 0xb41a = retour CC PC+2) ; L196 (ORPHAN-RETURN ret_tgt=0x7712 net_words=−1).
 - **Verdict** : PAS un bug décodeur. Racine = **entrée par mauvais chemin** : 0x76f8 est l'épilogue de restauration d'une routine de contexte/ISR, censée être entrée après un prologue PSHM ST1 + une trame d'appelant plus profonde. Le CC@0xb418 (premier op de pile cold-boot) l'atteint SANS ce prologue → le 2e pop tire un slot vierge. Vérification mot-par-mot de TOUT le chemin exécuté : aucun PSHM ST1 (0x4A07) ; seul 0x4A06 (PSHM ST0) @0x770d, branche disjointe.
 - **Fix proposé** : adresser le ROUTAGE D'ENTRÉE / contrôle amont — pourquoi le contrôle atteint l'épilogue POPM-ST1 de 0x76f8 sans le prologue PSHM-ST1 de l'appelant prévu. Aucun handler du décodeur dans cette région n'est à corriger.
@@ -112,7 +116,7 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 
 | addr | raw | décode ISA vs ému | pourquoi réfuté |
 |------|-----|-------------------|-----------------|
-| 0xb41f | f820 | BC NTC vs heuristique ACC≠0 (L6112) | Revert dialecte intentionnel documenté (L6083-6101) ; ZÉRO effet pile (BC ne push jamais) ; off-path (poll handshake ARM atteint seulement après retour propre de 0x76f8, qui n'arrive jamais) ; PC b41f jamais exécuté dans la trace. |
+| 0xb41f | f820 | BC NTC vs heuristique ACC≠0 (handler F8 L6212) | La description « heuristique ACC≠0 plate / revert dialecte » est PÉRIMÉE : un FIX 2026-06-23 (L6237-6252) utilise le vrai NTC/TC basé-TC quand l'op précédente est cmpm/bitf (0x60xx/0x61xx, mask 0xFE00) et ne retombe sur l'heuristique ACC que sinon. ZÉRO effet pile (BC ne push jamais) ; off-path (poll handshake ARM atteint seulement après retour propre de 0x76f8, qui n'arrive jamais) ; PC b41f jamais exécuté dans la trace. |
 | 0x75f3 | 1882 | AND vs LD | dataflow seul, stack-neutre ; PC 0x75e8/0x75f3 jamais atteint (tracer L4642 = 0 hit) ; direction d'alimentation backward jamais empruntée. |
 | 0x75fd | f520 | arith F5 vs RPT #0x20 | stack-neutre ; 0 hit dans la trace ; mis-armerait au pire un RPT mono-insn, pas une borne RPTB. |
 | 0x75ff | f500 | ADD A,0,B vs RPT #0x00 | stack-neutre ; 0 hit ; RPT #0 dégénéré sans effet SP/branche. |
@@ -138,15 +142,15 @@ Table unique ordonnée selon l'exécution réelle (reset → boot → callee →
 
 | opcode (site) | encodage ISA | mots poussés/poppés attendus | ce que fait l'ému | PC+4 vs PC+2 | verdict |
 |---------------|--------------|------------------------------|-------------------|--------------|---------|
-| CC 0xf900 (0xb418) | F900/0xFF00, cc byte 0x00=UNC | push 1 = PC+2 (non-retardé) | push1 PC+2=0xb41a, SP-- (L6716-6718) | PC+2 ✓ | **correct** |
-| CC 0xf945 (0x771c) | F900, cc=0x45=AEQ | push 1 = PC+2 si pris | near CC push PC+2 si AEQ (L6685) | PC+2 ✓ | **correct** (brief « PC+4 » ne vaut que pour CCD retardé) |
-| CALLD 0xf274 (0x7702) | F274 exact, retardé | push 1 = **PC+4** | push1 PC+4=0x7706, delay 2 (L5898) | **PC+4 ✓** | **correct** (SPRU172C:16654 + Example2) |
-| RCD LEQ 0xfe47 (0x75e8) | FExx cc=0x47=ALEQ, retardé | pop 1 si A≤0 | pop1 si cond, delay 2 (L6962) | n/a (pop RA) | **correct** |
-| RETD UNC 0xfe00 (0x7600) | FExx cc=0x00, retardé | pop 1 | pop1, delay 2 (L6918) | n/a | **correct** |
-| POPM ST1 0x8a07 (0x7706) | 0x8A00/0xFF00, MMR=0x07 | pop 1 | pop1 mmr=ST1 (L8170) | n/a | **correct décode** (site du sur-pop) |
-| RETD UNC 0xfe00 (0x7707) | FExx cc=0x00, retardé | pop 1 | pop1, ret_tgt vierge (L6918) | n/a | **correct décode** (sur-pop) |
+| CC 0xf900 (0xb418) | F900/0xFF00, cc byte 0x00=UNC | push 1 = PC+2 (non-retardé) | push1 PC+2=0xb41a, SP-- (L6824-6875) | PC+2 ✓ | **correct** |
+| CC 0xf945 (0x771c) | F900, cc=0x45=AEQ | push 1 = PC+2 si pris | near CC push PC+2 si AEQ (L6824) | PC+2 ✓ | **correct** (brief « PC+4 » ne vaut que pour CCD retardé) |
+| CALLD 0xf274 (0x7702) | F274 exact, retardé | push 1 = **PC+4** | push1 PC+4=0x7706, delay 2 (L6015-6027) | **PC+4 ✓** | **correct** (SPRU172C:16654 + Example2) |
+| RCD LEQ 0xfe47 (0x75e8) | FExx cc=0x47=ALEQ, retardé | pop 1 si A≤0 | pop1 si cond, delay 2 (L7057-7112) | n/a (pop RA) | **correct** |
+| RETD UNC 0xfe00 (0x7600) | FExx cc=0x00, retardé | pop 1 | pop1, delay 2 (L7057) | n/a | **correct** |
+| POPM ST1 0x8a07 (0x7706) | 0x8A00/0xFF00, MMR=0x07 | pop 1 | pop1 mmr=ST1 (L8484) | n/a | **correct décode** (site du sur-pop) |
+| RETD UNC 0xfe00 (0x7707) | FExx cc=0x00, retardé | pop 1 | pop1, ret_tgt vierge (L7057) | n/a | **correct décode** (sur-pop) |
 | FRET 0xf4e4 (0x770c) | F4E4 exact | **pop 2** (PC+XPC) | pop2 (L4923-4948) | n/a | **correct** (amplifie runaway une fois déraillé) |
-| PSHM ST0 0x4a06 (0x770d) | 0x4A00, MMR=0x06 | push 1 | push1 mmr=ST0 (L7869) | n/a | **correct** (≠ PSHM ST1 attendu) |
+| PSHM ST0 0x4a06 (0x770d) | 0x4A00, MMR=0x06 | push 1 | push1 mmr=ST0 (L8182) | n/a | **correct** (≠ PSHM ST1 attendu) |
 | CALL 0xf074 (0x770a/0x771e) | F0xx legacy (PAS F274 CALLD ni F273 BD) | push 1 (firmware near CALL) | push1 (L5678+), balancé par RETD@0x7791 | **PC+2/+4 NON vérifié** | low-confidence (équilibre trace OK ; arithmétique de retour à auditer) |
 
 **PSHM ST1 (0x4A07) attendu : ABSENT du chemin exécuté.** C'est le cœur du sur-pop — le POPM ST1 @0x7706 n'a pas de prologue correspondant.
@@ -199,6 +203,10 @@ Le §3.1 laissait 0xb416 en **UNCERTAIN**. SPRU172C tranche explicitement (def. 
 Le **vrai** boot (alignement correct) ne fait JAMAIS `CC 0x76f8` : après la PORTW (0xb416, 3 mots) il continue à `0xb419 = 76f8 0fff 0001` (ST #1,*(0xfff)), puis `0xb41c = 60f8 0fff` … une séquence de config de ports. La routine SQURA 0x76f8 serait atteinte plus tard par sa voie correcte (avec prologue PSHM ST1). La signature « la cible du CC = le mot d'instruction suivant lu comme pmad » est le marqueur classique d'un **glissement d'alignement d'1 mot**.
 
 ### Statut
-- **CONFIRMÉ sur papier** (SPRU172C explicite + preuve runtime de la dérive + absence de handler 0x75). Reclasse le §3.1 de UNCERTAIN → **CONFIRMED (bug décodeur, longueur)**, et le §1 (« pas un bug décodeur ») est **corrigé** : c'EST un bug décodeur, en amont, qui fabrique le faux point d'entrée.
-- **Kill-shot à valider en re-run** (méthodo BC/SQURA : décode correct ≠ causal tant que le re-run ne le prouve pas) : implémenter PORTW 0x75 (et vérifier PORTR 0x74) à **3 mots** quand Smem=abs (`0xXXf8`), puis vérifier que `net_words` reste **0**, qu'ORPHAN-RETURN #1 **disparaît**, que SP ne dérive plus, et idéalement que `d_fb_det` bascule.
-- **Caveat** : (a) la sémantique exacte de PORTW (lecture Smem → écriture port PA, vs le store-mémoire que l'ému fait aujourd'hui) est secondaire pour l'alignement mais à corriger pour la fidélité ; (b) balayer tout le firmware pour les autres `0x74f8/0x75f8` (abs) qui sous-décodent pareil ; (c) confirmer l'ordre des 3 mots (PA puis abs-addr, ou l'inverse) sur l'encodage binaire avant de coder le handler.
+
+> ⚠️ **PÉRIMÉ (audit 2026-07-01).** Ce statut « kill-shot à valider » est dépassé : le kill-shot **a atterri et N'A PAS débloqué d_fb_det**. Voir la correction ci-dessous.
+
+- ~~**CONFIRMÉ sur papier** … Reclasse le §3.1 de UNCERTAIN → CONFIRMED (bug décodeur, longueur), et le §1 (« pas un bug décodeur ») est corrigé : c'EST un bug décodeur, en amont, qui fabrique le faux point d'entrée.~~ — **RÉFUTÉ comme cause opérante.** Le mismatch de longueur PORTW était réel, mais le corriger ne débloque rien : voir le point ci-dessous.
+- ✅ **FIXÉ (`calypso_c54x.c:7501`, revival 2026-06-23) — MAIS SANS EFFET SUR d_fb_det.** Le handler `if ((op & 0xFF00) == 0x7500)` PORTW 0x75 3-mots (Smem abs) **est câblé et inconditionnel** dans le tree (consomme opcode+PA+lk quand Smem est absolu, donc 0xb416/0x75f8 ne glisse plus ; le CC fantôme @0xb418 ne se produit plus). Le PORTR 0x74 3-mots existe aussi (@7511, gardé `CALYPSO_FIX_PORTR`). **Résultat empirique (vérité-terrain session) : d_fb_det reste 0, le DSP déraille toujours (POST-BOOTSTUB-RET, PC=0x0000), l'IMR reste 0x0000.** La chaîne « PORTW→CC fantôme→sur-pop→collapse » est donc RÉFUTÉE comme root cause opérante — le fix kill-shot de ce doc a landé et n'a rien débloqué.
+- **VRAIE racine terminale (post-fix PORTW)** : le **handshake go-live ARM→DSP n'est jamais asserté** — `api_write_cb` est déclaré (`calypso_c54x.h`) mais **JAMAIS assigné** (`grep 'api_write_cb *=' = 0`) ; l'ARM n'écrit que 0x0000 vers les API 0x0314/0x0318 ; l'**IMR n'est jamais ré-armé** après le clear boot @0xb37e (reste 0x0000 sur tout le run) ; le lever `CALYPSO_DSP_FRAME_VEC28` est un **cul-de-sac** (force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub, IMR reste 0). Il n'y a **ni `calypso_orch.c` ni bus UDP 6920/6921**. Le correctif appartient au câblage `api_write_cb` + ré-armement IMR, PAS au décodeur PORTW (déjà corrigé).
+- **Caveat historique (conservé)** : (a) la sémantique exacte de PORTW (lecture Smem → écriture port PA, vs le store-mémoire que l'ému fait aujourd'hui) reste marquée TODO dans le handler @7503 ; (b) 128 `75f8` + 25 `74f8` (abs) dans le firmware ; (c) l'ordre des 3 mots (opcode, PA, abs-addr) est celui codé au handler.

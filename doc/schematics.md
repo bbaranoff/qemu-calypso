@@ -1,5 +1,7 @@
 # Schematics — Référence visuelle du câblage DSP C54x / ARM Calypso
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : `d_fb_det` reste 0, le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), IMR=0x0000 jamais ré-armé (jamais re-touché après le clear boot @0xb37e), `api_write_cb` jamais câblé (déclaré `calypso_c54x.h`, référencé `calypso_c54x.c:3357-3358`, mais AUCUNE affectation `api_write_cb = …`), pas de bus ORCH. **Le levier `CALYPSO_DSP_FRAME_VEC28` est un CUL-DE-SAC** (il force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub, IMR reste 0) — ce n'est PAS le correctif. Le vrai manque est le handshake go-live ARM→DSP. Corrections ci-dessous.
+
 > Objectif projet : faire tourner le VRAI DSP TMS320C54x émulé pour qu'il détecte
 > FB/FCCH et écrive `d_fb_det != 0`. Contrainte (règle #1) : AUCUN hack / AUCUN poke
 > de l'état interne DSP — on ne corrige que le CÂBLAGE de l'émulateur.
@@ -11,9 +13,14 @@
 > **Diagnostic terminal (engagé) :** `d_fb_det=0` parce que l'IMR du DSP est mis à
 > `0x0000` au boot (`calypso_c54x.c` BOOT-MMR-WR #7, `PC=0xb37e op=0x7700`) et
 > jamais ré-armé ⇒ l'IRQ frame livrée de façon fiable (`calypso_trx.c:1786`) est
-> masquée en permanence ET mal ciblée sur vec19 au lieu du vec28 du scheduler
-> firmware. Le correctif est du câblage d'interruption émulateur
-> (`calypso_c54x.c:13547-13565`), PAS un nouveau pipe ni un refactor.
+> masquée en permanence. ~~Le correctif est du câblage d'interruption émulateur
+> (`calypso_c54x.c:13547-13565`), PAS un nouveau pipe ni un refactor.~~ — **FAUX :**
+> le remap VEC28 (`CALYPSO_DSP_FRAME_VEC28`, `calypso_c54x.c:13549-13565`) est un
+> CUL-DE-SAC : il force-vectorise mais atterrit dans l'épilogue ISR → le DSP déraille
+> vers le boot-stub (POST-BOOTSTUB-RET, PC=0x0000), IMR reste `0x0000`, `d_fb_det`
+> reste 0. Le vrai manque est le **handshake go-live ARM→DSP** : l'ARM n'écrit que
+> `0x0000` dans les cellules API `0x0314/0x0318` et `api_write_cb` (le notify DSP→ARM)
+> n'est jamais enregistré (`calypso_c54x.c:3357-3358`, aucune affectation).
 
 ---
 
@@ -122,7 +129,7 @@ double rupture (mauvais vecteur + masqué). **[GAP C]** downstream : `0x2a00` ja
 
 | Zone | Adresse (DSP word) | Rôle | Référence |
 |---|---|---|---|
-| Reset vector | `0xFF80` (IPTR=0x1FF boot) | entrée reset ROM | `calypso_c54x.c:13618` |
+| Reset vector | `0xFF80` (IPTR=0x1FF boot) | entrée reset ROM (formule générique `pc=(iptr*0x80)+vec*4`, PAS un site de reset — coïncide 0xFF80 pour iptr=0x1FF/vec=0) | `calypso_c54x.c:13618` |
 | Stub RET haut | `0xFFCC` (vec19 sous IPTR=0x1FF) | RET-terminated, boot uniquement | C54X_DECODER_AUDIT.md:76-112 |
 | API-RAM base | `0x0800` (`C54X_API_BASE`) | mailbox ARM↔DSP | `calypso_c54x.h:21` |
 | d_task_md | `0x0804` / `0x0818` | commande tâche | `calypso_c54x.c:1696` |
@@ -182,7 +189,7 @@ stateDiagram-v2
       bit1 setter ~0xde9c gate TC sur
       cellules 0x0314/0x0318 (ARM API)
       ARM n ecrit que val=0x0000 fn=0
-      HS-ARM-GATE trx.c:3053-3070
+      HS-ARM-GATE trx.c:553-566 gate l.561
       DE-BR data 0x3f70=0x0001 TC=0
       jamais 0x0002  F70-SETBIT1 count=0
     end note
@@ -196,44 +203,57 @@ n'est touché que pendant les ~1874 premières insns. Le DSP entre la wait-loop 
 et teste `data[0x3f70] bit1` (`calypso_c54x.c:11945-11955`) : il lit toujours `0x0000`
 et **BLOQUE**. Cause : le setter bit1 (~`0xde9c`) est gaté TC sur les cellules API
 `0x0314/0x0318`, mais l'ARM n'y écrit que `val=0x0000` à `fn=0` (`HS-ARM-GATE`
-`calypso_trx.c:3053-3070`) ⇒ `DE-BR data[0x3f70]=0x0001 TC=0`, jamais `0x0002`. Donc
-go-live `0xa4c7`/`0xa582` (qui armerait `IMR=0x52fd`) n'est jamais atteint.
+`calypso_trx.c:553-566`, la garde `if (… offset == 0x0314 || offset == 0x0318)` est
+à `calypso_trx.c:561`) ⇒ `DE-BR data[0x3f70]=0x0001 TC=0`, jamais `0x0002`. Donc
+go-live `0xa4c7`/`0xa582` (qui armerait `IMR=0x52fd`) n'est jamais atteint. **C'est LE
+gap central** : le handshake go-live ARM→DSP n'assert jamais, notamment parce que le
+notify DSP→ARM `api_write_cb` n'est jamais enregistré (`calypso_c54x.c:3357-3358`,
+aucune affectation `api_write_cb =`) — l'ARM n'apprend donc jamais la fin du boot DSP.
 
 ---
 
-## (E) Vignette : boucle interne corrélateur & bug `case 0x5`
+## (E) Vignette : boucle interne corrélateur & `case 0x5` — ✅ FIXÉ
+
+> **✅ FIXÉ (`calypso_c54x.c:8226-8300`, 2026-06-22).** Le bug SFTA/SFTL décrit ci-dessous
+> est l'ANCIEN comportement, corrigé. `case 0x5` possède désormais un handler dédié
+> dual-long-word DADST/DSADT (encodage `0101 101D`/`0101 111D`, dst=bit8, sémantique
+> T-based, post-mod Lmem ±2 via `resolve_lmem`). Commentaire code l.8253 : « Avant :
+> 0x50-59/5C-5D tombaient en SFTA/SFTL. » La citation `c54x.c:7817-7852` était FAUSSE :
+> elle pointe le handler étendu `0x6F00` (ADD/SUB/STH/STL), sans rapport. Description
+> conservée ci-dessous comme HISTORIQUE.
 
 ```
-Corrélateur FCCH — 1 groupe ×8 taps  (ROM 0xa077..0xa09b)
+Corrélateur FCCH — 1 groupe ×8 taps  (ROM 0xa077..0xa09b)  [HISTORIQUE — comportement d'avant le fix 2026-06-22]
 ────────────────────────────────────────────────────────────────────────
- PC      op     instr              routage handler            état
- 0xa077  5a85   DADST *AR5,A   ──▶  case 0x5 (c54x.c:7817)     [BUG] → SFTA/SFTL
- 0xa078  5f95   DSADT *AR5+,B  ──▶  case 0x5                   [BUG] *AR5+ post-mod perdu
+ PC      op     instr              routage handler            état (aujourd'hui)
+ 0xa077  5a85   DADST *AR5,A   ──▶  case 0x5 (c54x.c:8226)     [FIXÉ] handler dual-long-word dédié
+ 0xa078  5f95   DSADT *AR5+,B  ──▶  case 0x5                   [FIXÉ] dst B, T-based, post-mod OK
  0xa079  8e94   CMPS A,*AR4+   ──▶  case 0x8 (hi8 0x8E)        [OK] +resolve_smem
  0xa07a  8f93   CMPS B,*AR3+   ──▶  case 0x8 (hi8 0x8F)        [OK] +resolve_smem
    … ×8 groupes (DADST/DSADT alternent dst A/B) …
- 0xa09b  5fd5   DSADT *AR5+0%,B ─▶  case 0x5                   [BUG] BK circulaire ignoré
+ 0xa09b  5fd5   DSADT *AR5+0%,B ─▶  case 0x5                   [FIXÉ] Lmem circulaire résolue
 ────────────────────────────────────────────────────────────────────────
 ```
 
 ```mermaid
 flowchart LR
-    OP["DADST/DSADT<br/>0x58-0x5F<br/>famille dual long-word"] --> C5["case 0x5<br/>calypso_c54x.c:7817-7852"]
-    C5 -->|"traite comme<br/>SFTA/SFTL"| WRONG["shiftLike=1 : A décalé<br/>B jamais touché (dB=0)<br/>=> 0 corrélation"]
-    C5 -->|"post-mod AR5<br/>*AR5+ / +0% perdu"| WALK["marche AR hors-buffer<br/>BK circulaire ignoré"]
+    OP["DADST/DSADT<br/>0x58-0x5F<br/>famille dual long-word"] --> C5["case 0x5<br/>calypso_c54x.c:8226-8300<br/>handler dédié (FIXÉ 2026-06-22)"]
+    C5 -->|"dst A/B via bit8<br/>sémantique T-based"| OK1["DADST/DSADT corrects<br/>vérifiés vs SPRU172C"]
+    C5 -->|"post-mod Lmem ±2<br/>resolve_lmem"| OK2["circulaire BK résolu"]
 
-    classDef bug fill:#8b0000,color:#fff,stroke:#4d0000;
-    class C5,WRONG,WALK bug;
+    classDef ok fill:#1b5e20,color:#fff,stroke:#0d3010;
+    class C5,OK1,OK2 ok;
 ```
 
-**Légende E.** La famille dual long-word DADST/DSADT (opcodes `0x58-0x5F`) est
-mal-routée par `case 0x5` (`calypso_c54x.c:7817-7852`) qui la traite en SFTA/SFTL :
-l'accumulateur `A` n'est que décalé (`shiftLike=1`), `B` jamais touché (`dB=0`) ⇒ **0
-corrélation calculée**, et le post-mod `*AR5+`/`+0%` (circulaire, `BK`) est perdu ⇒
-marche AR hors-buffer (cf. `doc/FB_CORRELATOR_PIPELINE.md:46-116`, sonde SHADOW-DADST
-run 2026-06-22, 40/40 échantillons). Note : ce bug est en AVAL du blocage principal —
-le corrélateur ne tourne même pas ce run (IMR=0 / DSP idle), donc `case 0x5` ne se
-déclenche pas encore ; il deviendra bloquant dès que la vectorisation FB sera câblée.
+**Légende E — ✅ FIXÉ.** La famille dual long-word DADST/DSADT (opcodes `0x58-0x5F`)
+possède désormais un handler dédié dans `case 0x5` (`calypso_c54x.c:8226-8300`, ajouté
+le 2026-06-22) : dst A/B sélectionné par bit8, sémantique T-based, post-mod Lmem ±2 via
+`resolve_lmem`, branche sur `ST1.C16`. ~~mal-routée … traitée en SFTA/SFTL, `A` décalé,
+`B` jamais touché (`dB=0`) ⇒ 0 corrélation~~ — c'était l'ANCIEN comportement (avant le
+fix ; cf. sonde SHADOW-DADST run 2026-06-22, `doc/FB_CORRELATOR_PIPELINE.md:46-116`). La
+citation `7817-7852` était fausse (elle pointe le handler `0x6F00`). Reste que ce chemin
+est de toute façon en AVAL du blocage principal — le corrélateur ne tourne pas ce run
+(IMR=0 / DSP déraille), donc `case 0x5` ne se déclenche pas encore.
 
 ---
 
@@ -241,22 +261,25 @@ déclenche pas encore ; il deviendra bloquant dès que la vectorisation FB sera 
 
 | # | GAP | Marqueur | Site du correctif | Preuve |
 |---|---|---|---|---|
-| A | IRQ frame livrée vec19/bit3 au lieu de vec28/bit12 | [GAP] | `calypso_c54x.c:13547-13565` (remap EXP) / `calypso_trx.c:1786` | REPORT_...IQ_CABLAGE.md:14 |
-| B | IMR=0x0000 tout le run ⇒ INTM=1 jamais levé | [GAP] | reach go-live 0xa582 (arme IMR=0x52fd) | qemu.log 0×`INTM=0`, 0×RETE |
+| A | IRQ frame livrée vec19/bit3 au lieu de vec28/bit12 | [GAP] | remap VEC28 `calypso_c54x.c:13549-13565` est un CUL-DE-SAC (déraille) / `calypso_trx.c:1786` | REPORT_...IQ_CABLAGE.md:14 |
+| B | IMR=0x0000 tout le run ⇒ INTM=1 jamais levé | [GAP] | atteindre go-live 0xa582 (arme IMR=0x52fd) via le handshake ARM→DSP | qemu.log 0×`INTM=0`, 0×RETE |
 | C | Fenêtre I/Q 0x2a00 écrite mais jamais lue | [GAP downstream] | se débloque quand corrélateur tourne | qemu.log 0 hit `2a00` |
-| D | Handshake go-live ARM→DSP jamais asserté (val=0x0000) | [GAP faithful] | `calypso_trx.c:3053-3070` + notify `c54x.c:3355` | qemu.log HS-ARM-GATE |
-| E | DADST/DSADT mal-routés `case 0x5` | [BUG latent] | `calypso_c54x.c:7817-7852` | FB_CORRELATOR_PIPELINE.md:52-68 |
+| D | Handshake go-live ARM→DSP jamais asserté (val=0x0000) — **GAP CENTRAL** | [GAP faithful] | `calypso_trx.c:553-566` (garde l.561) + notify `api_write_cb` `c54x.c:3357-3358` (jamais enregistré) | qemu.log HS-ARM-GATE |
+| E | ~~DADST/DSADT mal-routés `case 0x5`~~ | ✅ FIXÉ (2026-06-22) | handler dédié `calypso_c54x.c:8226-8300` | FB_CORRELATOR_PIPELINE.md:52-68 |
 
-**Lever principal (le plus proche causalement) :** `CALYPSO_DSP_FRAME_VEC28`
-(`calypso_c54x.c:13554-13565`) — retarget vec19→vec28/bit12 + force-vectorise quand
-`d_dsp_page bit1` posté (satisfait dès fn≈1206). OFF par défaut ce run
-(`VEC28-FORCE count=0`). Une seule vectorisation atteint go-live `0xa582` qui arme
-`IMR=0x52fd` lui-même — ensuite tout se vectorise seul. Aucun poke IMR/table/d_fb_det.
+**⚠️ Lever `CALYPSO_DSP_FRAME_VEC28` = CUL-DE-SAC (PAS le correctif).**
+~~Une seule vectorisation atteint go-live `0xa582` qui arme `IMR=0x52fd` lui-même —
+ensuite tout se vectorise seul.~~ — **FAUX (vérité-terrain 2026-07-01).** Le remap
+(`calypso_c54x.c:13549-13565`) retarget vec19→vec28/bit12 et force-vectorise, mais il
+atterrit dans l'épilogue ISR → le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), IMR reste
+`0x0000`, `d_fb_det` reste 0. Il n'atteint JAMAIS go-live `0xa582`. C'est une impasse,
+pas un levier.
 
-**Alternative plus fidèle (finding #3) :** câbler le notify `api_write_cb`
-(`calypso_c54x.c:3355`, non-enregistré/NULL) pour que l'ARM apprenne la fin de boot DSP
-et écrive l'enable non-nul dans `0x0314/0x0318` → le DSP arme l'IMR lui-même, sans
-bypass. Verdict refactor : **ORTHOGONAL** — nettoyage, pas le correctif, pas un
-prérequis. Un module `calypso_dspmb.c` (une entrée de livraison INT3, une DMA
-write-page, un feed `c54x_bsp_load`) réduirait le risque de régression mais ne bouge
-pas `d_fb_det` par lui-même.
+**Vrai correctif — le handshake go-live ARM→DSP.** Le blocage réel est que l'ARM
+n'écrit que `0x0000` dans les cellules API `0x0314/0x0318` (`HS-ARM-GATE`
+`calypso_trx.c:553-566`) et que le notify DSP→ARM `api_write_cb` n'est jamais enregistré
+(`calypso_c54x.c:3357-3358`, aucune affectation `api_write_cb =` dans tout le code) :
+l'ARM n'apprend donc jamais la fin de boot DSP et n'assert jamais l'enable non-nul qui
+permettrait au DSP d'armer lui-même son IMR via `0xa582`. Câbler ce handshake est le
+correctif fidèle — aucun poke IMR/table/`d_fb_det`. (Rappel : il n'existe PAS de
+`calypso_orch.c` ni de bus UDP ORCH 6920/6921 ; ne pas les invoquer.)

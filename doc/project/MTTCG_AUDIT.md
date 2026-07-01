@@ -1,5 +1,7 @@
 # MTTCG Audit — Calypso QEMU
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous. (Ce doc est un audit de locks MTTCG ; le cœur — ordre canonique des mutex — reste valide, mais les numéros de ligne et les statuts C2 ci-dessous ont été corrigés, et il n'existe PAS de `calypso_orch.c` ni de bus UDP 6920/6921.)
+
 État Phase C1 (scaffolding initial). Mode multi-thread TCG activable via
 `CALYPSO_MTTCG=1` qui passe `-accel tcg,thread=multi` à QEMU + force
 `icount=off` et `PCB_TICK_THREADS=0` (incompat / redondant).
@@ -47,8 +49,9 @@ Toujours acquire dans cet ordre, release dans l'inverse.
 |---|---|---|
 | `data_read()` wrapper | `daram_lock` | ✅ C1 |
 | `data_write()` wrapper | `daram_lock` | ✅ C1 |
-| `api_ram[woff] = val` L1141 | `api_ram_lock` | ❌ TODO C2 |
-| `s->api_ram[addr-API_BASE]` L498,566,657,1139 | `api_ram_lock` | ❌ TODO C2 |
+| `s->api_ram[woff] = val` (calypso_c54x.c:3315) | `api_ram_lock` | ❌ TODO C2 |
+| `s->api_ram[addr-API_BASE]` reads (calypso_c54x.c:1891,1967,2003,2033,2131,2231) | `api_ram_lock` | ❌ TODO C2 |
+| `s->api_ram[addr-API_BASE]` writes (calypso_c54x.c:13173,13201,13453) | `api_ram_lock` | ❌ TODO C2 |
 | MMR read/write (s->sp, s->imr, etc) | TBD | ❌ TODO C4 |
 
 ### calypso_sim.c — SIM controller
@@ -64,7 +67,7 @@ Toujours acquire dans cet ordre, release dans l'inverse.
 | `calypso_tdma_tick()` body | `tpu_lock` | ❌ TODO C3 |
 | `calypso_kick_cb()` body | `daram_lock` (cpu_phys_write rxDoneFlag) | ❌ TODO C3 |
 | TPU registers read/write | `tpu_lock` | ❌ TODO C3 |
-| PM emulator (TASK==1 hook) | `api_ram_lock` | ❌ TODO C2 |
+| DMA-page mirror → DSP DARAM (calypso_trx.c:996-1003) | `daram_lock` < `api_ram_lock` | ✅ FIXÉ (calypso_trx.c:995-1004, ordre canonique daram<api_ram) |
 
 ### calypso_bsp.c — BSP DMA
 | site | lock | status |
@@ -90,8 +93,8 @@ Toujours acquire dans cet ordre, release dans l'inverse.
 - c54x.c : data_read/write wrapped avec daram_lock
 
 **C2 (api_ram)** :
-- Wrap les 8 sites api_ram[] dans c54x.c avec api_ram_lock
-- Wrap PM emulator a_pm[] write dans calypso_trx.c
+- Wrap les sites api_ram[] dans c54x.c avec api_ram_lock (calypso_c54x.c:1891,1967,2003,2033,2131,2231,3315,13173,13201,13453) — ❌ TODO
+- ✅ FIXÉ : la mirror DMA-page → DSP DARAM dans calypso_trx.c est déjà sous `daram_lock` puis `api_ram_lock` (calypso_trx.c:995-1004, ordre canonique respecté). C'est le SEUL site non-daram C2/C3/C4 réellement verrouillé à ce jour.
 
 **C3 (sim, bsp, tpu, kick)** :
 - Wrap calypso_sim_reg_read/write
@@ -126,7 +129,7 @@ CALYPSO_MTTCG=1 ./run.sh
 ```
 
 Logs attendus dans qemu.log :
-- `[pcb] init OK ...` — orchestrator armé
+- `[pcb] init OK ...` ~~orchestrator armé~~ — FAUX: il n'existe pas d'orchestrateur (`calypso_orch.c` absent, aucun bus UDP 6920/6921). Le lock `bsp_q_lock` est déclaré « BSP UDP queue » dans calypso_full_pcb.h:52 mais aucune queue UDP n'est branchée.
 - Pas de `tick threads spawned` (CALYPSO_PCB_TICK_THREADS forcé à 0)
 - `INSN-COUNT-STATS rate=...` plus stable (ARM en thread propre)
 

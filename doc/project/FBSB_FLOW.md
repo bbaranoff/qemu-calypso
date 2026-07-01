@@ -109,7 +109,7 @@ Effets :
 2. **Écrit `d_fb_mode` dans le NDB** (non-double-buffer, partagé).
 3. **Programme la fenêtre RX du TPU** pour la frame suivante.
 
-C'est ce qu'on capte dans `calypso_trx.c` ligne 169-171 → `calypso_fbsb_on_dsp_task_change`.
+C'est ce qu'on capte dans `calypso_trx.c:889` (appel gardé par `g_fbsb_inited` @`calypso_trx.c:886`, dans le handler d'écriture `d_task_md`) → `calypso_fbsb_on_dsp_task_change`.
 
 ## 5. Le response — `l1s_fbdet_resp`
 
@@ -207,7 +207,8 @@ static int read_fb_result(struct mon_state *st, int attempt)
 }
 ```
 
-→ Confirme le commentaire dans `calypso_fbsb.c:152` (`pm << 3`) : si on injecte `pm` côté QEMU, il faut le décaler à gauche de 3 pour que le firmware retrouve la bonne valeur après son `>> 3`.
+→ Le décalage `>> 3` est documenté côté QEMU dans `calypso_layer1.c:122` et `calypso_layer1.c:158` (aussi `calypso_bsp.c:1211` et `calypso_dsp_shunt.c:427`) : si on injecte `pm` côté QEMU, il faut le décaler à gauche de 3 pour que le firmware retrouve la bonne valeur après son `>> 3`.
+NB : `calypso_fbsb.c:152` n'est **PAS** ce commentaire — c'est le `NOTE` du `dump()` (« le synth host est mort »), sans `pm << 3`. Et `publish_fb_found` (`calypso_fbsb.c:55`) écrit `pm` **sans aucun décalage**.
 
 ## 7. Completion — `l1a_fb_compl`
 

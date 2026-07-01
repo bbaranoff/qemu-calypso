@@ -1,5 +1,7 @@
 # doc_master — Index maître de la doc Calypso QEMU (DSP revival / FBSB)
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous. En particulier : **VEC28 n'est PAS le fix** (c'est un cul-de-sac) — la vraie lacune est le handshake ARM→DSP go-live (`api_write_cb` jamais enregistré).
+
 > Branche `dsp_revival`. But du projet : faire tourner le **VRAI** DSP TMS320C54x
 > émulé pour qu'il détecte FB/FCCH et écrive `d_fb_det != 0`. Règle #1 : on répare
 > **le câblage de l'émulateur uniquement**, aucun hack, aucun poke d'état DSP interne.
@@ -11,13 +13,17 @@
   insn=1047) et **jamais ré-armé**. Conséquence en chaîne : chaque frame-IRQ livrée est
   masquée → 0 ISR vectorisée → `INTM` ne se remet jamais à 0 → le scheduler/corrélateur
   par-frame ne tourne jamais → `d_fb_det` reste 0. (0 lignes `INTM=0`, 0 `RETE`, `d_fb_det(0x01F0)=0x0000`.)
-- **La pièce manquante (fix le plus causalement proche) :** la ligne frame TPU est livrée
-  au **mauvais vecteur** et en **wake-only**. Elle arrive en `vec19/bit3` (`C54X_INT_FRAME_VEC=19`,
-  `calypso_c54x.h:126-127`) via `calypso_trx.c:1786`, alors que le scheduler FB firmware
-  attend `vec28/bit12` (→ CALL 0xa4e4 → corrélateur → `d_fb_det`). Le seul code qui retargète
-  ET force-vectorise malgré IMR=0 est le bloc `CALYPSO_DSP_FRAME_VEC28` à
-  `calypso_c54x.c:13547-13565` — **OFF par défaut** (`VEC28-FORCE count=0`), bien que sa garde
-  `d_dsp_page bit1 (B_GSM_TASK)` soit satisfaite dès fn≈1206.
+- **La pièce manquante (vraie cause) :** le **handshake ARM→DSP go-live n'est jamais asserté**.
+  L'ARM n'écrit que `0x0000` aux offsets API `0x0314/0x0318` (`calypso_trx.c:553-566`, gating
+  lignes 557/561) et le notify `api_write_cb` est **déclaré (`calypso_c54x.h`) mais JAMAIS câblé**
+  (la garde `if (s->api_write_cb)` est à `calypso_c54x.c:3357-3358`, mais `grep 'api_write_cb =' = 0`).
+  Sans ce go-live, l'IMR n'est jamais ré-armé et le scheduler FB ne démarre pas.
+  La ligne frame TPU arrive bien en `vec19/bit3` (`C54X_INT_FRAME_VEC=19`, `calypso_c54x.h:126-127`)
+  via `calypso_trx.c:1786`, mais **retargeter vers `vec28/bit12` n'est PAS le fix** :
+  ~~le bloc `CALYPSO_DSP_FRAME_VEC28` (`calypso_c54x.c:13547`) atteint le go-live~~ — **FAUX**.
+  Ce levier est un **CUL-DE-SAC** : il force-vectorise malgré IMR=0, mais atterrit dans l'épilogue
+  ISR (POST-BOOTSTUB-RET, `PC=0x0000`) → **déraille vers le boot-stub**, IMR reste `0x0000`.
+  Il est OFF par défaut (`VEC28-FORCE count=0`) et doit le rester.
 - **Domaine du défaut :** signalisation WAKE/IRQ (interrupt-enable / INTM-IMR-vecteur).
   PAS le mailbox de contrôle (prouvé fonctionnel, `delivered=125093` I/Q dans DARAM 0x2a00),
   PAS le chemin I/Q (write-side vivant ; read-side mort = symptôme aval du DSP idle).
@@ -116,9 +122,9 @@ threading/MTTCG, statut, historique de patches.
 
 ### Rappel des leviers de fix (câblage émulateur, cités)
 
-1. `calypso_c54x.c:13547-13565` — remap `CALYPSO_DSP_FRAME_VEC28` + `frame_force` (le levier honnête, OFF par défaut). Un-gater / mapper en dur `vec19/bit3 → vec28/bit12`.
-2. `calypso_trx.c:1786` — site de tir de la ligne frame (`c54x_interrupt_ex(dsp, 19, 3)`).
-3. Alternative plus fidèle : handshake ARM→DSP go-live jamais asserté (`calypso_trx.c:3053-3070`, offsets 0x0314/0x0318 écrits val=0x0000) ; suspect = notify `api_write_cb` NULL (`calypso_c54x.c:3355`).
+1. ~~`calypso_c54x.c:13547-13565` — remap `CALYPSO_DSP_FRAME_VEC28` + `frame_force` (le levier honnête). Un-gater / mapper en dur `vec19/bit3 → vec28/bit12`.~~ — **CUL-DE-SAC (FAUX levier)** : force-vectorise mais atterrit dans l'épilogue ISR → déraille vers le boot-stub (POST-BOOTSTUB-RET, `PC=0x0000`), IMR reste `0x0000`. N'atteint jamais le go-live. **Ne pas le "un-gater".** (bloc à `calypso_c54x.c:13547`, OFF par défaut, y rester.)
+2. `calypso_trx.c:1786` — site de tir de la ligne frame (`c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT)` = vec 19, bit 3).
+3. **La vraie cause** : handshake ARM→DSP go-live jamais asserté (`calypso_trx.c:553-566`, offsets 0x0314/0x0318 écrits val=0x0000 aux lignes 557/561) ; cause = notify `api_write_cb` **déclaré (`calypso_c54x.h`) mais JAMAIS câblé** (garde `if (s->api_write_cb)` à `calypso_c54x.c:3357-3358` ; `grep 'api_write_cb =' = 0`).
 4. Vérifier que la fenêtre DARAM lue par le corrélateur (0x2a00) == `bsp.daram_addr` écrite (`calypso_bsp.c:1259`, défaut `calypso_bsp.c:795`).
 
 > Sources vérifiées ce run (CONFIRMED) : `qemu.log` (IMR=0x0000, 0 RETE, INT3-RATE idle=1,

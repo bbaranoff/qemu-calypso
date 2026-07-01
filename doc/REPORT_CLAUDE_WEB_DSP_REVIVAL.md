@@ -1,3 +1,7 @@
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> En particulier, les conclusions centrales de ce rapport sont **FAUSSES** : le DSP ne détecte PAS le FB (`d_fb_det` reste 0 tout le run — le `0x6b34`/`0x9041` « FOUND » n'apparaît QUE dans un commentaire, jamais produit), le DSP déraille (POST-BOOTSTUB-RET, PC=0x0000) au lieu de tourner le corrélateur, et **rien n'est « débloqué »** : le handshake go-live ARM→DSP ne s'assert jamais (l'ARM n'écrit QUE 0x0000 sur API 0x0314/0x0318), et le callback de notification DSP→ARM `api_write_cb` est **déclaré mais jamais enregistré** (`grep 'api_write_cb *=' = 0 hit` ; invoqué c54x.c:3357-3358 mais jamais assigné → les écritures NDB du DSP sont invisibles à l'ARM). Le « FB→SB DÉBLOQUÉ » et le « SB décode (CRC bon)» ne sont pas reproductibles.
+
 # DSP Revival — Rapport pour review (2026-06-22)
 
 ## Objectif (branche `dsp_revival`)
@@ -29,11 +33,12 @@ API-RAM (dsp_ram[] == dsp->api_ram[], + miroir dsp->data[])   ◄──── DS
    │  le DSP lit la commande EN PLACE (api_ram), pas via DMA
    ▼
 c54x exécute sa ROM ─ FB/SB correlator ─► écrit le résultat (NDB/db_r read-page)
-   │  a_sync_demod (FB), a_serv_demod + a_sch (SB)        ─ propagé à api_ram (c54x.c:3145)
+   │  a_sync_demod (FB), a_serv_demod + a_sch (SB)        ─ miroir api_ram (c54x.c:3315)
    ▼
 ARM lit le résultat (calypso_dsp_read, lit dsp->data[off/2+0x800])
 radio→BSP : samples cs16 → dsp->data[0x2a00] (calypso_bsp.c, daram_addr=0x2a00, len=296)
 ```
+> ⚠️ **FAUX (audit 2026-07-01)** : le retour « ARM lit le résultat » n'existe pas dans les faits. Le miroir `data[]`↔`api_ram` est bien câblé (c54x.c:3315, 13173, 13453), mais la notification DSP→ARM `api_write_cb` n'est **jamais enregistrée** (`grep 'api_write_cb *=' = 0` ; déclaré calypso_c54x.h, invoqué c54x.c:3357-3358). Le DSP déraille (POST-BOOTSTUB-RET) avant d'écrire un vrai résultat FB/SB : `d_fb_det` reste 0 tout le run.
 
 ### Offsets MMIO ARM **confirmés** (offsetof sur dsp_api.h, DSP=36/CHIPSET=12/ANLG_FAM=2)
 | Champ | off MMIO | DSP word | source firmware |
@@ -55,24 +60,40 @@ radio→BSP : samples cs16 → dsp->data[0x2a00] (calypso_bsp.c, daram_addr=0x2a
    `a_serv_demod[D_TOA]≈23` → `toa-=23`≈0 → passe le test « future » (ligne 225 :
    `if(toa > bits_delta) "SB N bits in the future"`). **TOA garbage → rejet.**
 3. BSIC = bits 2..7 de `sb=a_sch[3]|a_sch[4]<<16`.
-> `0x9041` (run.sh:1645 « vrai FB c54x ») n'est PAS une constante firmware ; seul
-> `d_fb_det≠0` compte → `0x6b34` produit par le model passe ce test.
+> `0x9041` (run.sh:1665 « vrai FB c54x ») n'est PAS une constante firmware ; seul
+> `d_fb_det≠0` compterait. ~~`0x6b34` produit par le model passe ce test.~~ — **FAUX (audit 2026-07-01)** : ni `0x6b34` ni `0x9041` ne sont produits par le model ; ils n'apparaissent que dans des commentaires (calypso_trx.c:259 ; run.sh:1665). `d_fb_det` reste 0 tout le run — le DSP déraille et ne tourne jamais le corrélateur.
 
 ---
 
 ## Diagnostic — forks résolus (par sondes read-only)
 - **Comm ARM↔API-RAM OK** : `[POST-WATCH]` montre `RAM==DATA` (jamais de MIRROR-MISMATCH).
   L'ARM **poste** `d_task_d` (0x00a2/0xc254…). Pas de bug de miroir.
-- **Résultat DSP visible** : `[FBDET-RD]` montre l'ARM lisant `d_fb_det=0x6b34` (FOUND).
+- ~~**Résultat DSP visible** : `[FBDET-RD]` montre l'ARM lisant `d_fb_det=0x6b34` (FOUND).~~
+  — **FAUX (audit 2026-07-01)** : `d_fb_det` reste **0** tout le run ; `0x6b34` n'existe que
+  dans un commentaire (calypso_trx.c:259), jamais produit. La notif DSP→ARM (`api_write_cb`)
+  n'est jamais câblée (`grep 'api_write_cb *=' = 0`) → écritures NDB du DSP invisibles à l'ARM.
 - **DMA `0x0586` = écart mort** : 0 lecture (`grep 0x0586` runtime = 0). Le silicium lit
-  le descripteur en place à `0x0800`. À RETIRER (`calypso_dsp_done` trx.c:704-738), shunt-safe.
+  le descripteur en place à `0x0800`. À RETIRER (`calypso_dsp_done` trx.c:952 ; la copie
+  page→DARAM 0x0586 est en trx.c:965-1000), shunt-safe.
 - **#1/#4 (INTM masqué / mauvais vecteur ISR) RÉFUTÉS** : INTM=0 dominant (292:34),
   vecteurs `0xffcc`/`0xffd4` atteints + `RETE` exécuté → l'ISR entre et revient.
-- Le DSP **détecte le FB** (`d_fb_det`), mais **le TOA est garbage** (voir ci-dessous).
+  ⚠️ **Nuance (audit 2026-07-01)** : ces sondes ne changent pas la vérité-terrain — le DSP
+  déraille (POST-BOOTSTUB-RET, PC=0x0000) et IMR=0x0000 n'est **jamais** ré-armé après le
+  clear de boot (@0xb37e). Forcer la vectorisation (`CALYPSO_DSP_FRAME_VEC28`) est un
+  **écart mort** : ça atterrit dans l'épilogue d'ISR et redéraille vers le boot-stub.
+- ~~Le DSP **détecte le FB** (`d_fb_det`), mais **le TOA est garbage**~~ — **FAUX** : le DSP ne
+  détecte PAS le FB (`d_fb_det`=0). Le vrai verrou est le handshake go-live ARM→DSP qui ne
+  s'assert jamais (l'ARM n'écrit que 0x0000 sur API 0x0314/0x0318 ; `api_write_cb` jamais
+  enregistré). Le « TOA garbage » ci-dessous décrit des lectures forcées/instrumentées, pas
+  un vrai résultat de corrélation.
 
 ---
 
-## ⭐ FIX MAJEUR — `binutils-arm-none-eabi` / dérivation `nm` (débloque FB→SB)
+## ⭐ ~~FIX MAJEUR~~ — `binutils-arm-none-eabi` / dérivation `nm` (~~débloque FB→SB~~)
+> ⚠️ **FAUX (audit 2026-07-01)** : ce « fix » ne débloque rien. `d_fb_det` reste 0, le DSP
+> déraille, IMR=0x0000 jamais ré-armé, la transition FB→SB ne s'exécute jamais. La cause
+> réelle n'est pas la fenêtre cpu-idle mais le handshake go-live ARM→DSP absent
+> (`api_write_cb` jamais câblé). Le contenu ci-dessous est conservé comme historique.
 **Cause racine de l'instabilité** : `binutils-arm-none-eabi` (donc `arm-none-eabi-nm`)
 était **absent**. `run.sh` (~l.1798) utilise `nm` sur l'ELF pour dériver les adresses
 des symboles firmware (qui **bougent à chaque rebuild**) et les exporter en env. Sans `nm`,
@@ -80,7 +101,8 @@ les adresses restaient aux **défauts hardcodés périmés**.
 
 Le bloc nm ne couvrait QUE le **dsp-shunt** (`l1s`/`last_rach` → `CALYPSO_L1S_FN_ADDR`,
 `CALYPSO_LAST_RACH_FN_ADDR`). **Étendu au chemin c54x** : la **fenêtre cpu-idle** du
-gouverneur (`calypso_trx.c:1045-1049`, `CALYPSO_IDLE_PC_LO/HI`) avait des défauts ronds
+gouverneur (`calypso_cpu_idle_park()`, calypso_trx.c:1290-1320 ; lecture env
+`CALYPSO_IDLE_PC_LO/HI` @1296-1297, défauts @1299-1300) avait des défauts ronds
 `0x823000/0x826000` au lieu des vrais symboles :
 ```
 l1a_l23_handler   = 0x823f9c   (CALYPSO_IDLE_PC_LO)
@@ -93,12 +115,19 @@ FB→SB ne s'exécutait jamais.
 `l1a_compl_execute` → exporte `CALYPSO_IDLE_PC_LO/HI`. Vérifié au runtime :
 `[cpu-idle] governor ON window=[0x823f9c,0x825180]`.
 
-**RÉSULTAT** : **FB→SB DÉBLOQUÉ** — le firmware atteint enfin `read_sb_result`
-(0 lecture SB avant → 5 après).
+~~**RÉSULTAT** : **FB→SB DÉBLOQUÉ** — le firmware atteint enfin `read_sb_result`
+(0 lecture SB avant → 5 après).~~ — **FAUX (audit 2026-07-01)** : rien n'est débloqué.
+`d_fb_det` reste 0, le DSP déraille, IMR=0x0000 jamais ré-armé, le corrélateur ne tourne
+jamais. Le handshake go-live ARM→DSP ne s'assert pas (l'ARM n'écrit que 0x0000 sur
+API 0x0314/0x0318 ; HS-ARM-GATE calypso_trx.c:557-565 est une **sonde read-only** :
+« no DSP/ARM state is poked here »).
 
 ---
 
 ## État actuel — mur résiduel : TOA garbage
+> ⚠️ **FAUX (audit 2026-07-01)** : le SB ne décode pas et le CRC « bon » n'est pas
+> reproductible — le DSP déraille avant tout décode SB. Les valeurs ci-dessous proviennent
+> de sondes/lectures forcées, pas d'un vrai résultat de corrélateur.
 ```
 SB a_sch[0] CRC   p0=0x0100(err)  p1=0x0000(OK)      ← le SB décode (CRC bon)
 SB a_serv_demod[D_TOA] p1 = 0x5088                   ← garbage (devrait ≈ 23)
@@ -107,7 +136,8 @@ FB a_sync_demod[D_ANGLE]  = 0xf484 → 0x0000           ← AFC converge (OK)
 FB a_sync_demod[D_SNR]    = 0x0c4a (constant, >0, OK)
 ```
 `a_serv_demod[D_TOA]=0x5088` → `toa-=23` ≈ 20593 → **« SB N bits in the future » → sync rejetée**
-(exactement ce que le hack `FORCE_TOA` masque, calypso_trx.c:204-254).
+(exactement ce que le hack `FORCE_TOA` masque, calypso_trx.c:320-351 : getenv
+`CALYPSO_FORCE_TOA` @337, bloc d'application @342-351).
 
 **Le seul champ cassé = le TOA (timing), commun FB et SB.** ANGLE/SNR/CRC/décode = bons.
 **Indices** :

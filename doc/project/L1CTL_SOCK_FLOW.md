@@ -1,5 +1,9 @@
 # L1CTL socket flow — QEMU ↔ osmocom-bb layer23
 
+> ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
+>
+> Spécifiquement pour ce doc : l'API **burst-mode** (`l1ctl_burst_mode`, `l1ctl_set_burst_mode`, champ `burst_mode`, `fbsb_requested`) N'EXISTE PAS dans le code (grep = 0 dans `l1ctl_sock.c`, headers, `calypso_trx.c`). Le handshake `vm_start` / `cli_rx_enabled` de `l1ctl_accept_cb` N'EXISTE PAS non plus. Et `l1ctl_sock_init` N'EST PAS commentée : elle est **active** à `calypso_soc.c:333-334` (path défaut = `/tmp/osmocom_l2`). Voir annotations inline.
+
 Référence: `hw/arm/calypso/l1ctl_sock.c` (QEMU) et
 `/opt/GSM/osmocom-bb/src/host/layer23/src/common/l1l2_interface.c` (mobile/L23).
 
@@ -41,7 +45,7 @@ Identique des deux côtés :
 
 ## 3. Flow d'init
 
-### Côté QEMU (`l1ctl_sock_init`, l1ctl_sock.c:397)
+### Côté QEMU (`l1ctl_sock_init`, l1ctl_sock.c:436)
 
 ```c
 unlink(path);
@@ -52,10 +56,10 @@ fcntl(srv_fd, O_NONBLOCK);
 qemu_set_fd_handler(srv_fd, l1ctl_accept_cb, NULL, s);
 ```
 
-Appelée depuis `calypso_soc.c:230-233` (actuellement **commentée**) :
+Appelée depuis `calypso_soc.c:333-334` (~~actuellement **commentée**~~ — **FAUX**: le code est **actif/non commenté** à `calypso_soc.c:333-334`; path défaut = `/tmp/osmocom_l2`) :
 ```c
 const char *l1ctl_path = getenv("L1CTL_SOCK");
-l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2_1");
+l1ctl_sock_init(&s->uart_modem, l1ctl_path ? l1ctl_path : "/tmp/osmocom_l2");
 ```
 
 ### Côté osmocom L23 (`layer2_open`, l1l2_interface.c:105)
@@ -74,19 +78,22 @@ overridable via `-s` sur la ligne de commande mobile. Dans nos runs c'est
 
 ## 4. Flow connection
 
-### QEMU `l1ctl_accept_cb` (l1ctl_sock.c:334)
+### QEMU `l1ctl_accept_cb` (l1ctl_sock.c:407)
 
 1. `accept()` → `cli_fd`. Un seul client à la fois (l'ancien est fermé).
 2. `cli_fd` non bloquant.
-3. Si VM en `-S` (paused) → `vm_start()`, mais `cli_rx_enabled = false`
-   (on attend que le firmware boot et envoie un premier frame avant
-   d'accepter du trafic mobile).
-4. Si VM déjà running (reconnect) → `cli_rx_enabled = true` immédiatement,
-   register `l1ctl_client_readable` → mobile peut envoyer RESET_REQ direct.
+3. ~~Si VM en `-S` (paused) → `vm_start()`, mais `cli_rx_enabled = false`~~ —
+   **FAUX**: `l1ctl_accept_cb` (l1ctl_sock.c:407-432) ne contient **ni**
+   `vm_start` **ni** `cli_rx_enabled` (grep = 0 dans le fichier). Il reset
+   `lp_len`/`sc_state`/`sc_len` puis register `l1ctl_client_readable`
+   **inconditionnellement** (l1ctl_sock.c:430).
+4. ~~Si VM déjà running (reconnect) → `cli_rx_enabled = true`~~ —
+   **FAUX**: pas de gating `cli_rx_enabled`; le handler RX est armé dès
+   l'accept dans tous les cas (l1ctl_sock.c:430).
 
 ## 5. Flow firmware → mobile (TX)
 
-Hook `l1ctl_sock_uart_tx_byte()` (l1ctl_sock.c:209) appelé par
+Hook `l1ctl_sock_uart_tx_byte()` (l1ctl_sock.c:257) appelé par
 `calypso_uart.c` pour chaque byte sortant de l'UART firmware.
 
 Machine d'états sercomm :
@@ -98,10 +105,13 @@ SC_IN_FRAME   → byte == FLAG  ? → si sc_len>0 → sercomm_frame_complete()
 SC_ESCAPE     → sc_buf[sc_len++] = byte ^ ESCAPE_XOR ; → SC_IN_FRAME
 ```
 
-`sercomm_frame_complete` (l1ctl_sock.c:139) :
+`sercomm_frame_complete` (l1ctl_sock.c:189) :
 1. `dlci = sc_buf[0]`, `payload = sc_buf+2`, `plen = sc_len-2`
 2. Si `dlci == SERCOMM_DLCI_L1CTL` :
-   - **Premier frame firmware** : drain stale bytes mobile → `cli_rx_enabled=true` → register `l1ctl_client_readable`
+   - ~~**Premier frame firmware** : drain stale bytes mobile → `cli_rx_enabled=true` → register `l1ctl_client_readable`~~ —
+     **FAUX**: aucun gating "premier frame" ni `cli_rx_enabled` dans
+     `sercomm_frame_complete` (l1ctl_sock.c:189-253); le handler RX est déjà
+     armé depuis `l1ctl_accept_cb`.
    - Log `TX→mobile: <name> (0x<mt>) len=<plen>`
    - Décode messages spécifiques (PM_CONF, FBSB_CONF, etc.)
    - `l1ctl_send_to_mobile(s, payload, plen)` →
@@ -122,14 +132,14 @@ l1ctl_recv(ms, msg);        // dispatch dans le L23
 
 ## 6. Flow mobile → firmware (RX)
 
-`l1ctl_client_readable` (l1ctl_sock.c:248) :
+`l1ctl_client_readable` (l1ctl_sock.c:296) :
 1. `recv(cli_fd, tmp, sizeof(tmp))` → accumule dans `lp_buf`
 2. Tant que `lp_len >= 2 + msglen` :
    - `msglen = (lp_buf[0]<<8) | lp_buf[1]`
    - `payload = &lp_buf[2]`
-   - **Track burst gating** :
-     - `payload[0]==0x01 (FBSB_REQ)` → `fbsb_requested=true`
-     - `payload[0]==0x0d (RESET_REQ)` → `burst_mode=false; fbsb_requested=false`
+   - ~~**Track burst gating** : `payload[0]==0x01 (FBSB_REQ)` → `fbsb_requested=true`; `payload[0]==0x0d (RESET_REQ)` → `burst_mode=false; fbsb_requested=false`~~ —
+     **FAUX**: ni `fbsb_requested` ni `burst_mode` n'existent (grep = 0). Aucun
+     tracking d'état burst dans `l1ctl_client_readable` (l1ctl_sock.c:296).
    - `flen = sercomm_wrap(SERCOMM_DLCI_L1CTL, payload, msglen, frame, ...)`
      (encapsule en sercomm avec FLAG/ESCAPE)
    - `calypso_uart_inject_raw(uart, frame, flen)` → bytes injectés dans
@@ -139,20 +149,21 @@ Côté L23, `layer2_write` (l1l2_interface.c:89) écrit directement
 `msg->data` (qui contient déjà le len-prefix posé en amont par le code
 constructeur du msg).
 
-## 7. Burst gating
+## 7. Burst gating — ⚠️ SECTION PÉRIMÉE (API inexistante)
 
-`l1ctl_burst_mode()` (l1ctl_sock.c:380) :
-```c
-return g_l1ctl.burst_mode;
-```
+> **FAUX — cette API n'existe pas dans le code.** `grep 'burst_mode\|l1ctl_burst_mode\|l1ctl_set_burst_mode'`
+> = **0 occurrence** dans `l1ctl_sock.c`, les headers, et `calypso_trx.c`. La
+> struct `L1CTLSock` (l1ctl_sock.c:74) n'a pas de champ `burst_mode`. Les
+> lignes `l1ctl_sock.c:380/387` citées ci-dessous sont **à l'intérieur de
+> `l1ctl_client_readable`** (296) et ne sont pas une API burst.
 
-`burst_mode = true` ssi (cf `l1ctl_set_burst_mode`, line 387) :
-- `fbsb_requested == true` (FBSB_REQ reçu de mobile)
-- ET TPU_CTRL_EN écrit par firmware (calypso_trx.c appelle
-  `l1ctl_set_burst_mode(true)` à ce moment-là)
+~~`l1ctl_burst_mode()` (l1ctl_sock.c:380) : `return g_l1ctl.burst_mode;`~~ — n'existe pas.
 
-Utilisé pour gater le forwarding TRXD UDP : on n'injecte des samples
-I/Q dans le DSP que quand le firmware est prêt à les recevoir.
+~~`burst_mode = true` ssi `fbsb_requested == true` ET TPU_CTRL_EN écrit par firmware
+(calypso_trx.c appelle `l1ctl_set_burst_mode(true)`)~~ — n'existe pas.
+
+~~Utilisé pour gater le forwarding TRXD UDP~~ — le rationale de gating TRXD UDP
+est de la prose non vérifiable : aucun mécanisme correspondant dans le code.
 
 ## 8. Conflit avec calypso-ipc-device
 
@@ -166,9 +177,14 @@ Concrètement :
 - Si on active aussi `l1ctl_sock_init` → QEMU crée la même socket → race
   bind() OU bytes mobile arrivent dans une seule des deux instances → désync.
 
+> **MàJ audit 2026-07-01** : `l1ctl_sock_init` n'est plus commentée — elle est
+> **active** à `calypso_soc.c:333-334`. L'étape 1 ci-dessous (« décommenter »)
+> est donc **DONE** ; il reste à traiter la coexistence avec calypso-ipc-device
+> (étapes 2-3).
+
 Solution pour réactiver QEMU L1CTL :
-1. Décommenter `l1ctl_sock_init(&s->uart_modem, ...)` dans
-   `calypso_soc.c:230-233`.
+1. ~~Décommenter~~ **✅ DONE** — `l1ctl_sock_init(&s->uart_modem, ...)` est
+   déjà appelée (active) à `calypso_soc.c:333-334`.
 2. Modifier calypso-ipc-device pour **ne plus créer la socket Unix** : retire la
    logique L1CTL bridge ↔ socket, ne garde que TRXD UDP + PTY (s'il y en
    a encore besoin pour autre chose) — ou virer calypso-ipc-device complètement
@@ -179,30 +195,36 @@ Solution pour réactiver QEMU L1CTL :
 ## 8b. Hook UART → l1ctl_sock (vérifié)
 
 `l1ctl_sock_uart_tx_byte()` n'est PAS orphelin : il est bien câblé depuis
-`hw/char/calypso_uart.c:505`, sur le chemin TX du THR (Transmit Holding
+`hw/char/calypso_uart.c:702-704`, sur le chemin TX du THR (Transmit Holding
 Register) du UART, mais **uniquement pour le label `"modem"`** :
 
 ```c
-qemu_chr_fe_write_all(&s->chr, &ch, 1);   // → PTY (vu par calypso-ipc-device)
-if (s->label && !strcmp(s->label, "modem")) {
-    l1ctl_sock_uart_tx_byte(ch);          // → parser sercomm interne
+(void)qemu_chr_fe_write(&s->chr, &ch, 1);   // calypso_uart.c:697 → PTY, NON-BLOQUANT (drop si backpressure)
+if (s->label && !strcmp(s->label, "modem")) {  // :702
+    l1ctl_sock_uart_tx_byte(ch);            // :703 → parser sercomm interne
 }
 ```
+
+> Note (corrigé): le write vers le chardev PTY est `qemu_chr_fe_write` (l.697),
+> **non bloquant et volontairement pas `write_all`** (cf commentaire
+> calypso_uart.c:690-696 : le backpressure amplifiait la boucle LOST). La ligne
+> 505 citée auparavant est sans rapport.
 
 Donc chaque byte TX du UART modem du firmware part **simultanément** vers
 deux destinations : le chardev PTY (que calypso-ipc-device lit) ET le parser sercomm
 interne `l1ctl_sock`. L'UART irda n'a pas ce double-tap.
 
-Si `l1ctl_sock_init` est désactivé (cas actuel), `l1ctl_sock_uart_tx_byte`
-parse quand même les frames mais `l1ctl_send_to_mobile` les drop dès la
-première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
+Si `l1ctl_sock_init` est actif mais qu'aucun client n'est connecté,
+`l1ctl_sock_uart_tx_byte` parse quand même les frames mais `l1ctl_send_to_mobile`
+les drop dès la première ligne (`if (s->cli_fd < 0) return;`) → no-op silencieux.
+(NB: `l1ctl_sock_init` **n'est plus désactivé** — cf calypso_soc.c:333-334.)
 
 ## 8c. Master/Slave et ordre de démarrage
 
 | Connexion           | Type                 | Master (server)                | Slave (client)            | État actuel                 |
 |---------------------|----------------------|--------------------------------|---------------------------|------------------------------|
 | `/tmp/osmocom_l2_1` | AF_UNIX SOCK_STREAM  | **calypso-ipc-device** (Python)         | mobile, ccch_scan         | actif                        |
-| `/tmp/osmocom_l2_1` | (alt) AF_UNIX        | QEMU `l1ctl_sock_init`         | mobile, ccch_scan         | **désactivé** (calypso_soc.c:230) |
+| `/tmp/osmocom_l2_1` | (alt) AF_UNIX        | QEMU `l1ctl_sock_init`         | mobile, ccch_scan         | **actif** (calypso_soc.c:333-334, path défaut `/tmp/osmocom_l2`) |
 | PTY `/dev/pts/N`    | tty                  | QEMU (`-serial pty`, master)   | calypso-ipc-device (lit le slave)  | actif                        |
 | `udp:6700` (CLK)    | UDP datagram         | QEMU `sercomm_gate.c`          | calypso-ipc-device                 | actif                        |
 | `udp:6701` (TRXC)   | UDP datagram         | QEMU                           | calypso-ipc-device                 | actif                        |
@@ -274,8 +296,8 @@ supplémentaire. Direct drop-in entre les deux.
 
 ## 9. Variables d'env
 
-- `L1CTL_SOCK` : override le path par défaut `/tmp/osmocom_l2_1` (lu dans
-  `calypso_soc.c:231`).
+- `L1CTL_SOCK` : override le path par défaut `/tmp/osmocom_l2` (lu dans
+  `calypso_soc.c:333`).
 - Côté osmocom : `mobile -s /tmp/osmocom_l2_1 ...` ou `ccch_scan -s ...`.
 
 ## 10. Récap mapping types L1CTL
