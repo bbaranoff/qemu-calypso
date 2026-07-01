@@ -1707,7 +1707,7 @@ if [ -r "$CALYPSO_DSP_ROM_TXT" ]; then
     done
     if [ "$_need_split" = "1" ]; then
         echo "[run.sh] auto-split $CALYPSO_DSP_ROM_TXT → ${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.{PROM0..3,DROM,PDROM}.bin"
-        python3 "$(dirname "$0")/dsp_txt2bin.py" \
+        python3 "$ROOT/python_scripts/dsp_txt2bin.py" \
             "$CALYPSO_DSP_ROM_TXT" \
             "${_DSP_TXT_DIR}/${_DSP_TXT_BASE}.bin" || {
                 echo "[run.sh] dsp_txt2bin.py failed — continuing without auto-split" >&2
@@ -1738,7 +1738,7 @@ unset _DSP_TXT_DIR _DSP_TXT_BASE
 if [ "${CALYPSO_DSP_L1STUB:-0}" = "1" ]; then
     _L1STUB_IN="${CALYPSO_DSP_PROM0:-/opt/GSM/calypso_dsp.PROM0.bin}"
     _L1STUB_OUT="/tmp/calypso_dsp_L1stub.PROM0.bin"
-    _L1STUB_SCRIPT="$(dirname "$0")/scripts/make_dsp_bin_L1.py"
+    _L1STUB_SCRIPT="$ROOT/scripts/make_dsp_bin_L1.py"
     [ -r "$_L1STUB_SCRIPT" ] || _L1STUB_SCRIPT="$ROOT/scripts/make_dsp_bin_L1.py"
     echo "[run.sh] CALYPSO_DSP_L1STUB=1 → patch $_L1STUB_IN → $_L1STUB_OUT"
     python3 "$_L1STUB_SCRIPT" "$_L1STUB_IN" "$_L1STUB_OUT" || {
@@ -1765,7 +1765,7 @@ if [ "${CALYPSO_DSP_L1_STUB:-0}" = "1" ]; then
     _L1_STUB_BIN="/tmp/calypso_dsp_L1stub.PROM0.bin"
     if [ ! -r "$_L1_STUB_BIN" ]; then
         echo "[run.sh] CALYPSO_DSP_L1_STUB=1 → generating $_L1_STUB_BIN"
-        python3 "$(dirname "$0")/scripts/make_dsp_bin_L1.py" \
+        python3 "$ROOT/scripts/make_dsp_bin_L1.py" \
             "/opt/GSM/calypso_dsp.PROM0.bin" \
             "$_L1_STUB_BIN" || {
                 echo "[run.sh] L1 stub generation FAILED — falling back to real PROM0" >&2
@@ -1839,6 +1839,7 @@ fi
 
 L1CTL_SOCK="$QEMU_DUMMY_SOCK" \
 "$QEMU" -M "$MACHINE_ARG" -cpu arm946 \
+    -display none \
     $QEMU_ICOUNT_FLAG \
     $QEMU_ACCEL_FLAG \
     $QEMU_GDB_FLAG \
