@@ -297,7 +297,7 @@ The system is a two-CPU emulated baseband: an ARM946 (`ArmCore`) running unmodif
 
 ## Chemins critiques (chaînes détaillées)
 
-### Chaîne interruption / go-live (frame IT → IMR → corrélateur → d_fb_det)
+### Chaine interruption / go-live (frame IT → IMR → corrélateur → d_fb_det)
 
 ```mermaid
 sequenceDiagram
