@@ -296,6 +296,7 @@ The system is a two-CPU emulated baseband: an ARM946 (`ArmCore`) running unmodif
 ## Chemins critiques (chaînes détaillées)
 
 ### Chaîne interruption / go-live (frame IT → IMR → corrélateur → d_fb_det)
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -358,6 +359,7 @@ sequenceDiagram
 
 Three independent, confirmed break points gate this chain, and all downstream of them is proven-good: (1) the idle-scheduler dispatch slot `data[0x4387]` (read via `BACC @0xb40f`) never resolves to the IMR-arm entry point `0xa4c7`, permanently self-resolving to the no-op stub `0xab38` (Addenda 15/20/21); (2) as a direct consequence, `0xa4c7: ORM #0x3000,IMR` — verified correct and sufficient when force-executed (IMR 0x0000→0x3000, Addendum 22) — has zero natural hits across every run this session; (3) even when IMR/vectoring is forced to fire faithfully, the shared prologue `CALL 0x013b` (itself fine in normal, non-ISR call sites) returns into a derailed continuation unique to ISR-entry context, storming to `PC=0x0000` before ever reaching the real dispatch/correlator code at `0xa4e4` (Addendum 22). Everything upstream (BSP burst delivery, FCCH signal quality, INT3/BRINT0 raising, IFR latching) and the vector-table mechanics themselves (IPTR routing to `0x00f0`→`0x7234`) are independently confirmed sound — the wall is entirely inside three narrow, now-precisely-located DSP-ROM-internal control-flow gaps. Statement-of-record source: `/opt/GSM/qemu-calypso/doc/project/STATUS_2026-07-01.md`, Addenda 15/19/20/21/22.
 ### Chaîne de commande FB (mobile → ARM → API-RAM → DSP → réponse)
+
 ```mermaid
 sequenceDiagram
     autonumber
