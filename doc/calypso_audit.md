@@ -324,13 +324,13 @@ sequenceDiagram
     IFR->>IMR: check IMR bit3  - imr_bit before vectoring
     Note over IMR: IMR = 0x0000 for the ENTIRE run.<br/>Cleared once at boot: '0xb37e STM 0x0000,IMR'  - insn~1047,<br/>confirmed legitimate/intentional init  - Addendum 19  -  NOT a decoder bug.<br/>Never re-armed naturally  =>  IT stays masked, DSP never vectors on its own.
 
-    rect rgb - 255,230,230
+    rect rgb(255,230,230)
     Note over IDLE,ARM7: BREAK POINT 1  -  dispatch stuck on no-op stub<br/>Idle-scheduler slot 'data[0x4387]'  - read via 'BACC A @0xb40f' is the ONLY<br/>live path to the IMR-arm code. Jump table @0xaae7-0xab37 has 2 entries<br/>pointing at '0xa4c7', but the slot rewrites its own current value every<br/>pass  =>  always resolves to stub '0xab38'  - RET no-op, never '0xa4c7'.<br/> - Addenda 15/20/21  -  "boucle fermée auto-référentielle"
     IDLE->>IDLE: data[0x4387] resolves -> 0xab38  - self-referential stub
     IDLE-->>ARM7:  - never routes here  -  0 hits on 0xa4c7 all session
     end
 
-    rect rgb - 255,230,230
+    rect rgb(255,230,230)
     Note over ARM7: BREAK POINT 2  -  armor instruction never executed<br/>'0xa4c7: ORM 0x3000,IMR'   - would set bit12=vec28 + bit13<br/>Immediately preceded by '0xa4c6 RET' of a separate routine  =>  0xa4c7 is a<br/>jump TARGET, not fallthrough. 0 hits on 0xa4c7 across every run this<br/>session. 3 words later, '0xa4ca SSBX INTM'  - start of the visible<br/>"wait-loop" entry has 130 hits  -  execution reaches the loop by a<br/>DIRECT path that skips the ORM entirely.
     Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break 1 is broken.
     end
@@ -343,7 +343,7 @@ sequenceDiagram
         ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
         ISR->>ISR: 0x7234 -> CALL 0x013b
         Note over ISR: '0x013b' = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0[0x713b], called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
-        rect rgb - 255,230,230
+        rect rgb(255,230,230)
         Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>'0x7234' and '0x013b' each fire exactly ONCE, then PC storms to<br/>0x0000  - "POST-BOOTSTUB-RET", 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>'0xa4e4'  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
         ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
         end
@@ -374,7 +374,7 @@ sequenceDiagram
     participant IPC as calypso-ipc-device/qemu_wrap.c<br/> - external bridge
     participant BSP as calypso_bsp.c<br/>BspDelivery
 
-    rect rgb - 200,255,200
+    rect rgb(200,255,200)
     Note over Mobile,L1S: CONFIRMED WORKING  -  real command path
     Mobile->>L1S: L1CTL FBSB_REQ  - ARFCN, flags=FB
     L1S->>ARMFW: inject sercomm-framed bytes into modem UART RX FIFO<br/> - calypso_uart_receive
@@ -387,7 +387,7 @@ sequenceDiagram
         TRX->>TRX: calypso_layer1_on_task_write -  latches g_l1_task_md<br/> - HLE stand-in, gated CALYPSO_L1=c
         TRX->>TRX: calypso_fbsb_on_dsp_task_change - <br/> - g_fbsb state tracker
     and PARALLEL real downlink I/Q delivery - independent of ARM command
-        rect rgb - 200,255,200
+        rect rgb(200,255,200)
         Note over IPC,BSP: CONFIRMED WORKING  -  real I/Q genuinely delivered
         IPC->>BSP: UDP :6702 TRXDv0 DL burst  - 8B hdr + 148 IQ samples
         BSP->>BSP: bsp_take_for_fn -  FN-window match,<br/>calypso_twl3025_apply_phase -  AFC rotation
@@ -397,7 +397,7 @@ sequenceDiagram
         end
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over BRIDGE,ROM: BROKEN  -  go-live blocker  - see ARM-DSP bridge diagram
     BRIDGE->>DSP: calypso_arm2dsp_on_dsp_step -  per executed instruction:<br/>intended to set DSP task-ready bit in s->data[]/api_ram[]
     DSP->>DSP: DISP-POLL loop  - C54x dispatcher ROM checks task-ready bit
@@ -407,14 +407,14 @@ sequenceDiagram
     end
 
     opt CALYPSO_ORCH=1 synthetic fallback - host-side, not real DSP
-        rect rgb - 255,235,180
+        rect rgb(255,235,180)
         Note over HOSTFB: PARTIAL/SYNTHETIC  -  bypasses DSP entirely
         HOSTFB->>DSP: calypso_bsp.c own FCCH correlator writes<br/>dsp->data[0x08F8..0x08FD] directly under calypso_orch -  gate
         Note over HOSTFB,DSP: This is a host-computed stand-in result,<br/>NOT the ARM-commanded DSP ROM's own output
         end
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over ARMFW,TRX: BROKEN  - when ORCH fallback absent  -  poll never sees a real result
     loop up to 12 TDMA frames
         ARMFW->>TRX: read d_task_md busy bit / d_fb_det  - l1s_fbdet_resp poll
@@ -423,7 +423,7 @@ sequenceDiagram
     ARMFW->>ARMFW: l1s_fbdet_resp times out or reads stale value
     end
 
-    rect rgb - 255,200,200
+    rect rgb(255,200,200)
     Note over ARMFW,Mobile: BROKEN/UNVERIFIED  -  FBSB_CONF does not reflect genuine DSP FB detection
     ARMFW->>L1S: L1CTL FBSB_CONF  - result derived from stale d_fb_det,<br/>or from CALYPSO_ORCH synthetic write if enabled
     L1S->>Mobile: forward FBSB_CONF
