@@ -428,7 +428,12 @@ static void cmd_read_binary(CalypsoSim *s, uint8_t p1, uint8_t p2, uint8_t le)
     }
     int offset = (p1 << 8) | p2;
     int n = (le == 0) ? 256 : le;
-    if (offset + n > f->size) {
+    /* Bound against both the declared file size AND the in-line backing store
+     * (f->data is uint8_t[64]): if a file ever declares size > 64, checking
+     * only f->size would let a guest-supplied offset/len over-read past
+     * f->data into adjacent struct memory. */
+    if (offset < 0 || n <= 0 ||
+        offset + n > f->size || offset + n > (int)sizeof(f->data)) {
         respond_sw(s, 0x67, 0x00);
         return;
     }
