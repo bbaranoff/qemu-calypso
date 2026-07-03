@@ -102,7 +102,7 @@ Arm2DspBridge -->|"pokes C54xState fields directly, sets task-ready bit"| C54xCo
 C54xCore -->|"lock/unlock calypso_pcb_daram_lock around DARAM access"| CalypsoFullPcb
 C54xCore -->|"~300 calypso_debug_enabled gated probes"| CalypsoDebug
 
-CalypsoTrx -->|"bsp_init once at realize; tx_rach_burst/tx_burst/send_ul UL path"| BspDelivery
+CalypsoTrx -->|"bsp_init once at realize, tx_rach_burst/tx_burst/send_ul UL path"| BspDelivery
 BspDelivery -->|"calypso_trx_get_fn FN alignment"| CalypsoTrx
 BspDelivery -->|"c54x_bsp_load / dsp->data DARAM burst write"| C54xCore
 BspDelivery -->|"c54x_interrupt_ex INT3 vec19/IMR3, BRINT0 vec21/IMR5"| C54xCore
@@ -141,7 +141,7 @@ EnvConfig -->|"CALYPSO_SIM_CFG env/mobile.cfg IMSI+Ki override"| SimModel
 
 CalypsoTrx -->|"TPU-RAM MOVE decode TSP_CTRL2 WR bit dev=0"| IotaModel
 IotaModel -->|"IOTA_DBG macro"| CalypsoDebug
-BspDelivery -.->|"stale comment only; real gate is bsp_take_for_fn/BSP_FN_MATCH_WINDOW, DEAD ref"| IotaModel
+BspDelivery -.->|"stale comment only, real gate is bsp_take_for_fn/BSP_FN_MATCH_WINDOW, DEAD ref"| IotaModel
 
 Tint0Model -.->|"calypso_tint0_do_tick defined but unreachable, tint0_start never called"| CalypsoTrx
 BspDelivery -->|"include for GSM_HYPERFRAME constant only"| Tint0Model
@@ -332,18 +332,19 @@ sequenceDiagram
 
     rect rgb(255,230,230)
     Note over ARM7: BREAK POINT 2  -  armor instruction never executed<br/>'0xa4c7: ORM 0x3000,IMR'   - would set bit12=vec28 + bit13<br/>Immediately preceded by '0xa4c6 RET' of a separate routine  =>  0xa4c7 is a<br/>jump TARGET, not fallthrough. 0 hits on 0xa4c7 across every run this<br/>session. 3 words later, '0xa4ca SSBX INTM'  - start of the visible<br/>"wait-loop" entry has 130 hits  -  execution reaches the loop by a<br/>DIRECT path that skips the ORM entirely.
-    Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break 1 is broken.
+    Note over ARM7: Falsification test Addendum 22 diagnostic-only reverted. Force-redirect PC to 0xa4c7 once and let ROM execute its real ORM instruction.
+    Note over ARM7: Result confirmed. IMR goes from 0x0000 to 0x3000 bit12 set. The ORM instruction itself is correct and sufficient, only its liveness Break Point 1 is broken.
     end
 
     rect rgb(230,240,255)
-    Note over ARM7,VEC: DIAGNOSTIC-ONLY condition  - CALYPSO_POKE_A4C7_ONCE + CALYPSO_DSP_FRAME_VEC28,<br/>Addendum 22: IMR successfully armed to 0x3000. This branch is NEVER<br/>reached naturally; every real run stays on the IMR=0x0000 path below.
+    Note over ARM7,VEC: DIAGNOSTIC-ONLY condition  - CALYPSO_POKE_A4C7_ONCE + CALYPSO_DSP_FRAME_VEC28,<br/>Addendum 22: IMR successfully armed to 0x3000. This branch is NEVER<br/>reached naturally, every real run stays on the IMR=0x0000 path below.
     ARM7->>IMR: IMR is-ORed with 0x3000  - bit12 + bit13 - diagnostic poke only
     IFR->>VEC: IFR bit remapped=1 and IMR bit=1 -> take interrupt
-    Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter;<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
+    Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter,<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
     VEC->>ISR: IPTR=0x001 -> vector 28 -> PC=0x00f0   - confirmed correct, NOT the 0x1ff/0xffcc garbage stub
     ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
     ISR->>ISR: 0x7234 -> CALL 0x013b
-    Note over ISR: 0x013b = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0 0x713b, called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
+    Note over ISR: 0x013b = shared prologue subroutine  - STM ST1=0x6900, STM ST0=0, ANDM...,<br/>copied from PROM0 0x713b, called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
     end
 
     rect rgb(255,230,230)
