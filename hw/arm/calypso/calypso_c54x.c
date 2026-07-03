@@ -11253,7 +11253,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static uint32_t pc_hist[0x10000];
             static uint64_t hist_last_dump = 0;
-            pc_hist[s->pc]++;
+            pc_hist[s->pc & 0xFFFF]++;
             if (s->insn_count - hist_last_dump >= 2000000) {
                 hist_last_dump = s->insn_count;
                 /* find top 20 */
@@ -11307,7 +11307,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static uint32_t pc_recent[0x10000];
             static uint32_t recent_last_dump = 0;
-            pc_recent[s->pc]++;
+            pc_recent[s->pc & 0xFFFF]++;
             if (s->insn_count - recent_last_dump >= 100000) {
                 recent_last_dump = s->insn_count;
                 uint32_t top_cnt[5] = {0};
@@ -13964,6 +13964,8 @@ void c54x_wake(C54xState *s)
 
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
 {
+    if (n <= 0) return;              /* guard: negative n would make the memcpy
+                                       size underflow to a huge size_t */
     if (n > 2048) n = 2048;
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;

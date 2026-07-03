@@ -111,8 +111,13 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
 
     uint16_t before = s->data[a2d_word];
     s->data[a2d_word] |= a2d_bit;
-    /* words >= 0x0800 are read by the DSP from api_ram (shared DARAM/API RAM) */
-    if (a2d_word >= A2D_API_BASE && s->api_ram) {
+    /* words >= 0x0800 are read by the DSP from api_ram (shared DARAM/API RAM).
+     * Bound the index against the API-RAM backing store (C54X_API_SIZE words):
+     * a2d_word comes from CALYPSO_ARM2DSP_TASKWORD (env, up to 0xFFFF) and
+     * without the upper check an out-of-range value would OR-write past the end
+     * of api_ram[]. */
+    if (a2d_word >= A2D_API_BASE && s->api_ram &&
+        (unsigned)(a2d_word - A2D_API_BASE) < C54X_API_SIZE) {
         s->api_ram[a2d_word - A2D_API_BASE] |= a2d_bit;
     }
 
