@@ -289,7 +289,7 @@ IpcBridgeTool -->|"named FIFO writes /tmp/iq_*.fifo"| LocalAnalysisTools
 | Twl3025Model | CalypsoTrx | direct call: calypso_twl3025_get_afc_hz | Read immediately after a DAC write, purely to log the resulting Hz offset. |
 | EnvConfig | SimModel | file read at init (CALYPSO_SIM_CFG) | calypso_sim_new() parses the osmocom-bb layer23 mobile.cfg to override default IMSI/Ki so the emulated SIM matches whatever `mobile` binary (MobileClient) the harness runs. |
 
-# Overview
+### Overview
 
 The system is a two-CPU emulated baseband: an ARM946 (`ArmCore`) running unmodified osmocom-bb firmware, and a modeled TMS320C54x DSP (`C54xCore`) running the real Calypso ROM, glued together by `CalypsoTrx`'s MMIO handlers and a lightweight one-instruction-granularity `Arm2DspBridge`. `CalypsoSoc`/`CalypsoMb` assemble the ARM-side peripheral fabric (INTH interrupt arbiter, timers, two UARTs, SPI/I2C stubs) and, at realize time, hand `CalypsoTrx` the DSP API-RAM/TPU/TSP/SIM MMIO windows and a 32-line IRQ array; `CalypsoTrx`'s own `calypso_tdma_tick()` QEMUTimer (not the nominally-present but dead `calypso_tint0.c`) is the actual per-TDMA-frame master clock driving `c54x_run`, UART polling, and burst delivery. Downlink RF samples reach the DSP either through the "real" path — `BspDelivery` (`calypso_bsp.c`) receiving TRXDv0 bursts over UDP 6702 from the external `IpcBridgeTool` (calypso-ipc-device) and DMA'ing them into DSP DARAM with AFC phase correction from `Twl3025Model` — or through `DspShunt`, an env-gated (`CALYPSO_DSP_SHUNT=1`) fake-DSP that intercepts the ARM's task-post write via an MMIO overlay and either synthesizes FB/SB/SI results directly into shared NDB memory or, when `CALYPSO_DSP=c54x`, replays the buffered burst into the real DSP itself, competing with `CalypsoTrx`'s own driving of `c54x_run`. Auxiliary chip models (`SimModel` for the SIM card, `IotaModel` and `Tint0Model`, both largely dead/unwired) and `FbsbOracle`/`CalypsoLayer1` (host-side stand-ins for real DSP burst detection) round out the peripheral set, all optionally traced through the single shared `CalypsoDebug` env-var-gated probe mechanism and serialized against each other via `CalypsoFullPcb`'s mutexes (which, despite its name, is not a wiring hub — several of its exported IRQ-raise and "invoker" functions are unreferenced dead code). Console/control traffic flows from firmware through `CalypsoUartModem`, split by `SercommGate` into a stub-answered DLCI4 (TRXC) channel and everything else, which is re-injected for firmware's own sercomm driver; L1CTL/DLCI5 traffic is additionally tapped by `L1ctlSocket`, which in production is a decoy (`L1CTL_SOCK` pointed at a disabled path) because the real `/tmp/osmocom_l2` socket to `MobileClient` is created by external `osmocon`. The whole emulated radio, in turn, presents itself to the outside world as a UHD-like device to `OsmoTrxIpc` (osmo-trx-ipc/osmo-bts-trx) via AF_UNIX control sockets and POSIX shared-memory sample rings, with `IpcBridgeTool` acting as the single host-side integration point tying together the QEMU UDP/shm sideband files (`calypso_rach`, `calypso_sdcch_ul`, `calypso_kc`) and, optionally, external gr-gsm relay/decoder processes and local FIFO analysis tools. Several APIs across the codebase (IOTA BDLENA gating, `calypso_bsp_rx_burst`, PCB IRQ helpers, `fw_console.c`, `sercomm_gate_init`, various "invoker" functions) are fully wired at the header/declaration level but have zero live call sites, representing intended-but-superseded or not-yet-activated control paths.
 
@@ -335,20 +335,24 @@ sequenceDiagram
     Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break 1 is broken.
     end
 
-    alt IMR successfully armed - bit12/vec28  -  only reproduced via diagnostic poke, never naturally
-        ARM7->>IMR: IMR |= 0x3000  - bit12 + bit13
-        IFR->>VEC: IFR bit - remapped=1 & IMR bit=1 -> take interrupt
-        Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter;<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
-        VEC->>ISR: IPTR=0x001 -> vector 28 -> PC=0x00f0   - confirmed correct, NOT the 0x1ff/0xffcc garbage stub
-        ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
-        ISR->>ISR: 0x7234 -> CALL 0x013b
-        Note over ISR: '0x013b' = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0[0x713b], called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
-        rect rgb(255,230,230)
-        Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>'0x7234' and '0x013b' each fire exactly ONCE, then PC storms to<br/>0x0000  - "POST-BOOTSTUB-RET", 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>'0xa4e4'  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
-        ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
-        end
-    else IMR stays 0x0000 - actual state, every real run
-        Note over IFR,VEC: No vectoring occurs at all. DSP stays in idle loops<br/>71xx/a4ca/b3xx/b4xx. 'd[0x3f70]' toggles 0x0000<->0x0001 only<br/> - dismiss path via SM 0xdde0, itself gated by d_background_enable/state<br/>= d[0x098a..0x098e], deliberately zeroed by real firmware  -  Addendum 11/18, a RED HERRING
+    rect rgb(230,240,255)
+    Note over ARM7,VEC: DIAGNOSTIC-ONLY condition  - CALYPSO_POKE_A4C7_ONCE + CALYPSO_DSP_FRAME_VEC28,<br/>Addendum 22: IMR successfully armed to 0x3000. This branch is NEVER<br/>reached naturally; every real run stays on the IMR=0x0000 path below.
+    ARM7->>IMR: IMR is-ORed with 0x3000  - bit12 + bit13 - diagnostic poke only
+    IFR->>VEC: IFR bit remapped=1 and IMR bit=1 -> take interrupt
+    Note over VEC: Requires CALYPSO_DSP_FRAME_VEC28 remap  - bit3->vec28 to matter;<br/>without it IMR=0x3000 has no bit3 - vec19 set -> still no vector  - Addendum 22
+    VEC->>ISR: IPTR=0x001 -> vector 28 -> PC=0x00f0   - confirmed correct, NOT the 0x1ff/0xffcc garbage stub
+    ISR->>ISR: 0x00f0 branches -> 0x7234   - fires, 301x observed
+    ISR->>ISR: 0x7234 -> CALL 0x013b
+    Note over ISR: 0x013b = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0 0x713b, called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
+    end
+
+    rect rgb(255,230,230)
+    Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>0x7234 and 0x013b each fire exactly ONCE, then PC storms to<br/>0x0000  - POST-BOOTSTUB-RET, 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>0xa4e4  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
+    ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
+    end
+
+    rect rgb(255,240,200)
+    Note over IFR,VEC: ACTUAL state, every real run  - IMR stays 0x0000, no diagnostic poke.<br/>No vectoring occurs at all. DSP stays in idle loops<br/>71xx/a4ca/b3xx/b4xx. d[0x3f70] toggles 0x0000 to 0x0001 only<br/> - dismiss path via SM 0xdde0, itself gated by d_background_enable/state<br/>= d[0x098a..0x098e], deliberately zeroed by real firmware  -  Addendum 11/18, a RED HERRING
     end
 
     DISP-->>COR:  - intended DMA burst into correlator page + AR3=burst pointer
