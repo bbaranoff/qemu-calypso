@@ -28,9 +28,10 @@ from pathlib import Path
 
 import pytest
 
-# Ajoute le parent dir au path pour importer inject
+# Ajoute python_scripts/ (qui contient inject.py) au path pour l'importer.
+# NB: inject.py vit dans <repo>/python_scripts/, pas directement sous <repo>/.
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "python_scripts"))
 try:
     import inject  # noqa: E402
 except ImportError as e:

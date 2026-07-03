@@ -28,8 +28,12 @@ CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
 QEMU_SRC = "/opt/GSM/qemu-src"
 QEMU_LOG = "/root/qemu.log"
-(removed) = "/tmp/bridge.log"
-BTS_LOG = "/tmp/bts.log"
+# bridge.py / osmo-bts-trx write under $CALYPSO_LOGDIR (default /root since
+# run.sh 2026-06 refactor, was /tmp historically) — see bash_scripts/run.sh
+# BTS_LOG=/DEMOD_BRIDGE_LOG. bridge.py's own log file is "bridge.py.log",
+# not "bridge.log" (renamed alongside the LOGDIR move).
+BRIDGE_LOG = "/root/bridge.py.log"
+BTS_LOG = "/root/bts.log"
 GRAPHS_OUT = "/tmp/timer_graphs.mmd"
 
 
@@ -78,26 +82,21 @@ AUDIT_PARAMS = [
      "hw/arm/calypso/calypso_sim.c",
      r"#define\s+WT_DELAY_NS\s+(\d+)",
      int, 95.0),  # connu off by 12× pour speed
-    # 6. PCB_TICK_TDMA_US — voulu 4615 µs
-    ("PCB_TICK_TDMA_US", 4615, "µs",
-     "hw/arm/calypso/calypso_full_pcb.c",
-     r"#define\s+PCB_TICK_TDMA_US\s+(\d+)",
-     int, 0.1),
-    # 7. PCB_TICK_TINT0_US — voulu 4615 µs
-    ("PCB_TICK_TINT0_US", 4615, "µs",
-     "hw/arm/calypso/calypso_full_pcb.c",
-     r"#define\s+PCB_TICK_TINT0_US\s+(\d+)",
-     int, 0.1),
-    # 8. PCB_TICK_KICK_US — voulu 5000 µs (legacy 200 Hz)
-    ("PCB_TICK_KICK_US", 5000, "µs",
-     "hw/arm/calypso/calypso_full_pcb.c",
-     r"#define\s+PCB_TICK_KICK_US\s+(\d+)",
-     int, 0.0),
-    # 9. PCB_TICK_FRAME_IRQ_US — voulu 1000 µs (existant)
-    ("PCB_TICK_FRAME_IRQ_US", 1000, "µs",
-     "hw/arm/calypso/calypso_full_pcb.c",
-     r"#define\s+PCB_TICK_FRAME_IRQ_US\s+(\d+)",
-     int, 0.0),
+    # NOTE 2026-07-03: PCB_TICK_TDMA_US / PCB_TICK_TINT0_US / PCB_TICK_KICK_US /
+    # PCB_TICK_FRAME_IRQ_US used to be audited here. They were removed: commit
+    # 4b93329 (2026-06-08) ripped the "PCB tick threads" architecture out of
+    # calypso_full_pcb.c entirely (see that file's new header comment: "Does
+    # NOT own any timer or clock. Timing (TDMA tick, BSP drain, etc.) is owned
+    # by the respective .c file"). `git log -p` confirms the #define's and the
+    # PcbTickCtx/pcb_tick_init_one() machinery that consumed them are gone;
+    # `grep -r PCB_TICK` across qemu-src and qemu-calypso today matches only
+    # git history and this file. The TDMA/TINT0 period values they checked are
+    # still covered above via TINT0_PERIOD_NS/GSM_TDMA_NS (now the sole owners
+    # of that constant); the old KICK/FRAME_IRQ periods have no surviving named
+    # constant to audit — calypso_trx.c now arms those QEMUTimers with inline
+    # literals (timer_mod_ns(..., +5000000) for kick; see calypso_frame_irq_lower
+    # call site) instead of a #define. Deleted rather than xfailed: this isn't
+    # a live product gap, the audited feature no longer exists in any form.
 ]
 
 
@@ -144,9 +143,19 @@ def _periods_ms(timestamps):
 
 
 TIMER_RUNTIME_PROBES = [
-    ("tdma_tick", QEMU_LOG, r"\[tdma\] tick #", 4.615, "TDMA frame (virtual)"),
+    # NOTE 2026-07-03: expected_ms was 4.615 (per-frame period) but
+    # calypso_trx.c only fprintf's "[tdma] tick #" every 1000 ticks
+    # (`if ((tdma_ticks % 1000) == 0)`, unconditional, not env-gated —
+    # verified via git log this cadence has been fixed since the log line
+    # was introduced). So the measurable inter-line period is always
+    # ~1000x the per-frame period (~4615 ms, confirmed empirically in
+    # /root/qemu.log: consecutive tick #N00 0 lines are ~4.615-4.617s
+    # apart), never ~4.615 ms — the old expected_ms made this probe
+    # permanently unsatisfiable (every period gets discarded by the
+    # `< expected_ms*10` outlier filter), not just occasionally skipped.
+    ("tdma_tick", QEMU_LOG, r"\[tdma\] tick #", 4615, "TDMA tick log cadence (1000 frames, virtual)"),
     ("kick", QEMU_LOG, r"\[kick\] fire #", 5.0, "Kick (wall, was REALTIME)"),
-    ("bridge_clk_ind", (removed), r"CLK IND", 235.4, "CLK IND (51 frames)"),
+    ("bridge_clk_ind", BRIDGE_LOG, r"CLK IND", 235.4, "CLK IND (51 frames)"),
     ("bts_clk_ind", BTS_LOG, r"Clock indication: fn=", 235.4, "BTS CLK IND reçu"),
     ("bsp_burst", QEMU_LOG, r"\[BSP\] BURST fn=", 4.615, "BSP RX burst"),
 ]

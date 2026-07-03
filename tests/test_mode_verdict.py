@@ -17,15 +17,20 @@ from pathlib import Path
 import pytest
 
 
+# LOGDIR par défaut du pipeline = /root (cf bash_scripts/run.sh:
+# LOGDIR="${CALYPSO_LOGDIR:-/root}"), override via CALYPSO_HOST_ROOT comme
+# dans test_calypso_milestones.py / test_run_observability.py (house style).
+HOST_ROOT = Path(os.environ.get("CALYPSO_HOST_ROOT", "/root"))
+
 LOGS = {
-    "qemu":    Path("/root/qemu.log"),
-    "mobile":  Path("/tmp/mobile.log"),
-    "bts":     Path("/tmp/bts.log"),
-    "osmocon": Path("/tmp/osmocon.log"),
-    "ipc":     Path("/tmp/calypso-ipc-device.log"),
-    "trxipc":  Path("/tmp/osmo-trx-ipc.log"),
-    "bridge":  Path("/tmp/bridge.py.log"),
-    "irda":    Path("/tmp/fw-irda.log"),
+    "qemu":    HOST_ROOT / "qemu.log",
+    "mobile":  HOST_ROOT / "mobile.log",
+    "bts":     HOST_ROOT / "bts.log",
+    "osmocon": HOST_ROOT / "osmocon.log",
+    "ipc":     HOST_ROOT / "calypso-ipc-device.log",
+    "trxipc":  HOST_ROOT / "osmo-trx-ipc.log",
+    "bridge":  HOST_ROOT / "bridge.py.log",
+    "irda":    HOST_ROOT / "fw-irda.log",
 }
 
 

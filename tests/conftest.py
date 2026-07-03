@@ -124,6 +124,9 @@ def pytest_configure(config):
         "osmocom_clock:        alignement clock domains (VIRTUAL vs REALTIME)",
         "osmocom_bridge:       calypso-ipc-device timing et CLK IND jitter",
         "osmocom_boot:         séquence boot ARM/DSP + handshake",
+        # test_timer_physical_audit.py
+        "timer_audit:          audit physique timers QEMU vs horloge reelle (icount, TDMA period, kick cadence)",
+        "timer_graph:          generation graphe/CSV timeline timers pour audit visuel",
     ):
         config.addinivalue_line("markers", marker)
 
