@@ -8,6 +8,7 @@
  */
 
 #include "calypso_c54x.h"
+#include "calypso_arm2dsp.h"
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1663,6 +1664,24 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
     read_stats_record(addr);
+    /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : le correlateur
+     * FB (PC=0xee38) lit data[0x2b97] via AR3 (STM hardcode ROM), region
+     * [0x2b80,0x2c00) distincte du buffer DMA BSP [0x2a00,0x2b28). Hypothese :
+     * cette region n'est jamais peuplee (reste a 0) -> le MAC accumule zero en
+     * boucle. Log tout READ dans cette fenetre (valeur, PC), cap 200. */
+    if (addr >= 0x2b80 && addr < 0x2c00) {
+        static int mw2b80_en = -1;
+        if (mw2b80_en < 0) mw2b80_en = getenv("CALYPSO_MEM_WATCH_2B80") ? 1 : 0;
+        if (mw2b80_en) {
+            static unsigned mw2b80_n = 0;
+            if (mw2b80_n < 200) {
+                mw2b80_n++;
+                fprintf(stderr, "[c54x] MEM-WATCH-2B80-RD data[0x%04x]=0x%04x "
+                        "PC=0x%04x insn=%u\n", addr, s->data[addr], s->pc,
+                        s->insn_count);
+            }
+        }
+    }
     /* PROBE 2026-05-31 frame-IT : valeur FIGÉE des flags polled + qui polle.
      * La valeur lue (jamais changée) = ce que le BSP doit produire/toggler. */
     if (addr == 0x006e || addr == 0x585f || addr == 0x8a44) {
@@ -2444,6 +2463,23 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : voir le
+     * commentaire jumeau dans data_read_locked. Log tout WRITE dans
+     * [0x2b80,0x2c00), cap 200 -- confirme/infirme si un boot-copy peuple
+     * jamais cette region avant que le correlateur la lise. */
+    if (addr >= 0x2b80 && addr < 0x2c00) {
+        static int mw2b80_wen = -1;
+        if (mw2b80_wen < 0) mw2b80_wen = getenv("CALYPSO_MEM_WATCH_2B80") ? 1 : 0;
+        if (mw2b80_wen) {
+            static unsigned mw2b80_wn = 0;
+            if (mw2b80_wn < 200) {
+                mw2b80_wn++;
+                fprintf(stderr, "[c54x] MEM-WATCH-2B80-WR data[0x%04x] 0x%04x -> 0x%04x "
+                        "PC=0x%04x insn=%u\n", addr, s->data[addr], val, s->pc,
+                        s->insn_count);
+            }
+        }
+    }
     /* SONDE GAP-1 : transitions du pointeur de handler data[0x3f5e] (machine à
      * états L1) + cellules de contrôle API 0x0908/0x0909 au même instant. Montre
      * si le scheduler avance l'état ou reste figé sur 0x7013 (FB), et d'où (PC). */
@@ -4049,8 +4085,52 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
     return true;
 }
 
+/* Faithful per-instruction interrupt LEVEL check (gated CALYPSO_C54X_IRQ_LEVEL).
+ * The base model services interrupts only at the c54x_interrupt_ex call edge: an
+ * IFR bit latched while INTM=1 is never taken later. Real C54x re-checks pending
+ * unmasked interrupts at each instruction boundary. This restores that, so an
+ * armed frame IT (INT3/bit3) fires once INTM drops -> native frame ISR runs. */
+static bool c54x_irq_level_check(C54xState *s)
+{
+    static int en = -1;
+    if (en < 0) en = getenv("CALYPSO_C54X_IRQ_LEVEL") ? 1 : 0;
+    if (!en) return false;
+    if ((s->st1 & ST1_INTM) || s->delay_slots != 0) return false;
+    /* Ne pas vectoriser tant que le ROM n a pas relocalise IPTR (reset=0x1ff ->
+     * table en 0xff80 = garbage). Attendre IPTR reloue (typiquement 0x001). */
+    if (((s->pmst >> PMST_IPTR_SHIFT) & 0x1FF) == 0x1FF) return false;
+    uint16_t pend = (uint16_t)(s->ifr & s->imr);
+    if (!pend) return false;
+    int b = __builtin_ctz(pend);          /* lowest set bit = highest priority */
+    int vec = b + 16;                     /* C54x: maskable IMR bit b -> vector b+16 */
+    /* VEC28 remap (comme c54x_interrupt_ex/VEC28-EXP) : la frame IT tape sur
+     * vec19/bit3 = stub RETE ; le VRAI scheduler frame est vec28 (data[0xf0]->0x7234).
+     * Gated CALYPSO_DSP_FRAME_VEC28. On consomme le bit3 de l IFR mais on vectorise 28. */
+    {
+        static int lv28 = -1;
+        if (lv28 < 0) lv28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
+        if (lv28 && b == 3) vec = 28;
+    }
+    s->ifr &= ~(1u << b);
+    s->sp--; data_write(s, s->sp, (uint16_t)s->pc);
+    s->sp--; data_write(s, s->sp, s->xpc);
+    s->st1 |= ST1_INTM;
+    s->xpc = 0;
+    uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
+    s->pc = (uint16_t)((iptr * 0x80) + vec * 4);
+    static unsigned lvln = 0;
+    if (lvln++ < 60)
+        fprintf(stderr, "[c54x] IRQ-LEVEL take bit=%d vec=%d -> PC=0x%04x "
+                "IPTR=0x%03x IMR=0x%04x IFR=0x%04x insn=%u\n",
+                b, vec, s->pc, iptr, s->imr, s->ifr, s->insn_count);
+    return true;
+}
+
 static int c54x_exec_one(C54xState *s)
 {
+    if (c54x_irq_level_check(s)) {
+        return 1;   /* per-instruction IRQ vectoring consumed this step */
+    }
     uint16_t op = prog_fetch(s, s->pc);
     uint16_t op2;
     bool ind;
@@ -5503,15 +5583,33 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            if ((op & 0xFCE0) == 0xF4A0) {
-                /* SFTL src,shift,dst — logical shift accumulator */
-                int src = (op >> 8) & 1, dst = (op >> 9) & 1;
-                int shift = op & 0x1F; if (shift > 15) shift -= 32;
-                uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
-                if (shift >= 0) uv <<= shift; else uv >>= (-shift);
-                uv &= 0xFFFFFFFFFFULL;
-                if (dst) s->b = sext40(uv); else s->a = sext40(uv);
-                return consumed + s->lk_used;
+            /* [2026-07-03] FIX-SFTL-RSBX-COLLISION (gated CALYPSO_FIX_SFTL_RSBX,
+             * default OFF). Per doc/opcodes/tic54x_hi8_map.md:141-143, hi8 0xF4-0xF7
+             * base add/shift pattern (mask 0xFCE0/0xF400) explicitly excludes RSBX
+             * (0xF4B0/0xFDF0) and SSBX (0xF5B0/0xFDF0): nibble low-byte high-nibble
+             * == 0xB (bits 7:4 = 1011) is ALWAYS rsbx/ssbx for every hi8 in
+             * {F4,F5,F6,F7} (bit9=ST0/ST1, bit8=rsbx/ssbx), NEVER a legal SFTL shift
+             * amount. This check's mask (0xFCE0) leaves bit4 don't-care and is not
+             * gated by hi8, so it silently swallows 0xF4Bx/F5Bx/F6Bx/F7Bx (incl.
+             * RSBX INTM=0xF6BB, SSBX INTM=0xF7BB) as a bogus accumulator shift
+             * BEFORE the real hi8==0xF6/0xF7 handlers further down ever run.
+             * Independent of and orthogonal to CALYPSO_FIX_MVDM -- does not touch
+             * that opcode family. Default OFF: behavior unchanged unless enabled. */
+            {
+                static int fix_sftl_rsbx = -1;
+                if (fix_sftl_rsbx < 0)
+                    fix_sftl_rsbx = getenv("CALYPSO_FIX_SFTL_RSBX") ? 1 : 0;
+                if ((op & 0xFCE0) == 0xF4A0 &&
+                    (fix_sftl_rsbx == 0 || (op & 0xF0) != 0xB0)) {
+                    /* SFTL src,shift,dst — logical shift accumulator */
+                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                    int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                    uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
+                    if (shift >= 0) uv <<= shift; else uv >>= (-shift);
+                    uv &= 0xFFFFFFFFFFULL;
+                    if (dst) s->b = sext40(uv); else s->a = sext40(uv);
+                    return consumed + s->lk_used;
+                }
             }
 
         /* F494/F594: SFTC src (mask FEFF, 1 word).
@@ -5767,15 +5865,33 @@ static int c54x_exec_one(C54xState *s)
                     if (dst) s->b = sext40(sv); else s->a = sext40(sv);
                     return consumed + s->lk_used;
                 }
-                if ((op & 0xFCE0) == 0xF4A0) {
-                    /* SFTL src,shift,dst — logical shift accumulator */
-                    int src = (op >> 8) & 1, dst = (op >> 9) & 1;
-                    int shift = op & 0x1F; if (shift > 15) shift -= 32;
-                    uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
-                    if (shift >= 0) uv <<= shift; else uv >>= (-shift);
-                    uv &= 0xFFFFFFFFFFULL;
-                    if (dst) s->b = sext40(uv); else s->a = sext40(uv);
-                    return consumed + s->lk_used;
+                            /* [2026-07-03] FIX-SFTL-RSBX-COLLISION (gated CALYPSO_FIX_SFTL_RSBX,
+                 * default OFF). Per doc/opcodes/tic54x_hi8_map.md:141-143, hi8 0xF4-0xF7
+                 * base add/shift pattern (mask 0xFCE0/0xF400) explicitly excludes RSBX
+                 * (0xF4B0/0xFDF0) and SSBX (0xF5B0/0xFDF0): nibble low-byte high-nibble
+                 * == 0xB (bits 7:4 = 1011) is ALWAYS rsbx/ssbx for every hi8 in
+                 * {F4,F5,F6,F7} (bit9=ST0/ST1, bit8=rsbx/ssbx), NEVER a legal SFTL shift
+                 * amount. This check's mask (0xFCE0) leaves bit4 don't-care and is not
+                 * gated by hi8, so it silently swallows 0xF4Bx/F5Bx/F6Bx/F7Bx (incl.
+                 * RSBX INTM=0xF6BB, SSBX INTM=0xF7BB) as a bogus accumulator shift
+                 * BEFORE the real hi8==0xF6/0xF7 handlers further down ever run.
+                 * Independent of and orthogonal to CALYPSO_FIX_MVDM -- does not touch
+                 * that opcode family. Default OFF: behavior unchanged unless enabled. */
+                {
+                    static int fix_sftl_rsbx2 = -1;
+                    if (fix_sftl_rsbx2 < 0)
+                        fix_sftl_rsbx2 = getenv("CALYPSO_FIX_SFTL_RSBX") ? 1 : 0;
+                    if ((op & 0xFCE0) == 0xF4A0 &&
+                        (fix_sftl_rsbx2 == 0 || (op & 0xF0) != 0xB0)) {
+                        /* SFTL src,shift,dst — logical shift accumulator */
+                        int src = (op >> 8) & 1, dst = (op >> 9) & 1;
+                        int shift = op & 0x1F; if (shift > 15) shift -= 32;
+                        uint64_t uv = (uint64_t)((src ? s->b : s->a) & 0xFFFFFFFFFFULL);
+                        if (shift >= 0) uv <<= shift; else uv >>= (-shift);
+                        uv &= 0xFFFFFFFFFFULL;
+                        if (dst) s->b = sext40(uv); else s->a = sext40(uv);
+                        return consumed + s->lk_used;
+                    }
                 }
             }
                         /* F4Bx: RSBX -- reset bit in ST0 (bit 9=0, bit 8=0).
@@ -6243,7 +6359,19 @@ static int c54x_exec_one(C54xState *s)
                  * (cmpm/bitf = 0x60xx/0x61xx, mask 0xFE00) - sinon heuristique
                  * ACC heritee pour les sites dispatcher (blanket TC-strict avait
                  * casse le 2026-05-15, avant le fix cmpm). */
-                if ((g_prev_op & 0xFE00) == 0x6000) {
+                /* [2026-07-02] go-live DSP : la boucle compute du state-machine
+                 * handshake (0xde0d-0xde26) se termine par F830 de0d = BC TC.
+                 * Rien dans la boucle ne pose TC (6d91=MAR, f5a9=RPT-fallback),
+                 * donc sur vrai C54x TC=0 -> BC TC NON pris -> la boucle tourne
+                 * UNE fois et tombe en 0xde28 vers le setter 0xde9c. L heuristique
+                 * ACC heritee (take si A==0, et A=0 ici via f0e1) la piege en
+                 * boucle infinie. Gate PC-range + env : semantique BC TC reelle
+                 * uniquement sur 0xde0d-0xde26. Defaut OFF -> aucun risque ailleurs. */
+                static int bctc_sm = -1;
+                if (bctc_sm < 0) bctc_sm = getenv("CALYPSO_C54X_BCTC_SM") ? 1 : 0;
+                bool tc_strict = ((g_prev_op & 0xFE00) == 0x6000) ||
+                                 (bctc_sm && s->pc >= 0xde0d && s->pc <= 0xde26);
+                if (tc_strict) {
                     bool tc = (s->st0 & ST0_TC) != 0;
                     take = (sub == 0x2) ? !tc : tc;     /* 0x2=NTC, 0x3=TC */
                 } else {
@@ -6898,12 +7026,34 @@ static int c54x_exec_one(C54xState *s)
                 s->delay_slots = 2;
                 return consumed + s->lk_used;
             }
-            /* REVERTED 2026-05-15 nuit : tentative de cond eval pour
-             * FA00-FA7F (BCD NEAR delayed branch) cassait le firmware
-             * (DSP stuck loops). Le binaire DSP Calypso semble dépendre
-             * du comportement "branch always" pour ces opcodes. Cf comment
-             * sur F820/F830 BC handler. */
-            /* NEAR FAxx fallback: simplified treat as branch */
+            /* Fix 2026-07-03 : etend a FA20/FA30 (BCD pmad,NTC/TC, delayed
+             * sibling de F820/F830) le fix deja valide le 2026-06-23 pour BC.
+             * REVERT 2026-05-15 : evaluer la vraie cond TC/NTC EN BLOC pour
+             * tout FA00-FA7F cassait le firmware (DSP stuck loops) -- la
+             * plupart des callers FAxx ne posent pas TC de facon fiable
+             * avant de brancher. On mirror EXACTEMENT la technique BC :
+             * n evaluer la vraie cond QUE quand l opcode precedent est
+             * CMPM/BITF (0x60xx/0x61xx, pose TC de facon fiable) ; sinon,
+             * comportement inchange (branch always, deja valide sur). Zero
+             * risque de regression hors de ce cas etroit et sur. Delayed :
+             * 2 delay slots (meme mecanisme que FBD FAR juste au-dessus). */
+            {
+                uint8_t fa_sub = (op >> 4) & 0xF;
+                if (fa_sub == 0x2 || fa_sub == 0x3) {
+                    bool fa_tc_strict = (g_prev_op & 0xFE00) == 0x6000;
+                    if (fa_tc_strict) {
+                        bool tc = (s->st0 & ST0_TC) != 0;
+                        bool take = (fa_sub == 0x2) ? !tc : tc;  /* 2=NTC,3=TC */
+                        if (take) {
+                            s->delayed_pc  = op2;
+                            s->delay_slots = 2;
+                        }
+                        return consumed + s->lk_used;
+                    }
+                }
+            }
+            /* NEAR FAxx fallback: simplified treat as branch (unchanged,
+             * proven-safe default for every case not handled above). */
             s->pc = op2;
             return 0;
         }
@@ -11944,11 +12094,150 @@ int c54x_run(C54xState *s, int n_insns)
         if (exec_pc == 0xa4d4) {
             static unsigned wt = 0; static uint16_t last = 0xffff;
             uint16_t fl = s->data[0x3f70];
+            /* FORCE-GOLIVE (etape1, gated CALYPSO_FORCE_GOLIVE) : release the
+             * go-live wait-loop by setting data[0x3f70] bit1 at the 0xa4d4 test
+             * (normally gated on control cells 0x098a/0x098c which the ARM leaves 0). */
+            { static int fg = -1; if (fg < 0) { const char *e = getenv("CALYPSO_FORCE_GOLIVE"); fg = (e && atoi(e) > 0) ? 1 : 0; }
+              if (fg && !(fl & 0x0002)) { s->data[0x3f70] = (uint16_t)(fl | 0x0002); fl = s->data[0x3f70];
+                static unsigned fgc = 0; if (fgc++ < 8) fprintf(stderr, "[c54x] FORCE-GOLIVE 0x3f70 |= bit1 -> 0x%04x insn=%u\n", fl, s->insn_count); } }
             if ((fl & 0x0002) || fl != last) {
                 if (wt++ < 60)
                     fprintf(stderr, "[c54x] WAIT-TEST PC=0xa4d4 data[0x3f70]=0x%04x bit1=%d "
                             "insn=%u\n", fl, !!(fl & 2), s->insn_count);
                 last = fl;
+            }
+        }
+        calypso_arm2dsp_on_dsp_step(s, exec_pc);
+
+        /* POKE-A4C7-ONCE (2026-07-03, gated CALYPSO_POKE_A4C7_ONCE, DIAGNOSTIC
+         * ONLY -- falsification test, not a fix, revert after use). Addendum 20 :
+         * the go-live wait-loop entry at 0xa4ca is ALWAYS reached directly,
+         * skipping 0xa4c7 (ORM #0x3000,IMR -- arms bit12/vec28) 3 words earlier,
+         * which is 0-hit all session. This redirects the FIRST arrival at 0xa4ca
+         * to 0xa4c7 instead -- the CPU then naturally executes the real ROM ORM
+         * instruction and falls through back into 0xa4ca normally. No register/
+         * memory value is poked directly -- only the entry PC, once, to let the
+         * ROM's OWN arming instruction run. Tests: does IMR arm (0x3000), does
+         * the frame IT then vector to vec28, does d_fb_det become nonzero, and
+         * do data[0x3f70]/data[0x435b] populate too (single-root-cause test). */
+        if (exec_pc == 0xa4ca) {
+            static int poke_en = -1;
+            if (poke_en < 0) poke_en = getenv("CALYPSO_POKE_A4C7_ONCE") ? 1 : 0;
+            static int poke_done = 0;
+            if (poke_en && !poke_done) {
+                poke_done = 1;
+                fprintf(stderr, "[c54x] POKE-A4C7-ONCE: redirecting PC 0xa4ca -> "
+                        "0xa4c7 (let ROM's own ORM #0x3000,IMR run) insn=%u\n",
+                        s->insn_count);
+                s->pc = 0xa4c7;
+                return 0;
+            }
+        }
+
+        /* CALA-71DA (2026-07-03, gated CALYPSO_CALA_71DA, RO) : le wrapper
+         * generique save/dispatch/restore a 0x71c0-0x71f2 (PSHM x19 ; ST0=0,
+         * ST1=0x6900 ; CALA @0x71da ; POPM x19 ; RET) dispatche vers l adresse
+         * dans A. Log A juste avant le CALA -- determine si ce dispatcher
+         * appelle jamais autre chose qu un stub no-op (meme famille de boucle
+         * fermee auto-referentielle que data[0x4387]->0xab38, addendum 15). */
+        if (exec_pc == 0x71da) {
+            static int cala_en = -1;
+            if (cala_en < 0) cala_en = getenv("CALYPSO_CALA_71DA") ? 1 : 0;
+            if (cala_en) {
+                static unsigned cala_n = 0;
+                static uint16_t last_target = 0xFFFF;
+                static unsigned same_target_count = 0;
+                uint16_t target = (uint16_t)(s->a & 0xFFFF);
+                if (target == last_target) same_target_count++;
+                else { same_target_count = 0; last_target = target; }
+                if (cala_n < 100 || same_target_count == 0 || (cala_n % 2000) == 0) {
+                    fprintf(stderr, "[c54x] CALA-71DA #%u target=0x%04x SP=0x%04x "
+                            "repeat_run=%u insn=%u\n", cala_n, target, s->sp,
+                            same_target_count, s->insn_count);
+                }
+                cala_n++;
+            }
+        }
+
+        /* FORCE-IMR (2026-07-02, gate CALYPSO_C54X_FORCE_IMR=<hex>) : le ROM efface
+         * IMR (STM #0,IMR @0xb37e insn~1047) et ne le re-arme jamais avant le
+         * scheduler b41c -> la frame IT (INT3, IFR bit3) reste masquee -> spin.
+         * On OR les bits demandes dans IMR a chaque pas HORS ISR (INTM=0 window de
+         * IRQ-LEVEL le sert). Test falsifiable de la chaine IMR->IT->0x0fff->golive.
+         * Defaut OFF. Typique : 0x52fd (bit3 INT3 + bit5 BRINT0 + ...). */
+        {
+            static int fimr = -1; static uint16_t fimrv = 0;
+            if (fimr < 0) { const char *e = getenv("CALYPSO_C54X_FORCE_IMR");
+                fimrv = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0; fimr = fimrv ? 1 : 0; }
+            if (fimr && (s->imr & fimrv) != fimrv) {
+                static unsigned fic = 0;
+                if (fic++ < 8)
+                    fprintf(stderr, "[c54x] FORCE-IMR 0x%04x |= 0x%04x @PC=0x%04x insn=%u\n",
+                            s->imr, fimrv, exec_pc, s->insn_count);
+                s->imr |= fimrv;
+            }
+            /* La boucle idle scheduler b380-b440 doit tourner INTM=0 (attente IT).
+             * Le ROM ne clear INTM (RSBX @0xa51b) qu apres go-live (chicken-egg) ->
+             * on clear INTM HORS ISR uniquement dans l idle loop, pour que IRQ-LEVEL
+             * serve la frame IT latchee. Ne touche pas les ISR (PC bas / 7234). */
+            if (fimr && exec_pc >= 0xb380 && exec_pc <= 0xb440 && (s->st1 & ST1_INTM) &&
+                ((s->pmst >> PMST_IPTR_SHIFT) & 0x1FF) != 0x1FF) {
+                static unsigned ftc = 0;
+                if (ftc++ < 8)
+                    fprintf(stderr, "[c54x] FORCE-INTM clr @PC=0x%04x IFR=0x%04x IMR=0x%04x insn=%u\n",
+                            exec_pc, s->ifr, s->imr, s->insn_count);
+                s->st1 &= ~ST1_INTM;
+            }
+        }
+
+        /* FORCE-098 (etape A faithful, gated CALYPSO_FORCE_098=<hexval>) : juste AVANT
+         * les lectures LD *(0x098c)/(0x098a) des setters (0xde86 chemin GO ; 0xde94 ;
+         * 0xb3e4), pose data[0x098a]/[0x098c] = valeur non nulle cote DSP. Teste si le
+         * DSP prend alors la branche GO (0xddf5) puis setter bit1 puis go-live. */
+        {
+            static int f98 = -1; static uint16_t f98v = 0;
+            if (f98 < 0) { const char *e = getenv("CALYPSO_FORCE_098");
+                f98v = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0; f98 = f98v ? 1 : 0; }
+            if (f98 && (exec_pc == 0xde86 || exec_pc == 0xde94 || exec_pc == 0xb3e4 ||
+                        exec_pc == 0xa5bd)) {
+                s->data[0x098a] = f98v; s->data[0x098c] = f98v;
+                static unsigned f9c = 0;
+                if (f9c++ < 12)
+                    fprintf(stderr, "[c54x] FORCE-098 @0x%04x data[098a/c]=0x%04x insn=%u\n",
+                            exec_pc, f98v, s->insn_count);
+            }
+        }
+        /* SM-TRACE (gated CALYPSO_SM_TRACE) : trace instruction-par-instruction
+         * l'etat-machine handshake 0xdde0-0xde9f (route reclear 0xde8b vs setter
+         * 0xde9c). Montre PC/op/A/TC + les 5 cellules 0x098a..0x098e a chaque
+         * pas, pour voir OU le flot devie du chemin de9c et quelles valeurs le
+         * routeraient. Cap 400. */
+        if (exec_pc >= 0xdde0 && exec_pc <= 0xde9f) {
+            static int smt = -1; static unsigned smn = 0;
+            if (smt < 0) smt = getenv("CALYPSO_SM_TRACE") ? 1 : 0;
+            if (smt && smn < 400) {
+                smn++;
+                fprintf(stderr, "[c54x] SM-TRACE PC=0x%04x op=0x%04x A=0x%04x TC=%d 098[a=%04x b=%04x c=%04x d=%04x e=%04x] insn=%u\n",
+                        exec_pc, exec_op, (unsigned)(s->a & 0xFFFF),
+                        (s->st0 & ST0_TC) ? 1 : 0,
+                        s->data[0x098a], s->data[0x098b], s->data[0x098c],
+                        s->data[0x098d], s->data[0x098e], s->insn_count);
+            }
+        }
+        /* B3-TRACE (gated CALYPSO_B3_TRACE) : le scheduler idle 0xb380-0xb440 poll
+         * le mot de flags data[0x0fff] (b424 BITF 0x0fff,#2 ; b427 BC NTC b41c) et
+         * doit router vers le bloc go-live b3db-b3ef (b3ef = ST #2,0x3f70). Trace PC +
+         * data[0x0fff]/[0x08d4=d_dsp_page]/[0x3f70=golive]. Montre pourquoi la commande
+         * ARM (d_dsp_page bit1) n aboutit pas au bloc b3db. Cap 500. */
+        if (exec_pc >= 0xb380 && exec_pc <= 0xb440) {
+            static int b3t = -1; static unsigned b3n = 0;
+            if (b3t < 0) b3t = getenv("CALYPSO_B3_TRACE") ? 1 : 0;
+            if (b3t && b3n < 500) {
+                b3n++;
+                fprintf(stderr, "[c54x] B3-TRACE PC=0x%04x op=0x%04x fff=0x%04x "
+                        "dsp_page=0x%04x 3f70=0x%04x TC=%d insn=%u\n",
+                        exec_pc, exec_op, s->data[0x0fff], s->data[0x08d4],
+                        s->data[0x3f70], (s->st0 & ST0_TC) ? 1 : 0, s->insn_count);
             }
         }
         if (exec_pc == 0xde97 || exec_pc == 0xde9c || exec_pc == 0xdddb || exec_pc == 0xde8b) {

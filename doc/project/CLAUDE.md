@@ -2,19 +2,72 @@
 
 > ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille (POST-BOOTSTUB-RET, PC=0x0000), IMR=0x0000 tout le run (jamais ré-armé après le clear boot @0xb37e), api_write_cb jamais câblé, pas de bus ORCH. Le handshake ARM→DSP go-live ne s'arme jamais (l'ARM n'écrit que 0x0000 dans API 0x0314/0x0318). Corrections ci-dessous.
 
-## 🔄 SYNC MIROIRS — À FAIRE À CHAQUE ÉDITION
+> 📍 **État le plus à jour et le plus précis : [`STATUS_2026-07-01.md`](STATUS_2026-07-01.md)**
+> (22 addenda, session 2026-07-02/03). Root cause du blocage go-live entièrement
+> circonscrite : `ORM #0x3000,IMR @0xa4c7` (arme le bit frame-IT) n'est jamais exécuté car
+> le dispatcher `data[0x4387]` reste bloqué sur un stub no-op auto-référencé (île ROM
+> `0xa9ea-0xc800` jamais réveillée de l'extérieur) — ET un second bug indépendant confirmé
+> par test de falsification : même quand la vectorisation fonctionne, la continuation après
+> `CALL 0x013b` dans le contexte ISR dérape (storm `PC=0x0000`). Un vrai bug de décodage a
+> aussi été trouvé et corrigé sans régression : `RSBX`/`SSBX` sur ST0/ST1 (dont `RSBX INTM`)
+> étaient mal décodés partout dans la ROM à cause d'une collision de masque avec SFTL
+> (`CALYPSO_FIX_SFTL_RSBX`, calypso_c54x.c ~ligne 5586/5850). Lire ce doc AVANT de reprendre
+> l'investigation go-live — il contient l'historique complet, ce qui a été réfuté, et
+> pourquoi (évite de refaire des essais déjà invalidés, notamment : ne JAMAIS forcer/poker
+> l'état DSP directement comme "fix" — seulement comme test de falsification ponctuel,
+> documenté et reverté après usage, cf. addenda 7-8 et 22).
 
-Le **latest / autoritaire** = `trying:/opt/GSM/qemu-src` (conteneur, où on build).
-**Après CHAQUE fichier édité**, propager depuis ce latest vers :
-- `/home/nirvana/qemu-src` (miroir full host)
-- `/home/nirvana/qemu-calypso` (subset curated host, même layout `hw/arm/calypso/` + `include/` + `run.sh`)
+## 🔄 SYNC MIROIRS — À FAIRE À CHAQUE ÉDITION (règle mise à jour 2026-07-03)
 
-**On IGNORE `/opt/GSM/qemu-calypso`.** Commande type (depuis latest) :
-```bash
-for dst in /home/nirvana/qemu-src /home/nirvana/qemu-calypso; do
-  mkdir -p "$dst/$(dirname FILE)"; docker cp trying:/opt/GSM/qemu-src/FILE "$dst/FILE"; done
-```
-Inclure ce CLAUDE.md lui-même dans la propagation.
+> ⚠️ La section précédente ("on ignore /opt/GSM/qemu-calypso", sync vers des chemins
+> `/home/nirvana/...` hôte) est **obsolète et remplacée**. Ces chemins hôte ne sont pas
+> forcément accessibles depuis toutes les sessions ; la règle actuelle sync **entre les
+> deux répertoires du conteneur**.
+
+**L'autoritaire / là où on build** = `/opt/GSM/qemu-src` (conteneur) — arbre QEMU 9.2.x
+**complet** (upstream + calypso mergé dedans), avec `build/` (binaire compilé).
+
+**`/opt/GSM/qemu-calypso`** = **overlay léger** — uniquement les fichiers/dossiers
+calypso-spécifiques (pas l'arbre QEMU complet), destiné à être publié/appliqué sur un
+checkout QEMU 9.2.x vanilla par un tiers. Son propre repo git
+(`github.com/bbaranoff/qemu-calypso`), séparé de celui de `qemu-src`
+(`github.com/bbaranoff/qemu`).
+
+**Règle de sync — après chaque édition dans `qemu-src`, propager vers `qemu-calypso` en
+respectant SA structure d'overlay** (ne PAS copier des dossiers entiers aveuglément —
+`configs/`, `include/`, `scripts/`, `tests/`, `tools/` dans `qemu-src` sont les arbres
+QEMU upstream COMPLETS ; qemu-calypso n'en a qu'un sous-ensemble calypso-spécifique) :
+
+1. **`hw/arm/calypso/`** : sync complet (répertoire 100% calypso-exclusif) — `tar`/`cp -r`
+   direct, exclure `*.bak_*`.
+2. **Fichiers individuels calypso-spécifiques dans les dossiers hw/ partagés** (chaque
+   fichier, PAS le dossier) : `hw/ssi/calypso_i2c.c`, `hw/ssi/calypso_spi.c`,
+   `hw/char/calypso_uart.c`, `hw/intc/calypso_inth.c`, `hw/timer/calypso_timer.c`, + leurs
+   `meson.build` respectifs.
+3. **Fichiers top-level** : `calypso.env`, `calypso_dsp.txt`, `README.md`, `.gitattributes`,
+   `.gitignore`, `start-clean.sh`.
+4. **Dossiers top-level 100% calypso-spécifiques** (sync complet, safe) : `bash_scripts/`,
+   `cfgs/`, `configs_calypso` (PAS `configs/` générique QEMU !), `diag/`, `dsp_blobs/`,
+   `gdb_scripts/`, `include/` (UNIQUEMENT le sous-dossier calypso, PAS `include/hw/*` générique
+   QEMU), `opt-gsm-scripts/`, `patches/`, `python_scripts/`, `scripts/` (UNIQUEMENT scripts
+   calypso, pas les scripts QEMU génériques), `tests/` (idem), `tools/calypso-ipc-device/`
+   (sources `.c/.h` + `Makefile`, PAS les binaires compilés `.o`/l'exécutable).
+5. **`doc/`** : sync bidirectionnel — qemu-src→qemu-calypso pour les fichiers partagés,
+   ET copier vers qemu-src tout fichier qui n'existerait que dans qemu-calypso (ex:
+   `doc/project/STATUS_2026-07-01.md`, `doc/project/TODO_golive.md` — la doc de session
+   doit être complète des deux côtés).
+
+**Avant tout sync en bloc d'un dossier "partagé"** (nom qui existe aussi dans l'arbre QEMU
+upstream), vérifier D'ABORD son contenu réel côté qemu-calypso (`ls`/`find`) pour confirmer
+qu'il s'agit bien d'un sous-ensemble calypso-spécifique et PAS de l'arbre upstream complet.
+**Après un sync en bloc, TOUJOURS vérifier `git status`/`git diff --stat` côté qemu-calypso**
+(c'est un repo git : ça révèle immédiatement toute pollution accidentelle — untracked massif
+= dossier upstream aspiré par erreur → `git clean -fdx -- <dossier>` pour corriger, c'est
+sans risque puisque purement additif si `git diff --stat` ne montrait aucun fichier tracké
+modifié avant le clean).
+
+**Ne JAMAIS `git commit`/`git push` sans instruction explicite de l'utilisateur** — il gère
+lui-même les commits/push sur les deux repos.
 
 ## Working style with user
 

@@ -12,6 +12,7 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'calypso_soc.c',
     'calypso_trx.c',
     'calypso_c54x.c',
+    'calypso_arm2dsp.c',
     'calypso_layer1.c',
     'calypso_fbsb.c',
     'calypso_bsp.c',

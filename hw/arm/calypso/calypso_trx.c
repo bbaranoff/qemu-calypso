@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "calypso_arm2dsp.h"
 #include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -566,6 +567,25 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 "[trx] HS-ARM-GATE #%u off=0x%04x dsp_word=0x%04x val=0x%04x fn=%u\n",
                 gate, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
                 (unsigned)(value & 0xFFFF), s->fn);
+        }
+    }
+
+    calypso_arm2dsp_on_arm_write((uint16_t)offset, (uint16_t)(value & 0xFFFF));
+
+    /* FORCE-HS (etape A, gated CALYPSO_FORCE_HS=<hexval>) : override the ARM go-live
+     * control cells 0x0314/0x0318 with a non-zero enable value, to test whether the
+     * REAL ROM setter (0xde9c / 0xa5bd) then fires (F70-SETBIT1) and the DSP reaches
+     * go-live. Runtime-configurable value so we can bracket without rebuild. */
+    if (dsp_real_rom_mode() && (offset == 0x0314 || offset == 0x0318)) {
+        static int fh = -1; static uint32_t fhv = 0;
+        if (fh < 0) { const char *e = getenv("CALYPSO_FORCE_HS");
+            fhv = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0; fh = fhv ? 1 : 0; }
+        if (fh) {
+            value = fhv;
+            static unsigned fhc = 0;
+            if (fhc++ < 12)
+                fprintf(stderr, "[trx] FORCE-HS off=0x%04x -> val=0x%04x\n",
+                        (unsigned)offset, (unsigned)(fhv & 0xFFFF));
         }
     }
 
