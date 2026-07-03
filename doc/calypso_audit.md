@@ -321,17 +321,17 @@ sequenceDiagram
     IFR->>IFR: IFR bit3 = 1  - frame IT latched
 
     IFR->>IMR: check IMR bit3  - imr_bit before vectoring
-    Note over IMR: IMR = 0x0000 for the ENTIRE run.<br/>Cleared once at boot: '0xb37e STM #0x0000,IMR'  - insn~1047,<br/>confirmed legitimate/intentional init  - Addendum 19  -  NOT a decoder bug.<br/>Never re-armed naturally  =>  IT stays masked, DSP never vectors on its own.
+    Note over IMR: IMR = 0x0000 for the ENTIRE run.<br/>Cleared once at boot: '0xb37e STM 0x0000,IMR'  - insn~1047,<br/>confirmed legitimate/intentional init  - Addendum 19  -  NOT a decoder bug.<br/>Never re-armed naturally  =>  IT stays masked, DSP never vectors on its own.
 
     rect rgb - 255,230,230
-    Note over IDLE,ARM7: BREAK POINT #1  -  dispatch stuck on no-op stub<br/>Idle-scheduler slot 'data[0x4387]'  - read via 'BACC A @0xb40f' is the ONLY<br/>live path to the IMR-arm code. Jump table @0xaae7-0xab37 has 2 entries<br/>pointing at '0xa4c7', but the slot rewrites its own current value every<br/>pass  =>  always resolves to stub '0xab38'  - RET no-op, never '0xa4c7'.<br/> - Addenda 15/20/21  -  "boucle fermée auto-référentielle"
+    Note over IDLE,ARM7: BREAK POINT 1  -  dispatch stuck on no-op stub<br/>Idle-scheduler slot 'data[0x4387]'  - read via 'BACC A @0xb40f' is the ONLY<br/>live path to the IMR-arm code. Jump table @0xaae7-0xab37 has 2 entries<br/>pointing at '0xa4c7', but the slot rewrites its own current value every<br/>pass  =>  always resolves to stub '0xab38'  - RET no-op, never '0xa4c7'.<br/> - Addenda 15/20/21  -  "boucle fermée auto-référentielle"
     IDLE->>IDLE: data[0x4387] resolves -> 0xab38  - self-referential stub
     IDLE-->>ARM7:  - never routes here  -  0 hits on 0xa4c7 all session
     end
 
     rect rgb - 255,230,230
-    Note over ARM7: BREAK POINT #2  -  armor instruction never executed<br/>'0xa4c7: ORM #0x3000,IMR'   - would set bit12=vec28 + bit13<br/>Immediately preceded by '0xa4c6 RET' of a separate routine  =>  0xa4c7 is a<br/>jump TARGET, not fallthrough. 0 hits on 0xa4c7 across every run this<br/>session. 3 words later, '0xa4ca SSBX INTM'  - start of the visible<br/>"wait-loop" entry has 130 hits  -  execution reaches the loop by a<br/>DIRECT path that skips the ORM entirely.
-    Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break #1 is broken.
+    Note over ARM7: BREAK POINT 2  -  armor instruction never executed<br/>'0xa4c7: ORM 0x3000,IMR'   - would set bit12=vec28 + bit13<br/>Immediately preceded by '0xa4c6 RET' of a separate routine  =>  0xa4c7 is a<br/>jump TARGET, not fallthrough. 0 hits on 0xa4c7 across every run this<br/>session. 3 words later, '0xa4ca SSBX INTM'  - start of the visible<br/>"wait-loop" entry has 130 hits  -  execution reaches the loop by a<br/>DIRECT path that skips the ORM entirely.
+    Note over ARM7: Falsification test  - Addendum 22, diagnostic-only, reverted:<br/>force-redirect PC 0xa4ca -> 0xa4c7 once, let ROM execute its real ORM.<br/>Result: IMR 0x0000 -> 0x3000  - bit12=1  -  CONFIRMED the instruction<br/>itself is correct and sufficient; only its liveness  - Break 1 is broken.
     end
 
     alt IMR successfully armed - bit12/vec28  -  only reproduced via diagnostic poke, never naturally
@@ -344,7 +344,7 @@ sequenceDiagram
         Note over ISR: '0x013b' = shared prologue subroutine  - STM ST1=0x6900; STM ST0=0; ANDM...,<br/>copied from PROM0[0x713b], called from MULTIPLE normal-flow sites<br/> - 0x7092/0x70a1/0x70b8 without issue  -  it is NOT ISR-specific,<br/>NOT itself buggy in isolation  - Addendum 22
 
         rect rgb - 255,230,230
-        Note over ISR,DISP: BREAK POINT #3  -  post-0x013b derail in ISR context only<br/>'0x7234' and '0x013b' each fire exactly ONCE, then PC storms to<br/>0x0000  - "POST-BOOTSTUB-RET", 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>'0xa4e4'  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
+        Note over ISR,DISP: BREAK POINT 3  -  post-0x013b derail in ISR context only<br/>'0x7234' and '0x013b' each fire exactly ONCE, then PC storms to<br/>0x0000  - "POST-BOOTSTUB-RET", 6300+ occurrences, starting at<br/>insn=4470  - 32 instructions after the poke at insn=4438.<br/>'0xa4e4'  - dispatch -> DMA burst + set AR3 -> correlator is<br/>NEVER reached. Reproducible regardless of trigger mechanism<br/> - same derail seen via earlier IMR pokes, Addenda 7-8, and via the<br/>faithful ORM instruction, Addendum 22. Root cause isolated to:<br/>the CALL 0x013b return continuation specific to ISR entry context<br/> - pushed PC/XPC from c54x_interrupt_ex  -  untraced beyond this point.
         ISR--xDISP: derail: PC -> 0x0000  - storm, 0xa4e4 never executed
         end
     else IMR stays 0x0000 - actual state, every real run
@@ -353,7 +353,7 @@ sequenceDiagram
 
     DISP-->>COR:  - intended DMA burst into correlator page + AR3=burst pointer
     COR-->>NDB:  - intended MAC over I/Q -> peak detect -> write d_fb_det
-    Note over NDB: Observed: d_fb_det  - data[0x08f8] = 0x0000 for the entire run.<br/>FBSB_CONF = FAIL. Every real run stops at Break #1  - never reaches<br/>Break #2/#3 without diagnostic force.
+    Note over NDB: Observed: d_fb_det  - data[0x08f8] = 0x0000 for the entire run.<br/>FBSB_CONF = FAIL. Every real run stops at Break 1  - never reaches<br/>Break 2/3 without diagnostic force.
 ```
 
 Three independent, confirmed break points gate this chain, and all downstream of them is proven-good: (1) the idle-scheduler dispatch slot `data[0x4387]` (read via `BACC @0xb40f`) never resolves to the IMR-arm entry point `0xa4c7`, permanently self-resolving to the no-op stub `0xab38` (Addenda 15/20/21); (2) as a direct consequence, `0xa4c7: ORM #0x3000,IMR` — verified correct and sufficient when force-executed (IMR 0x0000→0x3000, Addendum 22) — has zero natural hits across every run this session; (3) even when IMR/vectoring is forced to fire faithfully, the shared prologue `CALL 0x013b` (itself fine in normal, non-ISR call sites) returns into a derailed continuation unique to ISR-entry context, storming to `PC=0x0000` before ever reaching the real dispatch/correlator code at `0xa4e4` (Addendum 22). Everything upstream (BSP burst delivery, FCCH signal quality, INT3/BRINT0 raising, IFR latching) and the vector-table mechanics themselves (IPTR routing to `0x00f0`→`0x7234`) are independently confirmed sound — the wall is entirely inside three narrow, now-precisely-located DSP-ROM-internal control-flow gaps. Statement-of-record source: `/opt/GSM/qemu-calypso/doc/project/STATUS_2026-07-01.md`, Addenda 15/19/20/21/22.
