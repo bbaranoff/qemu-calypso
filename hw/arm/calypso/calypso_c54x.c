@@ -15,6 +15,16 @@
 #include <string.h>
 
 static int g_boot_trace = 0;
+/* VEC28-STACK-TRACE (2026-07-03, gated CALYPSO_TRACE_VEC28_STACK, READ-ONLY diagnostic,
+ * addendum 23). Traces the software stack from vec28 interrupt entry (2-word PC+XPC push
+ * by c54x_interrupt_ex) through every RET-family instruction until SP returns to the
+ * pre-interrupt level, to confirm whether a 1-word RET/RCD/RETED pop consumes the orphaned
+ * XPC word (expected 0x0000) as if it were a return PC -- the suspected mechanism of the
+ * PC=0x0000 derail (Addendum 22/23). No DSP state is modified, only observed. */
+static int g_vec28_trace_en = -1;
+static bool g_vec28_tracing = false;
+static uint16_t g_vec28_sp_entry = 0;
+static unsigned g_vec28_trace_pops = 0;
 
 #include "hw/arm/calypso/calypso_debug.h"
 
@@ -5116,6 +5126,19 @@ static int c54x_exec_one(C54xState *s)
             s->xpc = nx & 3;
             uint16_t ra = data_read(s, s->sp); s->sp++;   /* pop PC */
             s->st1 &= ~ST1_INTM;
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u RETE(2w,symmetric) PC=0x%04x "
+                            "popped=0x%04x words=2 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 2), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
+                }
             /* INT3-CYCLE-TRACE end-good hook NOT here : firmware exits ISR via
              * POPM ST1 + RCD (not RETE 0xF4EB), so this path is dead. Hook
              * moved to generic INTM 1→0 detector below — catches all idioms. */
@@ -5141,6 +5164,19 @@ static int c54x_exec_one(C54xState *s)
             uint16_t ra = data_read(s, s->sp); s->sp++;
             uint16_t prev_xpc = s->xpc;
             uint16_t nx = data_read(s, s->sp); s->sp++;
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u FRET(2w,symmetric) PC=0x%04x "
+                            "popped=0x%04x words=2 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 2), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
+                }
             if (nx > 2)
                 C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
                         nx, s->pc, s->sp, s->insn_count);
@@ -6696,6 +6732,19 @@ static int c54x_exec_one(C54xState *s)
                 s->st1 &= ~ST1_INTM;
                 s->delayed_pc  = ra;
                 s->delay_slots = 2;
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u RETED(1w,no-xpc-pop) PC=0x%04x "
+                            "popped=0x%04x words=1 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 1), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
+                }
                 {
                     static uint64_t reted_count;
                     reted_count++;
@@ -6785,6 +6834,19 @@ static int c54x_exec_one(C54xState *s)
                 if (s->xpc > 3) s->xpc &= 3;
                 uint16_t ra = data_read(s, s->sp); s->sp++;
                 if (op == 0xF6E5) s->st1 &= ~ST1_INTM;
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u FRETD-FRETED(2w,symmetric) PC=0x%04x "
+                            "popped=0x%04x words=2 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 2), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
+                }
                 s->delayed_pc  = ra;
                 s->delay_slots = 2;
                 return consumed + s->lk_used;
@@ -7146,6 +7208,19 @@ static int c54x_exec_one(C54xState *s)
                                 s->pc, cc, ra, s->sp);
                     rc_log++;
                 }
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u RC/RET(1w) PC=0x%04x "
+                            "popped=0x%04x words=1 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 1), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
+                }
                 /* POST-BOOTSTUB-RET : si on est en train de RET depuis le
                  * boot stub (PC ∈ 0x0000..0x0008), c'est la sortie du
                  * task-switch trampoline 0x701b/0x701d → 0x0000. Le ra
@@ -7257,6 +7332,19 @@ static int c54x_exec_one(C54xState *s)
                         C54_LOG("RCD/RETD PC=0x%04x cc=0x%02x -> ra=0x%04x SP=0x%04x (delayed)",
                                 s->pc, cc, ra, s->sp);
                     rcd_log++;
+                }
+                if (g_vec28_tracing) {
+                    g_vec28_trace_pops++;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE #%u RCD/RETD(1w,delayed) PC=0x%04x "
+                            "popped=0x%04x words=1 SP_before=0x%04x SP_after=0x%04x "
+                            "insn=%u\n", g_vec28_trace_pops, s->pc, ra,
+                            (uint16_t)(s->sp - 1), s->sp, s->insn_count);
+                    if (s->sp >= (uint16_t)(g_vec28_sp_entry + 2)) {
+                        fprintf(stderr, "[c54x] VEC28-STACK-TRACE DISARMED SP=0x%04x "
+                                "back at or above pre-interrupt level 0x%04x\n",
+                                s->sp, g_vec28_sp_entry);
+                        g_vec28_tracing = false;
+                    }
                 }
                 return consumed + s->lk_used;
             }
@@ -11253,7 +11341,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static uint32_t pc_hist[0x10000];
             static uint64_t hist_last_dump = 0;
-            pc_hist[s->pc & 0xFFFF]++;
+            pc_hist[s->pc]++;
             if (s->insn_count - hist_last_dump >= 2000000) {
                 hist_last_dump = s->insn_count;
                 /* find top 20 */
@@ -11307,7 +11395,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static uint32_t pc_recent[0x10000];
             static uint32_t recent_last_dump = 0;
-            pc_recent[s->pc & 0xFFFF]++;
+            pc_recent[s->pc]++;
             if (s->insn_count - recent_last_dump >= 100000) {
                 recent_last_dump = s->insn_count;
                 uint32_t top_cnt[5] = {0};
@@ -13819,6 +13907,7 @@ void c54x_reset(C54xState *s)
 
 int g_c54x_int3_src = 0;   /* 1=trx 2=bsp 3=shunt — diag source INT3 (RO) */
 
+
 void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 {
     if (vec < 0 || vec >= 32) return;
@@ -13905,6 +13994,20 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             s->xpc = 0;                            /* fetch vecteur sur page 0 */
             uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
             s->pc = (iptr * 0x80) + vec * 4;
+            if (vec == 28) {
+                if (g_vec28_trace_en < 0)
+                    g_vec28_trace_en = getenv("CALYPSO_TRACE_VEC28_STACK") ? 1 : 0;
+                if (g_vec28_trace_en && !g_vec28_tracing) {
+                    g_vec28_tracing = true;
+                    g_vec28_sp_entry = s->sp;
+                    g_vec28_trace_pops = 0;
+                    fprintf(stderr, "[c54x] VEC28-STACK-TRACE ARMED (idle-wake) "
+                            "SP_entry=0x%04x data[SP]=0x%04x(expect XPC) "
+                            "data[SP+1]=0x%04x(expect return PC) PC=0x%04x insn=%u\n",
+                            s->sp, data_read(s, s->sp), data_read(s, (uint16_t)(s->sp + 1)),
+                            s->pc, s->insn_count);
+                }
+            }
         }
         /* If masked: just wake, advance PC past IDLE */
         if (!unmasked) {
@@ -13935,6 +14038,20 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->xpc = 0;                                /* fetch vecteur sur page 0 */
         uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
         s->pc = (iptr * 0x80) + vec * 4;
+        if (vec == 28) {
+            if (g_vec28_trace_en < 0)
+                g_vec28_trace_en = getenv("CALYPSO_TRACE_VEC28_STACK") ? 1 : 0;
+            if (g_vec28_trace_en && !g_vec28_tracing) {
+                g_vec28_tracing = true;
+                g_vec28_sp_entry = s->sp;
+                g_vec28_trace_pops = 0;
+                fprintf(stderr, "[c54x] VEC28-STACK-TRACE ARMED (normal) "
+                        "SP_entry=0x%04x data[SP]=0x%04x(expect XPC) "
+                        "data[SP+1]=0x%04x(expect return PC) PC=0x%04x insn=%u\n",
+                        s->sp, data_read(s, s->sp), data_read(s, (uint16_t)(s->sp + 1)),
+                        s->pc, s->insn_count);
+            }
+        }
         /* INT3-CYCLE-TRACE : hook cycle start for vec=19 (INT3 FRAME) */
         if (vec == 19) {
             int3_cycle_start(s, s->pc);
@@ -13964,8 +14081,6 @@ void c54x_wake(C54xState *s)
 
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
 {
-    if (n <= 0) return;              /* guard: negative n would make the memcpy
-                                       size underflow to a huge size_t */
     if (n > 2048) n = 2048;
     memcpy(s->bsp_buf, samples, n * sizeof(uint16_t));
     s->bsp_len = n;

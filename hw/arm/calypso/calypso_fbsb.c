@@ -52,18 +52,11 @@ void calypso_fbsb_publish_fb_found(CalypsoFbsb *s, int16_t toa, uint16_t pm,
 
     calypso_pcb_daram_lock_acquire();
 
-    /* NDB_* constants are absolute DSP data-word addresses; s->ndb points at
-     * the API window base (api_base), so index relative to it. This keeps both
-     * backends correct: the dsp->data path (ndb = &data[api_base]) and the
-     * dsp_ram fallback (ndb = dsp_ram, which starts at api_base). Indexing with
-     * the raw absolute constant added api_base twice, landing the writes at
-     * data[api_base + NDB_*] where the ARM firmware never reads them. */
-    const uint16_t b = s->api_base;
-    s->ndb[NDB_D_FB_DET            - b] = 1;
-    s->ndb[NDB_A_SYNC_DEMOD_TOA    - b] = (uint16_t)toa;   /* <-- le wire manquant */
-    s->ndb[NDB_A_SYNC_DEMOD_PM     - b] = pm;
-    s->ndb[NDB_A_SYNC_DEMOD_ANG    - b] = (uint16_t)ang;
-    s->ndb[NDB_A_SYNC_DEMOD_SNR    - b] = snr;
+    s->ndb[NDB_D_FB_DET]            = 1;
+    s->ndb[NDB_A_SYNC_DEMOD_TOA]   = (uint16_t)toa;   /* <-- le wire manquant */
+    s->ndb[NDB_A_SYNC_DEMOD_PM]    = pm;
+    s->ndb[NDB_A_SYNC_DEMOD_ANG]   = (uint16_t)ang;
+    s->ndb[NDB_A_SYNC_DEMOD_SNR]   = snr;
 
     calypso_pcb_daram_lock_release();
 
