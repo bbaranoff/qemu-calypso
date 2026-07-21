@@ -1,4 +1,8 @@
 #!/bin/bash
-# start-clean.sh — alias racine : délègue à bash_scripts/start-clean.sh
-# (qui détecte ROOT, source calypso.env, exec bash_scripts/run.sh).
-exec "$(cd "$(dirname "$0")" && pwd)/bash_scripts/start-clean.sh" "$@"
+# start-clean.sh -- lance le pipeline Calypso avec les overrides de calypso.env
+set -euo pipefail
+cd "$(dirname "$0")"
+set -a
+. ./calypso.env
+set +a
+exec ./run.sh "$@"

@@ -1,393 +1,188 @@
-flowchart TB
+graph TD
   classDef pass    fill:#bef5b1,stroke:#1f7a1f,color:#0a3d0a;
   classDef partial fill:#fde79c,stroke:#b07a00,color:#3a2c00;
   classDef fail    fill:#fbb4b4,stroke:#a31a1a,color:#5a0000;
   classDef skip    fill:#e0e0e0,stroke:#6a6a6a,color:#333;
   classDef xfail   fill:#fde79c,stroke:#b07a00,color:#3a2c00;
-  subgraph SG_C_Ar ["Ar 4/8"]
-    direction TB
-    C_Ar_L__["—<br/>4/8"]
-    C_Ar_L__ --> T_001_pass_grp__["PASS 4<br/>0.0s"]
-    C_Ar_L__ --> T_002_test_reset_sp_silicon["test_reset_sp_silicon<br/>ar_imr_invariant<br/>0.01s"]
-    C_Ar_L__ --> T_003_test_reset_pmst_silicon["test_reset_pmst_silicon<br/>ar_imr_invariant<br/>0.01s"]
-    C_Ar_L__ --> T_004_test_irq_servicing_imr_nonzero["test_irq_servicing_imr_nonzero<br/>ar_imr_invariant<br/>0.01s"]
-    C_Ar_L__ --> T_005_test_tpu_frame_irq_delivered["test_tpu_frame_irq_delivered<br/>ar_imr_invariant<br/>0.01s"]
-  end
-
-  subgraph SG_C_Injection ["Injection 19/21"]
-    direction TB
-    C_Injection_L_ARM_feedback["ARM-feedback<br/>0/2"]
-    C_Injection_L_ARM_feedback --> T_006_test_efficacy_arm_reads_d_fb_det_1["test_efficacy_arm_reads_d_fb_det_1<br/>inject_efficacy<br/>3.01s"]
-    C_Injection_L_ARM_feedback --> T_007_test_efficacy_arm_reads_a_cd["test_efficacy_arm_reads_a_cd<br/>inject_efficacy<br/>2.59s"]
-    C_Injection_L_NDB["NDB<br/>19/19"]
-    C_Injection_L_ARM_feedback -.-> C_Injection_L_NDB
-    C_Injection_L_NDB --> T_008_pass_grp_NDB["PASS 19<br/>5.4s"]
-  end
-  SG_C_Ar -.-> SG_C_Injection
-
-  subgraph SG_C_Milestone ["Milestone 3/21"]
-    direction TB
-    C_Milestone_L_DSP["DSP<br/>3/10"]
-    C_Milestone_L_DSP --> T_009_pass_grp_DSP["PASS 3<br/>30.3s"]
-    C_Milestone_L_DSP --> T_010_test_dsp_throughput_5x["test_dsp_throughput_5x<br/>milestone_dsp_decoder<br/>0.01s"]
-    C_Milestone_L_DSP --> T_011_test_fb0_att_nonzero["test_fb0_att_nonzero<br/>milestone_fb_det<br/>0.00s"]
-    C_Milestone_L_DSP --> T_012_test_synth_zero_path_active["test_synth_zero_path_active<br/>milestone_fb_det<br/>0.01s"]
-    C_Milestone_L_DSP --> T_013_test_c54x_interrupt_ex_called_nonzero["test_c54x_interrupt_ex_called_nonzero<br/>milestone_irq<br/>0.00s"]
-    C_Milestone_L_DSP --> T_014_test_isr_entered_implies_rete["test_isr_entered_implies_rete<br/>milestone_irq<br/>0.00s"]
-    C_Milestone_L_DSP --> T_015_test_no_pending_irq_gated["test_no_pending_irq_gated<br/>milestone_irq<br/>0.00s"]
-    C_Milestone_L_DSP --> T_016_test_rxdoneflag_no_longer_blocks["test_rxdoneflag_no_longer_blocks<br/>milestone_dsp_decoder<br/>0.00s"]
-    C_Milestone_L_L1_ctrl["L1-ctrl<br/>0/2"]
-    C_Milestone_L_DSP -.-> C_Milestone_L_L1_ctrl
-    C_Milestone_L_L1_ctrl --> T_017_test_l1ctl_data_ind_received["test_l1ctl_data_ind_received<br/>milestone_l1ctl<br/>0.02s"]
-    C_Milestone_L_L1_ctrl --> T_018_test_neigh_pm_req_response_unchanged["test_neigh_pm_req_response_unchanged<br/>milestone_l1ctl<br/>0.00s"]
-    C_Milestone_L_L1_data["L1-data<br/>0/4"]
-    C_Milestone_L_L1_ctrl -.-> C_Milestone_L_L1_data
-    C_Milestone_L_L1_data --> T_019_test_ar3_init_source_identified["test_ar3_init_source_identified<br/>milestone_bsp_dma<br/>0.01s"]
-    C_Milestone_L_L1_data --> T_020_test_ar4_init_source_identified["test_ar4_init_source_identified<br/>milestone_bsp_dma<br/>0.01s"]
-    C_Milestone_L_L1_data --> T_021_test_bsp_dma_target_matches_correlator_read_zone["test_bsp_dma_target_matches_correlator<br/>milestone_bsp_dma<br/>0.01s"]
-    C_Milestone_L_L1_data --> T_022_test_no_d_fb_det_wr_site_anomaly["test_no_d_fb_det_wr_site_anomaly<br/>milestone_bsp_dma<br/>0.01s"]
-    C_Milestone_L_L3_MM["L3-MM<br/>0/5"]
-    C_Milestone_L_L1_data -.-> C_Milestone_L_L3_MM
-    C_Milestone_L_L3_MM --> T_023_test_rach_emitted["test_rach_emitted<br/>milestone_mm_lu<br/>0.00s"]
-    C_Milestone_L_L3_MM --> T_024_test_immediate_assignment_decoded["test_immediate_assignment_decoded<br/>milestone_mm_lu<br/>0.00s"]
-    C_Milestone_L_L3_MM --> T_025_test_rr_sdcch_established["test_rr_sdcch_established<br/>milestone_mm_lu<br/>0.00s"]
-    C_Milestone_L_L3_MM --> T_026_test_location_updating_request_sent["test_location_updating_request_sent<br/>milestone_mm_lu<br/>0.00s"]
-    C_Milestone_L_L3_MM --> T_027_test_location_updating_accept_received["test_location_updating_accept_received<br/>milestone_mm_lu<br/>0.00s"]
-  end
-  SG_C_Injection -.-> SG_C_Milestone
-
-  subgraph SG_C_Osmocom ["Osmocom 12/13"]
-    direction TB
-    C_Osmocom_L__["—<br/>12/13"]
-    C_Osmocom_L__ --> T_028_pass_grp__["PASS 12<br/>0.0s"]
-    C_Osmocom_L__ --> T_029_test_bridge_clock_from_qemu_defaultX["test_bridge_clock_from_qemu_default<br/>osmocom_bridge<br/>0.00s"]
-  end
-  SG_C_Milestone -.-> SG_C_Osmocom
-
-  subgraph SG_C_Other ["Other 3/18"]
-    direction TB
-    C_Other_L_unmarked["unmarked<br/>3/18"]
-    C_Other_L_unmarked --> T_030_pass_grp_unmarked["PASS 3<br/>0.0s"]
-    C_Other_L_unmarked --> T_031_test_verdict_shunt_works["test_verdict_shunt_works<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_032_test_verdict_shunt_silent["test_verdict_shunt_silent<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_033_test_verdict_bts_dead["test_verdict_bts_dead<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_034_test_verdict_ipc_chan_mismatch["test_verdict_ipc_chan_mismatch<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_035_test_bissection_fbsb_shunt_vs_full["test_bissection_fbsb_shunt_vs_full<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_036_test_bridge_vs_ipc_radio_chain["test_bridge_vs_ipc_radio_chain<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_037_test_lost_frames_consistency["test_lost_frames_consistency<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_038_test_errors_quiet["test_errors_quiet<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_039_test_verdict_dsp_wall_confirmed["test_verdict_dsp_wall_confirmed<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_040_test_verdict_arm_bug["test_verdict_arm_bug<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_041_test_verdict_pipeline_works["test_verdict_pipeline_works<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_042_test_verdict_radio_chain_broken["test_verdict_radio_chain_broken<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_043_test_verdict_instability["test_verdict_instability<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_044_test_verdict_bridge_vs_ipc["test_verdict_bridge_vs_ipc<br/><br/>0.00s"]
-    C_Other_L_unmarked --> T_045_test_zz_final_report["test_zz_final_report<br/><br/>0.00s"]
-  end
-  SG_C_Osmocom -.-> SG_C_Other
-
-  subgraph SG_C_Parametrize ["Parametrize 1/34"]
-    direction TB
-    C_Parametrize_L__["—<br/>1/34"]
-    C_Parametrize_L__ --> T_046_pass_grp__["PASS 1<br/>0.1s"]
-    C_Parametrize_L__ --> T_047_test_mode_executed_full_["test_mode_executed(full)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_048_test_mode_executed_shunt_["test_mode_executed(shunt)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_049_test_mode_executed_shunt_ipc_["test_mode_executed(shunt-ipc)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_050_test_mode_executed_bridge_["test_mode_executed(bridge)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_051_test_mode_executed_bare_["test_mode_executed(bare)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_052_test_mode_invariant_full_bts_ok___0_osmo_bts_trx["test_mode_invariant(full-bts_ok->-0-os<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_053_test_mode_invariant_full_ipc_ok___0_calypso_ipc_["test_mode_invariant(full-ipc_ok->-0-ca<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_054_test_mode_invariant_full_err_q____0_qemu_log_san["test_mode_invariant(full-err_q-==-0-qe<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_055_test_mode_invariant_shunt_shunt_latch___0_ARM_do["test_mode_invariant(shunt-shunt_latch-<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_056_test_mode_invariant_shunt_shunt_disp___0_le_mock["test_mode_invariant(shunt-shunt_disp-><br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_057_test_mode_invariant_shunt_err_q____0_qemu_log_sa["test_mode_invariant(shunt-err_q-==-0-q<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_058_test_mode_invariant_shunt_bts_ok____0_BTS_doit__["test_mode_invariant(shunt-bts_ok-==-0-<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_059_test_mode_invariant_shunt_ipc_ok____0_IPC_doit__["test_mode_invariant(shunt-ipc_ok-==-0-<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_060_test_mode_invariant_shunt_ipc_shunt_latch___0_AR["test_mode_invariant(shunt-ipc-shunt_la<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_061_test_mode_invariant_shunt_ipc_shunt_disp___0_le_["test_mode_invariant(shunt-ipc-shunt_di<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_062_test_mode_invariant_shunt_ipc_bts_ok___0_BTS_ali["test_mode_invariant(shunt-ipc-bts_ok-><br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_063_test_mode_invariant_shunt_ipc_ipc_ok___0_IPC_han["test_mode_invariant(shunt-ipc-ipc_ok-><br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_064_test_mode_invariant_bridge_bts_ok___0_BTS_alive_["test_mode_invariant(bridge-bts_ok->-0-<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_065_test_mode_invariant_bridge_ipc_ok____0_IPC_skipp["test_mode_invariant(bridge-ipc_ok-==-0<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_066_test_mode_invariant_bare_bts_ok____0_pas_de_BTS_["test_mode_invariant(bare-bts_ok-==-0-p<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_067_test_mode_invariant_bare_ipc_ok____0_pas_d_IPC_e["test_mode_invariant(bare-ipc_ok-==-0-p<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_068_test_mode_invariant_bare_rr_est____0_pas_de_mobi["test_mode_invariant(bare-rr_est-==-0-p<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_069_test_payload_coverage_FB_detect_["test_payload_coverage(FB_detect)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_070_test_payload_coverage_SB_decode_["test_payload_coverage(SB_decode)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_071_test_payload_coverage_Mock_LATCH_["test_payload_coverage(Mock_LATCH)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_072_test_payload_coverage_Mock_DISP_["test_payload_coverage(Mock_DISP)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_073_test_payload_coverage_RR_EST_REQ_["test_payload_coverage(RR_EST_REQ)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_074_test_payload_coverage_BTS_alive_["test_payload_coverage(BTS_alive)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_075_test_payload_coverage_IPC_handsh_["test_payload_coverage(IPC_handsh)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_076_test_timer_runtime_period_kick_["test_timer_runtime_period(kick)<br/>parametrize<br/>0.10s"]
-    C_Parametrize_L__ --> T_077_test_timer_runtime_period_bridge_clk_ind_["test_timer_runtime_period(bridge_clk_i<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_078_test_timer_runtime_period_bts_clk_ind_["test_timer_runtime_period(bts_clk_ind)<br/>parametrize<br/>0.00s"]
-    C_Parametrize_L__ --> T_079_test_timer_runtime_period_bsp_burst_["test_timer_runtime_period(bsp_burst)<br/>parametrize<br/>0.10s"]
-  end
-  SG_C_Other -.-> SG_C_Parametrize
-
-  subgraph SG_C_Runtime ["Runtime 64/96"]
-    direction TB
-    C_Runtime_L_DSP["DSP<br/>2/10"]
-    C_Runtime_L_DSP --> T_080_pass_grp_DSP["PASS 2<br/>0.0s"]
-    C_Runtime_L_DSP --> T_081_test_intm_reaches_zero["test_intm_reaches_zero<br/>runtime_dsp<br/>0.02s"]
-    C_Runtime_L_DSP --> T_082_test_dsp_throughput_above_threshold["test_dsp_throughput_above_threshold<br/>runtime_dsp<br/>0.02s"]
-    C_Runtime_L_DSP --> T_083_test_d_fb_det_pattern_unchanged["test_d_fb_det_pattern_unchanged<br/>runtime_dsp<br/>0.03s"]
-    C_Runtime_L_DSP --> T_084_test_bsp_daram_write_distribution["test_bsp_daram_write_distribution<br/>runtime_dsp<br/>0.02s"]
-    C_Runtime_L_DSP --> T_085_test_d_fb_det_data_no_longer_zero["test_d_fb_det_data_no_longer_zero<br/>runtime_dsp<br/>0.01s"]
-    C_Runtime_L_DSP --> T_086_test_interrupt_ex_called_counter_exposed["test_interrupt_ex_called_counter_expos<br/>runtime_irq<br/>0.00s"]
-    C_Runtime_L_DSP --> T_087_test_isr_entered_matches_rete["test_isr_entered_matches_rete<br/>runtime_irq<br/>0.00s"]
-    C_Runtime_L_DSP --> T_088_test_no_pending_irq_gating["test_no_pending_irq_gating<br/>runtime_irq<br/>0.00s"]
-    C_Runtime_L_FS["FS<br/>3/3"]
-    C_Runtime_L_DSP -.-> C_Runtime_L_FS
-    C_Runtime_L_FS --> T_089_pass_grp_FS["PASS 3<br/>0.0s"]
-    C_Runtime_L_Firmware_state["Firmware-state<br/>5/5"]
-    C_Runtime_L_FS -.-> C_Runtime_L_Firmware_state
-    C_Runtime_L_Firmware_state --> T_090_pass_grp_Firmware_state["PASS 5<br/>0.2s"]
-    C_Runtime_L_GDB_introspect["GDB-introspect<br/>8/8"]
-    C_Runtime_L_Firmware_state -.-> C_Runtime_L_GDB_introspect
-    C_Runtime_L_GDB_introspect --> T_091_pass_grp_GDB_introspect["PASS 8<br/>0.3s"]
-    C_Runtime_L_Infra["Infra<br/>5/5"]
-    C_Runtime_L_GDB_introspect -.-> C_Runtime_L_Infra
-    C_Runtime_L_Infra --> T_092_pass_grp_Infra["PASS 5<br/>13.0s"]
-    C_Runtime_L_IrDA_channel["IrDA-channel<br/>3/8"]
-    C_Runtime_L_Infra -.-> C_Runtime_L_IrDA_channel
-    C_Runtime_L_IrDA_channel --> T_093_pass_grp_IrDA_channel["PASS 3<br/>0.1s"]
-    C_Runtime_L_IrDA_channel --> T_094_test_irda_boot_marker_present["test_irda_boot_marker_present<br/>runtime_irda<br/>0.00s"]
-    C_Runtime_L_IrDA_channel --> T_095_test_irda_channel_produces_bytes["test_irda_channel_produces_bytes<br/>runtime_irda<br/>5.03s"]
-    C_Runtime_L_IrDA_channel --> T_096_test_irda_log_has_timestamp_prefix["test_irda_log_has_timestamp_prefix<br/>runtime_irda<br/>0.00s"]
-    C_Runtime_L_IrDA_channel --> T_097_test_irda_capture_process_alive["test_irda_capture_process_alive<br/>runtime_irda<br/>0.00s"]
-    C_Runtime_L_IrDA_channel --> T_098_test_irda_throughput_below_saturation["test_irda_throughput_below_saturation<br/>runtime_irda<br/>10.07s"]
-    C_Runtime_L_L1_ctrl["L1-ctrl<br/>1/6"]
-    C_Runtime_L_IrDA_channel -.-> C_Runtime_L_L1_ctrl
-    C_Runtime_L_L1_ctrl --> T_099_pass_grp_L1_ctrl["PASS 1<br/>0.1s"]
-    C_Runtime_L_L1_ctrl --> T_100_test_l1ctl_data_ind_received["test_l1ctl_data_ind_received<br/>runtime_l1ctl<br/>0.01s"]
-    C_Runtime_L_L1_ctrl --> T_101_test_a_cd_writes_nonzero["test_a_cd_writes_nonzero<br/>runtime_l1ctl<br/>0.01s"]
-    C_Runtime_L_L1_ctrl --> T_102_test_a_cd_write_pc_includes_ccch_demod["test_a_cd_write_pc_includes_ccch_demod<br/>runtime_l1ctl<br/>0.02s"]
-    C_Runtime_L_L1_ctrl --> T_103_test_l1ctl_data_ind_rate_vs_alc["test_l1ctl_data_ind_rate_vs_alc<br/>runtime_l1ctl<br/>0.02s"]
-    C_Runtime_L_L1_ctrl --> T_104_test_rach_attempted["test_rach_attempted<br/>runtime_l1ctl<br/>0.00s"]
-    C_Runtime_L_L1_data["L1-data<br/>1/3"]
-    C_Runtime_L_L1_ctrl -.-> C_Runtime_L_L1_data
-    C_Runtime_L_L1_data --> T_105_pass_grp_L1_data["PASS 1<br/>0.0s"]
-    C_Runtime_L_L1_data --> T_106_test_bridge_fn_drift_under_threshold["test_bridge_fn_drift_under_threshold<br/>runtime_bridge<br/>0.00s"]
-    C_Runtime_L_L1_data --> T_107_test_bridge_dl_lookahead_respected["test_bridge_dl_lookahead_respected<br/>runtime_bridge<br/>0.00s"]
-    C_Runtime_L_Log_grep["Log-grep<br/>19/30"]
-    C_Runtime_L_L1_data -.-> C_Runtime_L_Log_grep
-    C_Runtime_L_Log_grep --> T_108_pass_grp_Log_grep["PASS 19<br/>0.2s"]
-    C_Runtime_L_Log_grep --> T_109_test_grep_qemu_task24_dispatched["test_grep_qemu_task24_dispatched<br/>runtime_log_grep<br/>0.01s"]
-    C_Runtime_L_Log_grep --> T_110_test_grep_bridge_dl_bursts_received["test_grep_bridge_dl_bursts_received<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_111_test_grep_bridge_fb_pattern_dominant["test_grep_bridge_fb_pattern_dominant<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_112_test_grep_bridge_no_clock_skew_shutdown["test_grep_bridge_no_clock_skew_shutdow<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_113_test_grep_fwirda_log_present_or_skip["test_grep_fwirda_log_present_or_skip<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_114_test_grep_fwirda_boot_marker["test_grep_fwirda_boot_marker<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_115_test_blocker_bridge_no_bts_shutdown["test_blocker_bridge_no_bts_shutdown<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_116_test_blocker_bridge_no_rach_parity["test_blocker_bridge_no_rach_parity<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_117_test_blocker_bridge_no_socket_error["test_blocker_bridge_no_socket_error<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_118_test_blocker_fwirda_no_panic["test_blocker_fwirda_no_panic<br/>runtime_log_grep<br/>0.00s"]
-    C_Runtime_L_Log_grep --> T_119_test_grep_qemu_a_cd_wr_vs_task24["test_grep_qemu_a_cd_wr_vs_task24<br/>runtime_log_grep<br/>0.02s"]
-    C_Runtime_L_Mgmt["Mgmt<br/>3/3"]
-    C_Runtime_L_Log_grep -.-> C_Runtime_L_Mgmt
-    C_Runtime_L_Mgmt --> T_120_pass_grp_Mgmt["PASS 3<br/>4.5s"]
-    C_Runtime_L_Monitor_extended["Monitor-extended<br/>9/9"]
-    C_Runtime_L_Mgmt -.-> C_Runtime_L_Monitor_extended
-    C_Runtime_L_Monitor_extended --> T_121_pass_grp_Monitor_extended["PASS 9<br/>27.0s"]
-    C_Runtime_L_Net["Net<br/>2/2"]
-    C_Runtime_L_Monitor_extended -.-> C_Runtime_L_Net
-    C_Runtime_L_Net --> T_122_pass_grp_Net["PASS 2<br/>0.0s"]
-    C_Runtime_L_Osmocon["Osmocon<br/>2/3"]
-    C_Runtime_L_Net -.-> C_Runtime_L_Osmocon
-    C_Runtime_L_Osmocon --> T_123_pass_grp_Osmocon["PASS 2<br/>0.1s"]
-    C_Runtime_L_Osmocon --> T_124_test_osmocon_no_recent_lost_spam["test_osmocon_no_recent_lost_spam<br/>runtime_osmocon<br/>0.03s"]
-    C_Runtime_L_Summary["Summary<br/>1/1"]
-    C_Runtime_L_Osmocon -.-> C_Runtime_L_Summary
-    C_Runtime_L_Summary --> T_125_pass_grp_Summary["PASS 1<br/>30.2s"]
-  end
-  SG_C_Parametrize -.-> SG_C_Runtime
-
-  subgraph SG_C_Timer ["Timer 2/2"]
-    direction TB
-    C_Timer_L__["—<br/>2/2"]
-    C_Timer_L__ --> T_126_pass_grp__["PASS 2<br/>0.5s"]
-  end
-  SG_C_Runtime -.-> SG_C_Timer
-
-  subgraph SG_C_Timing ["Timing 11/19"]
-    direction TB
-    C_Timing_L_Drift["Drift<br/>4/10"]
-    C_Timing_L_Drift --> T_127_pass_grp_Drift["PASS 4<br/>0.1s"]
-    C_Timing_L_Drift --> T_128_test_qemu_insn_rate_cv_below_0_4["test_qemu_insn_rate_cv_below_0_4<br/>drift<br/>0.10s"]
-    C_Timing_L_Drift --> T_129_test_qemu_insn_rate_p1_above_1m["test_qemu_insn_rate_p1_above_1m<br/>drift<br/>0.06s"]
-    C_Timing_L_Drift --> T_130_test_bridge_qfn_tracks_qemu_fn["test_bridge_qfn_tracks_qemu_fn<br/>drift<br/>0.04s"]
-    C_Timing_L_Drift --> T_131_test_bridge_qfn_advances_steadily["test_bridge_qfn_advances_steadily<br/>drift<br/>0.00s"]
-    C_Timing_L_Drift --> T_132_test_log_still_growing_bridge__root_bridge_py_lo["test_log_still_growing(bridge-/root/br<br/>drift<br/>0.00s"]
-    C_Timing_L_Drift --> T_133_test_no_long_gap_bridge__root_bridge_py_log_10_0["test_no_long_gap(bridge-/root/bridge.p<br/>drift<br/>0.00s"]
-    C_Timing_L_Timers["Timers<br/>7/9"]
-    C_Timing_L_Drift -.-> C_Timing_L_Timers
-    C_Timing_L_Timers --> T_134_pass_grp_Timers["PASS 7<br/>0.0s"]
-    C_Timing_L_Timers --> T_135_test_frame_irq_per_tdma_ratio["test_frame_irq_per_tdma_ratio<br/>timer_invariant<br/>0.05s"]
-    C_Timing_L_Timers --> T_136_test_kick_realtime_cadence["test_kick_realtime_cadence<br/>timer_invariant<br/>0.04s"]
-  end
-  SG_C_Timer -.-> SG_C_Timing
-  class C_Ar_L__ partial;
-  class T_001_pass_grp__ pass;
-  class T_002_test_reset_sp_silicon skip;
-  class T_003_test_reset_pmst_silicon skip;
-  class T_004_test_irq_servicing_imr_nonzero skip;
-  class T_005_test_tpu_frame_irq_delivered skip;
+  C_Injection["Injection<br/>9/21"]
+  class C_Injection partial;
+  C_Injection_L_ARM_feedback["ARM-feedback<br/>0/2"]
   class C_Injection_L_ARM_feedback fail;
-  class T_006_test_efficacy_arm_reads_d_fb_det_1 xfail;
-  class T_007_test_efficacy_arm_reads_a_cd xfail;
-  class C_Injection_L_NDB pass;
-  class T_008_pass_grp_NDB pass;
+  C_Injection --> C_Injection_L_ARM_feedback
+  C_Injection_L_ARM_feedback --> T_001_test_efficacy_arm_reads_d_fb_det_1["test_efficacy_arm_reads_d_fb_det_1<br/>inject_efficacy<br/>3.15s"]
+  class T_001_test_efficacy_arm_reads_d_fb_det_1 fail;
+  C_Injection_L_ARM_feedback --> T_002_test_efficacy_arm_reads_a_cd["test_efficacy_arm_reads_a_cd<br/>inject_efficacy<br/>3.11s"]
+  class T_002_test_efficacy_arm_reads_a_cd xfail;
+  C_Injection_L_NDB["NDB<br/>9/19"]
+  class C_Injection_L_NDB partial;
+  C_Injection --> C_Injection_L_NDB
+  C_Injection_L_NDB --> T_003_test_probe_ndb["test_probe_ndb<br/>inject_frames<br/>0.29s"]
+  class T_003_test_probe_ndb pass;
+  C_Injection_L_NDB --> T_004_test_clear_ndb["test_clear_ndb<br/>inject_frames<br/>0.29s"]
+  class T_004_test_clear_ndb pass;
+  C_Injection_L_NDB --> T_005_test_inject_fbsb_fb_found["test_inject_fbsb_fb_found<br/>inject_frames<br/>0.62s"]
+  class T_005_test_inject_fbsb_fb_found fail;
+  C_Injection_L_NDB --> T_006_test_inject_fbsb_sb_found["test_inject_fbsb_sb_found<br/>inject_frames<br/>0.54s"]
+  class T_006_test_inject_fbsb_sb_found pass;
+  C_Injection_L_NDB --> T_007_test_inject_si_1_["test_inject_si(1)<br/>inject_frames<br/>0.33s"]
+  class T_007_test_inject_si_1_ fail;
+  C_Injection_L_NDB --> T_008_test_inject_si_2_["test_inject_si(2)<br/>inject_frames<br/>0.33s"]
+  class T_008_test_inject_si_2_ fail;
+  C_Injection_L_NDB --> T_009_test_inject_si_3_["test_inject_si(3)<br/>inject_frames<br/>0.33s"]
+  class T_009_test_inject_si_3_ fail;
+  C_Injection_L_NDB --> T_010_test_inject_si_4_["test_inject_si(4)<br/>inject_frames<br/>0.33s"]
+  class T_010_test_inject_si_4_ fail;
+  C_Injection_L_NDB --> T_011_test_inject_si_5_["test_inject_si(5)<br/>inject_frames<br/>0.37s"]
+  class T_011_test_inject_si_5_ fail;
+  C_Injection_L_NDB --> T_012_test_inject_si_6_["test_inject_si(6)<br/>inject_frames<br/>0.33s"]
+  class T_012_test_inject_si_6_ fail;
+  C_Injection_L_NDB --> T_013_test_inject_a_cd_pattern_23B["test_inject_a_cd_pattern_23B<br/>inject_frames<br/>0.33s"]
+  class T_013_test_inject_a_cd_pattern_23B fail;
+  C_Injection_L_NDB --> T_014_test_inject_a_cd_pattern_30B["test_inject_a_cd_pattern_30B<br/>inject_frames<br/>0.33s"]
+  class T_014_test_inject_a_cd_pattern_30B fail;
+  C_Injection_L_NDB --> T_015_test_inject_a_cd_invalid_length["test_inject_a_cd_invalid_length<br/>inject_frames<br/>0.00s"]
+  class T_015_test_inject_a_cd_invalid_length pass;
+  C_Injection_L_NDB --> T_016_test_inject_d_task_5_0_["test_inject_d_task(5-0)<br/>inject_frames<br/>0.04s"]
+  class T_016_test_inject_d_task_5_0_ pass;
+  C_Injection_L_NDB --> T_017_test_inject_d_task_6_1_["test_inject_d_task(6-1)<br/>inject_frames<br/>0.04s"]
+  class T_017_test_inject_d_task_6_1_ pass;
+  C_Injection_L_NDB --> T_018_test_inject_d_task_24_0_["test_inject_d_task(24-0)<br/>inject_frames<br/>0.04s"]
+  class T_018_test_inject_d_task_24_0_ pass;
+  C_Injection_L_NDB --> T_019_test_inject_d_task_28_1_["test_inject_d_task(28-1)<br/>inject_frames<br/>0.04s"]
+  class T_019_test_inject_d_task_28_1_ fail;
+  C_Injection_L_NDB --> T_020_test_inject_d_burst_0_["test_inject_d_burst(0)<br/>inject_frames<br/>0.04s"]
+  class T_020_test_inject_d_burst_0_ pass;
+  C_Injection_L_NDB --> T_021_test_inject_d_burst_1_["test_inject_d_burst(1)<br/>inject_frames<br/>0.04s"]
+  class T_021_test_inject_d_burst_1_ pass;
+  C_Milestone["Milestone<br/>6/21"]
+  class C_Milestone partial;
+  C_Milestone_L_DSP["DSP<br/>4/10"]
   class C_Milestone_L_DSP partial;
-  class T_009_pass_grp_DSP pass;
-  class T_010_test_dsp_throughput_5x skip;
-  class T_011_test_fb0_att_nonzero xfail;
-  class T_012_test_synth_zero_path_active xfail;
-  class T_013_test_c54x_interrupt_ex_called_nonzero xfail;
-  class T_014_test_isr_entered_implies_rete xfail;
-  class T_015_test_no_pending_irq_gated xfail;
-  class T_016_test_rxdoneflag_no_longer_blocks xfail;
+  C_Milestone --> C_Milestone_L_DSP
+  C_Milestone_L_DSP --> T_022_test_popm_decoder_active["test_popm_decoder_active<br/>milestone_dsp_decoder<br/>0.00s"]
+  class T_022_test_popm_decoder_active pass;
+  C_Milestone_L_DSP --> T_023_test_tier_a_decoder_fixes_present["test_tier_a_decoder_fixes_present<br/>milestone_dsp_decoder<br/>0.00s"]
+  class T_023_test_tier_a_decoder_fixes_present pass;
+  C_Milestone_L_DSP --> T_024_test_intm_dwell_no_regression["test_intm_dwell_no_regression<br/>milestone_dsp_decoder<br/>30.57s"]
+  class T_024_test_intm_dwell_no_regression pass;
+  C_Milestone_L_DSP --> T_025_test_dsp_throughput_5x["test_dsp_throughput_5x<br/>milestone_dsp_decoder<br/>0.13s"]
+  class T_025_test_dsp_throughput_5x pass;
+  C_Milestone_L_DSP --> T_026_test_fb0_att_nonzero["test_fb0_att_nonzero<br/>milestone_fb_det<br/>0.00s"]
+  class T_026_test_fb0_att_nonzero xfail;
+  C_Milestone_L_DSP --> T_027_test_synth_zero_path_active["test_synth_zero_path_active<br/>milestone_fb_det<br/>0.11s"]
+  class T_027_test_synth_zero_path_active skip;
+  C_Milestone_L_DSP --> T_028_test_c54x_interrupt_ex_called_nonzero["test_c54x_interrupt_ex_called_nonzero<br/>milestone_irq<br/>0.00s"]
+  class T_028_test_c54x_interrupt_ex_called_nonzero xfail;
+  C_Milestone_L_DSP --> T_029_test_isr_entered_implies_rete["test_isr_entered_implies_rete<br/>milestone_irq<br/>0.00s"]
+  class T_029_test_isr_entered_implies_rete xfail;
+  C_Milestone_L_DSP --> T_030_test_no_pending_irq_gated["test_no_pending_irq_gated<br/>milestone_irq<br/>0.00s"]
+  class T_030_test_no_pending_irq_gated xfail;
+  C_Milestone_L_DSP --> T_031_test_rxdoneflag_no_longer_blocks["test_rxdoneflag_no_longer_blocks<br/>milestone_dsp_decoder<br/>0.00s"]
+  class T_031_test_rxdoneflag_no_longer_blocks xfail;
+  C_Milestone_L_L1_ctrl["L1-ctrl<br/>0/2"]
   class C_Milestone_L_L1_ctrl fail;
-  class T_017_test_l1ctl_data_ind_received xfail;
-  class T_018_test_neigh_pm_req_response_unchanged xfail;
-  class C_Milestone_L_L1_data fail;
-  class T_019_test_ar3_init_source_identified skip;
-  class T_020_test_ar4_init_source_identified skip;
-  class T_021_test_bsp_dma_target_matches_correlator_read_zone skip;
-  class T_022_test_no_d_fb_det_wr_site_anomaly xfail;
+  C_Milestone --> C_Milestone_L_L1_ctrl
+  C_Milestone_L_L1_ctrl --> T_032_test_l1ctl_data_ind_received["test_l1ctl_data_ind_received<br/>milestone_l1ctl<br/>0.16s"]
+  class T_032_test_l1ctl_data_ind_received fail;
+  C_Milestone_L_L1_ctrl --> T_033_test_neigh_pm_req_response_unchanged["test_neigh_pm_req_response_unchanged<br/>milestone_l1ctl<br/>0.00s"]
+  class T_033_test_neigh_pm_req_response_unchanged xfail;
+  C_Milestone_L_L1_data["L1-data<br/>2/4"]
+  class C_Milestone_L_L1_data partial;
+  C_Milestone --> C_Milestone_L_L1_data
+  C_Milestone_L_L1_data --> T_034_test_ar3_init_source_identified["test_ar3_init_source_identified<br/>milestone_bsp_dma<br/>0.01s"]
+  class T_034_test_ar3_init_source_identified skip;
+  C_Milestone_L_L1_data --> T_035_test_ar4_init_source_identified["test_ar4_init_source_identified<br/>milestone_bsp_dma<br/>0.01s"]
+  class T_035_test_ar4_init_source_identified skip;
+  C_Milestone_L_L1_data --> T_036_test_bsp_dma_target_matches_correlator_read_zone["test_bsp_dma_target_matches_correlator<br/>milestone_bsp_dma<br/>0.06s"]
+  class T_036_test_bsp_dma_target_matches_correlator_read_zone pass;
+  C_Milestone_L_L1_data --> T_037_test_no_d_fb_det_wr_site_anomaly["test_no_d_fb_det_wr_site_anomaly<br/>milestone_bsp_dma<br/>0.17s"]
+  class T_037_test_no_d_fb_det_wr_site_anomaly pass;
+  C_Milestone_L_L3_MM["L3-MM<br/>0/5"]
   class C_Milestone_L_L3_MM fail;
-  class T_023_test_rach_emitted xfail;
-  class T_024_test_immediate_assignment_decoded xfail;
-  class T_025_test_rr_sdcch_established xfail;
-  class T_026_test_location_updating_request_sent xfail;
-  class T_027_test_location_updating_accept_received xfail;
-  class C_Osmocom_L__ partial;
-  class T_028_pass_grp__ pass;
-  class T_029_test_bridge_clock_from_qemu_defaultX xfail;
-  class C_Other_L_unmarked partial;
-  class T_030_pass_grp_unmarked pass;
-  class T_031_test_verdict_shunt_works skip;
-  class T_032_test_verdict_shunt_silent skip;
-  class T_033_test_verdict_bts_dead skip;
-  class T_034_test_verdict_ipc_chan_mismatch skip;
-  class T_035_test_bissection_fbsb_shunt_vs_full skip;
-  class T_036_test_bridge_vs_ipc_radio_chain skip;
-  class T_037_test_lost_frames_consistency skip;
-  class T_038_test_errors_quiet skip;
-  class T_039_test_verdict_dsp_wall_confirmed skip;
-  class T_040_test_verdict_arm_bug skip;
-  class T_041_test_verdict_pipeline_works skip;
-  class T_042_test_verdict_radio_chain_broken skip;
-  class T_043_test_verdict_instability skip;
-  class T_044_test_verdict_bridge_vs_ipc skip;
-  class T_045_test_zz_final_report skip;
-  class C_Parametrize_L__ partial;
-  class T_046_pass_grp__ pass;
-  class T_047_test_mode_executed_full_ skip;
-  class T_048_test_mode_executed_shunt_ skip;
-  class T_049_test_mode_executed_shunt_ipc_ skip;
-  class T_050_test_mode_executed_bridge_ skip;
-  class T_051_test_mode_executed_bare_ skip;
-  class T_052_test_mode_invariant_full_bts_ok___0_osmo_bts_trx skip;
-  class T_053_test_mode_invariant_full_ipc_ok___0_calypso_ipc_ skip;
-  class T_054_test_mode_invariant_full_err_q____0_qemu_log_san skip;
-  class T_055_test_mode_invariant_shunt_shunt_latch___0_ARM_do skip;
-  class T_056_test_mode_invariant_shunt_shunt_disp___0_le_mock skip;
-  class T_057_test_mode_invariant_shunt_err_q____0_qemu_log_sa skip;
-  class T_058_test_mode_invariant_shunt_bts_ok____0_BTS_doit__ skip;
-  class T_059_test_mode_invariant_shunt_ipc_ok____0_IPC_doit__ skip;
-  class T_060_test_mode_invariant_shunt_ipc_shunt_latch___0_AR skip;
-  class T_061_test_mode_invariant_shunt_ipc_shunt_disp___0_le_ skip;
-  class T_062_test_mode_invariant_shunt_ipc_bts_ok___0_BTS_ali skip;
-  class T_063_test_mode_invariant_shunt_ipc_ipc_ok___0_IPC_han skip;
-  class T_064_test_mode_invariant_bridge_bts_ok___0_BTS_alive_ skip;
-  class T_065_test_mode_invariant_bridge_ipc_ok____0_IPC_skipp skip;
-  class T_066_test_mode_invariant_bare_bts_ok____0_pas_de_BTS_ skip;
-  class T_067_test_mode_invariant_bare_ipc_ok____0_pas_d_IPC_e skip;
-  class T_068_test_mode_invariant_bare_rr_est____0_pas_de_mobi skip;
-  class T_069_test_payload_coverage_FB_detect_ skip;
-  class T_070_test_payload_coverage_SB_decode_ skip;
-  class T_071_test_payload_coverage_Mock_LATCH_ skip;
-  class T_072_test_payload_coverage_Mock_DISP_ skip;
-  class T_073_test_payload_coverage_RR_EST_REQ_ skip;
-  class T_074_test_payload_coverage_BTS_alive_ skip;
-  class T_075_test_payload_coverage_IPC_handsh_ skip;
-  class T_076_test_timer_runtime_period_kick_ skip;
-  class T_077_test_timer_runtime_period_bridge_clk_ind_ skip;
-  class T_078_test_timer_runtime_period_bts_clk_ind_ skip;
-  class T_079_test_timer_runtime_period_bsp_burst_ skip;
+  C_Milestone --> C_Milestone_L_L3_MM
+  C_Milestone_L_L3_MM --> T_038_test_rach_emitted["test_rach_emitted<br/>milestone_mm_lu<br/>0.00s"]
+  class T_038_test_rach_emitted xfail;
+  C_Milestone_L_L3_MM --> T_039_test_immediate_assignment_decoded["test_immediate_assignment_decoded<br/>milestone_mm_lu<br/>0.00s"]
+  class T_039_test_immediate_assignment_decoded xfail;
+  C_Milestone_L_L3_MM --> T_040_test_rr_sdcch_established["test_rr_sdcch_established<br/>milestone_mm_lu<br/>0.00s"]
+  class T_040_test_rr_sdcch_established xfail;
+  C_Milestone_L_L3_MM --> T_041_test_location_updating_request_sent["test_location_updating_request_sent<br/>milestone_mm_lu<br/>0.00s"]
+  class T_041_test_location_updating_request_sent xfail;
+  C_Milestone_L_L3_MM --> T_042_test_location_updating_accept_received["test_location_updating_accept_received<br/>milestone_mm_lu<br/>0.00s"]
+  class T_042_test_location_updating_accept_received xfail;
+  C_Runtime["Runtime<br/>19/28"]
+  class C_Runtime partial;
+  C_Runtime_L_DSP["DSP<br/>6/10"]
   class C_Runtime_L_DSP partial;
-  class T_080_pass_grp_DSP pass;
-  class T_081_test_intm_reaches_zero xfail;
-  class T_082_test_dsp_throughput_above_threshold skip;
-  class T_083_test_d_fb_det_pattern_unchanged skip;
-  class T_084_test_bsp_daram_write_distribution skip;
-  class T_085_test_d_fb_det_data_no_longer_zero skip;
-  class T_086_test_interrupt_ex_called_counter_exposed xfail;
-  class T_087_test_isr_entered_matches_rete xfail;
-  class T_088_test_no_pending_irq_gating xfail;
-  class C_Runtime_L_FS pass;
-  class T_089_pass_grp_FS pass;
-  class C_Runtime_L_Firmware_state pass;
-  class T_090_pass_grp_Firmware_state pass;
-  class C_Runtime_L_GDB_introspect pass;
-  class T_091_pass_grp_GDB_introspect pass;
+  C_Runtime --> C_Runtime_L_DSP
+  C_Runtime_L_DSP --> T_043_test_no_wait_a21a_on_window["test_no_wait_a21a_on_window<br/>runtime_dsp<br/>0.07s"]
+  class T_043_test_no_wait_a21a_on_window pass;
+  C_Runtime_L_DSP --> T_044_test_no_enter_7740_dwell["test_no_enter_7740_dwell<br/>runtime_dsp<br/>0.08s"]
+  class T_044_test_no_enter_7740_dwell pass;
+  C_Runtime_L_DSP --> T_045_test_intm_reaches_zero["test_intm_reaches_zero<br/>runtime_dsp<br/>0.07s"]
+  class T_045_test_intm_reaches_zero pass;
+  C_Runtime_L_DSP --> T_046_test_dsp_throughput_above_threshold["test_dsp_throughput_above_threshold<br/>runtime_dsp<br/>0.07s"]
+  class T_046_test_dsp_throughput_above_threshold pass;
+  C_Runtime_L_DSP --> T_047_test_d_fb_det_pattern_unchanged["test_d_fb_det_pattern_unchanged<br/>runtime_dsp<br/>0.06s"]
+  class T_047_test_d_fb_det_pattern_unchanged xfail;
+  C_Runtime_L_DSP --> T_048_test_bsp_daram_write_distribution["test_bsp_daram_write_distribution<br/>runtime_dsp<br/>0.08s"]
+  class T_048_test_bsp_daram_write_distribution pass;
+  C_Runtime_L_DSP --> T_049_test_d_fb_det_data_no_longer_zero["test_d_fb_det_data_no_longer_zero<br/>runtime_dsp<br/>0.08s"]
+  class T_049_test_d_fb_det_data_no_longer_zero pass;
+  C_Runtime_L_DSP --> T_050_test_interrupt_ex_called_counter_exposed["test_interrupt_ex_called_counter_expos<br/>runtime_irq<br/>0.06s"]
+  class T_050_test_interrupt_ex_called_counter_exposed xfail;
+  C_Runtime_L_DSP --> T_051_test_isr_entered_matches_rete["test_isr_entered_matches_rete<br/>runtime_irq<br/>0.13s"]
+  class T_051_test_isr_entered_matches_rete xfail;
+  C_Runtime_L_DSP --> T_052_test_no_pending_irq_gating["test_no_pending_irq_gating<br/>runtime_irq<br/>0.16s"]
+  class T_052_test_no_pending_irq_gating xfail;
+  C_Runtime_L_Infra["Infra<br/>5/5"]
   class C_Runtime_L_Infra pass;
-  class T_092_pass_grp_Infra pass;
-  class C_Runtime_L_IrDA_channel partial;
-  class T_093_pass_grp_IrDA_channel pass;
-  class T_094_test_irda_boot_marker_present xfail;
-  class T_095_test_irda_channel_produces_bytes xfail;
-  class T_096_test_irda_log_has_timestamp_prefix skip;
-  class T_097_test_irda_capture_process_alive xfail;
-  class T_098_test_irda_throughput_below_saturation skip;
+  C_Runtime --> C_Runtime_L_Infra
+  C_Runtime_L_Infra --> T_053_test_all_expected_processes_present["test_all_expected_processes_present<br/>runtime_health<br/>0.12s"]
+  class T_053_test_all_expected_processes_present pass;
+  C_Runtime_L_Infra --> T_054_test_no_zombie_or_defunct["test_no_zombie_or_defunct<br/>runtime_health<br/>0.05s"]
+  class T_054_test_no_zombie_or_defunct pass;
+  C_Runtime_L_Infra --> T_055_test_qemu_log_is_fresh["test_qemu_log_is_fresh<br/>runtime_health<br/>3.11s"]
+  class T_055_test_qemu_log_is_fresh pass;
+  C_Runtime_L_Infra --> T_056_test_mobile_pcap_growing["test_mobile_pcap_growing<br/>runtime_health<br/>10.00s"]
+  class T_056_test_mobile_pcap_growing pass;
+  C_Runtime_L_Infra --> T_057_test_volumes_mounted["test_volumes_mounted<br/>runtime_health<br/>0.08s"]
+  class T_057_test_volumes_mounted pass;
+  C_Runtime_L_L1_ctrl["L1-ctrl<br/>2/6"]
   class C_Runtime_L_L1_ctrl partial;
-  class T_099_pass_grp_L1_ctrl pass;
-  class T_100_test_l1ctl_data_ind_received xfail;
-  class T_101_test_a_cd_writes_nonzero skip;
-  class T_102_test_a_cd_write_pc_includes_ccch_demod xfail;
-  class T_103_test_l1ctl_data_ind_rate_vs_alc skip;
-  class T_104_test_rach_attempted xfail;
+  C_Runtime --> C_Runtime_L_L1_ctrl
+  C_Runtime_L_L1_ctrl --> T_058_test_neigh_pm_req_loop_alive["test_neigh_pm_req_loop_alive<br/>runtime_l1ctl<br/>0.19s"]
+  class T_058_test_neigh_pm_req_loop_alive pass;
+  C_Runtime_L_L1_ctrl --> T_059_test_l1ctl_data_ind_received["test_l1ctl_data_ind_received<br/>runtime_l1ctl<br/>0.17s"]
+  class T_059_test_l1ctl_data_ind_received fail;
+  C_Runtime_L_L1_ctrl --> T_060_test_a_cd_writes_nonzero["test_a_cd_writes_nonzero<br/>runtime_l1ctl<br/>0.09s"]
+  class T_060_test_a_cd_writes_nonzero pass;
+  C_Runtime_L_L1_ctrl --> T_061_test_a_cd_write_pc_includes_ccch_demod["test_a_cd_write_pc_includes_ccch_demod<br/>runtime_l1ctl<br/>0.19s"]
+  class T_061_test_a_cd_write_pc_includes_ccch_demod xfail;
+  C_Runtime_L_L1_ctrl --> T_062_test_l1ctl_data_ind_rate_vs_alc["test_l1ctl_data_ind_rate_vs_alc<br/>runtime_l1ctl<br/>0.24s"]
+  class T_062_test_l1ctl_data_ind_rate_vs_alc fail;
+  C_Runtime_L_L1_ctrl --> T_063_test_rach_attempted["test_rach_attempted<br/>runtime_l1ctl<br/>0.00s"]
+  class T_063_test_rach_attempted xfail;
+  C_Runtime_L_L1_data["L1-data<br/>2/3"]
   class C_Runtime_L_L1_data partial;
-  class T_105_pass_grp_L1_data pass;
-  class T_106_test_bridge_fn_drift_under_threshold xfail;
-  class T_107_test_bridge_dl_lookahead_respected skip;
-  class C_Runtime_L_Log_grep partial;
-  class T_108_pass_grp_Log_grep pass;
-  class T_109_test_grep_qemu_task24_dispatched xfail;
-  class T_110_test_grep_bridge_dl_bursts_received skip;
-  class T_111_test_grep_bridge_fb_pattern_dominant skip;
-  class T_112_test_grep_bridge_no_clock_skew_shutdown skip;
-  class T_113_test_grep_fwirda_log_present_or_skip skip;
-  class T_114_test_grep_fwirda_boot_marker skip;
-  class T_115_test_blocker_bridge_no_bts_shutdown skip;
-  class T_116_test_blocker_bridge_no_rach_parity skip;
-  class T_117_test_blocker_bridge_no_socket_error skip;
-  class T_118_test_blocker_fwirda_no_panic skip;
-  class T_119_test_grep_qemu_a_cd_wr_vs_task24 skip;
+  C_Runtime --> C_Runtime_L_L1_data
+  C_Runtime_L_L1_data --> T_064_test_bridge_log_shows_traffic["test_bridge_log_shows_traffic<br/>runtime_bridge<br/>0.05s"]
+  class T_064_test_bridge_log_shows_traffic pass;
+  C_Runtime_L_L1_data --> T_065_test_bridge_fn_drift_under_threshold["test_bridge_fn_drift_under_threshold<br/>runtime_bridge<br/>0.00s"]
+  class T_065_test_bridge_fn_drift_under_threshold xfail;
+  C_Runtime_L_L1_data --> T_066_test_bridge_dl_lookahead_respected["test_bridge_dl_lookahead_respected<br/>runtime_bridge<br/>0.05s"]
+  class T_066_test_bridge_dl_lookahead_respected pass;
+  C_Runtime_L_Mgmt["Mgmt<br/>3/3"]
   class C_Runtime_L_Mgmt pass;
-  class T_120_pass_grp_Mgmt pass;
-  class C_Runtime_L_Monitor_extended pass;
-  class T_121_pass_grp_Monitor_extended pass;
-  class C_Runtime_L_Net pass;
-  class T_122_pass_grp_Net pass;
-  class C_Runtime_L_Osmocon partial;
-  class T_123_pass_grp_Osmocon pass;
-  class T_124_test_osmocon_no_recent_lost_spam xfail;
+  C_Runtime --> C_Runtime_L_Mgmt
+  C_Runtime_L_Mgmt --> T_067_test_mobile_vty_reachable["test_mobile_vty_reachable<br/>runtime_vty<br/>1.61s"]
+  class T_067_test_mobile_vty_reachable pass;
+  C_Runtime_L_Mgmt --> T_068_test_mobile_imsi_loaded["test_mobile_imsi_loaded<br/>runtime_vty<br/>1.62s"]
+  class T_068_test_mobile_imsi_loaded pass;
+  C_Runtime_L_Mgmt --> T_069_test_mobile_mm_state_is_null_or_idle["test_mobile_mm_state_is_null_or_idle<br/>runtime_vty<br/>1.73s"]
+  class T_069_test_mobile_mm_state_is_null_or_idle pass;
+  C_Runtime_L_Summary["Summary<br/>1/1"]
   class C_Runtime_L_Summary pass;
-  class T_125_pass_grp_Summary pass;
-  class C_Timer_L__ pass;
-  class T_126_pass_grp__ pass;
-  class C_Timing_L_Drift partial;
-  class T_127_pass_grp_Drift pass;
-  class T_128_test_qemu_insn_rate_cv_below_0_4 skip;
-  class T_129_test_qemu_insn_rate_p1_above_1m skip;
-  class T_130_test_bridge_qfn_tracks_qemu_fn skip;
-  class T_131_test_bridge_qfn_advances_steadily skip;
-  class T_132_test_log_still_growing_bridge__root_bridge_py_lo skip;
-  class T_133_test_no_long_gap_bridge__root_bridge_py_log_10_0 skip;
-  class C_Timing_L_Timers partial;
-  class T_134_pass_grp_Timers pass;
-  class T_135_test_frame_irq_per_tdma_ratio skip;
-  class T_136_test_kick_realtime_cadence skip;
+  C_Runtime --> C_Runtime_L_Summary
+  C_Runtime_L_Summary --> T_070_test_run_summary_snapshot["test_run_summary_snapshot<br/>runtime_summary<br/>30.68s"]
+  class T_070_test_run_summary_snapshot pass;

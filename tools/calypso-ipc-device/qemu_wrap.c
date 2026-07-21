@@ -162,71 +162,6 @@ struct dl_fifo_entry {
     /* Pre-built TRXDv0 packet, header rewritten at send time with qfn. */
     uint8_t  pkt[TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4];
 };
-
-/* ===== Décimation DL 4 SPS -> 1 SPS (no-debt, 2026-06-24) ====================
- * Le blob corrélateur TI (ROM) corrèle sur 148 samples @ 1 SPS (fenêtre DARAM
- * [0x2a00..0x2b27] = 296 mots = 148 paires, lue par AR3/AR5 post-inc). osmo-trx
- * sort 4 SPS (592 samples/burst). On décime ICI : qemu_wrap = stand-in
- * ABB/front-end RF, qui livre à la cadence que le DSP ingère (flux RF->DSP
- * fidèle) ; le BSP reste à 600B (contrat BSP<->DSP figé, diffable bit-à-bit vs
- * connu-bon pré-2026-06-04). FIR linéaire-phase symétrique N=33 -> N-1=32 ≡ 0
- * mod 8 -> group delay (N-1)/2 = 16 samples d'entrée = 4 samples de sortie
- * ENTIER -> biais TOA CONSTANT (soustrait par le corrélateur ; sweepable
- * CALYPSO_DL_BURST_OFFSET). Cutoff 0.25·(Nyquist 4-SPS) = 0.5·Rsym = Nyquist
- * 1-SPS, fenêtre Hamming. Plancher physique ASSUMÉ : GMSK BT=0.3 déborde le
- * Nyquist 1-SPS -> un résidu se replie quel que soit le FIR (inhérent au 1-SPS
- * imposé par le blob, pas un défaut de filtre). JAMAIS drop 1/4. */
-#define DL_FIR_N      33
-#define DL_FIR_DELAY  ((DL_FIR_N - 1) / 2)   /* 16 samples d'entree */
-static double g_dl_fir[DL_FIR_N];
-static int    g_dl_fir_ready = 0;
-static void dl_fir_init(void)
-{
-    const double fc = 0.25;   /* normalise au Nyquist 4-SPS */
-    double sum = 0.0;
-    for (int k = 0; k < DL_FIR_N; k++) {
-        int    m = k - DL_FIR_DELAY;
-        double sinc = (m == 0) ? fc : sin(M_PI * fc * (double)m) / (M_PI * (double)m);
-        double win  = 0.54 - 0.46 * cos(2.0 * M_PI * (double)k / (double)(DL_FIR_N - 1));
-        g_dl_fir[k] = sinc * win;
-        sum += g_dl_fir[k];
-    }
-    for (int k = 0; k < DL_FIR_N; k++) g_dl_fir[k] /= sum;   /* gain unite DC */
-    g_dl_fir_ready = 1;
-}
-/* in : cs16 I/Q entrelace @ 4 SPS, in_avail samples complexes dispo.
- * out: cs16 I/Q @ 1 SPS, jusqu'a n_out samples. Retourne le nb produit.
- * out[j] = somme_k h[k]*in[j*4 + k]  (centre FIR a in[j*4 + DELAY]). */
-static int dl_decimate_4to1(const int16_t *in, int in_avail,
-                            int16_t *out, int n_out)
-{
-    if (!g_dl_fir_ready) dl_fir_init();
-    int produced = 0;
-    for (int j = 0; j < n_out; j++) {
-        int base = j * 4;
-        /* Zero-pad au-dela de in_avail au lieu de break : garantit TOUJOURS
-         * n_out sorties PROPRES. La fenetre burst (592 @ 4 SPS) ne supporte
-         * pleinement que ~140 sorties decimees ; les ~8 de bord etaient avant
-         * laissees STALE (contenu du burst precedent dans fe->pkt) -> queue de
-         * la fenetre correlateur 0x2a00 = garbage -> D_TOA/D_ANGLE=0. Ici on
-         * zero-pad : attenuation lineaire-phase bornee, mais propre. */
-        double accI = 0.0, accQ = 0.0;
-        for (int k = 0; k < DL_FIR_N; k++) {
-            int idx = base + k;
-            double sI = (idx < in_avail) ? (double)in[2 * idx]     : 0.0;
-            double sQ = (idx < in_avail) ? (double)in[2 * idx + 1] : 0.0;
-            accI += g_dl_fir[k] * sI;
-            accQ += g_dl_fir[k] * sQ;
-        }
-        long iI = lround(accI), iQ = lround(accQ);
-        if (iI >  32767) iI =  32767; else if (iI < -32768) iI = -32768;
-        if (iQ >  32767) iQ =  32767; else if (iQ < -32768) iQ = -32768;
-        out[2 * j]     = (int16_t)iI;
-        out[2 * j + 1] = (int16_t)iQ;
-        produced++;
-    }
-    return produced;
-}
 static struct dl_fifo_entry g_dl_fifo[DL_FIFO_SIZE];
 static volatile size_t      g_dl_fifo_head = 0;   /* next pop index */
 static volatile size_t      g_dl_fifo_tail = 0;   /* next push index */
@@ -359,7 +294,7 @@ static void *clk_listener(void *arg)
         e->pkt[3] = (uint8_t)(bfn >>  8);
         e->pkt[4] = (uint8_t)(bfn);
         ssize_t sent = sendto(g_bsp_fd, e->pkt,
-                              TRXD_HDR_LEN + CALYPSO_BSP_BURSTLEN * 4, 0,  /* 148 @ 1 SPS = 600B (decime) */
+                              TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4, 0,
                               (struct sockaddr *)&g_bsp_peer,
                               sizeof(g_bsp_peer));
         bool was_fcch = e->is_fcch;
@@ -638,12 +573,14 @@ static void ul_gmsk_mod(const int8_t *bits, int16_t *iq)
     const int N = CALYPSO_BSP_BURSTLEN, OSR = CALYPSO_TRX_OSR, NS = N * OSR;
     int active = N;
     if (ACT > 0) active = ACT;
-    else {
-        int tail0 = 1, guard0 = 1;
-        for (int i = 0; i < 8 && i < N; i++) if (bits[i] > 0) { tail0 = 0; break; }
-        for (int i = 88; i < N; i++) if (bits[i] > 0) { guard0 = 0; break; }
-        if (tail0 && guard0) active = 88;   /* access burst (RACH) */
-    }
+    /* FIX RACH FANTÔMES : plus d'auto-détection access-burst depuis le motif de bits.
+     * Le repli non-RACH (bits BSP idle, souvent tail0+guard0) était modulé en
+     * access-burst -> osmo-trx détectait des RACH RA=3 FANTÔMES (mesuré : 90 CHAN RQD
+     * pour 6 vrais RACH) -> canaux SDCCH alloués sans SABM -> WAIT_RLL timeout ->
+     * fuite -> épuisement du pool -> le SMS MO n'obtient plus de canal. Le VRAI RACH
+     * passe par ul_mod_laurent (waveform osmo-trx exacte), JAMAIS par ul_gmsk_mod ;
+     * le self-test aussi. Donc ici = toujours burst normal 148 sym (override possible
+     * via CALYPSO_UL_ACTIVE_SYMS pour debug). */
     if (active > N) active = N;
 
     if (!USEG) {
@@ -929,7 +866,7 @@ static void ul_drain(void)
     if (!_stdone) { _stdone = 1; ul_laurent_selftest(); }   /* #12 : valide le port Laurent 1x */
     if (g_bsp_fd < 0) return;
     uint8_t pkt[UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN + 16];
-    int got = 0;
+    int got = 0, got_rach = 0;   /* got_rach : un VRAI access-burst RACH a ete draine */
     for (;;) {
         ssize_t n = recvfrom(g_bsp_fd, pkt, sizeof(pkt), MSG_DONTWAIT, NULL, NULL);
         if (n < (ssize_t)(UL_TRXD_HDR + CALYPSO_BSP_BURSTLEN)) break;
@@ -998,6 +935,7 @@ static void ul_drain(void)
             ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (RACH brute BSP) */
         }
         got = 1;
+        if (used_tab) got_rach = 1;   /* seul un VRAI RACH (RA publiee) arme g_ul_pending */
         /* INSTR 2026-06-04 : dump one-shot des 1ers bursts UL recus du BSP pour
          * VOIR si c'est un vrai access-burst (sync RACH 41b) ou autre chose, et
          * confirmer la sortie OSR=4. Couper via CALYPSO_UL_DEBUG=0. */
@@ -1016,7 +954,13 @@ static void ul_drain(void)
                  CALYPSO_BSP_BURSTLEN*CALYPSO_TRX_OSR, s0, s1, smid, bs);
         }
     }
-    if (got) g_ul_pending = 1;
+    /* FIX PHANTOM RACH : g_ul_pending (= déclenche la réinjection de g_rach_iq +
+     * la calibration FN) ne doit s'armer que pour un VRAI RACH, pas pour chaque burst
+     * SDCCH/idle drainé du BSP. Avant : tout burst -> g_ul_pending=1 -> réinjection du
+     * dernier RACH à chaque frame -> osmo-trx corrèle en boucle (200 RACH-DET / 9 vrais)
+     * -> CHAN RQD fantômes -> fuite SDCCH -> épuisement -> SMS sans canal. Le vrai RACH
+     * du mobile (used_tab=1, RA publiée) arme toujours g_ul_pending -> LU/RACH intacts. */
+    if (got_rach) g_ul_pending = 1;
 }
 
 /* === RELAIS I/Q CONTINU (mode full-grgsm) ===
@@ -1220,16 +1164,10 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
      * CALYPSO_UL_FN_GATE   : 1 = n'injecter que sur un FN RACH-eligible (combined
      *                        CCCH+SDCCH4 : osmo_fn%51 in {4,5,14..36,45,46}).
      * CALYPSO_UL_SLOT_OFFSET : offset intra-slot (samples) du burst (TOA). */
-    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1, ul_dsp_shunt = -1;
-    /* GATE PAR MODE (revival dsp 2026-06-22) : les offsets de RACH SYNTHETIQUE
-     * (FN=36, slot=1875) ne valent QU'EN dsp-shunt (qemu_wrap REFAIT le RACH car
-     * le DSP est shunte). En c54x (vrai DSP, UL reel genere par le firmware), le
-     * default devient 0 (aucun decalage synthetique a appliquer). L'override env
-     * CALYPSO_UL_FN_OFFSET / CALYPSO_UL_SLOT_OFFSET reste prioritaire dans les 2 modes. */
-    if (ul_dsp_shunt < 0)   { const char *e = getenv("CALYPSO_DSP_SHUNT"); ul_dsp_shunt = (e && *e == '1') ? 1 : 0; }
-    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : (ul_dsp_shunt ? 36 : 0);     /* gate: shunt=36, c54x=0 */ }
+    static int ul_fnoff = -99999, ul_fngate = -1, ul_slotoff = -1;
+    if (ul_fnoff == -99999) { const char *e = getenv("CALYPSO_UL_FN_OFFSET"); ul_fnoff = (e && *e) ? atoi(e) : 36;       /* hardcode : offset FN device->osmo-trx (gate vide=36) */ }
     if (ul_fngate < 0)      { const char *e = getenv("CALYPSO_UL_FN_GATE");   ul_fngate = (!e || *e != '0'); }
-    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : (ul_dsp_shunt ? 1875 : 0); /* gate: shunt=1875, c54x=0 */ }
+    if (ul_slotoff < 0)     { const char *e = getenv("CALYPSO_UL_SLOT_OFFSET"); ul_slotoff = (e && *e) ? atoi(e) : 1875;   /* hardcode : TOA intra-slot RACH (gate vide=1875) */ }
     uint32_t internal_fn = (uint32_t)(d->rx_ts / (uint64_t)CALYPSO_FRAME_SAMPLES);
     uint32_t osmo_fn = internal_fn + (uint32_t)ul_fnoff;     /* FN tel que vu par osmo-trx (SDCCH only) */
     /* FN-GATE RACH (FIX MT-SMS 2026-06-09) : osmo-trx TAMPONNE+CORRELE le burst injecte
@@ -1715,41 +1653,13 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
         fe->pkt[0] = 0;
         fe->pkt[1] = 0; fe->pkt[2] = 0; fe->pkt[3] = 0; fe->pkt[4] = 0;
         fe->pkt[5] = 0; fe->pkt[6] = 0; fe->pkt[7] = 0;
-        /* DECIMATION 4 SPS -> 1 SPS (no-debt) : burst_src = 'avail' samples
-         * @ 4 SPS (entree, fenetre CALYPSO_DL_BURSTLEN) ; on produit
-         * CALYPSO_BSP_BURSTLEN (148) samples @ 1 SPS = la fenetre du correlateur
-         * DSP. payload_len reflete la SORTIE -> paquet = 8 + 148*4 = 600B. */
-        /* REVERT phantom (2026-06-24) : on passe 'avail' (=2500 mesure, PAS 592).
-         * Les samples in[592..620] que le dernier output decime EXISTENT vraiment
-         * dans le buffer osmo-trx -> vrais echantillons, pas du stale. Caper a
-         * n_samples=592 zero-paddait a tort 8 samples reels = PHANTOM. Le zero-pad
-         * du decimateur reste comme garde short-read benigne (jamais declenchee
-         * tant que avail >> 620). */
-        int n_out = dl_decimate_4to1(burst_src, avail,
-                                     (int16_t *)(fe->pkt + TRXD_HDR_LEN),
-                                     CALYPSO_BSP_BURSTLEN);
-        payload_len = (size_t)n_out * 4u;
-        (void)payload_len;   /* taille d'envoi figee a 148 samples cote clk_listener */
-        { /* DIAG (confirme le bug) : combien de sorties avaient le contexte FIR
-           * COMPLET avant le fix (base+33<=n_samples) vs combien etaient
-           * stale/zero-paddees au bord. edge>0 => la troncature existait. */
-            static int dlog = 0;
-            if (dlog < 8 || (dlog % 4000) == 0) {
-                int full = 0;
-                for (int j = 0; j < CALYPSO_BSP_BURSTLEN; j++)
-                    if (j * 4 + DL_FIR_N <= n_samples) full++;
-                LOGP(DDEV, LOGL_NOTICE,
-                     "DL-DECIM avail=%d n_samples=%d n_out=%d full_ctx=%d "
-                     "edge_zeropad=%d\n",
-                     avail, n_samples, n_out, full,
-                     CALYPSO_BSP_BURSTLEN - full);
-            }
-            dlog++;
-        }
+        memcpy(fe->pkt + TRXD_HDR_LEN, burst_src, payload_len);
         if (iq_conj) {
-            /* Conjugaison I/Q (-Q) sur la SORTIE decimee. */
+            /* Conjugaison I/Q (-Q) : le démod gr-gsm a montré rot=-1 (tone FCCH
+             * de signe opposé à la réf du corrélateur DSP). Flip le signe de Q
+             * remet le tone à la bonne fréquence pour le FB-det. */
             int16_t *p = (int16_t *)(fe->pkt + TRXD_HDR_LEN);
-            for (int k = 0; k < n_out; k++)
+            for (int k = 0; k < n_samples; k++)
                 p[2 * k + 1] = (int16_t)(-p[2 * k + 1]);
         }
         g_dl_fifo_tail = tail + 1;

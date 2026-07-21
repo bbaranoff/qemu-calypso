@@ -21,15 +21,10 @@ CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
 
 QEMU_LOG    = os.environ.get("CALYPSO_QEMU_LOG",    "/root/qemu.log")
-# NB 2026-07-03 : les défauts pointaient vers /tmp/*.log, un ancien layout.
-# run.sh (bash_scripts/run.sh:1453 LOGDIR="${CALYPSO_LOGDIR:-/root}") écrit
-# désormais tout dans $LOGDIR (défaut /root) — aligné sur QEMU_LOG ci-dessus.
-# bridge.py (legacy, CALYPSO_MODE=bridge) écrit "$LOGDIR/bridge.py.log", pas
-# "bridge.log" (cf run.sh:2008/2213) : nom corrigé en plus du dossier.
-BRIDGE_LOG  = os.environ.get("CALYPSO_BRIDGE_LOG",  "/root/bridge.py.log")
-OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/root/osmocon.log")
-MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/root/mobile.log")
-FW_IRDA_LOG = os.environ.get("CALYPSO_FW_IRDA_LOG", "/root/fw-irda.log")
+(removed)  = os.environ.get("CALYPSO_(removed)",  "/tmp/bridge.log")
+OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/tmp/osmocon.log")
+MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/tmp/mobile.log")
+FW_IRDA_LOG = os.environ.get("CALYPSO_FW_IRDA_LOG", "/tmp/fw-irda.log")
 
 
 def _grep_count(path: str, pattern: str, tail: int = 0) -> int:
@@ -84,67 +79,22 @@ def test_grep_qemu_log_exists_and_nonempty():
 
 @pytest.mark.runtime_log_grep
 def test_grep_qemu_dsp_booted():
-    """Le DSP a complété son init (au moins 1 occurrence du marker).
-
-    FIX 2026-07-03 : "DSP init complete"/"DSP boot ver=" sont émis par
-    TRX_LOG(), lui-même gated par calypso_debug_enabled("TRX")
-    (calypso_trx.c:39-41). calypso_debug.c:51 montre que CALYPSO_DEBUG vide
-    ou non défini = TOUTES les sondes OFF (calypso_debug_master=0) — donc
-    en config par défaut (et a fortiori sous un CALYPSO_DEBUG restreint à
-    d'autres sondes, ex. RSBX-INTM,POPM-ST1 comme cette session), ces 2
-    strings n'apparaissent JAMAIS, DSP booté ou pas. Marker inutilisable
-    tel quel. On garde les 2 strings originales (comptent si TRX est un
-    jour activé) et on ajoute `INT3-RATE.*idle=1` : sonde INCONDITIONNELLE
-    (calypso_c54x.c:13856+, simple fprintf sans gate debug) qui expose le
-    même flag `s->idle` que celui testé par "DSP init complete" côté trx
-    (calypso_trx.c:1729 `if (s->dsp->idle)`) — donc équivalent fonctionnel
-    toujours visible, vérifié présent 100× dans ce run (insn=4424+).
-    """
-    n = _grep_count(QEMU_LOG, "DSP init complete|DSP boot ver=|INT3-RATE.*idle=1")
-    assert n >= 1, "aucun marker 'DSP boot'/'DSP init complete'/'idle=1' dans qemu.log"
+    """Le DSP a complété son init (au moins 1 occurrence du marker)."""
+    n = _grep_count(QEMU_LOG, "DSP init complete|DSP boot ver=")
+    assert n >= 1, "aucun marker 'DSP boot'/'DSP init complete' dans qemu.log"
 
 
 @pytest.mark.runtime_log_grep
 def test_grep_qemu_bsp_dma_active():
-    """Le BSP DMA pousse des preuves de DMA actif (au moins 10× sur le run).
-
-    FIX 2026-07-03 : "DARAM-WR-STATS" est émis par BSP_LOG(), gated par
-    calypso_debug_enabled("BSP") (calypso_bsp.c:48-50) — même problème que
-    test_grep_qemu_dsp_booted : sous CALYPSO_DEBUG par défaut (vide) ou
-    restreint à d'autres sondes, cette string n'apparaît jamais même si le
-    DMA tourne. On garde le marker original et on ajoute "DSP-DONE-DMA"
-    (calypso_trx.c:1002+) : fprintf INCONDITIONNEL (pas de gate debug,
-    juste un compteur cappé à 60) qui prouve directement le DMA API-write
-    -> DARAM 0x0586 à chaque page — vérifié 60/60 (cap atteint) dans ce run.
-    """
-    n = _grep_count(QEMU_LOG, "DARAM-WR-STATS|DSP-DONE-DMA")
-    assert n >= 10, f"BSP DMA stats/preuves trop rares : {n} (attendu ≥ 10)"
+    """Le BSP DMA pousse des DARAM-WR-STATS (au moins 10× sur le run)."""
+    n = _grep_count(QEMU_LOG, "DARAM-WR-STATS")
+    assert n >= 10, f"BSP DMA stats trop rares : {n} (attendu ≥ 10)"
 
 
 @pytest.mark.runtime_log_grep
 def test_grep_qemu_task24_dispatched():
-    """ARM dispatche task_md=24 (ALLC CCCH demod) au moins 100×.
-
-    XFAIL 2026-07-03 : régression connue et documentée, pas un bug de test.
-    task=24 fire 0× dans ce run (confirmé jusqu'à insn=5.25M / +270s, donc
-    pas un "run trop court" — cf test_grep_qemu_a_cd_wr_vs_task24 plus bas
-    et son commentaire mis à jour). Root cause suivie dans
-    doc/project/STATUS_2026-07-01.md addenda 13-14 (2026-07-03) : le
-    go-live DSP reste bloqué, IMR n'est jamais réarmé après
-    `IMR-ARM 0x52fd->0x0000 @insn=1047` et `d_fb_det` reste à 0 — les
-    conditions amont CCCH ne sont pas réunies pour que l'ALLC (task 24)
-    soit posté. Même diagnostic, même formulation que le xfail déjà en
-    place pour ce cas dans test_calypso_milestones.py::
-    test_l1ctl_data_ind_received ("task=24 (ALLC) fire 0× — conditions
-    amont CCCH pas réunies").
-    """
+    """ARM dispatche task_md=24 (ALLC CCCH demod) au moins 100×."""
     n = _grep_count(QEMU_LOG, r"task=24|task_md=24|d_task_md.*24")
-    if n == 0:
-        pytest.xfail(
-            "task=24 (ALLC) fire 0× — conditions amont CCCH pas réunies "
-            "(go-live DSP bloqué : IMR jamais réarmé, d_fb_det=0 ; cf "
-            "STATUS_2026-07-01.md addenda 13-14)"
-        )
     assert n >= 100, f"task=24 dispatché seulement {n}× (attendu ≥ 100)"
 
 
@@ -161,19 +111,19 @@ def test_grep_qemu_no_sp_catastrophe_recent():
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_dl_bursts_received():
     """Bridge reçoit des DL bursts de osmo-bts-trx (≥ 100)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip("bridge.log absent")
-    n = _grep_count(BRIDGE_LOG, "bridge: DL #")
+    n = _grep_count((removed), "bridge: DL #")
     assert n >= 100, f"DL bursts reçus seulement {n} (attendu ≥ 100)"
 
 
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_fb_pattern_dominant():
     """≥ 50% des DL bursts sont des FB bursts (cell BCCH idle pattern)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip("bridge.log absent")
-    total = _grep_count(BRIDGE_LOG, "bridge: DL #")
-    fb    = _grep_count(BRIDGE_LOG, r"\*\*\* FB \*\*\*")
+    total = _grep_count((removed), "bridge: DL #")
+    fb    = _grep_count((removed), r"\*\*\* FB \*\*\*")
     if total < 10:
         pytest.skip(f"DL count trop faible ({total})")
     ratio = fb / total
@@ -183,9 +133,9 @@ def test_grep_bridge_fb_pattern_dominant():
 @pytest.mark.runtime_log_grep
 def test_grep_bridge_no_clock_skew_shutdown():
     """Pas de message 'shutdown' / 'PC clock skew' dans bridge.log (BTS vivant)."""
-    if not _log_exists(BRIDGE_LOG):
+    if not _log_exists((removed)):
         pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "shutdown|clock skew|No more clock")
+    n = _grep_count((removed), "shutdown|clock skew|No more clock")
     assert n == 0, f"signal shutdown BTS détecté ({n}×) — bts-trx a give-up"
 
 
@@ -335,24 +285,24 @@ def test_blocker_osmocon_no_pty_error():
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_bts_shutdown():
     """Bridge ne signale pas de shutdown BTS."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "BTS shutdown|shutdown_fsm|No more clock")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "BTS shutdown|shutdown_fsm|No more clock")
     assert n == 0, f"bridge : {n}× BTS shutdown — bts-trx mort"
 
 
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_rach_parity():
     """Pas d'erreur RACH parity / framing dans bridge.log."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "odd burst length|parity.*error|TRXD.*malformed")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "odd burst length|parity.*error|TRXD.*malformed")
     assert n == 0, f"bridge : {n}× RACH/TRXD framing error"
 
 
 @pytest.mark.runtime_log_grep
 def test_blocker_bridge_no_socket_error():
     """Pas d'erreur socket UDP dans bridge.log."""
-    if not _log_exists(BRIDGE_LOG): pytest.skip()
-    n = _grep_count(BRIDGE_LOG, "Connection refused|recvfrom.*fail|sendto.*fail")
+    if not _log_exists((removed)): pytest.skip()
+    n = _grep_count((removed), "Connection refused|recvfrom.*fail|sendto.*fail")
     assert n == 0, f"bridge : {n}× socket error"
 
 
@@ -413,19 +363,7 @@ def test_grep_qemu_a_cd_wr_vs_task24():
     n_task = _grep_count(QEMU_LOG, "task=24|task_md=24")
     n_acd  = _grep_count(QEMU_LOG, "A_CD-WR")
     if n_task < 100:
-        # NB 2026-07-03 : "run trop court" est optimiste — vérifié que n_task
-        # reste à 0 même après +270s / 5.25M instructions dans cette session.
-        # Cause réelle probable = même blocage go-live que
-        # test_grep_qemu_task24_dispatched (cf STATUS_2026-07-01.md addenda
-        # 13-14), pas juste une question de durée. On garde le skip (pas de
-        # xfail ici : le test suivant sur le ratio n'a de sens que si
-        # task=24 fire assez pour calculer un ratio stable) mais avec un
-        # message honnête.
-        pytest.skip(
-            f"task=24 trop rare ({n_task}) — probablement le go-live DSP "
-            f"bloqué (IMR jamais réarmé, cf STATUS_2026-07-01.md addenda "
-            f"13-14), pas juste un run court"
-        )
+        pytest.skip(f"task=24 trop rare ({n_task}) — run trop court")
     ratio = n_acd / n_task
     if ratio < 0.001:
         pytest.xfail(

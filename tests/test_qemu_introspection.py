@@ -64,21 +64,9 @@ def test_monitor_socket_reachable():
 
 @pytest.mark.runtime_monitor
 def test_monitor_info_status_is_running():
-    """`info status` indique 'running' (VM non haltée).
-
-    Le socket monitor unix est partagé avec d'autres suites qui peuvent s'y
-    connecter en même temps (ex. test_gdb_stub, test_inject_frames) et
-    entrelacer un stop/cont bref. On retente donc quelques fois avant de
-    conclure à un vrai souci — un seul relevé "paused" concurrent avec un
-    pair ne veut rien dire en soi.
-    """
-    r = ""
-    for attempt in range(3):
-        r = _qemu_monitor("info status")
-        if "running" in r.lower():
-            break
-        time.sleep(1.0)
-    assert "running" in r.lower(), f"VM status pas 'running' (après retries) : {r!r}"
+    """`info status` indique 'running' (VM non haltée)."""
+    r = _qemu_monitor("info status")
+    assert "running" in r.lower(), f"VM status pas 'running' : {r!r}"
 
 
 @pytest.mark.runtime_monitor
@@ -133,24 +121,12 @@ def test_monitor_info_qom_tree_has_calypso_or_arm():
 
 @pytest.mark.runtime_monitor
 def test_monitor_info_registers_arm():
-    """`info registers` retourne au moins PC + un autre registre ARM.
-
-    Comme pour `info status`, le socket monitor est partagé avec d'autres
-    suites concurrentes : une commande entrelacée peut retarder la vraie
-    réponse au-delà du timeout de lecture et faire croire à une absence de
-    registres. On retente donc avant de conclure.
-    """
-    found = 0
-    r = ""
-    for attempt in range(3):
-        r = _qemu_monitor("info registers")
-        found = sum(1 for tok in ("R00", "R01", "R02", "PC", "CPSR",
-                                  "r0", "r1", "pc", "cpsr") if tok in r)
-        if found >= 2:
-            break
-        time.sleep(1.0)
+    """`info registers` retourne au moins PC + un autre registre ARM."""
+    r = _qemu_monitor("info registers")
+    found = sum(1 for tok in ("R00", "R01", "R02", "PC", "CPSR",
+                              "r0", "r1", "pc", "cpsr") if tok in r)
     assert found >= 2, \
-        f"info registers ne ressemble pas à ARM (found={found}, après retries) : {r[:300]!r}"
+        f"info registers ne ressemble pas à ARM (found={found}) : {r[:300]!r}"
 
 
 @pytest.mark.runtime_monitor

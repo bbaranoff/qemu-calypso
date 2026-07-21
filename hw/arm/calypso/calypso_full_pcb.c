@@ -19,7 +19,7 @@
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
 
-#include "hw/arm/calypso/calypso_full_pcb.h"
+#include "calypso_full_pcb.h"
 
 #include <stdlib.h>
 #include <stdio.h>

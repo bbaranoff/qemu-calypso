@@ -105,9 +105,6 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
 /* Test fixture: return the C54x DSP state pointer for `-M calypso,dsp-blob=`.
  * Returns NULL if calypso_trx_init() hasn't run or the DSP ROM load failed. */
 C54xState *calypso_trx_get_dsp(void);
-/* DSP hardware reset driven by ARM firmware CNTL_RST (RESET_DSP). assert!=0 → hold
- * the c54x in reset ; assert==0 → fresh c54x_reset boot. Gated revival (SHUNT=0). */
-void calypso_trx_dsp_hw_reset(int assert_reset);
 
 /* Per-section ROM paths — called by mb.c machine_init BEFORE sysbus_realize
  * so trx_init can load each section at its silicon-correct DSP address

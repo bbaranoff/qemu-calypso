@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
-#include "calypso_arm2dsp.h"
 #include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -15,15 +14,13 @@
 #include "hw/arm/calypso/calypso_trx.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_c54x.h"
-extern int g_c54x_int3_src;  /* diag source INT3 (RO) */
+#include "hw/arm/calypso/calypso_timer.h"   /* calypso_timer_lost_frame_tick() */
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* api_ram_lock pour MTTCG race fix */
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_iota.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_sim.h"
 #include "hw/arm/calypso/calypso_fbsb.h"
-#include "hw/arm/calypso/calypso_layer1.h"   /* HLE L1 scaffold (CALYPSO_L1=c) */
-#include "calypso_orch.h"
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -104,6 +101,7 @@ static CalypsoTRX *g_trx;
 
 #include "qemu/atomic.h"
 #include "calypso_dsp_shunt.h"
+#include "calypso_layer1.h"   /* CALYPSO_L1=c : HLE L1 scaffold (FB via corrélation host) */
 
 /* FBSB host-side orchestration. Reintroduced after preNoCell refactor
  * (28 Apr) accidentally removed the wire. The bridge delivers I/Q from
@@ -151,62 +149,11 @@ extern uint16_t g_arm_taskmd5_ea;
 
 uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
 
-/* Real-ROM mode = CALYPSO_DSP_REG_MODE=c54x : the genuine DSP ROM derives its own
- * state and must drive the bootloader handshake itself. bin/hybrid (default) inject a
- * captured register snapshot (mock-ish) and the bridge fakes the handshake. Memoized,
- * init-order-safe (getenv) — matches calypso_c54x.c reg_mode==0. Only the
- * execution-affecting handshake fakes gate on this (snapshot-injection additionally
- * needs a .bin, i.e. reg_init_valid — not conflated here). */
-static bool dsp_real_rom_mode(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        /* The bridge fakes the boot handshake ONLY when NO real DSP ROM services it.
-         * Runtime fact (qemu.log: "[dsp-shunt] active — c54x emulator should be
-         * skipped"): CALYPSO_DSP_SHUNT=1 SKIPS the c54x entirely (gr-gsm does the
-         * demod) → no ROM writes IDLE → the bridge MUST keep faking, else the
-         * firmware's dsp_bl_wait_ready hangs → mobile breaks. SHUNT=0 → the genuine
-         * c54x ROM runs and drives the real handshake → drop the fake. So the right
-         * predicate is SHUNT, NOT CALYPSO_DSP / REG_MODE (both default to c54x even
-         * in the shunt/mock run where the c54x is skipped). getenv → init-order-safe. */
-        const char *sh = getenv("CALYPSO_DSP_SHUNT");
-        bool shunt_on = sh && sh[0] == '1';
-        v = shunt_on ? 0 : 1;
-    }
-    return v != 0;
-}
-
 /* ---- DSP API RAM ---- */
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
-
-    /* === CO-RUN (fix scheduling, mech 2) — 2026-06-23 ===
-     * Le firmware spin sur BL_CMD_STATUS (0x0ffe) dans dsp_bl_wait_ready
-     * (while readw(0x0ffe) != IDLE=1). Ce spin tight côté ARM AFFAME le tick QEMU
-     * qui exécute c54x_run → la ROM n'avance pas → n'écrit jamais son IDLE @0xb419 →
-     * le firmware spin éternel (le read-fake ne fire qu'UNE fois, dsp_booted latch).
-     * On fait avancer la ROM ICI, à chaque lecture de la cellule : elle atteint
-     * 0xb419 (write IDLE=1) puis spin en la lisant → le firmware lit un VRAI IDLE →
-     * sort de TOUS ses wait_ready → atteint dsp_bl_start_at (write cmd 2 @82be68) →
-     * la ROM lit cmd 2 @0xb424 → BACC vers L1. Gaté revival (SHUNT=0), fake gardé. */
-    if (offset == 0x0ffe && dsp_real_rom_mode()
-        && s->dsp && s->dsp->running) {
-        c54x_run(s->dsp, 1024);
-    }
-
-    /* === BL-READ (diag GAP-0) : l'ARM lit BL_CMD_STATUS (0x0ffe) en boucle dans
-     * dsp_bl_wait_ready (while readw(0x0ffe) != IDLE). Voir la valeur réellement
-     * lue (cell, APRÈS le co-run) + l'état du fake → tracer si le firmware sort du
-     * spin (lit IDLE=1) et continue vers dsp_bl_start_at. Capé. Gaté revival. */
-    if (offset == 0x0ffe && dsp_real_rom_mode()) {
-        static unsigned blr = 0;
-        if (blr < 120) { blr++;
-            fprintf(stderr, "[trx] BL-READ #%u BL_CMD_STATUS(0x0ffe) cell=0x%04x booted=%d fn=%u\n",
-                    blr, (unsigned)s->dsp_ram[offset/2], s->dsp_booted, s->fn);
-        }
-    }
 
     /* === Hypothesis #4 probe : ARM reads R_PAGE_X (= DSP responses) ===
      * ARM lit a_pm via R_PAGE_X. R_PAGE_0 = 0x0050, R_PAGE_1 = 0x0078.
@@ -256,68 +203,6 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
               (size == 4) ? ((uint32_t)src[0] | ((uint32_t)src[1] << 16)) :
               ((uint8_t *)src)[offset & 1];
     }
-    /* === FBDET-RD (revival dsp) : l'ARM lit-il d_fb_det (offset 0x01F0) != 0 =
-     * le résultat FB écrit par le DSP (data[0x08F8]=0x6b34) ? Log sur CHANGEMENT
-     * de valeur (capté 100) → on voit la transition 0 -> FOUND. Lit la vraie
-     * valeur (avant tout FORCE_TOA). */
-    if (size == 2 && offset == 0x01F0) {
-        static uint16_t fbdet_last = 0xFFFF;
-        static unsigned fbdet_log;
-        if ((uint16_t)val != fbdet_last && (fbdet_log < 100 || (fbdet_log % 20) == 0)) {
-            fprintf(stderr,
-                    "[FBDET-RD] ARM read d_fb_det(0x01F0)=0x%04x fn=%u\n",
-                    (unsigned)val, (unsigned)s->fn);
-            fbdet_last = (uint16_t)val;
-            fbdet_log++;
-        }
-    }
-    /* === FBSBRES-RD (read-only, 2026-06-22) : logue le BLOC RESULTAT FB et SB
-     * lu par l'ARM, AVANT tout FORCE_TOA, sur les offsets MMIO CONFIRMES par
-     * VerifyOffsets (identiques aux dérivés ; convention DSP word = 0x0800 +
-     * off/2) :
-     *   FB a_sync_demod (NDB) : D_TOA 0x01F4 / D_PM 0x01F6 / D_ANGLE 0x01F8 /
-     *                           D_SNR 0x01FA
-     *   SB a_serv_demod[D_TOA] : page0 0x0060 / page1 0x0088
-     *   SB a_sch (BSIC/CRC) : a_sch[0] CRC 0x006E(p0)/0x0096(p1),
-     *                         a_sch[3] 0x0074(p0)/0x009C(p1),
-     *                         a_sch[4] 0x0076(p0)/0x009E(p1)
-     * Permet de voir si ces words portent une valeur valide ou du garbage
-     * (cause "SB N bits in the future"). Compteur capé ~150, ne spamme pas. */
-    if (size == 2) {
-        static unsigned fbsbres_log = 0;
-        const char *tag = NULL;
-        switch (offset) {
-        /* --- bloc FB (a_sync_demod, NDB) --- */
-        case 0x01F4: tag = "FB a_sync_demod[D_TOA]";   break;
-        case 0x01F6: tag = "FB a_sync_demod[D_PM]";    break;
-        case 0x01F8: tag = "FB a_sync_demod[D_ANGLE]"; break;
-        case 0x01FA: tag = "FB a_sync_demod[D_SNR]";   break;
-        /* --- bloc SB (a_serv_demod[D_TOA], db_r page0/page1) --- */
-        case 0x0060: tag = "SB a_serv_demod[D_TOA] p0"; break;
-        case 0x0088: tag = "SB a_serv_demod[D_TOA] p1"; break;
-        /* --- bloc SB BSIC / CRC (a_sch, db_r page0/page1) --- */
-        case 0x006E: tag = "SB a_sch[0] CRC p0"; break;
-        case 0x0096: tag = "SB a_sch[0] CRC p1"; break;
-        case 0x0074: tag = "SB a_sch[3] BSIC p0"; break;
-        case 0x009C: tag = "SB a_sch[3] BSIC p1"; break;
-        case 0x0076: tag = "SB a_sch[4] BSIC p0"; break;
-        case 0x009E: tag = "SB a_sch[4] BSIC p1"; break;
-        default: break;
-        }
-        if (tag) {
-            /* SB (db_r 0x60..0x9E) = rare -> cap haut ; FB (a_sync_demod) =
-             * frequent -> 150 premiers + echantillon 1/2000 pour voir le
-             * steady-state (le TOA converge-t-il apres le fix DL FN-LOCK ?). */
-            static unsigned sb_log = 0;
-            bool is_sb = (offset >= 0x0060 && offset <= 0x009E);
-            bool emit = is_sb ? (sb_log < 3000)
-                              : (fbsbres_log < 150 || (fbsbres_log % 2000) == 0);
-            if (is_sb) sb_log++; else fbsbres_log++;
-            if (emit)
-                fprintf(stderr, "[FBSBRES-RD] %s(0x%04x)=0x%04x fn=%u\n",
-                        tag, (unsigned)offset, (unsigned)val, (unsigned)s->fn);
-        }
-    }
     /* CALYPSO_FORCE_TOA=<N> (env gated, rigolo) : force une détection FB
      * complète vue par l'ARM, sans toucher le DSP. osmocom prim_fbsb.c
      * n'atteint read_fb_result (lecture TOA dans ndb->a_sync_demod[D_TOA]
@@ -365,7 +250,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         static int force_nb = -1;
         if (force_nb < 0) {
             const char *e = getenv("CALYPSO_FORCE_NB");
-            force_nb = (calypso_orch() && !(e && e[0] == '0')) ? 1 : 0;
+            force_nb = (e && *e == '1') ? 1 : 0;
         }
         if (force_nb) {
             if ((offset == 0x0050 || offset == 0x0078) && val == 0) {
@@ -375,45 +260,14 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
                  * commandé via dsp_load_rx_task) → passe le check
                  * d_burst_d != burst_id. db_w d_burst_d : p0 DSP word 0x801,
                  * p1 0x815 (db_w p0=0xFFD00000 off0x02, p1=0xFFD00028 off0x2A). */
-                /* d_burst_d : le firmware (l1s_nb_resp) attend 0,1,2,3 sur les
-                 * 4 bursts consécutifs d'un bloc et copie a_cd->DATA_IND au
-                 * burst 3. L'écho db_w (0x801/0x815) était décalé d'un cran
-                 * (double-buffer : db_w porte la commande du burst SUIVANT) ->
-                 * "BURST ID X!=Y" -> jamais de DATA_IND. On dérive donc d_burst_d
-                 * du FN : un bloc = 4 frames consécutives (fn..fn+3) ; un saut de
-                 * FN = nouveau bloc -> reset à 0. (Vérifié sur la sonde : blocs =
-                 * 1281,1282,1283,1284 puis gros saut.) Donne exactement 0,1,2,3. */
-                static uint32_t bd_last_fn = 0xFFFFFFFFu;
-                static uint8_t  bd_cnt = 0;
-                if (s->fn != bd_last_fn) {
-                    uint8_t prev = bd_cnt;
-                    bd_cnt = (s->fn == bd_last_fn + 1) ? (uint8_t)((bd_cnt + 1) & 3)
-                                                       : 0;
-                    bd_last_fn = s->fn;
-                    /* SONDE PARTITION (2) : le firmware atteint-il le burst 3 ?
-                     * Si oui (compteur croît régulièrement) -> DATA_IND émis ->
-                     * mur aval (contenu/FN). Si non -> reset avant burst 3 ->
-                     * mur timing. On logge la transition ->3 avec le FN. */
-                    if (bd_cnt == 3 && prev != 3) {
-                        static unsigned n3 = 0;
-                        if (n3++ < 60 || (n3 % 200) == 0)
-                            fprintf(stderr, "[nb3] reached burst3 #%u fn=%u fn%%51=%u "
-                                    "off=0x%04x\n", n3, (unsigned)s->fn,
-                                    (unsigned)(s->fn % 51), (unsigned)offset);
-                    }
-                }
-                val = bd_cnt;
+                if (s->dsp && s->dsp->data)
+                    val = s->dsp->data[(offset == 0x0052) ? 0x801 : 0x815];
+                else
+                    val = s->dsp_ram[(offset == 0x0052) ? 0x01 : 0x15];
             }
         }
     }
-    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT.
-     * FAKE INCONDITIONNEL. PROUVÉ (2026-06-23) : virer le fake en revival (SHUNT=0)
-     * → le c54x ne tourne PLUS (0 ligne, reproductible) alors que c54x_reset pose
-     * running=true. Mécanisme = le spin tight du firmware `dsp_bl_wait_ready`
-     * (while readw(0x0ffe)!=1) affame le tick QEMU qui exécute c54x_run → la ROM
-     * n'écrit jamais son IDLE → deadlock scheduling. Le fake court-circuite le spin
-     * (le firmware sort tôt) → QEMU schedule le tick → la ROM tourne. Donc le fake est
-     * load-bearing POUR FAIRE TOURNER la ROM, pas juste pour mentir au firmware. */
+    /* DSP boot handshake: firmware polls DL_STATUS until it reads BOOT */
     if (offset == DSP_DL_STATUS_ADDR && !s->dsp_booted) {
         if (++s->boot_frame > 3) {
             s->dsp_ram[DSP_DL_STATUS_ADDR/2] = DSP_DL_STATUS_BOOT;
@@ -506,89 +360,6 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
 
-    /* SONDE GAP-1 : l'ARM écrit-il data[0x0c36] (= ARM byte 0x86c), le pointeur
-     * de tâche que le DSP CALA à 0xb3a5 et qui est nul → derail ? */
-    if (offset == 0x086c && size == 2) {
-        static unsigned atw = 0;
-        if (atw < 40) { atw++;
-            fprintf(stderr, "[trx] TASKPTR-WR-ARM off=0x086c val=0x%04x fn=%u "
-                    "(-> data[0x0c36])\n", (unsigned)(value & 0xFFFF), s->fn);
-        }
-    }
-
-    /* === HS-ARM-WR : boot-handshake write discriminator (reg_mode==c54x) ===
-     * insn 10-11 proved one full command transits end-to-end; the suspect is that
-     * the firmware never RE-ARMS command #2 after the DSP republishes IDLE. This
-     * logs every ARM write into the bootloader mailbox region [0x0FF0,0x0FFF] (cmd
-     * cell DSP 0x0fff = ARM 0x0ffe ; BL_ADDR/SIZE companions just below) so a grep
-     * answers the cheap question: does the ARM emit a write of 2/4 after IDLE, yes
-     * or no? No write → ARM logic bails (read-back/stale-IDLE = Plan-A mech 1).
-     * Write present but DSP never reads it (cross-check WATCH-READ) → scheduling
-     * (Plan-A mech 2). Only fires in real-ROM mode; harmless to the mock path. */
-    if (dsp_real_rom_mode() && offset >= 0x0FF0 && offset <= 0x0FFF) {
-        static unsigned hsw = 0;
-        if (hsw < 300) {
-            hsw++;
-            /* fprintf, PAS TRX_LOG : TRX_LOG est gaté CALYPSO_DEBUG=TRX → muet
-             * dans le run banc → le "HS-ARM-WR=0" était un ARTEFACT de logging,
-             * pas une preuve d'absence d'écriture. On force l'affichage. */
-            fprintf(stderr, "[trx] HS-ARM-WR #%u off=0x%04x val=0x%04x fn=%u\n",
-                    hsw, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
-        }
-    }
-
-    /* === HS-ARM-WR-WIDE : sonde write ÉLARGIE (trancher §2.6) ===
-     * Toute écriture ARM NON-NULLE dans l'API DSP (offset<0x1000). On filtre
-     * value!=0 pour sauter le dsp_api_memset (8192 zéros @82bcd4) et ne capter
-     * que NDB (d_dsp_state=3, etc.) + params + cmd 2. La DERNIÈRE écriture loggée
-     * = jusqu'où le firmware progresse avant de hang. fprintf, capé, gaté revival. */
-    if (dsp_real_rom_mode() && offset < 0x1000 && (value & 0xFFFF) != 0) {
-        static unsigned wide = 0;
-        if (wide < 220) {
-            wide++;
-            fprintf(stderr, "[trx] WR-WIDE #%u off=0x%04x val=0x%04x fn=%u\n",
-                    wide, (unsigned)offset, (unsigned)(value & 0xFFFF), s->fn);
-        }
-    }
-
-    /* === HS-ARM-GATE : read-only capture of the foreground go-live gating cells ===
-     * The wait-loop at PROM 0xa4d4 exits only when data[0x3f70] bit1 is set by
-     * one of the FOREGROUND setters (0xde9c/0xa5bd/0xb3ef/0x710c), which are
-     * gated by CMPM/BC tests on the CONTROL cells data[0x098a] / data[0x098c].
-     * Those DSP words map to ARM API offsets 0x0314 / 0x0318 (dsp_word =
-     * offset/2 + 0x0800). This PINS whether the ARM osmocom/TI L1 DSP bring-up
-     * ever writes those cells. READ-ONLY instrumentation: no DSP/ARM state is
-     * poked here — the existing mirror below performs the genuine transport. */
-    if (dsp_real_rom_mode() && (offset == 0x0314 || offset == 0x0318)) {
-        static unsigned gate = 0;
-        if (gate < 256) {
-            gate++;
-            fprintf(stderr,
-                "[trx] HS-ARM-GATE #%u off=0x%04x dsp_word=0x%04x val=0x%04x fn=%u\n",
-                gate, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
-                (unsigned)(value & 0xFFFF), s->fn);
-        }
-    }
-
-    calypso_arm2dsp_on_arm_write((uint16_t)offset, (uint16_t)(value & 0xFFFF));
-
-    /* FORCE-HS (etape A, gated CALYPSO_FORCE_HS=<hexval>) : override the ARM go-live
-     * control cells 0x0314/0x0318 with a non-zero enable value, to test whether the
-     * REAL ROM setter (0xde9c / 0xa5bd) then fires (F70-SETBIT1) and the DSP reaches
-     * go-live. Runtime-configurable value so we can bracket without rebuild. */
-    if (dsp_real_rom_mode() && (offset == 0x0314 || offset == 0x0318)) {
-        static int fh = -1; static uint32_t fhv = 0;
-        if (fh < 0) { const char *e = getenv("CALYPSO_FORCE_HS");
-            fhv = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0; fh = fhv ? 1 : 0; }
-        if (fh) {
-            value = fhv;
-            static unsigned fhc = 0;
-            if (fhc++ < 12)
-                fprintf(stderr, "[trx] FORCE-HS off=0x%04x -> val=0x%04x\n",
-                        (unsigned)offset, (unsigned)(fhv & 0xFFFF));
-        }
-    }
-
     /* === Unconditional probe : count ALL writes by offset range ===
      * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone
      * pour voir si ARM hit les bonnes zones (page 0 task 0x00-0x1F, page 1
@@ -635,28 +406,6 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
          * dsp_ram-only path which is fine for the sub-word case. */
     }
 
-    /* === CO-RUN-on-WRITE (fix scheduling, symétrique du co-run lecture) — 2026-06-23 ===
-     * Le firmware écrit cmd 2 (COPY_BLOCK) dans BL_CMD_STATUS (ARM 0x0ffe = DSP word
-     * 0x0fff) APRÈS avoir posé BL_ADDR=0x7000 (0x0ffc) et BL_SIZE=0 (0x0ffa). Mais
-     * il ne RELIT plus 0x0ffe ensuite → le co-run-lecture ne fire pas → le c54x ne
-     * tourne plus assez pour repoller → ne consomme JAMAIS cmd 2 (PC 0xb429 vu 1 seule
-     * fois, le passage garbage du boot). On force la ROM à avancer ICI, juste après le
-     * write de la commande : elle repolle 0xb424 (cmpm #2 → match), lit les VRAIS
-     * addr=0x7000/len=0 → bc bneq faux (len=0) → bacc 0x7000 → SORT du bootloader → L1.
-     * Gaté revival (SHUNT=0), seulement sur écriture d'une commande (2=COPY_BLOCK,
-     * 4=COPY_MODE), data[0x0fff] déjà à jour ci-dessus. */
-    if (offset == 0x0FFE && dsp_real_rom_mode() && s->dsp && s->dsp->running
-        && ((value & 0xFFFF) == 2 || (value & 0xFFFF) == 4)) {
-        static unsigned cmw = 0;
-        if (cmw < 40) { cmw++;
-            fprintf(stderr, "[trx] CMD-CORUN #%u cmd=0x%04x addr(0x0ffe)=0x%04x "
-                    "len(0x0ffd)=0x%04x fn=%u — running ROM to consume\n",
-                    cmw, (unsigned)(value & 0xFFFF),
-                    (unsigned)s->dsp->data[0x0ffe], (unsigned)s->dsp->data[0x0ffd], s->fn);
-        }
-        c54x_run(s->dsp, 4096);
-    }
-
     /* Debug: log task-related writes to write pages (d_task_d/u/md/ra) */
     if ((offset == 0x0000 || offset == 0x0004 || offset == 0x0008 ||
          offset == 0x000E || offset == 0x0028 || offset == 0x002C ||
@@ -673,11 +422,6 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * devrait fire — mais on voit count=0 → contradiction à investiguer.
      * Gated par CALYPSO_DEBUG=D_TASK_MD_ALL. */
     if ((offset == 0x0008 || offset == 0x0030) && size == 2) {
-        /* Latch d_task_md pour calypso_layer1.c (CALYPSO_L1=c) : le poll tick-time
-         * rate le transient task=5, on le capture ici au write-time. */
-        if (calypso_l1_c_active()) {
-            calypso_layer1_on_task_write((uint16_t)value);
-        }
         if (calypso_debug_enabled("D_TASK_MD_ALL")) {
             static unsigned dtm_log = 0;
             if (dtm_log < 30 || (dtm_log % 100) == 0) {
@@ -848,6 +592,11 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
         hwaddr w1_d  = DSP_API_W_PAGE1 + DB_W_D_TASK_D * 2;
         if ((offset == w0_md || offset == w1_md ||
              offset == w0_d  || offset == w1_d) && value != 0) {
+            /* CALYPSO_L1=c : latch le d_task_md écrit par l'ARM (le poll tick-time
+             * rate ce transient, l1s efface la write-page chaque frame). */
+            if (calypso_l1_c_active() && (offset == w0_md || offset == w1_md)) {
+                calypso_layer1_on_task_write((uint16_t)value);
+            }
             static unsigned task_log = 0;
             /* Always log non-PM tasks (value != 1) so FB_TASK=5 / SB=6
              * surfaces no matter when it occurs. PM=1 thinned. */
@@ -933,26 +682,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
              * Skip if dsp-blob fixture is active: another reset would
              * re-run the PROM→DARAM auto-copy and overwrite the loaded
              * blob plus the PC override. */
-            if (s->dsp && !s->dsp->blob_loaded && !dsp_real_rom_mode()) {
+            if (s->dsp && calypso_dsp_shunt_early_booted()) {
+                /* revive c54x : DSP deja boote+parke a machine-init (early-boot).
+                 * NE PAS re-reset : le re-boot re-ecrirait 0xb419 ST #1 = IDLE(1)
+                 * PAR-DESSUS la cmd bootloader COPY_BLOCK(2)+entry de l'ARM. En la
+                 * preservant, le DSP parke lit 2 -> 0xb424 LDU/BACC -> saute a l'entry. */
+                TRX_LOG("C54x DSP reset SKIPPED — early-booted, preserve bootloader cmd");
+            } else if (s->dsp && !s->dsp->blob_loaded) {
                 c54x_reset(s->dsp);
                 s->dsp->running = true;
                 s->dsp_init_done = false;
                 s->dsp_ram[0x01A8/2] = 0;
                 TRX_LOG("C54x DSP reset — boot via TDMA ticks");
-            } else if (s->dsp && dsp_real_rom_mode()) {
-                /* === FIX collision COPY_BLOCK(2) ≡ DL_STATUS_READY(2) — 2026-06-23 ===
-                 * En revival, la valeur 2 écrite ici N'EST PAS « le DSP dit READY » :
-                 * c'est la commande bootloader BL_CMD_STATUS=2 (COPY_BLOCK) du firmware
-                 * (dsp_bl_start_at). La vraie ROM est en plein bootloader ; le co-run
-                 * (calypso_dsp_write/read) vient de lui faire consommer cmd 2 → bacc
-                 * 0x7000 → L1. Un c54x_reset ICI EFFACERAIT ce bacc (observé :
-                 * HIGHVEC-ENTRY #2 prev_PC=0xb424 juste après que le c54x lit api_ram=2).
-                 * Donc en revival : NE PAS reset — laisser la ROM bacc dans L1. */
-                static unsigned norst = 0;
-                if (norst < 10) { norst++;
-                    fprintf(stderr, "[trx] DL_STATUS=2 revival = bootloader COPY_BLOCK cmd, "
-                            "NOT resetting c54x (let it bacc) fn=%u\n", s->fn);
-                }
             } else if (s->dsp) {
                 TRX_LOG("DSP_DL_STATUS_READY received but dsp-blob mode "
                         "active — skipping reset (PC=0x%04x preserved)",
@@ -972,15 +713,6 @@ static const MemoryRegionOps calypso_dsp_ops = {
 static void calypso_dsp_done(void *opaque) {
     CalypsoTRX *s = opaque;
     s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_EN;
-    /* SONDE DSP-DONE (2026-06-24 diag livraison ordre, RO) : entree + gate. */
-    {
-        static unsigned dde = 0;
-        if (dde++ < 60)
-            fprintf(stderr, "[trx] DSP-DONE-ENTRY #%u d_dsp_page=0x%04x "
-                    "dsp=%d shunt_active=%d fn=%u\n",
-                    dde, (unsigned)s->dsp_ram[0x01A8/2], !!s->dsp,
-                    calypso_dsp_shunt_active(), s->fn);
-    }
 
     /* Hardware DMA: copy API write page → DSP DARAM 0x0586.
      * Triggered by firmware writing TPU_CTRL with EN bit (dsp_end_scenario).
@@ -998,11 +730,6 @@ static void calypso_dsp_done(void *opaque) {
         uint16_t task_d  = wp[DB_W_D_TASK_D];
         uint16_t task_u  = wp[DB_W_D_TASK_U];
         uint16_t task_md = wp[DB_W_D_TASK_MD];
-        { static unsigned ddc = 0; if (ddc++ < 60)
-            fprintf(stderr, "[trx] DSP-DONE-DMA #%u page=%u d_dsp_page=0x%04x "
-                    "task_d=%u task_u=%u task_md=%u -> DARAM 0x0586 fn=%u\n",
-                    ddc, page, (unsigned)s->dsp_ram[0x01A8/2],
-                    task_d, task_u, task_md, s->fn); }
         if (task_d || task_u || task_md) {
             static int dma_task_log = 0;
             if (++dma_task_log <= 50)
@@ -1199,8 +926,8 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     CalypsoTRX *s=o; if (off/2<CALYPSO_TPU_SIZE/2) s->tpu_regs[off/2]=val;
     if (off==TPU_CTRL) {
         static int tpu_log = 0;
-        if (++tpu_log <= 50)   /* fprintf inconditionnel (GAP-1 ÉTAPE 0 : tracer si l'ARM arme le TPU) */
-            fprintf(stderr, "[trx] TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u\n",
+        if (++tpu_log <= 50)
+            TRX_LOG("TPU_CTRL WR val=0x%04x (EN=%d DSP_EN=%d) fn=%u",
                     (unsigned)val, !!(val&TPU_CTRL_EN), !!(val&TPU_CTRL_DSP_EN), s->fn);
     }
     if (off==TPU_CTRL && (val&TPU_CTRL_EN)) {
@@ -1213,8 +940,8 @@ static void calypso_tpu_write(void *o, hwaddr off, uint64_t val, unsigned sz) {
     }
     if (off==TPU_INT_CTRL) {
         static int ictrl_log = 0;
-        if (++ictrl_log <= 30)   /* fprintf inconditionnel (GAP-1 ÉTAPE 0 : DSP_FRAME armé ?) */
-            fprintf(stderr, "[trx] INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u\n",
+        if (++ictrl_log <= 30)
+            TRX_LOG("INT_CTRL WR val=0x%02x (MCU_FRAME=%d DSP_FRAME=%d DSP_FORCE=%d) fn=%u",
                     (unsigned)val,
                     !!(val&ICTRL_MCU_FRAME), !!(val&ICTRL_DSP_FRAME),
                     !!(val&ICTRL_DSP_FRAME_FORCE), s->fn);
@@ -1340,249 +1067,6 @@ static void calypso_cpu_idle_park(void)
 }
 
 /* ---- TDMA ---- */
-/* === NB -> DATA_IND : real BCCH SI from GSMTAP 4730 into a_cd (real DSP path)
- * ===========================================================================
- * Listens for grgsm-decoded System Information (RR, BCCH) on UDP GSMTAP 4730
- * and presents the 23-byte L2 block in the DSP a_cd cells (dsp word 0x09D0+),
- * which the ARM reads via API RAM 0x03A0+ when it runs task=24 (ALLC/CCCH).
- * Pairs with CALYPSO_FORCE_NB (supplies d_task_d/d_burst_d so prim_rx_nb does
- * not bail "EMPTY"). Same injection philosophy as the FB d_fb_det wiring: the
- * real DSP CCCH demod does not produce a_cd, so the real decoded SI is placed
- * in its own cells. Opt-in via CALYPSO_NB_DATAIND=1. The 23B SI source is the
- * genuine grgsm decode of the BTS I/Q (si_bridge -> GSMTAP 4730). */
-#define NBDI_GSMTAP_HDR  16
-#define NBDI_ACD_WORD    0x09D2   /* a_cd[0] in DSP data space (firmware: &a_cd=0xFFD003A4 -> data[0x3A4/2+0x800]=0x09D2; a_cd[3]/L2 byte0 -> 0x09D5/ARM 0x03A4) */
-static int     g_nbdi      = -1;  /* -1 uninit, 0 off, 1 on */
-static int     g_nbdi_fd   = -1;
-static uint8_t g_nbdi_si[6][23];  /* latest SI per type: SI1,SI2,SI3,SI4,2bis,2ter */
-static bool    g_nbdi_have[6];
-static int     g_nbdi_rr;          /* round-robin cursor over available SI types */
-
-static int nbdi_slot_for_mt(uint8_t mt)
-{
-    switch (mt) {
-    case 0x19: return 0;  /* SI1    */
-    case 0x1a: return 1;  /* SI2    */
-    case 0x1b: return 2;  /* SI3    */
-    case 0x1c: return 3;  /* SI4    */
-    case 0x1d: return 4;  /* SI2bis */
-    case 0x1e: return 5;  /* SI2ter */
-    default:   return -1;
-    }
-}
-
-static void nbdi_open(void)
-{
-    const char *e = getenv("CALYPSO_NB_DATAIND");
-    g_nbdi = (calypso_orch() && !(e && e[0] == '0')) ? 1 : 0;
-    if (!g_nbdi)
-        return;
-    const char *pe = getenv("CALYPSO_SHUNT_GSMTAP_PORT");
-    int port = (pe && *pe) ? atoi(pe) : 4730;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) { g_nbdi = 0; return; }
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        fprintf(stderr, "[nb-di] bind(:%d) failed (port busy?) — NB->DATA_IND off\n", port);
-        close(fd); g_nbdi = 0; return;
-    }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-    g_nbdi_fd = fd;
-    fprintf(stderr, "[nb-di] GSMTAP SI listener on :%d -> a_cd (real DSP path)\n", port);
-}
-
-/* Read l1s.current_time.fn (firmware L1 FN) from ARM RAM. This is the clock the
- * firmware schedules its BCCH-Norm block on and reads a_cd at burst 3 (fn%51==5);
- * nbdi must select the SI type and gate the a_cd write on THIS, not s->fn. Default
- * addr 0x836508, env override CALYPSO_L1S_FN_ADDR — identical to the shunt. */
-static uint32_t nbdi_l1s_fn(void)
-{
-    static uint32_t addr = 0;
-    if (!addr) {
-        const char *e = getenv("CALYPSO_L1S_FN_ADDR");
-        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836508;
-    }
-    uint32_t v = 0;
-    cpu_physical_memory_read(addr, &v, sizeof(v));
-    return le32_to_cpu(v);
-}
-
-static void nbdi_poll_and_present(CalypsoTRX *s)
-{
-    if (g_nbdi < 0)
-        nbdi_open();
-    if (g_nbdi != 1 || g_nbdi_fd < 0 || !s || !s->dsp || !s->dsp->data)
-        return;
-
-    /* Drain all pending GSMTAP datagrams; latch SI blocks by type. */
-    uint8_t buf[256];
-    for (;;) {
-        ssize_t n = recvfrom(g_nbdi_fd, buf, sizeof(buf), 0, NULL, NULL);
-        if (n <= 0)
-            break;
-        if (n < NBDI_GSMTAP_HDR + 3)
-            continue;
-        const uint8_t *l2 = buf + NBDI_GSMTAP_HDR;
-        int l2len = (int)n - NBDI_GSMTAP_HDR;
-        if (l2[1] != 0x06)                 /* RR protocol discriminator only */
-            continue;
-        int slot = nbdi_slot_for_mt(l2[2]);
-        if (slot < 0)                      /* SI types only (ignore AGCH/PCH) */
-            continue;
-        int cl = l2len < 23 ? l2len : 23;
-        memcpy(g_nbdi_si[slot], l2, cl);
-        for (int i = cl; i < 23; i++)
-            g_nbdi_si[slot][i] = 0x2b;     /* L2 fill */
-        g_nbdi_have[slot] = true;
-    }
-
-    /* Gate the a_cd write to the firmware's BCCH-Norm quad and pick the SI type
-     * by the GSM 05.02 6.3.1.3 TC schedule, keyed off the FIRMWARE L1 FN — the
-     * same clock the firmware arms BCCH_NORM (fn%51 in {2,3,4,5}) and reads a_cd
-     * at burst 3 (fn%51==5). TC=(fn/51)%8 is CONSTANT across the 4-burst block,
-     * so the chosen SI is stable across the block (no torn block, no RR). */
-    uint32_t fn_fw = nbdi_l1s_fn();
-    uint32_t pos = fn_fw % 51u;
-    if (pos < 2u || pos > 5u)        /* only the BCCH-Norm quad (fn%51 in {2,3,4,5}) */
-        return;
-    unsigned tc = (unsigned)((fn_fw / 51u) % 8u);
-    /* TC0->SI1 TC1->SI2 TC2->SI3 TC3->SI4 TC4->SI2ter TC5->SI2bis TC6->SI3 TC7->SI4 */
-    static const int tc_slot[8] = { 0, 1, 2, 3, 5, 4, 2, 3 };
-    int slot = tc_slot[tc];
-    if (!g_nbdi_have[slot]) {          /* fall back to SI3, then any available type */
-        if (g_nbdi_have[2]) {
-            slot = 2;
-        } else {
-            slot = -1;
-            for (int k = 0; k < 6; k++)
-                if (g_nbdi_have[k]) { slot = k; break; }
-        }
-    }
-    if (slot < 0)
-        return;
-    g_nbdi_rr = slot;                  /* retained only for the present-SI log line */
-
-    const uint8_t *m = g_nbdi_si[slot];
-    uint16_t *d = s->dsp->data;
-    d[NBDI_ACD_WORD + 0] = 0x0000;         /* a_cd[0] FIRE bits -> CRC pass */
-    d[NBDI_ACD_WORD + 1] = 0x0000;         /* a_cd[1] */
-    d[NBDI_ACD_WORD + 2] = 0x0000;         /* a_cd[2] num_biterr */
-    for (int k = 0; k < 12; k++) {         /* a_cd[3..14] = 23 bytes (12 words) */
-        uint8_t lo = m[2 * k];
-        uint8_t hi = (2 * k + 1 < 23) ? m[2 * k + 1] : 0x2b;
-        d[NBDI_ACD_WORD + 3 + k] = (uint16_t)(lo | (hi << 8));
-    }
-    static unsigned nlog = 0;
-    if (nlog++ < 40 || (nlog % 200) == 0)
-        fprintf(stderr, "[nb-di] present SI mt=0x%02x slot=%d #%u -> a_cd[3..]\n",
-                m[2], slot, nlog);
-}
-
-/* === SB sync: real BSIC+FN from grgsm (UDP 4731) -> a_sch (real DSP path) ===
- * ORCH-only. grgsm decodes the real SCH burst and sends "SCH1"+int32{bsic,fn,toa}
- * on UDP 4731. We encode the 25-bit SCH word (inverse of the firmware's
- * l1s_decode_sb) and write the DSP a_sch cells, so the mobile syncs to the REAL
- * BTS frame number instead of SB=0x00000000 -> BSIC=0/FN=52 -> BCCH window
- * misaligned -> sync timeout. a_sch is PAGED (p0/p1) -> write both. */
-#define SBI_SCH_PORT 4731
-static int      g_sbi      = -1;   /* -1 uninit, 0 off, 1 on */
-static int      g_sbi_fd   = -1;
-static int      g_sbi_bsic = -1;
-static uint32_t g_sbi_fn   = 0;
-
-static void sbi_open(void)
-{
-    g_sbi = calypso_orch() ? 1 : 0;
-    if (!g_sbi)
-        return;
-    const char *pe = getenv("CALYPSO_SHUNT_SCH_PORT");
-    int port = (pe && *pe) ? atoi(pe) : SBI_SCH_PORT;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) { g_sbi = 0; return; }
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        fprintf(stderr, "[sb-sync] bind(:%d) failed (busy?) — SB sync off\n", port);
-        close(fd); g_sbi = 0; return;
-    }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-    g_sbi_fd = fd;
-    fprintf(stderr, "[sb-sync] SCH listener on :%d -> a_sch (real BSIC/FN)\n", port);
-}
-
-/* Encode the 25-bit SCH word from BSIC + GSM frame number (exact inverse of the
- * firmware l1s_decode_sb in prim_fbsb.c). */
-static uint32_t sbi_encode(int bsic, uint32_t fn)
-{
-    uint32_t t1 = fn / 1326u;          /* 1326 = 51*26 */
-    uint32_t t2 = fn % 26u;
-    uint32_t t3 = fn % 51u;
-    uint32_t t3p = (t3 >= 1u) ? ((t3 - 1u) / 10u) : 0u;
-    uint32_t sb = 0;
-    sb |= ((uint32_t)(bsic & 0x3f)) << 2;   /* BSIC -> sb[7:2]   */
-    sb |= (t1 & 1u) << 23;                  /* t1[0]  -> sb[23]  */
-    sb |= (t1 & 0x1feu) << 7;               /* t1[8:1]-> sb[15:8]*/
-    sb |= (t1 >> 9) & 3u;                    /* t1[10:9]->sb[1:0] */
-    sb |= (t2 & 0x1fu) << 18;               /* t2     -> sb[22:18]*/
-    sb |= (t3p & 1u) << 24;                  /* t3p[0] -> sb[24]  */
-    sb |= ((t3p >> 1) & 3u) << 16;           /* t3p[2:1]->sb[17:16]*/
-    return sb;
-}
-
-static void sbi_poll_and_present(CalypsoTRX *s)
-{
-    if (g_sbi < 0)
-        sbi_open();
-    if (g_sbi != 1 || g_sbi_fd < 0 || !s || !s->dsp || !s->dsp->data)
-        return;
-
-    uint8_t buf[64];
-    for (;;) {
-        ssize_t n = recvfrom(g_sbi_fd, buf, sizeof(buf), 0, NULL, NULL);
-        if (n <= 0)
-            break;
-        if (n >= 16 && buf[0]=='S' && buf[1]=='C' && buf[2]=='H' && buf[3]=='1') {
-            int32_t bsic, fn, toa;
-            memcpy(&bsic, buf + 4, 4);
-            memcpy(&fn,   buf + 8, 4);
-            memcpy(&toa,  buf + 12, 4);
-            (void)toa;
-            g_sbi_bsic = (int)bsic;
-            g_sbi_fn   = (uint32_t)fn;
-        }
-    }
-    if (g_sbi_bsic < 0)
-        return;
-
-    uint32_t sb = sbi_encode(g_sbi_bsic, g_sbi_fn);
-    uint16_t *d = s->dsp->data;
-    /* a_sch[0] CRC (bit8=0 => OK): p0 0x0837 / p1 0x084B */
-    d[0x0837] = 0x0000; d[0x084B] = 0x0000;
-    /* a_sch[3] = sb[15:0] : p0 0x083A / p1 0x084E */
-    d[0x083A] = (uint16_t)(sb & 0xFFFF); d[0x084E] = (uint16_t)(sb & 0xFFFF);
-    /* a_sch[4] = sb[24:16] : p0 0x083B / p1 0x084F */
-    d[0x083B] = (uint16_t)(sb >> 16); d[0x084F] = (uint16_t)(sb >> 16);
-    /* a_serv_demod[D_TOA] on-time (23) so the SB passes the "future" check:
-     * p0 0x0830 / p1 0x0844 */
-    d[0x0830] = (uint16_t)23; d[0x0844] = (uint16_t)23;
-
-    static unsigned nlog = 0;
-    if (nlog++ < 40 || (nlog % 200) == 0)
-        fprintf(stderr, "[sb-sync] a_sch <- bsic=%d fn=%u sb=0x%08x #%u\n",
-                g_sbi_bsic, g_sbi_fn, (unsigned)sb, nlog);
-}
-
 static void calypso_frame_irq_lower(void *o){
     /* Frame IRQ lower counter — log thinned 1/1000 pour drift detection. */
     static uint64_t firq_lower_n = 0;
@@ -1597,12 +1081,6 @@ static void calypso_frame_irq_lower(void *o){
     /* DSP shunt service hook (no-op si shunt off). Servir APRÈS le lower
      * pour que le mock écrive ses résultats entre deux ticks ARM. */
     calypso_dsp_shunt_on_frame_tick();
-
-    /* NB -> DATA_IND : present real grgsm SI in a_cd (opt-in). */
-    nbdi_poll_and_present((CalypsoTRX *)o);
-
-    /* SB sync : present real grgsm BSIC/FN in a_sch (ORCH). */
-    sbi_poll_and_present((CalypsoTRX *)o);
 
     /* Per-frame work for this tick is done — park the vCPU if the guest is
      * back in its idle super-loop, so the host core sleeps until the next
@@ -1766,43 +1244,12 @@ static void calypso_tdma_tick(void *opaque) {
 
         bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
         bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
-        /* GAP-1 FIX FAITHFUL (2026-06-23) : l'IT trame DSP est une LIGNE INT3
-         * CÂBLÉE pilotée par le TPU — elle n'est PAS gatée par l'IMR du DSP en
-         * amont. L'ancien `&& imr_armed` (ajout empirique, cf 1419-1423) inversait
-         * la causalité silicium et créait un VERROU CIRCULAIRE : le DSP a besoin de
-         * recevoir l'IT pour atteindre son code d'armement IMR (ROM 0x702b
-         * `OR #0x001d,IMR`), mais l'IT était gatée sur IMR déjà armé → prouvé au
-         * runtime (tpu_armed=1, imr_armed=0, fire=0 à jamais). On délivre l'IT dès
-         * que le TPU l'arme ; c'est le c54x (IMR/INTM dans c54x_interrupt_ex, déjà
-         * fidèle SPRU131) qui décide de vectoriser ou juste sortir d'IDLE. Firmware
-         * INCHANGÉ. `imr_armed` conservé pour la sonde FRAME-GATE seulement. */
-        /* TEST 2026-06-23 : revert temporaire du fix imr_armed pour falsifier
-         * l'hypothèse « firer l'IT masquée perturbe le DSP → derail ». */
-        /* FIX FIDELE (restaure 2026-06-24) : l'IT trame DSP est une LIGNE INT3
-         * CABLEE pilotee par le TPU, PAS gatee par l'IMR du DSP. Le `&& imr_armed`
-         * (test reverte 2026-06-23, jamais restaure) cree un VERROU CIRCULAIRE
-         * prouve au runtime (tpu_armed=1 imr_armed=0 fire=0 a jamais) : le DSP a
-         * besoin de l'IT pour atteindre son armement IMR (ROM 0x702b OR #0x1d,IMR),
-         * mais l'IT etait gatee sur IMR deja arme. On livre l'IT des que le TPU
-         * l'arme ; c54x_interrupt_ex (deja fidele INTM/IMR/IDLE) decide de
-         * vectoriser, poser IFR, ou sortir d'IDLE. Firmware INCHANGE = on EXECUTE
-         * le DSP, on ne l'orchestre pas. Gated CALYPSO_FRAME_FAITHFUL pour A/B. */
-        static int g_frame_faithful = -1;
-        if (g_frame_faithful < 0)
-            g_frame_faithful = getenv("CALYPSO_FRAME_FAITHFUL") ? 1 : 0;
-        bool periodic_armed = g_frame_faithful ? tpu_armed
-                                               : (tpu_armed && imr_armed);
+        bool periodic_armed = tpu_armed && imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
-        /* GAP-1 ÉTAPE 0 : état du gate au runtime (le verrou circulaire tpu_armed
-         * && imr_armed). Montre si l'IT trame est bloquée par imr_armed seul. */
-        { static unsigned gate_log = 0;
-          if (gate_log < 50) { gate_log++;
-            fprintf(stderr, "[trx] FRAME-GATE tpu_armed=%d imr_armed=%d(IMR=0x%04x) "
-                    "force=%d -> fire=%d fn=%u\n",
-                    tpu_armed, imr_armed, (unsigned)s->dsp->imr,
-                    force_pulse, (periodic_armed||force_pulse), s->fn); } }
-        if (periodic_armed || force_pulse) {
-            g_c54x_int3_src = 1;
+        /* FIX DOUBLE-INT3 : quand la route c54x du shunt est active, c'est
+         * shunt_route_to_c54x() qui fire l'INT3 frame. Ne PAS le double-firer ici,
+         * sinon le c54x reçoit 2 IT frame/tick -> déraille -> crash qemu. */
+        if ((periodic_armed || force_pulse) && !calypso_dsp_shunt_route_c54x_active()) {
             c54x_interrupt_ex(s->dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
             if (force_pulse)
                 s->tpu_regs[TPU_CTRL/2] &= ~TPU_CTRL_DSP_EN;
@@ -1817,6 +1264,17 @@ static void calypso_tdma_tick(void *opaque) {
          * GATE DSP_SHUNT : skip si shunt actif (cf section 2 commentaire). */
         if (!s->dsp->idle && !calypso_dsp_shunt_active()) {
             dsp_n_exec_5 = c54x_run(s->dsp, dsp_budget);
+        }
+
+        /* CALYPSO_L1=c : pilote le modèle L1 HLE APRÈS le c54x RX (qui ne produit
+         * rien d'exploitable) -> d_fb_det + a_sync_demod sont les dernières écritures
+         * de la frame. Lit l'I/Q injectée en DARAM 0x2a00 et corrèle le FCCH. */
+        /* Ne PAS piloter le modèle L1=c quand le shunt est actif : il écrirait
+         * d_fb_det=0 par-dessus le d_fb_det=1 du shunt (clobber -> FB perdu).
+         * Le shunt possède alors la réception (FB+SB+SI). Le modèle L1=c ne tourne
+         * que sans shunt (chemin HLE pur). */
+        if (calypso_l1_c_active() && !calypso_dsp_shunt_active()) {
+            calypso_layer1_tick(s->dsp, s->dsp_ram, s->fn);
         }
 
         /* Do NOT clear tasks here — the firmware's l1s_compl() does
@@ -1851,32 +1309,6 @@ static void calypso_tdma_tick(void *opaque) {
                 (unsigned long long)tdma_ticks, s->fn, (long long)entry_t,
                 dsp_n_exec_2, dsp_n_exec_5,
                 (unsigned long long)dsp_insn_total, dsp_budget);
-    }
-
-    /* === POST-WATCH (revival dsp) : l'ARM poste-t-il jamais d_task_d/d_burst_d
-     * (db_w command), et le DSP les voit-il ? On lit les mots depuis dsp_ram[]
-     * (partagé = ce que le DSP lit via api_ram) ET dsp->data[] (copie privée
-     * prog-fetch) pour distinguer "post jamais émis" (tout=0) de "post non
-     * miroité" (RAM != DATA). Log seulement quand non-nul, capé 200. */
-    if (s->dsp && s->dsp->data) {
-        uint16_t r_td0 = s->dsp_ram[0x00], r_bd0 = s->dsp_ram[0x01];
-        uint16_t r_td1 = s->dsp_ram[0x14], r_bd1 = s->dsp_ram[0x15];
-        uint16_t d_td0 = s->dsp->data[0x800], d_bd0 = s->dsp->data[0x801];
-        uint16_t d_td1 = s->dsp->data[0x814], d_bd1 = s->dsp->data[0x815];
-        if (r_td0|r_bd0|r_td1|r_bd1|d_td0|d_bd0|d_td1|d_bd1) {
-            static unsigned pw_log;
-            if (pw_log < 200) {
-                fprintf(stderr,
-                  "[POST-WATCH] fn=%u RAM td0=%04x bd0=%04x td1=%04x bd1=%04x "
-                  "DATA td0=%04x bd0=%04x td1=%04x bd1=%04x%s\n",
-                  (unsigned)s->fn, r_td0, r_bd0, r_td1, r_bd1,
-                  d_td0, d_bd0, d_td1, d_bd1,
-                  (r_td0 != d_td0 || r_bd0 != d_bd0 ||
-                   r_td1 != d_td1 || r_bd1 != d_bd1)
-                    ? " *MIRROR-MISMATCH*" : "");
-                pw_log++;
-            }
-        }
     }
 
     /* ── 6. BSP DL delivery is now driven by wall-clock drain timer in
@@ -1943,17 +1375,6 @@ static void calypso_tdma_tick(void *opaque) {
     }
     t_ul = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    /* ── 6.5 calypso_layer1.c — HLE L1 scaffold (CALYPSO_L1=c, default off) ──
-     * Modèle L1 du DSP en C, cadencé ICI : s->fn est posé, l'I/Q de la trame est
-     * déjà en data[0x2a00], et on écrit AVANT l'IRQ qui déclenche l1s_fbdet_resp
-     * côté ARM → résultats lus dans la fenêtre 1ms. Gaté strict → mock (SHUNT) et
-     * revival (vrai c54x, arc LLE/IPTR) intacts. Scaffold intermédiaire, PAS
-     * l'endgame : le revival reste le but faithful, gardé vivant derrière le gate
-     * off. ÉTAPE 0 = read-only (ratio de cohérence FCCH loggé, zéro write). */
-    if (calypso_l1_c_active() && s->dsp && s->dsp->data) {
-        calypso_layer1_tick(s->dsp, s->dsp_ram, s->fn);
-    }
-
     /* ── 7. TPU FRAME IRQ → ARM L1 scheduler ── */
     {
         static FILE *firq_log = NULL;
@@ -1974,6 +1395,9 @@ static void calypso_tdma_tick(void *opaque) {
             }
         }
     }
+    /* Fige timer #1 sur la grille de trame pour cette IRQ délivrée -> le firmware
+     * check_lost_frame() voit un pas de 1875 exact (fin du spam LOST). */
+    calypso_timer_lost_frame_tick(s->fn);
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_TPU_FRAME]);
     timer_mod_ns(s->frame_irq_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
@@ -2280,38 +1704,6 @@ C54xState *calypso_trx_get_dsp(void)
     return g_trx ? g_trx->dsp : NULL;
 }
 
-/* DSP hardware reset, driven by the ARM firmware via CNTL_RST (RESET_DSP bit) at
- * 0xfffffd04 — appelé par calypso_cntl_write (soc). Sur silicium le firmware tient
- * le DSP en reset (dsp_pre_boot : assert RESET_DSP) puis le release → la ROM boote
- * FRESH, synchronisée à la timeline firmware. L'ému ignorait ce registre → la ROM
- * tournait en roue libre depuis le realize, désynchro (GAP-0). Ici : assert →
- * running=false (tenir) ; release (transition 1→0) → c54x_reset (boot frais, pose
- * running=true). Gaté revival (SHUNT=0) ; le fake reste en place. */
-void calypso_trx_dsp_hw_reset(int assert_reset)
-{
-    static unsigned hrdbg = 0;
-    if (hrdbg < 12) { hrdbg++;
-        fprintf(stderr, "[trx] HW-RESET-CALL assert=%d g_trx=%p dsp=%p revival=%d\n",
-                assert_reset, (void *)g_trx,
-                (void *)(g_trx ? g_trx->dsp : NULL), dsp_real_rom_mode());
-    }
-    if (!g_trx || !g_trx->dsp || !dsp_real_rom_mode()) return;
-    static int in_reset = 0;
-    if (assert_reset) {
-        if (!in_reset) {
-            g_trx->dsp->running = false;
-            in_reset = 1;
-            TRX_LOG("DSP HW reset ASSERTED (firmware CNTL_RST RESET_DSP=1) — c54x held");
-        }
-    } else {
-        if (in_reset) {
-            c54x_reset(g_trx->dsp);   /* fresh boot ; c54x_reset pose running=true */
-            in_reset = 0;
-            TRX_LOG("DSP HW reset RELEASED — c54x fresh boot, synced to firmware timeline");
-        }
-    }
-}
-
 /* Per-section ROM bin paths, set by mb.c machine_init BEFORE sysbus_realize
  * so that trx_init can load each section into prog[]/data[] **before**
  * c54x_reset() — the reset's PROM→DARAM auto-copy needs prog[] populated. */
@@ -2350,8 +1742,6 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
 
     memory_region_init_io(&s->dsp_iomem,NULL,&calypso_dsp_ops,s,"calypso.dsp_api",CALYPSO_DSP_SIZE);
     memory_region_add_subregion(sysmem,CALYPSO_DSP_BASE,&s->dsp_iomem);
-    /* Pre-fake DSP booted — INCONDITIONNEL (cf read handler : load-bearing pour faire
-     * tourner la ROM, le spin firmware affame sinon le tick c54x). */
     s->dsp_ram[DSP_DL_STATUS_ADDR/2]=DSP_DL_STATUS_READY; s->dsp_ram[DSP_API_VER_ADDR/2]=DSP_API_VERSION; s->dsp_booted=true;
 
     memory_region_init_io(&s->tpu_iomem,NULL,&calypso_tpu_ops,s,"calypso.tpu",CALYPSO_TPU_SIZE);
@@ -2457,11 +1847,6 @@ void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs)
             if (g_section_registers)
                 c54x_load_registers(s->dsp, g_section_registers);
             c54x_reset(s->dsp);
-            /* running reste false ici : le c54x ne démarre PAS de façon autonome
-             * (running=false = dormant). En revival il ne BACC pas (GAP-0), donc le
-             * laisser spinner n'achète rien et ajoute un writer sur data[0x0fff]
-             * (race avec le fake). Quand GAP-0 tombera, re-dégainer le running=true
-             * realive gaté. */
             calypso_bsp_init(s->dsp);
         }
     }

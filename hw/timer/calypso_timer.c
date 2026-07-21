@@ -133,6 +133,46 @@ static void calypso_timer_start(CalypsoTimerState *s)
     timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
 }
 
+/* ---- Frame-locked lost-frame latch (timer #1 only) ----
+ * Firmware check_lost_frame() (layer1/sync.c) reads timer #1 once per TDMA
+ * frame-IRQ and expects the count to advance by exactly 1875 ticks between two
+ * IRQs (tolérance ±1). Sous CALYPSO_TDMA_REALTIME=1 + -icount auto, l'instant
+ * d'échantillonnage jitte (±~13 ticks) -> "LOST N!" en continu. On fige la
+ * valeur READ de timer #1 sur une grille dérivée du FN : count(fn) = load -
+ * (fn mod 4)*1875 ∈ {7499,5624,3749,1874}. Deux frames consécutives diffèrent
+ * de 1875 pile -> zéro LOST ; un vrai saut (fn +k) donne k*1875 -> LOST légitime
+ * conservé. timer #1 est le SEUL hwtimer lu par check_lost_frame(). */
+#define LOST_TICKS_PER_TDMA 1875
+
+static CalypsoTimerState *g_lost_timer;   /* timer #1 @ 0xFFFE3800 */
+
+static bool calypso_lost_latch_enabled(void)
+{
+    static int cached = -1;   /* défaut ON ; opt-out CALYPSO_LOST_LATCH=0 */
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_LOST_LATCH");
+        cached = (e && *e == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+void calypso_timer_register_lost(DeviceState *d)
+{
+    g_lost_timer = CALYPSO_TIMER(d);
+}
+
+void calypso_timer_lost_frame_tick(uint32_t fn)
+{
+    CalypsoTimerState *s = g_lost_timer;
+    if (!s || !s->running || !calypso_lost_latch_enabled()) {
+        return;
+    }
+    uint32_t period = (uint32_t)s->load + 1;                 /* 7500 */
+    uint32_t step = ((uint64_t)fn * LOST_TICKS_PER_TDMA) % period;
+    s->lost_latch_count = (uint16_t)(s->load - step);        /* down-counter */
+    s->lost_latch_active = true;
+}
+
 /* ---- MMIO ---- */
 
 static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
@@ -159,7 +199,11 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
     switch (offset) {
     case 0x00: return s->ctrl;
     case 0x02: return s->load;
-    case 0x04: return calypso_timer_current_count(s);
+    case 0x04:
+        if (s->lost_latch_active) {   /* frame-locked value for check_lost_frame() */
+            return s->lost_latch_count;
+        }
+        return calypso_timer_current_count(s);
     default:   return 0;
     }
 }
@@ -230,6 +274,8 @@ static void calypso_timer_reset(DeviceState *dev)
     s->ctrl = 0;
     s->prescaler = 0;
     s->running = false;
+    s->lost_latch_active = false;
+    s->lost_latch_count = 0;
     timer_del(s->timer);
 }
 

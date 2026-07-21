@@ -111,11 +111,6 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn);
 
 /* Trace helper — single-line dump of current state. */
-/* Host-side synthetic FB detection — writes d_fb_det + a_sync_demod
- * cells into the NDB (CALL_FLOW.md step 4). */
-void calypso_fbsb_publish_fb_found(CalypsoFbsb *s, int16_t toa, uint16_t pm,
-                                  int16_t ang, uint16_t snr);
-
 void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag);
 
 #endif /* CALYPSO_FBSB_H */

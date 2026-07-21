@@ -4103,7 +4103,7 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
 static bool c54x_irq_level_check(C54xState *s)
 {
     static int en = -1;
-    if (en < 0) en = getenv("CALYPSO_C54X_IRQ_LEVEL") ? 1 : 0;
+    if (en < 0) { const char *_d = getenv("CALYPSO_DSP"); en = (getenv("CALYPSO_C54X_IRQ_LEVEL") || (_d && !strcmp(_d, "c54x"))) ? 1 : 0; }  /* natif revive */
     if (!en) return false;
     if ((s->st1 & ST1_INTM) || s->delay_slots != 0) return false;
     /* Ne pas vectoriser tant que le ROM n a pas relocalise IPTR (reset=0x1ff ->
@@ -4118,7 +4118,7 @@ static bool c54x_irq_level_check(C54xState *s)
      * Gated CALYPSO_DSP_FRAME_VEC28. On consomme le bit3 de l IFR mais on vectorise 28. */
     {
         static int lv28 = -1;
-        if (lv28 < 0) lv28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
+        if (lv28 < 0) { const char *_d = getenv("CALYPSO_DSP"); lv28 = (getenv("CALYPSO_DSP_FRAME_VEC28") || (_d && !strcmp(_d, "c54x"))) ? 1 : 0; }  /* natif revive */
         if (lv28 && b == 3) vec = 28;
     }
     s->ifr &= ~(1u << b);
@@ -5635,8 +5635,13 @@ static int c54x_exec_one(C54xState *s)
                 static int fix_sftl_rsbx = -1;
                 if (fix_sftl_rsbx < 0)
                     fix_sftl_rsbx = getenv("CALYPSO_FIX_SFTL_RSBX") ? 1 : 0;
+                /* NATIF 2026-07-20 : RSBX/SSBX (low-byte nibble 0xB = 0x?Bx) ne sont
+                 * JAMAIS un shift accumulator legal (cf binutils tic54x-opc.c). Exclusion
+                 * INCONDITIONNELLE du pattern shift -> ils tombent dans leur vrai handler
+                 * RSBX/SSBX. C etait CALYPSO_FIX_SFTL_RSBX (default OFF) -> rendu natif.
+                 * Sans ca, RSBX INTM=0xF6BB etait avale en shift bidon -> INTM jamais clear. */
                 if ((op & 0xFCE0) == 0xF4A0 &&
-                    (fix_sftl_rsbx == 0 || (op & 0xF0) != 0xB0)) {
+                    (op & 0xF0) != 0xB0) {
                     /* SFTL src,shift,dst — logical shift accumulator */
                     int src = (op >> 8) & 1, dst = (op >> 9) & 1;
                     int shift = op & 0x1F; if (shift > 15) shift -= 32;
@@ -12144,7 +12149,7 @@ int c54x_run(C54xState *s, int n_insns)
          * trampoline -> go-live. Succes = GOLIVE-WATCH voit 0xa51b + INTM-CLEAR. */
         {
             static int seed_on = -1;
-            if (seed_on < 0) seed_on = getenv("CALYPSO_SEED5AC8") ? 1 : 0;
+            if (seed_on < 0) { const char *e = getenv("CALYPSO_SEED5AC8"); seed_on = (e && atoi(e) > 0) ? 1 : 0; }
             if (seed_on && exec_pc == 0xb40f) {
                 static unsigned sd = 0;
                 if (sd < 8)
@@ -12210,7 +12215,7 @@ int c54x_run(C54xState *s, int n_insns)
          * do data[0x3f70]/data[0x435b] populate too (single-root-cause test). */
         if (exec_pc == 0xa4ca) {
             static int poke_en = -1;
-            if (poke_en < 0) poke_en = getenv("CALYPSO_POKE_A4C7_ONCE") ? 1 : 0;
+            if (poke_en < 0) { const char *e = getenv("CALYPSO_POKE_A4C7_ONCE"); poke_en = (e && atoi(e) > 0) ? 1 : 0; }
             static int poke_done = 0;
             if (poke_en && !poke_done) {
                 poke_done = 1;

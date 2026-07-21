@@ -3,62 +3,32 @@ graph LR
   classDef partial fill:#fde79c,stroke:#b07a00,color:#3a2c00;
   classDef fail    fill:#fbb4b4,stroke:#a31a1a,color:#5a0000;
   classDef skip    fill:#e0e0e0,stroke:#6a6a6a,color:#333;
-  classDef brk  fill:#ff5252,stroke:#990000,color:#fff,stroke-width:3px;
+  classDef break_  fill:#ff5252,stroke:#990000,color:#fff,stroke-width:3px;
   P_Infra["Infra<br/>5/5"]
   class P_Infra pass;
-  P_GDB_introspect["GDB-introspect<br/>8/8"]
-  class P_GDB_introspect pass;
-  P_Infra --> P_GDB_introspect
-  P_Monitor_extended["Monitor-extended<br/>9/9"]
-  class P_Monitor_extended pass;
-  P_GDB_introspect --> P_Monitor_extended
-  P_Firmware_state["Firmware-state<br/>5/5"]
-  class P_Firmware_state pass;
-  P_Monitor_extended --> P_Firmware_state
-  P_Osmocon["Osmocon<br/>2/3"]
-  class P_Osmocon partial;
-  P_Firmware_state --> P_Osmocon
-  P_DSP["DSP<br/>5/20"]
+  P_DSP["DSP<br/>10/20"]
   class P_DSP partial;
-  P_Osmocon --> P_DSP
-  P_L1_data["L1-data<br/>1/7"]
+  P_Infra --> P_DSP
+  P_L1_data["L1-data<br/>4/7"]
   class P_L1_data partial;
   P_DSP --> P_L1_data
-  P_L1_ctrl["L1-ctrl<br/>1/8"]
+  P_L1_ctrl["L1-ctrl<br/>2/8"]
   class P_L1_ctrl partial;
   P_L1_data --> P_L1_ctrl
-  P_Timers["Timers<br/>7/9"]
-  class P_Timers partial;
-  P_L1_ctrl --> P_Timers
-  P_Drift["Drift<br/>4/10"]
-  class P_Drift partial;
-  P_Timers --> P_Drift
-  P_NDB["NDB<br/>19/19"]
-  class P_NDB pass;
-  P_Drift --> P_NDB
+  P_NDB["NDB<br/>9/19"]
+  class P_NDB partial;
+  P_L1_ctrl --> P_NDB
   P_ARM_feedback["ARM-feedback<br/>0/2"]
   class P_ARM_feedback fail;
   P_NDB --> P_ARM_feedback
   P_ARM_feedback -.->|🛑| BREAK_ARM_feedback["BREAK HERE<br/>ARM-feedback 0% pass"]
-  class BREAK_ARM_feedback brk;
-  P_IrDA_channel["IrDA-channel<br/>3/8"]
-  class P_IrDA_channel partial;
-  P_ARM_feedback --> P_IrDA_channel
+  class BREAK_ARM_feedback break_;
   P_L3_MM["L3-MM<br/>0/5"]
   class P_L3_MM fail;
-  P_IrDA_channel --> P_L3_MM
+  P_ARM_feedback --> P_L3_MM
   P_Mgmt["Mgmt<br/>3/3"]
   class P_Mgmt pass;
   P_L3_MM --> P_Mgmt
-  P_Net["Net<br/>2/2"]
-  class P_Net pass;
-  P_Mgmt --> P_Net
-  P_FS["FS<br/>3/3"]
-  class P_FS pass;
-  P_Net --> P_FS
-  P_Log_grep["Log-grep<br/>19/30"]
-  class P_Log_grep partial;
-  P_FS --> P_Log_grep
   P_Summary["Summary<br/>1/1"]
   class P_Summary pass;
-  P_Log_grep --> P_Summary
+  P_Mgmt --> P_Summary

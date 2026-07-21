@@ -71,10 +71,4 @@ void calypso_bsp_send_ul(uint8_t tn, uint32_t fn, const uint8_t bits[148]);
  * future bursts (fn > current_fn) are kept for later frames. */
 void calypso_bsp_deliver_buffered(uint32_t current_fn);
 
-/* Latest real host-measured FB (FCCH tone) detection from the BSP
- * correlator. Returns 1 and fills out-params on a fresh TONAL_FB
- * (consuming it); 0 otherwise. Read by calypso_fbsb. */
-int calypso_bsp_get_fb_detection(int16_t *toa, uint16_t *pm,
-                                 int16_t *ang, uint16_t *snr);
-
 #endif /* HW_ARM_CALYPSO_BSP_H */

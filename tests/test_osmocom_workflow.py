@@ -10,29 +10,14 @@ Markers :
   - `osmocom_bridge`     : calypso-ipc-device timing
   - `osmocom_boot`       : séquence boot ARM/DSP
 
-Couvre les divergences identifiées dans WORKFLOW_OSMOCOM.md (historique) :
+Couvre les divergences identifiées dans WORKFLOW_OSMOCOM.md :
   ✓ SIM IT bits clear semantics (NATR/WT/OV on read, TX on DTX write)
-  ✓ BSP drain timer REALTIME + monotonic anti-drift rearm (2026-05-29/30 :
-    VIRTUAL droppait 95% des bursts sous charge DSP lourde, revert
-    volontaire et documenté dans calypso_bsp.c)
-  ✗ Bridge clock verrouillé sur QEMU FN (CALYPSO_QFN_FORCE) reste =0 par
-    défaut — une tentative de spin-wait qfn-pacé a starve l'IPC osmo-trx
-    (crash), le pacing wall clock_nanosleep(ABSTIME) reste le défaut stable
-
-Retirés 2026-07-03 (cleanup pytest) — code/feature structurellement
-supprimé du produit, voir commentaires source datés pour la trace :
-  - rxDoneFlag address injection (default `rxdone_addr` codé en dur) :
-    supprimé, le firmware gère rxDoneFlag lui-même via le read-to-clear
-    normal de SIM_IT (plus besoin d'injection d'adresse par QEMU)
-  - SIM defer-clear timer (clear_edge_timer/clear_edge_cb/pending_edge_clear) :
-    supprimé 2026-05-27, la race cpu_io_recompile qu'il contournait s'est
-    avérée INEXISTANTE (probes empiriques, cf calypso_sim.c)
-  - CALYPSO_FORCE_RX_DONE : hack env-gated retiré du code source 2026-05-26
-    (politique no-hack, CLAUDE.md règle #1 — cf bash_scripts/run.sh)
-  - calypso-ipc-device `select.select()` timeout : le bridge a été réécrit
-    en C (tools/calypso-ipc-device/), pacing par
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME) — aucun code Python
-    select.select ne subsiste pour matcher
+  ✓ rxDoneFlag address aligned with nm
+  ✓ BSP drain timer on QEMU_CLOCK_VIRTUAL
+  ✓ Bridge.py select timeout < 5ms
+  ✓ Defer clear timer present (race fix contre cpu_io_recompile)
+  ✗ TCG conditional STR commit sous -icount auto (vraie cause non patchée,
+    contournée par defer)
 """
 from __future__ import annotations
 
@@ -47,17 +32,18 @@ import pytest
 CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
 QEMU_SRC = "/opt/GSM/qemu-src"
+FW_ELF = os.environ.get(
+    "FW_ELF",
+    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf")
 SIM_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_sim.c"
 SIM_H = f"{QEMU_SRC}/include/hw/arm/calypso/calypso_sim.h"
 TRX_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_trx.c"
 BSP_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_bsp.c"
 TINT0_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_tint0.c"
-# calypso-ipc-device a été réécrit Python -> C (fix 2026-07-03) : il n'y a
-# plus de script `calypso-ipc-device` avec select.select(), la logique de
-# pacing vit maintenant dans qemu_wrap.c (clock_nanosleep ABSTIME / QFN_FORCE).
-BRIDGE_C = f"{QEMU_SRC}/tools/calypso-ipc-device/qemu_wrap.c"
+BRIDGE_PY = f"{QEMU_SRC}/calypso-ipc-device"
+RUN_SH = f"{QEMU_SRC}/run.sh"
 QEMU_LOG = "/root/qemu.log"
-BTS_LOG = "/root/bts.log"
+BTS_LOG = "/tmp/bts.log"
 
 
 def _read(path: str) -> str:
@@ -74,6 +60,20 @@ def _read(path: str) -> str:
         return r.stdout
     except Exception:
         return ""
+
+
+def _nm_symbol(elf_path: str, sym: str) -> str | None:
+    """Look up a symbol address via nm. Returns hex string '0x...' or None."""
+    cmd = ["nm", elf_path] if INSIDE else ["docker", "exec", CONTAINER, "nm", elf_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1] == sym:
+                return "0x" + parts[0].lstrip("0").rjust(8, "0")[-8:]
+    except Exception:
+        pass
+    return None
 
 
 # =============================================================================
@@ -152,18 +152,30 @@ def test_sim_rx_is_level_sensitive():
 
 
 # =============================================================================
-# 2. (removed 2026-07-03) rxDoneFlag address injection no longer exists.
+# 2. rxDoneFlag address alignment — QEMU default = firmware nm symbol
 # =============================================================================
-# `test_rxdone_addr_matches_firmware_nm` used to check that QEMU's
-# hardcoded fallback `rxdone_addr` (a memory address QEMU poked directly
-# to set the firmware's rxDoneFlag) matched the real firmware ELF symbol.
-# That whole mechanism has been structurally removed from calypso_sim.c /
-# calypso_trx.c — verified by grep, no `rxdone_addr`, no `0x008302xx`
-# literal, no such getenv anywhere left in hw/. rxDoneFlag is now set by
-# the firmware's own normal execution path; QEMU only provides correct
-# SIM_IT/WT semantics (see section 1 above and the SIM_IT read handler in
-# calypso_sim.c, "rxDoneFlag side-effect" comment). Nothing left to check
-# here — deleted rather than left failing against dead code.
+
+@pytest.mark.osmocom_compliant
+@pytest.mark.osmocom_sim
+def test_rxdone_addr_matches_firmware_nm():
+    """Le default rxdone_addr dans QEMU doit matcher l'adresse réelle dans le
+    firmware ELF (per `nm`).
+
+    Avant fix 2026-05-24 : default stale `0x008302a0` (vieux build), firmware
+    était à `0x008302d4`. Le hack tapait la mauvaise case.
+    """
+    expected = _nm_symbol(FW_ELF, "rxDoneFlag")
+    if expected is None:
+        pytest.skip(f"can't resolve rxDoneFlag in {FW_ELF}")
+    for path in (SIM_C, TRX_C):
+        src = _read(path)
+        # Cherche le default fallback dans le getenv pattern
+        m = re.search(r":\s*(0x008302[0-9a-fA-F]{2})\s*;", src)
+        assert m, f"no default rxdone_addr in {path}"
+        actual = "0x" + m.group(1).lstrip("0x").lstrip("0").rjust(8, "0")[-8:]
+        assert actual == expected, (
+            f"{path}: default rxdone_addr = {actual}, "
+            f"but firmware nm says {expected}")
 
 
 # =============================================================================
@@ -174,30 +186,22 @@ def test_sim_rx_is_level_sensitive():
 @pytest.mark.osmocom_compliant
 @pytest.mark.osmocom_clock
 def test_bsp_drain_timer_on_virtual_clock():
-    """BSP drain timer doit être REALTIME wall-paced avec rearm monotonic
-    anti-drift (PAS VIRTUAL).
+    """BSP drain timer doit être sur QEMU_CLOCK_VIRTUAL pour s'aligner avec
+    TINT0/tdma_tick et éviter le drift bts↔qfn sous icount=auto.
 
-    Historique : fix 2026-05-24 était REALTIME → VIRTUAL (contre le drift
-    bts↔qfn sous icount=auto). Fix 2026-05-29/30 (voir calypso_bsp.c) est
-    revenu volontairement à REALTIME : sous charge DSP lourde, VIRTUAL
-    tournait plus lentement que le wall clock → la queue UDP BSP débordait
-    → 95% des bursts étaient droppés. tdma_tick/clk_master étant devenus
-    REALTIME-monotonic entre-temps, wall et virtual restent alignés, donc
-    le retour à REALTIME ne réintroduit pas le drift original — cf le
-    rearm `last_target + period` dans bsp_drain_cb (anti-jitter monotonic,
-    équivalent fonctionnel de l'alignement VIRTUAL visé par le fix d'origine).
+    Avant fix 2026-05-24 : QEMU_CLOCK_REALTIME → drift ~1300 fr en 6s wall.
     """
     src = _read(BSP_C)
     assert src, f"can't read {BSP_C}"
+    # timer_new_* doit utiliser VIRTUAL
     assert re.search(
-        r"timer_new_ns\s*\(\s*QEMU_CLOCK_REALTIME\s*,\s*bsp_drain_cb", src), (
-        "BSP drain timer must use QEMU_CLOCK_REALTIME (2026-05-29 revert — "
-        "VIRTUAL dropped 95% of bursts under DSP load)")
-    # Le rearm anti-drift monotonic (`last_target`) doit être présent dans
-    # bsp_drain_cb — c'est lui qui remplace la garantie qu'apportait VIRTUAL.
-    assert "last_target" in src, (
-        "bsp_drain_cb must keep the monotonic anti-drift rearm "
-        "(last_target + period) now that the timer is REALTIME")
+        r"timer_new_ns\s*\(\s*QEMU_CLOCK_VIRTUAL\s*,\s*bsp_drain_cb", src), (
+        "BSP drain timer must use QEMU_CLOCK_VIRTUAL")
+    # Pas de REALTIME résiduel dans le code fonctionnel (commentaires OK)
+    code_only = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    code_only = re.sub(r"//.*", "", code_only)
+    assert "QEMU_CLOCK_REALTIME" not in code_only, (
+        "BSP must not use REALTIME in functional code (commentaires OK)")
 
 
 @pytest.mark.osmocom_compliant
@@ -224,72 +228,76 @@ def test_tdma_tick_on_virtual_clock():
 
 
 # =============================================================================
-# 4. (removed 2026-07-03) Bridge.py select.select() jitter check no longer
-#    applies — calypso-ipc-device was rewritten from Python to C.
+# 4. Bridge.py timing — jitter CLK IND
 # =============================================================================
 # osmo-bts s'attend à CLK IND à 51 frames d'intervalle (235ms). Jitter
-# trop élevé → "We were 1 FN faster/slower than TRX". `test_bridge_
-# select_timeout_low_jitter` used to regex-match a Python
-# `select.select(..., timeout)` call in a `calypso-ipc-device` script.
-# That script doesn't exist anymore: tools/calypso-ipc-device/ is now a
-# small C project (qemu_wrap.c et al, compiled to a binary). The
-# select()-timeout polling loop was replaced by
-# `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_deadline, NULL)`
-# on an absolute deadline (see qemu_wrap.c, "WALL-PACED UL heartbeat"
-# comment) — a different mechanism, sub-µs precision by construction, with
-# no select()-timeout value to assert a bound on. Deleted rather than left
-# failing against removed code; see test_bridge_clock_from_qemu_default
-# below for the still-live, still-open pacing divergence in this same file.
+# trop élevé → "We were 1 FN faster/slower than TRX".
+
+@pytest.mark.osmocom_compliant
+@pytest.mark.osmocom_bridge
+def test_bridge_select_timeout_low_jitter():
+    """calypso-ipc-device select.select timeout doit être ≤ 5ms pour limiter jitter
+    sur l'émission CLK IND (sub-frame).
+
+    Avant fix 2026-05-24 : 50ms → jitter ±10 frames → BTS log spam
+    'We were 1 FN faster/slower than TRX'.
+    Fix : 1ms → ±0.2 frame, sous seuil compensation BTS.
+    """
+    src = _read(BRIDGE_PY)
+    assert src, f"can't read {BRIDGE_PY}"
+    m = re.search(r"select\.select\([^,]+,\s*\[\],\s*\[\],\s*([0-9.]+)\)", src)
+    assert m, "select.select call not found in calypso-ipc-device"
+    timeout = float(m.group(1))
+    assert timeout <= 0.005, (
+        f"calypso-ipc-device select timeout = {timeout*1000:.1f}ms, "
+        f"max accepté = 5ms (idéal 1ms) pour low-jitter CLK IND")
 
 
 # =============================================================================
-# 5. (removed 2026-07-03) TCG race workaround — defer clear timer.
+# 5. TCG race workaround — defer clear timer présent
 # =============================================================================
-# `test_sim_defer_clear_timer_present` used to check for a QEMUTimer
-# (`clear_edge_timer`/`clear_edge_cb`/`pending_edge_clear`) added to defer
-# clearing SIM_IT edge bits by 1µs, working around a presumed
-# cpu_io_recompile TB-truncation race under -icount=auto that could drop
-# the STRNE committing rxDoneFlag.
-#
-# This was removed from calypso_sim.c on 2026-05-27 — verified by grep,
-# none of those symbols exist anywhere in hw/ anymore — with an explicit,
-# dated in-code justification (struct CalypsoSim comment + SIM_IT read
-# handler comment): the presumed race was investigated further and proven
-# EMPIRICALLY NOT TO EXIST (cputlb.c's cpu_io_recompile longjmps out via
-# cpu_loop_exit_noexc *before* memory_region_dispatch_read runs; probes on
-# 40 consecutive SIM_IT/UART reads showed the MMIO handler firing exactly
-# once per LDR, 1:1, every time). Worse, the defer mechanism itself was
-# actively harmful under icount=auto busy-polling (each read rescheduled
-# the timer, the clear never fired, IRQ stayed asserted forever — a real
-# deadlock in calypso_sim_powerup). It was replaced by a plain synchronous
-# read-to-clear, which is what section 1's tests above verify and which
-# passes today.
-#
-# Given the underlying bug this test tracked has been disproven (not
-# fixed-via-workaround, but shown to never have existed) and the
-# workaround code is gone, this test — and the xfail below that
-# referenced it — are deleted rather than kept failing/xfailing against a
-# narrative that no longer matches the code. Flagging for a second look:
-# this is the most interpretive deletion in this file; the grounding is
-# the dated source comments in calypso_sim.c (struct CalypsoSim field
-# removal comment, and the SIM_IT read-handler comment above
-# `s->it &= ~edge_seen;`), not an external doc.
+# Sous icount=auto, cpu_io_recompile truncate la TB après LDRH MMIO mid-TB.
+# Notre fix : defer le clear edge bits via QEMUTimer 1µs pour escape la race.
+
+@pytest.mark.osmocom_compliant
+@pytest.mark.osmocom_sim
+def test_sim_defer_clear_timer_present():
+    """calypso_sim.c doit avoir un QEMUTimer pour différer le clear edge bits.
+
+    Sans ça, le clear synchrone dans la callback MMIO race avec
+    cpu_io_recompile (TB truncation) → STRNE rxDoneFlag jamais committé.
+    """
+    src = _read(SIM_C)
+    assert src, f"can't read {SIM_C}"
+    assert "QEMUTimer  *clear_edge_timer" in src or \
+           "QEMUTimer *clear_edge_timer" in src, (
+        "Missing clear_edge_timer field in CalypsoSim struct")
+    assert "static void clear_edge_cb" in src, (
+        "Missing clear_edge_cb callback")
+    assert "pending_edge_clear" in src, (
+        "Missing pending_edge_clear tracking field")
+    # Init du timer dans calypso_sim_new
+    assert re.search(
+        r"clear_edge_timer\s*=\s*timer_new_ns\s*\(\s*QEMU_CLOCK_VIRTUAL\s*,\s*"
+        r"clear_edge_cb", src), (
+        "clear_edge_timer not initialized with QEMU_CLOCK_VIRTUAL + clear_edge_cb")
 
 
 # =============================================================================
-# 6. (removed 2026-07-03) CALYPSO_FORCE_RX_DONE default — the env var itself
-#    was removed as a hack.
+# 6. Default env values — convention OsmocomBB-friendly
 # =============================================================================
-# `test_force_rx_done_default_on` asserted that bash_scripts/run.sh
-# defaults `CALYPSO_FORCE_RX_DONE=1`. That env var is not read by any .c
-# file anymore (verified by grep across qemu-src) — it was one of several
-# env-gated hacks (PM_INJECT, FBSB_SYNTH, DSP_FBDET_SKIP, FORCE_RX_DONE,
-# BYPASS_BDLENA, FORCE_DARAM62) explicitly removed from source on
-# 2026-05-26, per run.sh's own "=== Defaults no-hack ===" section:
-# "Politique : aucun bypass de chemin firmware. [...] retires du code
-# source 2026-05-26. Conforme a CLAUDE.md regle #1 : 'PAS DE HACK'."
-# There is nothing left to default — asserting this would mean asking for
-# the reintroduction of a hack the project deliberately removed.
+
+@pytest.mark.osmocom_compliant
+@pytest.mark.osmocom_boot
+def test_force_rx_done_default_on():
+    """run.sh doit défaulter CALYPSO_FORCE_RX_DONE=1 puisque c'est la gestion
+    SIM normative (firmware ne peut pas commit le STRNE rxDoneFlag sous icount=auto).
+    """
+    src = _read(RUN_SH)
+    assert src, f"can't read {RUN_SH}"
+    assert re.search(
+        r'CALYPSO_FORCE_RX_DONE\s*=\s*"\$\{\s*CALYPSO_FORCE_RX_DONE\s*:-\s*1\s*\}"',
+        src), "run.sh must default CALYPSO_FORCE_RX_DONE=1"
 
 
 # =============================================================================
@@ -297,35 +305,42 @@ def test_tdma_tick_on_virtual_clock():
 # =============================================================================
 
 @pytest.mark.osmocom_divergent
+@pytest.mark.xfail(reason="TCG conditional STR commit bug under icount=auto — "
+                          "not patched, workarounded via SIM defer clear")
+def test_tcg_strne_commits_under_icount_auto():
+    """Le vrai root cause TCG : sous icount=auto, conditional STR (STRNE) peut
+    ne pas commit son store quand l'insn précédente MMIO triggere
+    cpu_io_recompile. Le TB est truncate après MMIO via CF_MEMI_ONLY,
+    le STRNE n'est jamais exécuté dans cette TB.
+
+    Notre defer clear contourne le symptôme, mais le bug TCG sous-jacent
+    reste. Vrai fix nécessite patch QEMU upstream (translator.c ou
+    cputlb.c cpu_io_recompile logic).
+
+    Ce test est marqué xfail tant que le bug TCG n'est pas patché.
+    """
+    pytest.fail("TCG bug not fixed — contourné par defer in SIM emulator")
+
+
+@pytest.mark.osmocom_divergent
 @pytest.mark.osmocom_bridge
 def test_bridge_clock_from_qemu_default():
-    """CALYPSO_QFN_FORCE devrait être =1 par défaut sous icount=auto pour
-    verrouiller le pacing du bridge sur le FN QEMU au lieu du wall clock.
+    """(removed) devrait être =1 par défaut sous icount=auto pour
+    aligner la bridge clock sur QEMU FN au lieu de wall.
 
-    Fixed 2026-07-03 : ce test visait à l'origine `run.sh` avec un nom de
-    variable qui avait été redacté en littéral `(removed)` dans le fichier
-    (probablement un artefact d'un renommage/réécriture précédent) — la
-    variable s'appelle en réalité CALYPSO_QFN_FORCE et son default vit
-    dans le bridge C (tools/calypso-ipc-device/qemu_wrap.c), pas dans
-    run.sh (qui ne la mentionne pas du tout, confirmé par grep).
-
-    Actuel default = 0 (wall-paced, clock_nanosleep ABSTIME). Une
-    première tentative de spin-wait qfn-pacé (chemin QFN_FORCE=1) a
-    starve l'IPC osmo-trx sous lag QEMU (crash — cf commentaire "Échec"
-    dans qemu_wrap.c). Divergence réelle et toujours ouverte : à flipper
-    par défaut seulement une fois ce mode rendu robuste contre le starve.
+    Actuel default = 0 (wall-paced). Sous icount=auto + default=0, bridge
+    drifte de qfn. À flipper par défaut quand on confirme icount=auto stable.
     """
-    src = _read(BRIDGE_C)
-    assert src, f"can't read {BRIDGE_C}"
+    src = _read(RUN_SH)
+    assert src, f"can't read {RUN_SH}"
     m = re.search(
-        r"QFN_FORCE\s*=\s*\(f\s*&&\s*\*f\s*==\s*'1'\)\s*\?\s*1\s*:\s*([01])",
+        r'(removed)\s*=\s*"\$\{\s*(removed)\s*:-\s*([01])\s*\}"',
         src)
-    assert m, "CALYPSO_QFN_FORCE default ternary not found in qemu_wrap.c"
+    assert m, "(removed) default line not found"
     default = m.group(1)
     if default == "0":
-        pytest.xfail("CALYPSO_QFN_FORCE=0 default — pas idéal sous icount=auto, "
-                     "mais le mode QFN_FORCE=1 a un starve IPC documenté "
-                     "(non-robuste), à flipper seulement une fois corrigé")
+        pytest.xfail("(removed)=0 default — pas idéal sous icount=auto, "
+                     "à flipper à =1 quand stable")
     assert default == "1"
 
 
@@ -342,16 +357,21 @@ def _qemu_running() -> bool:
         return False
 
 
-# (removed 2026-07-03) `test_runtime_sim_it_wt_rxdone_log_present` used to
-# xfail-check qemu.log for `[sim] SIM IT_WT → rxDoneFlag=1 @0x008302d4`,
-# the log line produced by the (now removed, see section 2 above)
-# hardcoded rxDoneFlag address-injection mechanism. That log line can
-# never appear again — verified against the live qemu.log (grep finds no
-# "rxDoneFlag" or "@0x0083" lines at all anymore) and against source (no
-# code path writes it). The xfail reason also referenced
-# CALYPSO_FORCE_RX_DONE as the fix to apply, which was itself removed as
-# a hack (section 6). Deleted rather than left mis-xfailing for a reason
-# that no longer describes anything reachable.
+@pytest.mark.osmocom_compliant
+@pytest.mark.osmocom_boot
+@pytest.mark.skipif(not Path(QEMU_LOG).exists() and not INSIDE,
+                    reason="qemu.log absent")
+def test_runtime_sim_it_wt_rxdone_log_present():
+    """Si QEMU tourne avec notre fix SIM, qemu.log doit contenir des lignes
+    `[sim] SIM IT_WT → rxDoneFlag=1 @0x008302d4 #N`.
+    """
+    log = _read(QEMU_LOG)
+    if not log:
+        pytest.skip("qemu.log vide ou absent")
+    pattern = re.compile(r"\[sim\] SIM IT_WT → rxDoneFlag=1 @0x008302d4")
+    if not pattern.search(log):
+        pytest.xfail("Fix SIM pas encore en effet — rebuild + relancer QEMU "
+                     "avec CALYPSO_FORCE_RX_DONE=1 (default après fix)")
 
 
 @pytest.mark.osmocom_compliant

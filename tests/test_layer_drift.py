@@ -26,26 +26,11 @@ from pathlib import Path
 
 import pytest
 
-# Défauts alignés sur bash_scripts/run.sh : LOGDIR="${CALYPSO_LOGDIR:-/root}"
-# (tout ce qui grossit va dans /root depuis le refactor "plus de /tmp tmpfs
-# 512M qui se remplissait -> writes échouent -> firmware perd la sync" —
-# cf. run.sh "---- log paths ----"). QEMU_LOG était déjà à jour (issue
-# 2026-05-16) ; OSMOCON_LOG/MOBILE_LOG/BRIDGE_LOG pointaient encore vers
-# /tmp et étaient donc des chemins morts (skip permanent, jamais un vrai
-# check) — corrigé ici.
 CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 QEMU_LOG    = os.environ.get("CALYPSO_QEMU_LOG",    "/root/qemu.log")
-# BRIDGE_LOG : bridge.py est le pipeline radio *legacy* (mutex avec
-# IPC_DEVICE/TRX_IPC, cf run.sh "BRIDGE_PY est mutuellement exclusif avec
-# IPC_DEVICE et TRX_IPC"). Le pipeline par défaut aujourd'hui est
-# calypso-ipc-device + osmo-trx-ipc, PAS bridge.py — donc ce fichier
-# n'existera pas tant que le run n'est pas lancé en mode bridge-py
-# (CALYPSO_SKIP_BRIDGE_PY=0). C'est un skip légitime dans la config
-# courante, pas un chemin cassé. Nom réel du fichier quand actif :
-# $LOGDIR/bridge.py.log (run.sh: BRIDGE_LOG="${BRIDGE_LOG:-$LOGDIR/bridge.py.log}").
-BRIDGE_LOG  = os.environ.get("CALYPSO_BRIDGE_LOG",  "/root/bridge.py.log")
-OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/root/osmocon.log")
-MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/root/mobile.log")
+(removed)  = os.environ.get("CALYPSO_(removed)",  "/tmp/bridge.log")
+OSMOCON_LOG = os.environ.get("CALYPSO_OSMOCON_LOG", "/tmp/osmocon.log")
+MOBILE_LOG  = os.environ.get("CALYPSO_MOBILE_LOG",  "/tmp/mobile.log")
 
 TS_RE = re.compile(r'^(\d+\.\d+)\s+\+(\d+\.\d+)s\s+(.*)$')
 
@@ -128,7 +113,7 @@ def test_qemu_insn_rate_p1_above_1m(have_timestamps):
 def test_bridge_qfn_tracks_qemu_fn(have_timestamps):
     """At any wall timestamp, bridge.qfn should be within 200 frames of qemu fn."""
     b_samples = []
-    for ts, _, body in _parse_timestamped(BRIDGE_LOG, "wall_fn="):
+    for ts, _, body in _parse_timestamped((removed), "wall_fn="):
         mw = re.search(r'wall_fn=(\d+)', body)
         mq = re.search(r'qfn=(\d+)', body)
         if mw and mq:
@@ -158,7 +143,7 @@ def test_bridge_qfn_advances_steadily(have_timestamps):
     blocker — pas un soft warning à 150.
     """
     samples = []
-    for ts, _, body in _parse_timestamped(BRIDGE_LOG, "qfn="):
+    for ts, _, body in _parse_timestamped((removed), "qfn="):
         mq = re.search(r'qfn=(\d+)', body)
         if mq: samples.append((ts, int(mq.group(1))))
     if len(samples) < 10:
@@ -182,7 +167,7 @@ def test_bridge_qfn_advances_steadily(have_timestamps):
 @pytest.mark.drift
 @pytest.mark.parametrize("name,path,min_rate_per_30s", [
     ("qemu",    QEMU_LOG,    1000),
-    ("bridge",  BRIDGE_LOG,  10),
+    ("bridge",  (removed),  10),
     ("osmocon", OSMOCON_LOG, 1),
     # mobile is often quiet (no commands sent) — skip strict liveness
 ])
@@ -204,7 +189,7 @@ def test_log_still_growing(have_timestamps, name, path, min_rate_per_30s):
 def test_log_start_within_10s(have_timestamps):
     """All logs should have started within a 10s window."""
     starts = {}
-    for name, path in [("qemu", QEMU_LOG), ("bridge", BRIDGE_LOG),
+    for name, path in [("qemu", QEMU_LOG), ("bridge", (removed)),
                        ("osmocon", OSMOCON_LOG), ("mobile", MOBILE_LOG)]:
         samples = _parse_timestamped(path, tail_n=10)
         if samples:
@@ -222,7 +207,7 @@ def test_log_start_within_10s(have_timestamps):
 @pytest.mark.drift
 @pytest.mark.parametrize("name,path,max_gap_s", [
     ("qemu",    QEMU_LOG,    5.0),
-    ("bridge",  BRIDGE_LOG,  10.0),
+    ("bridge",  (removed),  10.0),
 ])
 def test_no_long_gap(have_timestamps, name, path, max_gap_s):
     """No gap longer than `max_gap_s` between consecutive log lines."""

@@ -1,123 +1,11 @@
 {
   "counts": {
-    "passed": 119,
-    "failed": 0,
-    "skipped": 83,
-    "xfailed": 30
+    "passed": 34,
+    "failed": 14,
+    "skipped": 3,
+    "xfailed": 19
   },
   "tests": [
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_reset_sp_silicon",
-      "name": "test_reset_sp_silicon",
-      "outcome": "skipped",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.01330817595589906,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 105, 'Skipped: No Reset: line in log')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 105, 'Skipped: No Reset: line in log')",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_reset_pmst_silicon",
-      "name": "test_reset_pmst_silicon",
-      "outcome": "skipped",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.012037295033223927,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 118, 'Skipped: No Reset: line in log')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 118, 'Skipped: No Reset: line in log')",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_ar2_zero_categorization",
-      "name": "test_ar2_zero_categorization",
-      "outcome": "passed",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.007568851986434311,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_imr_not_persistently_zero",
-      "name": "test_imr_not_persistently_zero",
-      "outcome": "passed",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.010569929028861225,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_irq_servicing_imr_nonzero",
-      "name": "test_irq_servicing_imr_nonzero",
-      "outcome": "skipped",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.01064334501279518,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 192, 'Skipped: No IRQ # events \u2014 TPU/BRINT0 ne fire pas. V\u00e9rifier pipeline ARM dispatch.')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 192, 'Skipped: No IRQ # events \u2014 TPU/BRINT0 ne fire pas. V\u00e9rifier pipeline ARM dispatch.')",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_rsbx_intm_reached_or_flag_nmi",
-      "name": "test_rsbx_intm_reached_or_flag_nmi",
-      "outcome": "passed",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.010390969982836396,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_no_bootstub_entry",
-      "name": "test_no_bootstub_entry",
-      "outcome": "passed",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.011560207000002265,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_ar_imr_inth_invariants.py::test_tpu_frame_irq_delivered",
-      "name": "test_tpu_frame_irq_delivered",
-      "outcome": "skipped",
-      "markers": [
-        "ar_imr_invariant"
-      ],
-      "duration_s": 0.010952914017252624,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 249, 'Skipped: 0 IRQ vec=19 (INT3 FRAME) \u2014 TPU ne fire pas. Diagnostique : bridge CLK_IND ? ARM init TPU ? Pas un fail (peut \u00eatre d\u00e9clenc",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_ar_imr_inth_invariants.py', 249, 'Skipped: 0 IRQ vec=19 (INT3 FRAME) \u2014 TPU ne fire pas. Diagnostique : bridge CLK_IND ? ARM init TPU ? Pas un fail (peut \u00eatre d\u00e9clench\u00e9 par config).')",
-      "category": "Ar",
-      "layer": "\u2014"
-    },
     {
       "nodeid": "test_calypso_milestones.py::test_popm_decoder_active",
       "name": "test_popm_decoder_active",
@@ -125,12 +13,8 @@
       "markers": [
         "milestone_dsp_decoder"
       ],
-      "duration_s": 0.001218634017277509,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 0.0006512199906865135,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_tier_a_decoder_fixes_present",
@@ -139,12 +23,8 @@
       "markers": [
         "milestone_dsp_decoder"
       ],
-      "duration_s": 0.0024801469990052283,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 0.0017717470036586747,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_intm_dwell_no_regression",
@@ -153,26 +33,18 @@
       "markers": [
         "milestone_dsp_decoder"
       ],
-      "duration_s": 30.340888220001943,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 30.571563064993825,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_dsp_throughput_5x",
       "name": "test_dsp_throughput_5x",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "milestone_dsp_decoder"
       ],
-      "duration_s": 0.008969146991148591,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 333, 'Skipped: Pas de INSN-COUNT-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 333, 'Skipped: Pas de INSN-COUNT-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9')",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 0.1316050260065822,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_ar3_init_source_identified",
@@ -181,12 +53,8 @@
       "markers": [
         "milestone_bsp_dma"
       ],
-      "duration_s": 0.0094521589926444,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 368, \"Skipped: Source litt\u00e9rale (i) candidate : 8 sites avec lk=0x0000\\nPremiers: [('PROM0', 41801, '0000'), ('PROM0', 42046, '0000'), ('PROM",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 368, \"Skipped: Source litt\u00e9rale (i) candidate : 8 sites avec lk=0x0000\\nPremiers: [('PROM0', 41801, '0000'), ('PROM0', 42046, '0000'), ('PROM2', 173302, '0000'), ('PROM2', 173339, '0000'), ('PROM2', 173394, '0000')]\\nV\u00e9rifier manuellement caller chain de ces sites au runtime.\")",
-      "category": "Milestone",
-      "layer": "L1-data"
+      "duration_s": 0.006673113006399944,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_ar4_init_source_identified",
@@ -195,40 +63,28 @@
       "markers": [
         "milestone_bsp_dma"
       ],
-      "duration_s": 0.006216307985596359,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 387, \"Skipped: Source litt\u00e9rale (i) candidate AR4 : 18 sites avec lk\u22480x2bc0\\nPremiers: [('PROM0', 35269, '2bc0'), ('PROM0', 35331, '2bc0'), (",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 387, \"Skipped: Source litt\u00e9rale (i) candidate AR4 : 18 sites avec lk\u22480x2bc0\\nPremiers: [('PROM0', 35269, '2bc0'), ('PROM0', 35331, '2bc0'), ('PROM0', 35459, '2bc0'), ('PROM0', 35789, '2bc0'), ('PROM0', 35860, '2bc0')]\")",
-      "category": "Milestone",
-      "layer": "L1-data"
+      "duration_s": 0.0050358060107100755,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_bsp_dma_target_matches_correlator_read_zone",
       "name": "test_bsp_dma_target_matches_correlator_read_zone",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "milestone_bsp_dma"
       ],
-      "duration_s": 0.009336562012322247,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 416, 'Skipped: Pas de DARAM-WR-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_calypso_milestones.py', 416, 'Skipped: Pas de DARAM-WR-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9')",
-      "category": "Milestone",
-      "layer": "L1-data"
+      "duration_s": 0.06458597799064592,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_no_d_fb_det_wr_site_anomaly",
       "name": "test_no_d_fb_det_wr_site_anomaly",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "milestone_bsp_dma"
       ],
-      "duration_s": 0.011036070995032787,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: D_FB_DET-WR-SITE 0 hits \u2014 PC=0x8f51 jamais atteint car IMR bit12(vec28) jamais arm\u00e9 nativement (dispatcher data[0x4387] bloqu\u00e9 sur stub 0xab38, cf STATUS_2026-07-01.md ad",
-      "err_long": "E   _pytest.outcomes.XFailed: D_FB_DET-WR-SITE 0 hits \u2014 PC=0x8f51 jamais atteint car IMR bit12(vec28) jamais arm\u00e9 nativement (dispatcher data[0x4387] bloqu\u00e9 sur stub 0xab38, cf STATUS_2026-07-01.md addenda 15/20/22). Gap DSP en cours d'investigation, pas une r\u00e9gression du probe.",
-      "category": "Milestone",
-      "layer": "L1-data"
+      "duration_s": 0.16858306800713763,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_fb0_att_nonzero",
@@ -237,12 +93,8 @@
       "markers": [
         "milestone_fb_det"
       ],
-      "duration_s": 9.610096458345652e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Compute converge mais fb0_att=0 \u2014 seuil de d\u00e9cision FB-det non franchi. Investiguer la comparaison A vs threshold dans le firmware DSP.",
-      "err_long": "E   _pytest.outcomes.XFailed: Compute converge mais fb0_att=0 \u2014 seuil de d\u00e9cision FB-det non franchi. Investiguer la comparaison A vs threshold dans le firmware DSP.",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 0.0003906739875674248,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_synth_zero_path_active",
@@ -251,12 +103,8 @@
       "markers": [
         "milestone_fb_det"
       ],
-      "duration_s": 0.008069762028753757,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Vrai demod CCCH pas convergent",
-      "err_long": "E   _pytest.outcomes.XFailed: Vrai demod CCCH pas convergent",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 0.11143485699722078,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_c54x_interrupt_ex_called_nonzero",
@@ -265,12 +113,8 @@
       "markers": [
         "milestone_irq"
       ],
-      "duration_s": 7.401598850265145e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: TODO: ajouter compteur + exposition monitor",
-      "err_long": "E   _pytest.outcomes.XFailed: TODO: ajouter compteur + exposition monitor",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 5.084100121166557e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_isr_entered_implies_rete",
@@ -279,12 +123,8 @@
       "markers": [
         "milestone_irq"
       ],
-      "duration_s": 6.945198401808739e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: D\u00e9pend des deux compteurs ci-dessus",
-      "err_long": "E   _pytest.outcomes.XFailed: D\u00e9pend des deux compteurs ci-dessus",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 5.148700438439846e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_no_pending_irq_gated",
@@ -293,26 +133,18 @@
       "markers": [
         "milestone_irq"
       ],
-      "duration_s": 7.064000237733126e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: TODO: probe sur pending_replay_block",
-      "err_long": "E   _pytest.outcomes.XFailed: TODO: probe sur pending_replay_block",
-      "category": "Milestone",
-      "layer": "DSP"
+      "duration_s": 4.945899127051234e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_l1ctl_data_ind_received",
       "name": "test_l1ctl_data_ind_received",
-      "outcome": "skipped",
+      "outcome": "failed",
       "markers": [
         "milestone_l1ctl"
       ],
-      "duration_s": 0.02303275599842891,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies, DATA_IND non interpr\u00e9table",
-      "err_long": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies, DATA_IND non interpr\u00e9table",
-      "category": "Milestone",
-      "layer": "L1-ctrl"
+      "duration_s": 0.16363406300661154,
+      "wasxfail": false
     },
     {
       "nodeid": "test_calypso_milestones.py::test_neigh_pm_req_response_unchanged",
@@ -321,12 +153,8 @@
       "markers": [
         "milestone_l1ctl"
       ],
-      "duration_s": 0.0001417070161551237,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: TODO: parse pcap mobile-gsmtap.pcap pour confirmer",
-      "err_long": "E   _pytest.outcomes.XFailed: TODO: parse pcap mobile-gsmtap.pcap pour confirmer",
-      "category": "Milestone",
-      "layer": "L1-ctrl"
+      "duration_s": 5.011800385545939e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_rach_emitted",
@@ -335,12 +163,8 @@
       "markers": [
         "milestone_mm_lu"
       ],
-      "duration_s": 0.00012726499699056149,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: D\u00e9pend de L1 pr\u00eat",
-      "err_long": "E   _pytest.outcomes.XFailed: D\u00e9pend de L1 pr\u00eat",
-      "category": "Milestone",
-      "layer": "L3-MM"
+      "duration_s": 4.7255001845769584e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_immediate_assignment_decoded",
@@ -349,12 +173,8 @@
       "markers": [
         "milestone_mm_lu"
       ],
-      "duration_s": 0.0001321299932897091,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: D\u00e9pend de CCCH demod r\u00e9el",
-      "err_long": "E   _pytest.outcomes.XFailed: D\u00e9pend de CCCH demod r\u00e9el",
-      "category": "Milestone",
-      "layer": "L3-MM"
+      "duration_s": 4.630499461200088e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_rr_sdcch_established",
@@ -363,12 +183,8 @@
       "markers": [
         "milestone_mm_lu"
       ],
-      "duration_s": 0.0003704759874381125,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed",
-      "err_long": "E   _pytest.outcomes.XFailed",
-      "category": "Milestone",
-      "layer": "L3-MM"
+      "duration_s": 5.031500768382102e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_location_updating_request_sent",
@@ -377,12 +193,8 @@
       "markers": [
         "milestone_mm_lu"
       ],
-      "duration_s": 0.00013645197032019496,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed",
-      "err_long": "E   _pytest.outcomes.XFailed",
-      "category": "Milestone",
-      "layer": "L3-MM"
+      "duration_s": 4.4742002501152456e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_location_updating_accept_received",
@@ -391,12 +203,8 @@
       "markers": [
         "milestone_mm_lu"
       ],
-      "duration_s": 0.0001266759936697781,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Objectif final",
-      "err_long": "E   _pytest.outcomes.XFailed: Objectif final",
-      "category": "Milestone",
-      "layer": "L3-MM"
+      "duration_s": 4.70140075776726e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_calypso_milestones.py::test_rxdoneflag_no_longer_blocks",
@@ -405,237 +213,8 @@
       "markers": [
         "milestone_dsp_decoder"
       ],
-      "duration_s": 0.000130140979308635,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: R\u00e9gression historique \u2014 non actif aujourd'hui",
-      "err_long": "E   _pytest.outcomes.XFailed: R\u00e9gression historique \u2014 non actif aujourd'hui",
-      "category": "Milestone",
-      "layer": "DSP"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_qemu_monitor_responsive",
-      "name": "test_qemu_monitor_responsive",
-      "outcome": "passed",
-      "markers": [
-        "runtime_firmware"
-      ],
-      "duration_s": 0.0046965290093794465,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Firmware-state"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_pc_advances",
-      "name": "test_pc_advances",
-      "outcome": "passed",
-      "markers": [
-        "runtime_firmware"
-      ],
-      "duration_s": 0.14888879598584026,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Firmware-state"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_pc_not_in_known_busy_loop",
-      "name": "test_pc_not_in_known_busy_loop",
-      "outcome": "passed",
-      "markers": [
-        "runtime_firmware"
-      ],
-      "duration_s": 0.0047973100445233285,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Firmware-state"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_rxdoneflag_addr_resolvable",
-      "name": "test_rxdoneflag_addr_resolvable",
-      "outcome": "passed",
-      "markers": [
-        "runtime_firmware"
-      ],
-      "duration_s": 0.0034831350203603506,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Firmware-state"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_osmocon_started_download",
-      "name": "test_osmocon_started_download",
-      "outcome": "passed",
-      "markers": [
-        "runtime_osmocon"
-      ],
-      "duration_s": 0.024347918981220573,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Osmocon"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_osmocon_past_romload",
-      "name": "test_osmocon_past_romload",
-      "outcome": "passed",
-      "markers": [
-        "runtime_osmocon"
-      ],
-      "duration_s": 0.12454735598294064,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Osmocon"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_osmocon_no_recent_lost_spam",
-      "name": "test_osmocon_no_recent_lost_spam",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_osmocon",
-        "xfail"
-      ],
-      "duration_s": 0.02898747002473101,
-      "wasxfail": true,
-      "err_short": "E   AssertionError: 116324\u00d7 'LOST' dans osmocon.log (seuil 10000) \u2014 sercomm d\u00e9synchronis\u00e9 (QEMU UART_MODEM corruption ou firmware crash silencieux)",
-      "err_long": "E   AssertionError: 116324\u00d7 'LOST' dans osmocon.log (seuil 10000) \u2014 sercomm d\u00e9synchronis\u00e9 (QEMU UART_MODEM corruption ou firmware crash silencieux)\n    assert 116324 < 10000",
-      "category": "Runtime",
-      "layer": "Osmocon"
-    },
-    {
-      "nodeid": "test_firmware_state.py::test_bridge_has_dl_bursts",
-      "name": "test_bridge_has_dl_bursts",
-      "outcome": "passed",
-      "markers": [
-        "runtime_firmware"
-      ],
-      "duration_s": 0.0036691819550469518,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Firmware-state"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_stub_reachable",
-      "name": "test_gdb_stub_reachable",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.011215837963391095,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_handshake_succeeds",
-      "name": "test_gdb_handshake_succeeds",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.0007111100130714476,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_query_supported",
-      "name": "test_gdb_query_supported",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.00040521600749343634,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_read_arm_registers",
-      "name": "test_gdb_read_arm_registers",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.0007647909806109965,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_read_pc_nonzero",
-      "name": "test_gdb_read_pc_nonzero",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.000821700959932059,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_read_memory_at_dsp_api_base",
-      "name": "test_gdb_read_memory_at_dsp_api_base",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.000690812012180686,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_stub_survives_3_quick_reconnects",
-      "name": "test_gdb_stub_survives_3_quick_reconnects",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.30987503298092633,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
-    },
-    {
-      "nodeid": "test_gdb_stub.py::test_gdb_read_dsp_daram_xfail",
-      "name": "test_gdb_read_dsp_daram_xfail",
-      "outcome": "passed",
-      "markers": [
-        "runtime_gdb"
-      ],
-      "duration_s": 0.0008018430089578032,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "GDB-introspect"
+      "duration_s": 4.4840999180451035e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_inject_frames.py::test_probe_ndb",
@@ -644,12 +223,8 @@
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.29139835602836683,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.28867087299295235,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_clear_ndb",
@@ -658,26 +233,18 @@
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.3307327549555339,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.2894646909990115,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_fbsb_fb_found",
       "name": "test_inject_fbsb_fb_found",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.7124828179948963,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.6167823529976886,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_fbsb_sb_found",
@@ -686,130 +253,94 @@
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.5786161280120723,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.5352532730030362,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[1]",
       "name": "test_inject_si[1]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.37371229100972414,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.32942267699399963,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[2]",
       "name": "test_inject_si[2]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.3683348100166768,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.32933007199608255,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[3]",
       "name": "test_inject_si[3]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.3681173989898525,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.3306949620018713,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[4]",
       "name": "test_inject_si[4]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.3691926139872521,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.33049907100212295,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[5]",
       "name": "test_inject_si[5]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.37153610098175704,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.3707511590037029,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_si[6]",
       "name": "test_inject_si[6]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.3704364309669472,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.329262187005952,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_a_cd_pattern_23B",
       "name": "test_inject_a_cd_pattern_23B",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.3718118969700299,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.3306340949930018,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_a_cd_pattern_30B",
       "name": "test_inject_a_cd_pattern_30B",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.37731434899615124,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.3302446629968472,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_a_cd_invalid_length",
@@ -818,12 +349,8 @@
       "markers": [
         "inject_frames"
       ],
-      "duration_s": 0.00029039697255939245,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.000601755004026927,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_task[5-0]",
@@ -833,12 +360,8 @@
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08183569001266733,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.04134623700520024,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_task[6-1]",
@@ -848,12 +371,8 @@
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08109962998423725,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.04148273200553376,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_task[24-0]",
@@ -863,27 +382,19 @@
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08196437498554587,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.04192233299545478,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_task[28-1]",
       "name": "test_inject_d_task[28-1]",
-      "outcome": "passed",
+      "outcome": "failed",
       "markers": [
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08172265597386286,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.043025259001296945,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_burst[0]",
@@ -893,12 +404,8 @@
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08391340402886271,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.04343801800860092,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_inject_d_burst[1]",
@@ -908,27 +415,19 @@
         "inject_frames",
         "parametrize"
       ],
-      "duration_s": 0.08169533405452967,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Injection",
-      "layer": "NDB"
+      "duration_s": 0.04180138200172223,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_efficacy_arm_reads_d_fb_det_1",
       "name": "test_efficacy_arm_reads_d_fb_det_1",
-      "outcome": "skipped",
+      "outcome": "failed",
       "markers": [
         "inject_efficacy",
         "inject_frames"
       ],
-      "duration_s": 3.01068209199002,
-      "wasxfail": true,
-      "err_short": "E   TimeoutError: timed out",
-      "err_long": "E   TimeoutError: timed out\n\nDuring handling of the above exception, another exception occurred:\nE   _pytest.outcomes.XFailed: gdb-stub timeout pendant burst_inject (QEMU surcharg\u00e9 DSP) : timed out",
-      "category": "Injection",
-      "layer": "ARM-feedback"
+      "duration_s": 3.151354130997788,
+      "wasxfail": false
     },
     {
       "nodeid": "test_inject_frames.py::test_efficacy_arm_reads_a_cd",
@@ -938,1558 +437,8 @@
         "inject_efficacy",
         "inject_frames"
       ],
-      "duration_s": 2.5891397960367613,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: ARM L1 prim_rx_nb didn't read a_cd[] during window",
-      "err_long": "E   _pytest.outcomes.XFailed: ARM L1 prim_rx_nb didn't read a_cd[] during window",
-      "category": "Injection",
-      "layer": "ARM-feedback"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_pty_exists",
-      "name": "test_irda_pty_exists",
-      "outcome": "passed",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 0.02241932600736618,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_pty_readable",
-      "name": "test_irda_pty_readable",
-      "outcome": "passed",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 0.02694759698351845,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_boot_marker_present",
-      "name": "test_irda_boot_marker_present",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 6.877596024423838e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: fw-irda.log absent \u2014 canal IrDA OFF par d\u00e9faut (CALYPSO_IRDA_PEER=0, cf. run.sh \u00a71bis) : l'ancienne capture passive (irda_capture.py) a \u00e9t\u00e9 retir\u00e9e de l'orchestration (un",
-      "err_long": "E   _pytest.outcomes.XFailed: fw-irda.log absent \u2014 canal IrDA OFF par d\u00e9faut (CALYPSO_IRDA_PEER=0, cf. run.sh \u00a71bis) : l'ancienne capture passive (irda_capture.py) a \u00e9t\u00e9 retir\u00e9e de l'orchestration (un sniffer ne peut pas maintenir un lien avec un firmware IrDA SECONDARY), et le peer actif de remplacement (tools/irda_peer.py) n'est pas encore impl\u00e9ment\u00e9 sur ce host (v\u00e9rifi\u00e9 2026-07-03). Cf. PLAN_CLAUDE_CODE_20260516_IRDA_DEBUG_CHANNEL.md",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_channel_produces_bytes",
-      "name": "test_irda_channel_produces_bytes",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 5.027924511989113,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Canal silencieux \u2014 le firmware compal_e88 est un IrDA SECONDARY qui ne parle qu'\u00e0 un PRIMARY ayant fait XID/SNRM (cf. run.sh \u00a71bis) ; sans peer actif connect\u00e9 (CALYPSO_IR",
-      "err_long": "E   _pytest.outcomes.XFailed: Canal silencieux \u2014 le firmware compal_e88 est un IrDA SECONDARY qui ne parle qu'\u00e0 un PRIMARY ayant fait XID/SNRM (cf. run.sh \u00a71bis) ; sans peer actif connect\u00e9 (CALYPSO_IRDA_PEER=0 par d\u00e9faut, et tools/irda_peer.py pas encore impl\u00e9ment\u00e9 sur ce host), le lien IrDA ne se monte jamais et rien n'est \u00e9mis.",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_does_not_break_uart_modem",
-      "name": "test_irda_does_not_break_uart_modem",
-      "outcome": "passed",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 0.01378230401314795,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_log_has_timestamp_prefix",
-      "name": "test_irda_log_has_timestamp_prefix",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 0.0002436470240354538,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_irda_channel.py', 236, 'Skipped: fw-irda.log absent (canal IrDA OFF par d\u00e9faut / peer actif non d\u00e9marr\u00e9)')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_irda_channel.py', 236, 'Skipped: fw-irda.log absent (canal IrDA OFF par d\u00e9faut / peer actif non d\u00e9marr\u00e9)')",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_capture_process_alive",
-      "name": "test_irda_capture_process_alive",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 0.0016877310117706656,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Peer IrDA actif pas d\u00e9marr\u00e9 (pas de /tmp/irda_peer.pid) \u2014 CALYPSO_IRDA_PEER=0 par d\u00e9faut (cf. run.sh \u00a71bis) et/ou tools/irda_peer.py pas encore impl\u00e9ment\u00e9 sur ce host (v\u00e9",
-      "err_long": "E   _pytest.outcomes.XFailed: Peer IrDA actif pas d\u00e9marr\u00e9 (pas de /tmp/irda_peer.pid) \u2014 CALYPSO_IRDA_PEER=0 par d\u00e9faut (cf. run.sh \u00a71bis) et/ou tools/irda_peer.py pas encore impl\u00e9ment\u00e9 sur ce host (v\u00e9rifi\u00e9 2026-07-03)",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_irda_channel.py::test_irda_throughput_below_saturation",
-      "name": "test_irda_throughput_below_saturation",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_irda"
-      ],
-      "duration_s": 10.068140546965878,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_irda_channel.py', 289, 'Skipped: canal silencieux \u2014 pas de throughput \u00e0 mesurer')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_irda_channel.py', 289, 'Skipped: canal silencieux \u2014 pas de throughput \u00e0 mesurer')",
-      "category": "Runtime",
-      "layer": "IrDA-channel"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_qemu_insn_rate_cv_below_0_4",
-      "name": "test_qemu_insn_rate_cv_below_0_4",
-      "outcome": "skipped",
-      "markers": [
-        "drift"
-      ],
-      "duration_s": 0.10158024402335286,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 106, 'Skipped: only 0 INSN-COUNT-STATS samples \u2014 needs >= 20')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 106, 'Skipped: only 0 INSN-COUNT-STATS samples \u2014 needs >= 20')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_qemu_insn_rate_p1_above_1m",
-      "name": "test_qemu_insn_rate_p1_above_1m",
-      "outcome": "skipped",
-      "markers": [
-        "drift"
-      ],
-      "duration_s": 0.059332904987968504,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 119, 'Skipped: only 0 samples \u2014 needs >= 100')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 119, 'Skipped: only 0 samples \u2014 needs >= 100')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_bridge_qfn_tracks_qemu_fn",
-      "name": "test_bridge_qfn_tracks_qemu_fn",
-      "outcome": "skipped",
-      "markers": [
-        "drift"
-      ],
-      "duration_s": 0.03658283205004409,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 141, 'Skipped: few samples bridge=0 qemu=0')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 141, 'Skipped: few samples bridge=0 qemu=0')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_bridge_qfn_advances_steadily",
-      "name": "test_bridge_qfn_advances_steadily",
-      "outcome": "skipped",
-      "markers": [
-        "drift"
-      ],
-      "duration_s": 6.69719884172082e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 165, 'Skipped: only 0 qfn samples')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 165, 'Skipped: only 0 qfn samples')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_log_still_growing[qemu-/root/qemu.log-1000]",
-      "name": "test_log_still_growing[qemu-/root/qemu.log-1000]",
-      "outcome": "passed",
-      "markers": [
-        "drift",
-        "parametrize"
-      ],
-      "duration_s": 0.04285189998336136,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_log_still_growing[bridge-/root/bridge.py.log-10]",
-      "name": "test_log_still_growing[bridge-/root/bridge.py.log-10]",
-      "outcome": "skipped",
-      "markers": [
-        "drift",
-        "parametrize"
-      ],
-      "duration_s": 6.473698886111379e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 193, 'Skipped: /root/bridge.py.log has no timestamped lines')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 193, 'Skipped: /root/bridge.py.log has no timestamped lines')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_log_still_growing[osmocon-/root/osmocon.log-1]",
-      "name": "test_log_still_growing[osmocon-/root/osmocon.log-1]",
-      "outcome": "passed",
-      "markers": [
-        "drift",
-        "parametrize"
-      ],
-      "duration_s": 0.019072576018515974,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_log_start_within_10s",
-      "name": "test_log_start_within_10s",
-      "outcome": "passed",
-      "markers": [
-        "drift"
-      ],
-      "duration_s": 0.03992331103654578,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_no_long_gap[qemu-/root/qemu.log-5.0]",
-      "name": "test_no_long_gap[qemu-/root/qemu.log-5.0]",
-      "outcome": "passed",
-      "markers": [
-        "drift",
-        "parametrize"
-      ],
-      "duration_s": 0.04135469801258296,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_layer_drift.py::test_no_long_gap[bridge-/root/bridge.py.log-10.0]",
-      "name": "test_no_long_gap[bridge-/root/bridge.py.log-10.0]",
-      "outcome": "skipped",
-      "markers": [
-        "drift",
-        "parametrize"
-      ],
-      "duration_s": 7.777998689562082e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 231, 'Skipped: bridge: only 0 samples')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_layer_drift.py', 231, 'Skipped: bridge: only 0 samples')",
-      "category": "Timing",
-      "layer": "Drift"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_log_exists_and_nonempty",
-      "name": "test_grep_qemu_log_exists_and_nonempty",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 5.6100019719451666e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_dsp_booted",
-      "name": "test_grep_qemu_dsp_booted",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.018210610025562346,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_bsp_dma_active",
-      "name": "test_grep_qemu_bsp_dma_active",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.012329154997132719,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_task24_dispatched",
-      "name": "test_grep_qemu_task24_dispatched",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.011343064019456506,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies (go-live DSP bloqu\u00e9 : IMR jamais r\u00e9arm\u00e9, d_fb_det=0 ; cf STATUS_2026-07-01.md addenda 13-14)",
-      "err_long": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies (go-live DSP bloqu\u00e9 : IMR jamais r\u00e9arm\u00e9, d_fb_det=0 ; cf STATUS_2026-07-01.md addenda 13-14)",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_no_sp_catastrophe_recent",
-      "name": "test_grep_qemu_no_sp_catastrophe_recent",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.0031460360041819513,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_bridge_dl_bursts_received",
-      "name": "test_grep_bridge_dl_bursts_received",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.00012334203347563744,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 165, 'Skipped: bridge.log absent')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 165, 'Skipped: bridge.log absent')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_bridge_fb_pattern_dominant",
-      "name": "test_grep_bridge_fb_pattern_dominant",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.00011091696796938777,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 174, 'Skipped: bridge.log absent')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 174, 'Skipped: bridge.log absent')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_bridge_no_clock_skew_shutdown",
-      "name": "test_grep_bridge_no_clock_skew_shutdown",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.00010636297520250082,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 187, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 187, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_osmocon_l1ctl_reset_req",
-      "name": "test_grep_osmocon_l1ctl_reset_req",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.004556700005196035,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_osmocon_l1ctl_fbsb_req_attempted",
-      "name": "test_grep_osmocon_l1ctl_fbsb_req_attempted",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.004013499012216926,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_osmocon_lost_ratio_acceptable",
-      "name": "test_grep_osmocon_lost_ratio_acceptable",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.010050052020233124,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_mobile_alive_signal",
-      "name": "test_grep_mobile_alive_signal",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.006349106028210372,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_fwirda_log_present_or_skip",
-      "name": "test_grep_fwirda_log_present_or_skip",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 6.382499122992158e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 250, 'Skipped: fw-irda.log absent (Phase 3 capture pas activ\u00e9e)')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 250, 'Skipped: fw-irda.log absent (Phase 3 capture pas activ\u00e9e)')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_fwirda_boot_marker",
-      "name": "test_grep_fwirda_boot_marker",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 5.423097172752023e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 257, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 257, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_qemu_no_qemu_abort",
-      "name": "test_blocker_qemu_no_qemu_abort",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.01757475803606212,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_qemu_no_panic",
-      "name": "test_blocker_qemu_no_panic",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.016901891969610006,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_qemu_no_runaway_dsp",
-      "name": "test_blocker_qemu_no_runaway_dsp",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.0028323589940555394,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_qemu_no_long_wait_a21a",
-      "name": "test_blocker_qemu_no_long_wait_a21a",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.0071443740162067115,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_qemu_no_assert_failed",
-      "name": "test_blocker_qemu_no_assert_failed",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.02008455095347017,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_osmocon_no_layer2_socket_failed",
-      "name": "test_blocker_osmocon_no_layer2_socket_failed",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.004661915998440236,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_osmocon_no_connection_refused",
-      "name": "test_blocker_osmocon_no_connection_refused",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.004142869031056762,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_osmocon_no_pty_error",
-      "name": "test_blocker_osmocon_no_pty_error",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.005386316042859107,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_bridge_no_bts_shutdown",
-      "name": "test_blocker_bridge_no_bts_shutdown",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.00011211697710677981,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 338, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 338, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_bridge_no_rach_parity",
-      "name": "test_blocker_bridge_no_rach_parity",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 9.684002725407481e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 346, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 346, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_bridge_no_socket_error",
-      "name": "test_blocker_bridge_no_socket_error",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 9.427097393199801e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 354, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 354, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_mobile_no_crash",
-      "name": "test_blocker_mobile_no_crash",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.00789079099195078,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_mobile_no_vty_bind_error",
-      "name": "test_blocker_mobile_no_vty_bind_error",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.007449647004250437,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_fwirda_no_panic",
-      "name": "test_blocker_fwirda_no_panic",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 6.10490096732974e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 380, 'Skipped')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 380, 'Skipped')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_blocker_no_out_of_memory",
-      "name": "test_blocker_no_out_of_memory",
-      "outcome": "passed",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.0022462530178017914,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_log_grep.py::test_grep_qemu_a_cd_wr_vs_task24",
-      "name": "test_grep_qemu_a_cd_wr_vs_task24",
-      "outcome": "skipped",
-      "markers": [
-        "runtime_log_grep"
-      ],
-      "duration_s": 0.01599826297024265,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 424, 'Skipped: task=24 trop rare (0) \u2014 probablement le go-live DSP bloqu\u00e9 (IMR jamais r\u00e9arm\u00e9, cf STATUS_2026-07-01.md addenda 13-14), pas juste un run ",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_log_grep.py', 424, 'Skipped: task=24 trop rare (0) \u2014 probablement le go-live DSP bloqu\u00e9 (IMR jamais r\u00e9arm\u00e9, cf STATUS_2026-07-01.md addenda 13-14), pas juste un run court')",
-      "category": "Runtime",
-      "layer": "Log-grep"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_shunt_works",
-      "name": "test_verdict_shunt_works",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 7.48399761505425e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 105, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 105, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_shunt_silent",
-      "name": "test_verdict_shunt_silent",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 5.480897380039096e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 124, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 124, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_bts_dead",
-      "name": "test_verdict_bts_dead",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 5.4289004765450954e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 142, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 142, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_ipc_chan_mismatch",
-      "name": "test_verdict_ipc_chan_mismatch",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 4.94639971293509e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 162, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_mode_verdict.py', 162, \"Skipped: verdict ne s'applique pas au mode unknown\")",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_mobile_stuck_gsm322",
-      "name": "test_verdict_mobile_stuck_gsm322",
-      "outcome": "passed",
-      "markers": [],
-      "duration_s": 5.082704592496157e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_verdict_instability",
-      "name": "test_verdict_instability",
-      "outcome": "passed",
-      "markers": [],
-      "duration_s": 4.625995643436909e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_mode_verdict.py::test_zz_per_mode_report",
-      "name": "test_zz_per_mode_report",
-      "outcome": "passed",
-      "markers": [],
-      "duration_s": 0.00017409003339707851,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_sim_it_read_clear_mask_per_firmware_spec",
-      "name": "test_sim_it_read_clear_mask_per_firmware_spec",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_compliant",
-        "osmocom_sim"
-      ],
-      "duration_s": 0.00023918598890304565,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_sim_dtx_write_clears_it_tx",
-      "name": "test_sim_dtx_write_clears_it_tx",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_compliant",
-        "osmocom_sim"
-      ],
-      "duration_s": 9.924900950863957e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_sim_rx_is_level_sensitive",
-      "name": "test_sim_rx_is_level_sensitive",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_compliant",
-        "osmocom_sim"
-      ],
-      "duration_s": 8.695595897734165e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_bsp_drain_timer_on_virtual_clock",
-      "name": "test_bsp_drain_timer_on_virtual_clock",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "osmocom_compliant"
-      ],
-      "duration_s": 0.00023143395083025098,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_tint0_on_virtual_clock",
-      "name": "test_tint0_on_virtual_clock",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "osmocom_compliant"
-      ],
-      "duration_s": 7.809902308508754e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_tdma_tick_on_virtual_clock",
-      "name": "test_tdma_tick_on_virtual_clock",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "osmocom_compliant"
-      ],
-      "duration_s": 0.00013257499085739255,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_bridge_clock_from_qemu_default",
-      "name": "test_bridge_clock_from_qemu_default",
-      "outcome": "skipped",
-      "markers": [
-        "osmocom_bridge",
-        "osmocom_divergent"
-      ],
-      "duration_s": 0.0002513270010240376,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: CALYPSO_QFN_FORCE=0 default \u2014 pas id\u00e9al sous icount=auto, mais le mode QFN_FORCE=1 a un starve IPC document\u00e9 (non-robuste), \u00e0 flipper seulement une fois corrig\u00e9",
-      "err_long": "E   _pytest.outcomes.XFailed: CALYPSO_QFN_FORCE=0 default \u2014 pas id\u00e9al sous icount=auto, mais le mode QFN_FORCE=1 a un starve IPC document\u00e9 (non-robuste), \u00e0 flipper seulement une fois corrig\u00e9",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_osmocom_workflow.py::test_runtime_bts_no_fn_skew_messages",
-      "name": "test_runtime_bts_no_fn_skew_messages",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "osmocom_compliant",
-        "skipif"
-      ],
-      "duration_s": 0.00014827598351985216,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_socket_reachable",
-      "name": "test_monitor_socket_reachable",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.003495098964777,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_status_is_running",
-      "name": "test_monitor_info_status_is_running",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.003677061002236,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_chardev_lists_serial",
-      "name": "test_monitor_info_chardev_lists_serial",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.002908837981522,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_qtree_has_calypso",
-      "name": "test_monitor_info_qtree_has_calypso",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.0034782479633577,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_mtree_has_uart_irda",
-      "name": "test_monitor_info_mtree_has_uart_irda",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.0035617999965325,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_mtree_has_uart_modem",
-      "name": "test_monitor_info_mtree_has_uart_modem",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.0034521729685366,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_qom_tree_has_calypso_or_arm",
-      "name": "test_monitor_info_qom_tree_has_calypso_or_arm",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.0039779390208423,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_registers_arm",
-      "name": "test_monitor_info_registers_arm",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.003004116995726,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_qemu_introspection.py::test_monitor_info_irq_listed",
-      "name": "test_monitor_info_irq_listed",
-      "outcome": "passed",
-      "markers": [
-        "runtime_monitor"
-      ],
-      "duration_s": 3.003285073034931,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Monitor-extended"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_executed[full]",
-      "name": "test_mode_executed[full]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00038075802149251103,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_executed[shunt]",
-      "name": "test_mode_executed[shunt]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00019528198754414916,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_executed[shunt-ipc]",
-      "name": "test_mode_executed[shunt-ipc]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00018802698468789458,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_executed[bridge]",
-      "name": "test_mode_executed[bridge]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00018881598953157663,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_executed[bare]",
-      "name": "test_mode_executed[bare]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00017147301696240902,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 85, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[full-bts_ok->-0-osmo-bts-trx doit \\xeatre online]",
-      "name": "test_mode_invariant[full-bts_ok->-0-osmo-bts-trx doit \\xeatre online]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016739300917834044,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[full-ipc_ok->-0-calypso-ipc-device doit avoir handshake-\\xe9]",
-      "name": "test_mode_invariant[full-ipc_ok->-0-calypso-ipc-device doit avoir handshake-\\xe9]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00017202598974108696,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[full-err_q-==-0-qemu.log sans erreur]",
-      "name": "test_mode_invariant[full-err_q-==-0-qemu.log sans erreur]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00019332999363541603,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-shunt_latch->-0-ARM doit poser au moins une t\\xe2che (sinon firmware boot fail)]",
-      "name": "test_mode_invariant[shunt-shunt_latch->-0-ARM doit poser au moins une t\\xe2che (sinon firmware boot fail)]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.0001693369704298675,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-shunt_disp->-0-le mock doit dispatch au moins une fois (sinon frame_irq hook cass\\xe9)]",
-      "name": "test_mode_invariant[shunt-shunt_disp->-0-le mock doit dispatch au moins une fois (sinon frame_irq hook cass\\xe9)]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.0003618900082074106,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-err_q-==-0-qemu.log sans erreur]",
-      "name": "test_mode_invariant[shunt-err_q-==-0-qemu.log sans erreur]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016149599105119705,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-bts_ok-==-0-BTS doit \\xeatre skipped en shunt mode]",
-      "name": "test_mode_invariant[shunt-bts_ok-==-0-BTS doit \\xeatre skipped en shunt mode]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.0001776280114427209,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-ipc_ok-==-0-IPC doit \\xeatre skipped en shunt mode]",
-      "name": "test_mode_invariant[shunt-ipc_ok-==-0-IPC doit \\xeatre skipped en shunt mode]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00017183198360726237,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-ipc-shunt_latch->-0-ARM doit poser au moins une t\\xe2che]",
-      "name": "test_mode_invariant[shunt-ipc-shunt_latch->-0-ARM doit poser au moins une t\\xe2che]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016752700321376324,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-ipc-shunt_disp->-0-le mock doit dispatch]",
-      "name": "test_mode_invariant[shunt-ipc-shunt_disp->-0-le mock doit dispatch]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.000147557002492249,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-ipc-bts_ok->-0-BTS alive en shunt-ipc (radio chain cosmetic)]",
-      "name": "test_mode_invariant[shunt-ipc-bts_ok->-0-BTS alive en shunt-ipc (radio chain cosmetic)]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00014511996414512396,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[shunt-ipc-ipc_ok->-0-IPC handshake (devrait passer avec cfg 1-chan)]",
-      "name": "test_mode_invariant[shunt-ipc-ipc_ok->-0-IPC handshake (devrait passer avec cfg 1-chan)]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016156700439751148,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[bridge-bts_ok->-0-BTS alive avec bridge.py legacy]",
-      "name": "test_mode_invariant[bridge-bts_ok->-0-BTS alive avec bridge.py legacy]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016974698519334197,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[bridge-ipc_ok-==-0-IPC skipped en bridge mode (mutex)]",
-      "name": "test_mode_invariant[bridge-ipc_ok-==-0-IPC skipped en bridge mode (mutex)]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00015852099750190973,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[bare-bts_ok-==-0-pas de BTS en bare]",
-      "name": "test_mode_invariant[bare-bts_ok-==-0-pas de BTS en bare]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00015211902791634202,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[bare-ipc_ok-==-0-pas d'IPC en bare]",
-      "name": "test_mode_invariant[bare-ipc_ok-==-0-pas d'IPC en bare]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00014744000509381294,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_mode_invariant[bare-rr_est-==-0-pas de mobile en bare]",
-      "name": "test_mode_invariant[bare-rr_est-==-0-pas de mobile en bare]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00015900598373264074,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 93, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_bissection_fbsb_shunt_vs_full",
-      "name": "test_bissection_fbsb_shunt_vs_full",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00017127697356045246,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 115, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 115, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_bridge_vs_ipc_radio_chain",
-      "name": "test_bridge_vs_ipc_radio_chain",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00015659502241760492,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 139, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 139, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_lost_frames_consistency",
-      "name": "test_lost_frames_consistency",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.000156636000610888,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 152, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 152, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_errors_quiet",
-      "name": "test_errors_quiet",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00019619899103417993,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 169, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 169, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_dsp_wall_confirmed",
-      "name": "test_verdict_dsp_wall_confirmed",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00018124200869351625,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 200, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 200, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_arm_bug",
-      "name": "test_verdict_arm_bug",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.0001676150131970644,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 222, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 222, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_pipeline_works",
-      "name": "test_verdict_pipeline_works",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00017355295130982995,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 243, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 243, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_radio_chain_broken",
-      "name": "test_verdict_radio_chain_broken",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00017345399828627706,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 263, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 263, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_instability",
-      "name": "test_verdict_instability",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00017028400907292962,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 286, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 286, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_verdict_bridge_vs_ipc",
-      "name": "test_verdict_bridge_vs_ipc",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.00015605502994731069,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 304, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 304, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[FB_detect]",
-      "name": "test_payload_coverage[FB_detect]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00015083799371495843,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[SB_decode]",
-      "name": "test_payload_coverage[SB_decode]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00018473196541890502,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[Mock_LATCH]",
-      "name": "test_payload_coverage[Mock_LATCH]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016786495689302683,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[Mock_DISP]",
-      "name": "test_payload_coverage[Mock_DISP]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00016072200378403068,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[RR_EST_REQ]",
-      "name": "test_payload_coverage[RR_EST_REQ]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.0001566230203025043,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[BTS_alive]",
-      "name": "test_payload_coverage[BTS_alive]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.00017866899725049734,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_payload_coverage[IPC_handsh]",
-      "name": "test_payload_coverage[IPC_handsh]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize"
-      ],
-      "duration_s": 0.000160337018314749,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 336, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_run_all_modes.py::test_zz_final_report",
-      "name": "test_zz_final_report",
-      "outcome": "skipped",
-      "markers": [],
-      "duration_s": 0.0001644620206207037,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 351, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_all_modes.py', 351, 'Skipped: results.json absent: /tmp/run-all/results.json')",
-      "category": "Other",
-      "layer": "unmarked"
+      "duration_s": 3.111664115000167,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_all_expected_processes_present",
@@ -2498,12 +447,8 @@
       "markers": [
         "runtime_health"
       ],
-      "duration_s": 0.0074536449974402785,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Infra"
+      "duration_s": 0.12174676801078022,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_no_zombie_or_defunct",
@@ -2512,12 +457,8 @@
       "markers": [
         "runtime_health"
       ],
-      "duration_s": 0.00858105398947373,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Infra"
+      "duration_s": 0.05381169499014504,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_qemu_log_is_fresh",
@@ -2526,12 +467,8 @@
       "markers": [
         "runtime_health"
       ],
-      "duration_s": 3.007548933965154,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Infra"
+      "duration_s": 3.109358126006555,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_mobile_pcap_growing",
@@ -2540,12 +477,8 @@
       "markers": [
         "runtime_health"
       ],
-      "duration_s": 10.011706098972354,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Infra"
+      "duration_s": 10.000359783996828,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_volumes_mounted",
@@ -2554,12 +487,8 @@
       "markers": [
         "runtime_health"
       ],
-      "duration_s": 0.010012574028223753,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Infra"
+      "duration_s": 0.07884691499930341,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_no_wait_a21a_on_window",
@@ -2568,12 +497,8 @@
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.012024525029119104,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.07095613700221293,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_no_enter_7740_dwell",
@@ -2582,40 +507,28 @@
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.031163298001047224,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.0789268130029086,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_intm_reaches_zero",
       "name": "test_intm_reaches_zero",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.018414369027595967,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: POST-BOOTSTUB-RET=0 \u2014 INTM jamais clear sur ce run : gate IMR bit12 jamais arm\u00e9 (liveness DSP-ROM-interne, pas un bug de decode/routing \u2014 STATUS_2026-07-01.md ADDENDUM 15",
-      "err_long": "E   _pytest.outcomes.XFailed: POST-BOOTSTUB-RET=0 \u2014 INTM jamais clear sur ce run : gate IMR bit12 jamais arm\u00e9 (liveness DSP-ROM-interne, pas un bug de decode/routing \u2014 STATUS_2026-07-01.md ADDENDUM 15-18 'Case A confirm\u00e9e'). Observ\u00e9 : boucle POPM ST1 INTM_bit=1 stable \u00e0 PC=0x71e0 (ADDENDUM 17, frame-tick dispatcher normal, mais l'appelant ne clear jamais INTM).",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.06592988698685076,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_dsp_throughput_above_threshold",
       "name": "test_dsp_throughput_above_threshold",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.01825856399955228,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 482, \"Skipped: Aucun INSN-COUNT-STATS \u2014 QEMU pas rebuild\u00e9 avec l'instrumentation, ou run trop jeune (<1M insn)\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 482, \"Skipped: Aucun INSN-COUNT-STATS \u2014 QEMU pas rebuild\u00e9 avec l'instrumentation, ou run trop jeune (<1M insn)\")",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.06552594499953557,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_d_fb_det_pattern_unchanged",
@@ -2624,40 +537,28 @@
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.028526726993732154,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 577, 'Skipped: Aucun hit D_FB_DET-WR-SITE dans /root/qemu.log \u2014 probe inactive')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 577, 'Skipped: Aucun hit D_FB_DET-WR-SITE dans /root/qemu.log \u2014 probe inactive')",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.06422479399770964,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_bsp_daram_write_distribution",
       "name": "test_bsp_daram_write_distribution",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.015877892030403018,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 626, \"Skipped: Aucun DARAM-WR-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9 avec l'instrumentation bsp.c (cf rapport 05-14 \u00a7 Priorit\u00e9 A)\")",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 626, \"Skipped: Aucun DARAM-WR-STATS dans qemu.log \u2014 QEMU pas rebuild\u00e9 avec l'instrumentation bsp.c (cf rapport 05-14 \u00a7 Priorit\u00e9 A)\")",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.08322074900206644,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_d_fb_det_data_no_longer_zero",
       "name": "test_d_fb_det_data_no_longer_zero",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_dsp"
       ],
-      "duration_s": 0.008726208994630724,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 671, 'Skipped: Aucun hit D_FB_DET \u2014 milestone non testable encore')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 671, 'Skipped: Aucun hit D_FB_DET \u2014 milestone non testable encore')",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.07593955101037864,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_bridge_log_shows_traffic",
@@ -2666,12 +567,8 @@
       "markers": [
         "runtime_bridge"
       ],
-      "duration_s": 0.0015584229840897024,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "L1-data"
+      "duration_s": 0.05131141099263914,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_bridge_fn_drift_under_threshold",
@@ -2680,26 +577,18 @@
       "markers": [
         "runtime_bridge"
       ],
-      "duration_s": 8.795299800112844e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Parser dual \u00e0 \u00e9crire \u2014 voir BRIDGE_FN_DRIFT_MAX_FRAMES",
-      "err_long": "E   _pytest.outcomes.XFailed: Parser dual \u00e0 \u00e9crire \u2014 voir BRIDGE_FN_DRIFT_MAX_FRAMES",
-      "category": "Runtime",
-      "layer": "L1-data"
+      "duration_s": 0.00010453999857418239,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_bridge_dl_lookahead_respected",
       "name": "test_bridge_dl_lookahead_respected",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_bridge"
       ],
-      "duration_s": 0.0009628210100345314,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 747, \"Skipped: calypso-ipc-device (pont actif) n'expose pas de compteur 'lookahead drop' \u2014 concept sp\u00e9cifique \u00e0 bridge.py legacy, non actif su",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 747, \"Skipped: calypso-ipc-device (pont actif) n'expose pas de compteur 'lookahead drop' \u2014 concept sp\u00e9cifique \u00e0 bridge.py legacy, non actif sur ce run (run.sh 'Regle 2' : bridge.py XOR ipc-device).\")",
-      "category": "Runtime",
-      "layer": "L1-data"
+      "duration_s": 0.050983241002541035,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_neigh_pm_req_loop_alive",
@@ -2708,40 +597,28 @@
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 0.14930957899196073,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 0.18901657100650482,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_l1ctl_data_ind_received",
       "name": "test_l1ctl_data_ind_received",
-      "outcome": "skipped",
+      "outcome": "failed",
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 0.013585297972895205,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies, DATA_IND non interpr\u00e9table",
-      "err_long": "E   _pytest.outcomes.XFailed: task=24 (ALLC) fire 0\u00d7 \u2014 conditions amont CCCH pas r\u00e9unies, DATA_IND non interpr\u00e9table",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 0.17349923300207593,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_a_cd_writes_nonzero",
       "name": "test_a_cd_writes_nonzero",
-      "outcome": "skipped",
+      "outcome": "passed",
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 0.00931617897003889,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 846, 'Skipped: Aucun A_CD-WR \u2014 QEMU pas rebuild\u00e9 avec helper watch_write_zone_check')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 846, 'Skipped: Aucun A_CD-WR \u2014 QEMU pas rebuild\u00e9 avec helper watch_write_zone_check')",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 0.08789997900021262,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_a_cd_write_pc_includes_ccch_demod",
@@ -2750,26 +627,18 @@
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 0.024550061963964254,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Aucun A_CD-WR depuis PROM1 mirror \u2014 vrai CCCH demod ne tourne pas",
-      "err_long": "E   _pytest.outcomes.XFailed: Aucun A_CD-WR depuis PROM1 mirror \u2014 vrai CCCH demod ne tourne pas",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 0.19321265199687332,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_l1ctl_data_ind_rate_vs_alc",
       "name": "test_l1ctl_data_ind_rate_vs_alc",
-      "outcome": "skipped",
+      "outcome": "failed",
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 0.01886352401925251,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 900, 'Skipped: Aucun task=24 ALLC hook')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_run_observability.py', 900, 'Skipped: Aucun task=24 ALLC hook')",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 0.24033405100635719,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_rach_attempted",
@@ -2778,12 +647,8 @@
       "markers": [
         "runtime_l1ctl"
       ],
-      "duration_s": 6.3561019487679e-05,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Bloqu\u00e9 par mobile L23 en cell-search (DSC scan, pr\u00e9-BCCH)",
-      "err_long": "E   _pytest.outcomes.XFailed: Bloqu\u00e9 par mobile L23 en cell-search (DSC scan, pr\u00e9-BCCH)",
-      "category": "Runtime",
-      "layer": "L1-ctrl"
+      "duration_s": 5.111399514134973e-05,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_mobile_vty_reachable",
@@ -2792,12 +657,8 @@
       "markers": [
         "runtime_vty"
       ],
-      "duration_s": 1.5100638080039062,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Mgmt"
+      "duration_s": 1.611705704999622,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_mobile_imsi_loaded",
@@ -2806,12 +667,8 @@
       "markers": [
         "runtime_vty"
       ],
-      "duration_s": 1.5136702739982866,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Mgmt"
+      "duration_s": 1.621448395002517,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_mobile_mm_state_is_null_or_idle",
@@ -2820,12 +677,8 @@
       "markers": [
         "runtime_vty"
       ],
-      "duration_s": 1.5161387259722687,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Mgmt"
+      "duration_s": 1.7306717859901255,
+      "wasxfail": false
     },
     {
       "nodeid": "test_run_observability.py::test_interrupt_ex_called_counter_exposed",
@@ -2834,12 +687,8 @@
       "markers": [
         "runtime_irq"
       ],
-      "duration_s": 0.003400804998818785,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Compteur 'interrupt_ex_called' pas expos\u00e9 via monitor. \u00c0 ajouter dans hw/arm/calypso/calypso_c54x.c + commande monitor info.",
-      "err_long": "E   _pytest.outcomes.XFailed: Compteur 'interrupt_ex_called' pas expos\u00e9 via monitor. \u00c0 ajouter dans hw/arm/calypso/calypso_c54x.c + commande monitor info.",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.06319150800118223,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_isr_entered_matches_rete",
@@ -2848,12 +697,8 @@
       "markers": [
         "runtime_irq"
       ],
-      "duration_s": 0.003085375006776303,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Compteurs isr_entered/rete_executed pas expos\u00e9s",
-      "err_long": "E   _pytest.outcomes.XFailed: Compteurs isr_entered/rete_executed pas expos\u00e9s",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.1301416209898889,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_no_pending_irq_gating",
@@ -2862,12 +707,8 @@
       "markers": [
         "runtime_irq"
       ],
-      "duration_s": 0.002681037993170321,
-      "wasxfail": true,
-      "err_short": "E   _pytest.outcomes.XFailed: Compteur pending_irq_gated pas expos\u00e9",
-      "err_long": "E   _pytest.outcomes.XFailed: Compteur pending_irq_gated pas expos\u00e9",
-      "category": "Runtime",
-      "layer": "DSP"
+      "duration_s": 0.15952931699575856,
+      "wasxfail": true
     },
     {
       "nodeid": "test_run_observability.py::test_run_summary_snapshot",
@@ -2876,391 +717,8 @@
       "markers": [
         "runtime_summary"
       ],
-      "duration_s": 30.200580450007692,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Summary"
-    },
-    {
-      "nodeid": "test_runtime_net_fs.py::test_qemu_ports_listening",
-      "name": "test_qemu_ports_listening",
-      "outcome": "passed",
-      "markers": [
-        "runtime_net"
-      ],
-      "duration_s": 0.017042117018718272,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Net"
-    },
-    {
-      "nodeid": "test_runtime_net_fs.py::test_no_unexpected_high_ports",
-      "name": "test_no_unexpected_high_ports",
-      "outcome": "passed",
-      "markers": [
-        "runtime_net"
-      ],
-      "duration_s": 0.012973691977094859,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "Net"
-    },
-    {
-      "nodeid": "test_runtime_net_fs.py::test_qemu_fd_usage_below_limit",
-      "name": "test_qemu_fd_usage_below_limit",
-      "outcome": "passed",
-      "markers": [
-        "runtime_fs"
-      ],
-      "duration_s": 0.007358964998275042,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "FS"
-    },
-    {
-      "nodeid": "test_runtime_net_fs.py::test_qemu_log_disk_size_under_2gb",
-      "name": "test_qemu_log_disk_size_under_2gb",
-      "outcome": "passed",
-      "markers": [
-        "runtime_fs"
-      ],
-      "duration_s": 0.002370813977904618,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "FS"
-    },
-    {
-      "nodeid": "test_runtime_net_fs.py::test_container_disk_space_above_min",
-      "name": "test_container_disk_space_above_min",
-      "outcome": "passed",
-      "markers": [
-        "runtime_fs"
-      ],
-      "duration_s": 0.0023402959923259914,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Runtime",
-      "layer": "FS"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_tdma_log_present",
-      "name": "test_tdma_log_present",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 8.501502452418208e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_dsp_n_exec_within_budget",
-      "name": "test_dsp_n_exec_within_budget",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 5.787494592368603e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_dsp_budget_saturation_signal",
-      "name": "test_dsp_budget_saturation_signal",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 4.650303162634373e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_tdma_period_virtual_close_to_target",
-      "name": "test_tdma_period_virtual_close_to_target",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 4.656199598684907e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_frame_irq_per_tdma_ratio",
-      "name": "test_frame_irq_per_tdma_ratio",
-      "outcome": "skipped",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 0.046546375029720366,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_invariants.py', 171, 'Skipped: no [frame_irq] log lines')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_invariants.py', 171, 'Skipped: no [frame_irq] log lines')",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_kick_realtime_cadence",
-      "name": "test_kick_realtime_cadence",
-      "outcome": "skipped",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 0.041935521992854774,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_invariants.py', 187, 'Skipped: no [kick] log lines')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_invariants.py', 187, 'Skipped: no [kick] log lines')",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_log_timeline_csv_produced",
-      "name": "test_log_timeline_csv_produced",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 6.984098581597209e-05,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_log_timeline_csv_no_dead_bucket",
-      "name": "test_log_timeline_csv_no_dead_bucket",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 0.00015698297647759318,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_invariants.py::test_log_timeline_csv_steady_qemu_rate",
-      "name": "test_log_timeline_csv_steady_qemu_rate",
-      "outcome": "passed",
-      "markers": [
-        "timer_invariant"
-      ],
-      "duration_s": 0.00012262503150850534,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timing",
-      "layer": "Timers"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_physical_param[TINT0_PERIOD_NS]",
-      "name": "test_timer_physical_param[TINT0_PERIOD_NS]",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.00021890399511903524,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_physical_param[GSM_TDMA_NS]",
-      "name": "test_timer_physical_param[GSM_TDMA_NS]",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.00017584103625267744,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_physical_param[GSM_HYPERFRAME]",
-      "name": "test_timer_physical_param[GSM_HYPERFRAME]",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.00016008701641112566,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_physical_param[BSP_DRAIN_PERIOD_MS]",
-      "name": "test_timer_physical_param[BSP_DRAIN_PERIOD_MS]",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.00020863499958068132,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_physical_param[WT_DELAY_NS]",
-      "name": "test_timer_physical_param[WT_DELAY_NS]",
-      "outcome": "passed",
-      "markers": [
-        "osmocom_clock",
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.0001767930225469172,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Osmocom",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_runtime_period[tdma_tick]",
-      "name": "test_timer_runtime_period[tdma_tick]",
-      "outcome": "passed",
-      "markers": [
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.10009370994521305,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_runtime_period[kick]",
-      "name": "test_timer_runtime_period[kick]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.09890478802844882,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: kick: only 0 samples in /root/qemu.log')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: kick: only 0 samples in /root/qemu.log')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_runtime_period[bridge_clk_ind]",
-      "name": "test_timer_runtime_period[bridge_clk_ind]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 8.948001777753234e-05,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 173, 'Skipped: /root/bridge.py.log vide')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 173, 'Skipped: /root/bridge.py.log vide')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_runtime_period[bts_clk_ind]",
-      "name": "test_timer_runtime_period[bts_clk_ind]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.00017730199033394456,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: bts_clk_ind: only 0 samples in /root/bts.log')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: bts_clk_ind: only 0 samples in /root/bts.log')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_runtime_period[bsp_burst]",
-      "name": "test_timer_runtime_period[bsp_burst]",
-      "outcome": "skipped",
-      "markers": [
-        "parametrize",
-        "timer_audit"
-      ],
-      "duration_s": 0.10287089395569637,
-      "wasxfail": false,
-      "err_short": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: bsp_burst: only 0 samples in /root/qemu.log')",
-      "err_long": "('/opt/GSM/qemu-calypso/tests/test_timer_physical_audit.py', 176, 'Skipped: bsp_burst: only 0 samples in /root/qemu.log')",
-      "category": "Parametrize",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_temporal_graphs_emit_mermaid",
-      "name": "test_timer_temporal_graphs_emit_mermaid",
-      "outcome": "passed",
-      "markers": [
-        "timer_graph"
-      ],
-      "duration_s": 0.28512185701401904,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timer",
-      "layer": "\u2014"
-    },
-    {
-      "nodeid": "test_timer_physical_audit.py::test_timer_drift_summary_table",
-      "name": "test_timer_drift_summary_table",
-      "outcome": "passed",
-      "markers": [
-        "timer_graph"
-      ],
-      "duration_s": 0.26170805899892,
-      "wasxfail": false,
-      "err_short": "",
-      "err_long": "",
-      "category": "Timer",
-      "layer": "\u2014"
+      "duration_s": 30.67651417500747,
+      "wasxfail": false
     }
   ]
 }

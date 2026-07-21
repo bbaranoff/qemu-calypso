@@ -41,12 +41,11 @@ INSIDE    = os.path.exists("/.dockerenv")
 # ---- Regex patterns côté qemu.log ----
 
 AR_W_RE = re.compile(
-    r'\[c54x\] AR(\d+)-W #(\d+) (\S+) @insn=(\d+) PC=0x([0-9a-f]+) '
-    r'op=0x([0-9a-f]+)\s+AR\d+ ([0-9a-f]+) → ([0-9a-f]+) \(Δ=([+-]\d+)\)'
+    r'\[c54x\] AR(\d)-W #(\d+) (\S+) @insn=(\d+) PC=0x([0-9a-f]+) '
+    r'op=0x([0-9a-f]+)\s+AR\d (\S+) → (\S+) \(Δ=(-?\d+)\)'
 )
 AR_ZERO_RE = re.compile(
-    r'\[c54x\] AR(\d+)-W ZERO (DELIBERATE|SIDE-EFFECT) @insn=(\d+) '
-    r'PC=0x([0-9a-f]+) op=0x([0-9a-f]+)'
+    r'\[c54x\] AR(\d)-W ZERO! @insn=(\d+) PC=0x([0-9a-f]+) op=0x([0-9a-f]+)'
 )
 IMR_ZERO_RE = re.compile(
     r'\[c54x\] IMR-W \*ZERO\* 0x([0-9a-f]+) → 0x([0-9a-f]+) PC=0x([0-9a-f]+) '
