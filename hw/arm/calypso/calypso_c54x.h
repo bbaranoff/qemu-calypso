@@ -153,6 +153,14 @@ typedef struct C54xState {
     uint16_t imr;
     uint16_t ifr;
 
+    /* Optional reset-state override loaded from calypso_dsp.Registers.bin via
+     * `-M calypso,dsp-registers=<path>` (default-wired by run.sh, like the
+     * other ROM sections). reg_init[i] = value for MMR index i (0x00..0x1F).
+     * When reg_init_valid, c54x_reset() applies these AFTER its silicon
+     * hardcode defaults, so the .bin snapshot is authoritative. */
+    uint16_t reg_init[0x20];
+    bool     reg_init_valid;
+
     /* Program counter */
     uint32_t pc;     /* 16-bit (or 23-bit with XPC) */
     uint16_t xpc;
@@ -170,6 +178,7 @@ typedef struct C54xState {
     uint16_t rpt_count;  /* remaining RPT iterations */
     uint16_t rpt_pc;     /* PC of repeated instruction */
     bool     rpt_active;
+    bool     rpt_fresh;   /* RPT vient d'etre arme : 1ere lecture READA/MVPD repart de la base, pas du mvpd_src stale (fix 2026-06-24) */
     uint16_t par;        /* Program Address Register (for READA/WRITA/MACD/MACP) */
     bool     par_set;
     bool     lk_used;    /* resolve_smem consumed extra word for lk */
@@ -198,6 +207,11 @@ typedef struct C54xState {
     /* State */
     bool     running;
     bool     idle;       /* IDLE instruction executed */
+    bool     blob_loaded; /* Test fixture: set by c54x_set_initial_pc().
+                           * Suppresses the secondary c54x_reset() that
+                           * normally fires when ARM writes DSP_DL_STATUS_READY,
+                           * which would otherwise clobber the user's blob
+                           * via the reset-time PROM→DARAM auto-copy. */
     uint64_t cycles;
     uint32_t insn_count;
 
@@ -209,16 +223,40 @@ typedef struct C54xState {
     /* Debug */
     uint32_t unimpl_count;
     uint16_t last_unimpl;
+    /* Last executed instruction snapshot — captured at end of each
+     * c54x_run iteration. Used by the INTM-TRANS tracer (and others)
+     * to attribute post-instruction state changes to the actual cause
+     * PC/opcode rather than the post-advance PC. */
+    uint16_t last_exec_pc;
+    uint16_t last_exec_op;
+
+    /* writer_kind : set by each opcode handler / external writer before
+     * calling data_write. Logged in DATA-W-MMR trace to disambiguate
+     * which path is responsible for stray writes to MMR (addr<=0x1F).
+     * Reset to WK_UNKNOWN at the top of c54x_exec_one. */
+    uint8_t  writer_kind;
 } C54xState;
+
+/* writer_kind enum — keep small, extend as needed */
+enum {
+    WK_UNKNOWN     = 0,
+    WK_OPCODE_F3   = 1,   /* 0xF3xx family (SFTL/AND/OR/XOR/INTR/etc.) */
+    WK_OPCODE_8x   = 2,   /* 0x80xx-0x8Fxx (STL/STH/STLM/STM/LD-Smem) */
+    WK_OPCODE_77   = 3,   /* 0x77xx STM #lk, MMR */
+    WK_OPCODE_76   = 4,   /* 0x76xx ST #lk, Smem */
+    WK_OPCODE_PSHM = 5,   /* PSHM/POPM stack ops */
+    WK_OPCODE_RET  = 6,   /* RET/RETI/RETD frame restore */
+    WK_IRQ_ACK     = 7,   /* IRQ acknowledge / vector dispatch */
+    WK_ARM_MMIO    = 8,   /* ARM-side write through shared region */
+    WK_RESOLVE_AR  = 9,   /* resolve_smem AR-modify side effect */
+    WK_OPCODE_OTHER= 10,  /* anything else inside an opcode handler */
+};
 
 /* Feed burst samples to BSP (called by calypso_trx) */
 void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n);
 
 /* Create and initialize C54x state */
 C54xState *c54x_init(void);
-
-/* Load ROM dump from text file */
-int c54x_load_rom(C54xState *s, const char *path);
 
 /* Link API RAM (shared memory with ARM) */
 void c54x_set_api_ram(C54xState *s, uint16_t *api_ram);
@@ -235,5 +273,31 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit);
 
 /* Wake from IDLE */
 void c54x_wake(C54xState *s);
+
+/* Test fixture: override PC after reset.
+ * Used by `-M calypso,dsp-blob=<path>` to start execution at a custom
+ * address instead of the silicon-default reset vector (IPTR * 0x80). */
+void c54x_set_initial_pc(C54xState *s, uint32_t pc);
+
+/* Test fixture: load a raw binary blob into DARAM starting at daram_addr.
+ * File bytes are read pairwise as little-endian DSP words.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_blob_daram(C54xState *s, const char *path, uint16_t daram_addr);
+
+/* Explicit per-section ROM load: write raw LE 16-bit words from `path`
+ * into either prog[] (when is_program=true) or data[] (when false),
+ * starting at DSP word address `start_addr`. Used by the per-section
+ * machine properties (dsp-prom0/prom1/prom2/prom3/drom/pdrom) to load
+ * each ROM section at its silicon-correct DSP address.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_section(C54xState *s, const char *path,
+                       uint32_t start_addr, bool is_program);
+
+/* Load the DSP register snapshot (calypso_dsp.Registers.bin: raw LE 16-bit
+ * words, MMR page 0x00..0x1F first) into reg_init[] so c54x_reset() applies
+ * it as the reset state. Words >= 0x20 are written into data[] (low scratch).
+ * Used by the `-M calypso,dsp-registers=<path>` machine property.
+ * Returns number of words loaded, or -1 on error. */
+int  c54x_load_registers(C54xState *s, const char *path);
 
 #endif /* CALYPSO_C54X_H */

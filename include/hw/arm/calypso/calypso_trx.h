@@ -8,6 +8,7 @@
 
 #include "hw/irq.h"
 #include "exec/memory.h"
+#include "hw/arm/calypso/calypso_c54x.h"
 
 /* IRQ map */
 #define CALYPSO_IRQ_WATCHDOG       0
@@ -83,8 +84,11 @@
 #define ULPD_GAUGING_CTRL     0x24
 #define ULPD_GSM_TIMER        0x28
 
-/* GSM timing — real 4.615ms TDMA frame period */
-#define GSM_TDMA_NS           4615000
+/* GSM timing — vraie période trame TDMA = 60/13 ms = 4 615 384,6 ns.
+ * 4615384 matche EXACTEMENT osmo-trx (WALL_TDMA_NS, 1250 smpl / 270833,33 sps)
+ * -> zéro dérive FN QEMU↔radio. L'ancien 4615000 était 384 ns/trame TROP RAPIDE
+ * (~83 µs/s) = source des 'We were N FN faster than TRX'. */
+#define GSM_TDMA_NS           4615384
 #define GSM_HYPERFRAME        2715648
 
 /* DSP boot */
@@ -98,6 +102,29 @@
 
 void calypso_trx_init(MemoryRegion *sysmem, qemu_irq *irqs);
 
+/* Test fixture: return the C54x DSP state pointer for `-M calypso,dsp-blob=`.
+ * Returns NULL if calypso_trx_init() hasn't run or the DSP ROM load failed. */
+C54xState *calypso_trx_get_dsp(void);
+
+/* Per-section ROM paths — called by mb.c machine_init BEFORE sysbus_realize
+ * so trx_init can load each section at its silicon-correct DSP address
+ * before c54x_reset() (PROM→DARAM auto-copy depends on prog[] populated).
+ * Pass NULL for sections that should be left empty. */
+/* Set the optional DSP register-snapshot path (calypso_dsp.Registers.bin).
+ * Loaded into the C54x reg_init[] before c54x_reset() so the snapshot is the
+ * authoritative reset MMR state. NULL = no override (silicon hardcode used). */
+void calypso_trx_set_registers_path(const char *registers);
+
+void calypso_trx_set_section_paths(const char *prom0, const char *prom1,
+                                   const char *prom2, const char *prom3,
+                                   const char *drom,  const char *pdrom);
+
+/* W1C (Write-1-to-Clear) latch toggle for ARM↔DSP a_sync_* cells.
+ * Returns 1 if CALYPSO_W1C_LATCH=1 env is set, 0 otherwise. Used by
+ * both calypso_c54x.c (capture side) and calypso_trx.c (consume side)
+ * to gate the latch flow. */
+int calypso_w1c_latch_enabled(void);
+
 /* Sercomm burst transport (DLCI 4) — called by UART hardware */
 void calypso_trx_rx_burst(const uint8_t *data, int len);
 void calypso_trx_tx_burst_poll(void);
@@ -105,5 +132,20 @@ void calypso_trx_tx_burst_poll(void);
 /* Current TDMA frame number (0..GSM_HYPERFRAME-1). Used by BSP for
  * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
 uint32_t calypso_trx_get_fn(void);
+
+/* calypso_tpu.c: interpret a committed TPU RAM scenario (MOVE
+ * instructions only; AT/SYNC/WAIT/OFFSET timing unmodeled). Called
+ * from calypso_dsp_done() when TPU_CTRL_EN is written. */
+void calypso_tpu_run_scenario(uint16_t *tpu_ram, C54xState *dsp, uint32_t fn);
+/* Variant that also wires SYNCHRO/OFFSET writes back into the TPU MMIO
+ * regs[] array (pass s->tpu_regs). */
+void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
+                                    uint32_t fn, uint16_t *tpu_regs);
+
+/* calypso_tpu.c: advance the TPU sequencer's qbit-position wait
+ * (AT/WAIT instructions can pause it for N real TDMA frames). Call once
+ * per real TDMA frame tick, from calypso_tdma_tick(). No-op if no
+ * scenario is currently paused. */
+void calypso_tpu_sequencer_tick(uint32_t fn);
 
 #endif /* CALYPSO_TRX_H */

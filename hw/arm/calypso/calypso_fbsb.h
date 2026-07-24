@@ -28,7 +28,7 @@
  *                                                              FAIL        SUCCESS
  *
  * NDB cells we read/write (offsets in DSP data words from API base 0x0800):
- *   d_dsp_page         0x08D4    (page toggle from ARM)
+ *   d_dsp_page         0x08E2    (page toggle from ARM)
  *   d_fb_det           0x08F9    (DSP → ARM: non-zero = FB found)
  *   d_fb_mode          0x08FA    (ARM → DSP: 0 = wideband search, 1 = narrow)
  *   a_sync_demod[0]    0x08FB    D_TOA  — time-of-arrival
@@ -48,7 +48,7 @@
 /* Offsets verified against calypso_trx.c lines 575-581: ARM sees NDB
  * starting at byte 0x01A8 (= dsp_ram word 0xD4), and d_fb_det is at
  * dsp_ram[0xF8]. With api_base=0x0800 → DSP word = 0x0800 + 0xF8. */
-#define NDB_D_DSP_PAGE       0x08D4
+#define NDB_D_DSP_PAGE       0x08E2
 #define NDB_D_FB_DET         0x08F8
 #define NDB_D_FB_MODE        0x08F9
 #define NDB_A_SYNC_DEMOD_TOA 0x08FA
@@ -64,6 +64,7 @@
 #define DSP_TASK_SB         6   /* SB_DSP_TASK (sync burst, idle)      */
 #define DSP_TASK_TCH_FB     8   /* TCH_FB_DSP_TASK (dedicated) */
 #define DSP_TASK_TCH_SB     9   /* TCH_SB_DSP_TASK (dedicated) */
+#define DSP_TASK_ALLC      24   /* ALLC_DSP_TASK (CCCH read while FULL BCCH/CCCH) */
 
 /* FBSB orchestration state. One instance per Calypso. */
 typedef enum {
@@ -108,18 +109,6 @@ void calypso_fbsb_reset(CalypsoFbsb *s);
 /* Hooks. */
 void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
                                      uint64_t fn);
-void calypso_fbsb_on_frame_tick(CalypsoFbsb *s, uint64_t fn);
-
-/* Direct write helpers (used by the orchestration to publish results
- * into NDB so the ARM firmware sees them). */
-void calypso_fbsb_publish_fb_found(CalypsoFbsb *s,
-                                   int16_t toa, uint16_t pm,
-                                   int16_t angle, uint16_t snr);
-void calypso_fbsb_clear_fb(CalypsoFbsb *s);
-
-/* SB synthesis: writes a_sch[0..4] in BOTH db_r pages so l1s_sbdet_resp
- * sees CRC=OK + a decodable sync burst regardless of d_dsp_page state. */
-void calypso_fbsb_publish_sb_found(CalypsoFbsb *s, uint8_t bsic);
 
 /* Trace helper — single-line dump of current state. */
 void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag);

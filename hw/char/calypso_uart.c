@@ -18,10 +18,12 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
+#include "hw/core/cpu.h"          /* current_cpu, mem_io_pc — for RBR-READ-PROBE */
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/calypso_trx.h"
+#include "hw/arm/calypso/calypso_full_pcb.h"  /* calypso_async_log : tick log off main thread */
 #include "hw/arm/calypso/sercomm_gate.h"
 
 /* Register offsets */
@@ -147,6 +149,21 @@ static uint8_t fifo_pop(CalypsoUARTState *s)
     s->rx_tail = (s->rx_tail + 1) % CALYPSO_UART_RX_FIFO_SIZE;
     s->rx_count--;
 
+    /* RBR-POP-PROBE (2026-05-27, c web review) : count fifo_pop calls to
+     * discriminate icount-rerun vs access-size-decomposition vs other
+     * byte-loss mechanisms. One romload run shows the ratio. */
+    {
+        static uint64_t pop_total;
+        pop_total++;
+        if (s->label && !strcmp(s->label, "modem") && pop_total <= 200) {
+            fprintf(stderr,
+                    "[UART-POP-PROBE] #%llu byte=0x%02x rx_count_after=%u\n",
+                    (unsigned long long)pop_total,
+                    (unsigned)data,
+                    (unsigned)s->rx_count);
+        }
+    }
+
     return data;
 }
 
@@ -237,15 +254,40 @@ static void calypso_uart_rx_poll(void *opaque)
 {
     CalypsoUARTState *s = (CalypsoUARTState *)opaque;
 
-    /* Kick the main loop to process any pending I/O sources.
-     * This is necessary because the CPU may run for long periods
-     * without returning to the event loop, starving chardev I/O. */
+    /* AUDIT FIX 2026-05-08 night : `main_loop_wait(false)` removed.
+     *
+     * In QEMU API, the parameter is named `nonblocking`. `false` means
+     * BLOCKING — the prior comment "non-blocking poll" was wrong.
+     * Worse, calling main_loop_wait from a timer callback creates
+     * arbitrary recursion : the very loop that dispatched this REALTIME
+     * timer is re-entered from within itself.
+     *
+     * Under -icount, this breaks the invariant
+     *   virtual_time = icount * (1 << shift)
+     * because nested TCG bursts update icount non-monotonically relative
+     * to the outer loop's scheduling decisions ; the auto-tune algorithm
+     * drifts and VIRTUAL-clock timers (tdma/firq) miss their deadlines
+     * for seconds at a time. Symptom : bridge UDP path frozen under any
+     * `icount != off`.
+     *
+     * `qemu_chr_fe_accept_input` alone is what's needed : it signals the
+     * chardev backend that more bytes can be delivered. The main loop
+     * resumes naturally at the end of this callback.
+     *
+     * Diagnosed by Claude web event-loop audit 2026-05-08. The user
+     * wants `CALYPSO_ICOUNT != off` to work end-to-end. */
     qemu_chr_fe_accept_input(&s->chr);
-    main_loop_wait(false);  /* non-blocking poll of all I/O sources */
 
-    /* Re-arm (realtime, 50ms) */
+    /* Re-arm (realtime, 5ms — tightened from 50ms 2026-05-26 night).
+     *
+     * Sous icount=auto, le main_loop QEMU itère moins fréquemment
+     * pendant les TCG bursts ARM, ce qui creuse une latence wall-clock
+     * entre l'arrivée de bytes osmocon sur la PTY et leur livraison à
+     * calypso_uart_receive. À 50ms la romload upload (64 KiB / blocks
+     * 1024) prenait > 60s wall et osmocon timeout. À 5ms ça matche la
+     * cadence émission osmocon (~1KB tous les 5ms). */
     timer_mod(s->rx_poll_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5);
 }
 
 /* ---- Control PTY callbacks ---- */
@@ -413,32 +455,17 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         uart_log_raw("/tmp/qemu-irda-rx.raw", buf, size);
     }
 
-    /* IrDA UART: burst-only channel from bridge.
-     * Parse sercomm, extract DLCI 4, route to calypso_trx_rx_burst.
-     * Nothing goes to FIFO — this UART is dedicated to bursts. */
+    /* IrDA UART: raw debug / IrDA-stack channel.  The firmware irphy SIR
+     * de-framer reads these bytes via the RX FIFO (uart_getchar_nb), so push
+     * them straight into the FIFO and raise LSR_DR + the RX IRQ (same as
+     * calypso_uart_inject_raw).  Legacy burst-over-UART routing removed: GSM
+     * DL bursts arrive via UDP/BSP, never this UART. */
     if (s->label && !strcmp(s->label, "irda")) {
-        static uint8_t ir_buf[512];
-        static int ir_len = 0;
-        static int ir_state = 0;
-        for (int i = 0; i < size; i++) {
-            uint8_t b = buf[i];
-            if (ir_state == 0) {
-                if (b == 0x7E) { ir_state = 1; ir_len = 0; }
-            } else if (ir_state == 2) {
-                if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b ^ 0x20;
-                ir_state = 1;
-            } else {
-                if (b == 0x7E) {
-                    if (ir_len >= 2 && ir_buf[0] == 4)
-                        calypso_trx_rx_burst(&ir_buf[2], ir_len - 2);
-                    ir_len = 0;
-                } else if (b == 0x7D) {
-                    ir_state = 2;
-                } else {
-                    if (ir_len < (int)sizeof(ir_buf)) ir_buf[ir_len++] = b;
-                }
-            }
-        }
+        for (int i = 0; i < size; i++)
+            fifo_push(s, buf[i]);
+        if (s->rx_count > 0)
+            s->lsr |= LSR_DR;
+        calypso_uart_update_irq(s);
         return;
     }
 
@@ -458,6 +485,11 @@ void calypso_uart_receive(void *opaque, const uint8_t *buf, int size)
         if (pt_len > 0) {
             sercomm_gate_feed(s, passthrough, pt_len);
         }
+        /* Réamorce le chardev backend pour la batch suivante.
+         * Sous icount=auto le main_loop itère moins souvent → sans cet
+         * appel les bytes osmocon attendent jusqu'au prochain tick du
+         * rx_poll_timer (5ms). osmocon timeout sur ses blocs romload. */
+        qemu_chr_fe_accept_input(&s->chr);
         return;
     }
 
@@ -483,6 +515,25 @@ static uint64_t calypso_uart_read(void *opaque, hwaddr offset, unsigned size)
         if (s->lcr & LCR_DLAB) {
             val = s->dll;
         } else {
+            /* RBR-READ-PROBE (2026-05-27) : log access size + offset + ARM
+             * mem_io_pc (host retaddr, but stable within a single insn).
+             * Combine with [UART-POP-PROBE] : if N pops per N reads with same
+             * mem_io_pc → access-size decomposition. If N pops per N reads
+             * with distinct mem_io_pc → real distinct LDRs (no decomposition,
+             * no rerun). Different counts → other byte-loss mechanism. */
+            if (s->label && !strcmp(s->label, "modem")) {
+                static int read_log = 0;
+                if (read_log < 200) {
+                    uintptr_t pc = current_cpu ? current_cpu->mem_io_pc : 0;
+                    fprintf(stderr,
+                            "[UART-RBR-READ] #%d off=0x%02x size=%u "
+                            "mem_io_pc=0x%lx rx_count_before=%u\n",
+                            read_log, (unsigned)offset, size,
+                            (unsigned long)pc, (unsigned)s->rx_count);
+                    read_log++;
+                }
+            }
+
             val = fifo_pop(s);
 
             if (s->rx_count > 0) {
@@ -601,14 +652,26 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
         } else {
             uint8_t ch = (uint8_t)value;
 
-            /* TX trace: tag modem UART as L1CTL-PTY */
+            /* TX trace: tag modem UART as L1CTL-PTY.
+             * Per-byte log is volume-heavy (>140k lines per minute under
+             * fw-console "LOST N!" flood). Gated on env CALYPSO_UART_TRACE=1
+             * (default OFF) to keep host I/O free for QEMU emulation —
+             * heavy stderr writes were causing BTS to die from "No more
+             * clock from transceiver" because bridge couldn't get scheduled. */
             {
-                const char *tag = (s->label && !strcmp(s->label, "modem"))
-                                  ? "L1CTL-PTY" : "UART";
-                const char *lbl = (s->label && !strcmp(s->label, "modem"))
-                                  ? "" : s->label ? s->label : "?";
-                fprintf(stderr, "[%s%s%s] >>>TX %02x\n",
-                        tag, *lbl ? ":" : "", lbl, ch);
+                static int trace_enabled = -1;
+                if (trace_enabled < 0) {
+                    const char *e = getenv("CALYPSO_UART_TRACE");
+                    trace_enabled = (e && *e == '1') ? 1 : 0;
+                }
+                if (trace_enabled) {
+                    const char *tag = (s->label && !strcmp(s->label, "modem"))
+                                      ? "L1CTL-PTY" : "UART";
+                    const char *lbl = (s->label && !strcmp(s->label, "modem"))
+                                      ? "" : s->label ? s->label : "?";
+                    fprintf(stderr, "[%s%s%s] >>>TX %02x\n",
+                            tag, *lbl ? ":" : "", lbl, ch);
+                }
             }
 
             if (s->label && !strcmp(s->label, "modem")) {
@@ -617,9 +680,25 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
                 uart_log_raw("/tmp/qemu-irda-tx.raw", &ch, 1);
             }
 
-            qemu_chr_fe_write_all(&s->chr, &ch, 1);
+            /* Non-blocking TX (2026-05-29 fix — observer-effect kill).
+             *
+             * `qemu_chr_fe_write_all` est synchrone : bloque ARM jusqu'à ce
+             * que tout soit écrit dans le chardev backend (PTY). Sous LOST
+             * cascade firmware (20-char × 217/sec = 37% du wall en sercomm
+             * print à 115200 bps), ARM saturait → frame_irq pas servicé →
+             * next check_lost_frame voit pire diff → encore LOST → boucle
+             * self-amplifiante. La mesure était la maladie.
+             *
+             * Maintenant : write non-blocking. Si le backend ne peut pas
+             * absorber tout immédiatement, on DROP (= la trace diagnostique
+             * a priorité moindre que l'avancement firmware). Firmware ne
+             * voit jamais le backpressure → frame_irq toujours servicé à
+             * temps → boucle LOST cassée. */
+            (void)qemu_chr_fe_write(&s->chr, &ch, 1);
 
-            /* Feed TX byte to L1CTL socket (sercomm parser) */
+            /* Feed TX byte to L1CTL socket (sercomm parser).
+             * Cette voie n'a pas le problème de backpressure (= unix socket
+             * non-bloquant by default), on la laisse synchrone. */
             if (s->label && !strcmp(s->label, "modem")) {
                 l1ctl_sock_uart_tx_byte(ch);
             }
@@ -639,7 +718,10 @@ static void calypso_uart_write(void *opaque, hwaddr offset,
             s->ier = value & 0x0F;
 
             if (old != s->ier && s->label && strcmp(s->label, "modem") != 0) {
-                fprintf(stderr, "[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
+                /* Off-main-thread : ARM TCG ne bloque pas sur stdio.
+                 * Avant : fprintf inline → IER toggle 1.25 Hz × ~50µs
+                 * stdio lock = jitter cumulé sur ARM. */
+                calypso_async_log("[UART:%s] IER=0x%02x (RX=%d TX=%d)\n",
                         s->label ? s->label : "?",
                         s->ier,
                         !!(s->ier & IER_RX_DATA),

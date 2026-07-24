@@ -2,7 +2,7 @@
  * Calypso BSP/RIF DMA — public interface.
  *
  * Faithful path for downlink I/Q samples between sercomm_gate (the QEMU
- * surrogate of the IOTA RF frontend wired through bridge.py) and the
+ * surrogate of the IOTA RF frontend wired through calypso-ipc-device) and the
  * Calypso DSP DARAM. No NDB result hacking — the DSP code itself is
  * expected to find FB/SB and post results in the NDB.
  *
@@ -49,6 +49,13 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
  * the burst is valid (any non-zero), false otherwise.
  */
 bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148]);
+
+/* Build a RACH access burst (148 bits) by reading d_rach from NDB and
+ * channel-encoding it via libosmocoding (gsm0503_rach_ext_encode).
+ * Returns true if a valid RACH was produced, false if d_rach is zero or
+ * the encoder failed. Called by calypso_trx.c when ARM L1 commits a
+ * d_task_ra (RACH access). */
+bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148]);
 
 uint16_t calypso_bsp_get_daram_addr(void);
 uint16_t calypso_bsp_get_daram_len(void);

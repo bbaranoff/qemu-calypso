@@ -1,5 +1,40 @@
 # Calypso HW — C54x DSP Emulator Context
 
+## Debug pattern : gdb-stub vs DSP API RAM
+
+**Finding 2026-05-26** : le gdb-stub QEMU **skip silencieusement les writes**
+vers les regions `memory_region_init_io` (par design : un debugger ne doit
+pas trigger des effets de bord IO). Les reads marchent. Les writes vers une
+adresse `IO`-typed sont **droppes sans erreur** par `address_space_rw_debug`.
+
+Verification :
+1. `gdb writemem(0xFFD003A0, 30B)` returns `True` (mensonge)
+2. HMP `xp/30bx 0xffd003a0` = unchanged
+3. `gdb readmem(0xFFD003A0)` = unchanged
+4. Test sur XRAM `0x01000000` (RAM type) = write OK, persistant
+5. Counter `DSP WR` dans qemu.log = inchange apres gdb write
+   -> `calypso_dsp_write` callback **non invoque** par gdb
+
+**Consequence pour scripts inject (`inject.py`, `verify_si_inject.py`, etc.)** :
+les writes via gdb-stub vers le DSP API RAM (`0xFFD00000..0xFFD009C8`) ne
+fonctionnent **PAS**. Cela inclut tous les writes vers `d_fb_det`, `a_cd[]`,
+`a_sync_demod[]`, etc.
+
+**Workarounds possibles** (sans hack) :
+- (a) Convertir le DSP API region de `init_io` en `init_ram` (backing store
+  reel). Garder les hooks via une seconde MemoryRegion overlay typed-IO
+  qui shadow les writes pour mirror dans `dsp->data`.
+- (b) Exposer un side-channel d'inject explicite (UNIX socket dedicated
+  pour `calypso_dsp_write_external(addr, value)`).
+- (c) HMP halt + manipuler la memory via le code QEMU directement (= mod
+  ds le runtime).
+
+L'option (a) est la plus standard. Voir TODO.md pour le plan.
+
+**Combo HMP+GDB pour debug** : pour halt **tous** les CPUs (ARM + c54x emule),
+utiliser HMP `stop` via `/tmp/qemu-calypso-mon.sock`. GDB seul halt l'ARM
+mais pas le c54x.
+
 ## Opcode Debug Workflow
 
 1. Find the suspect opcode value (from boot trace or PC HIST)

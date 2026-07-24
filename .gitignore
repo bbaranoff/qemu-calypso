@@ -1,4 +1,15 @@
 build/
-*.o
+
+tests/keys/id_rsa
+
+# Python bytecode — never commit (was polluting 63b4fe5 with 23 .pyc files)
 __pycache__/
 *.pyc
+*.pyo
+
+# Manual snapshot backups
+*.bak
+*.bak.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*

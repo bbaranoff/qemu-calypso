@@ -27,37 +27,54 @@
 static void calypso_inth_update(CalypsoINTHState *s)
 {
     uint32_t active = s->levels & ~s->mask;
-    int best_irq = -1;
-    int best_prio = 0x7F;
-    int is_fiq = 0;
+    int best_irq = -1, best_irq_prio = 0x7F;
+    int best_fiq = -1, best_fiq_prio = 0x7F;
 
-    /* Round-robin scan within same priority: start from rr_start so that
-     * after servicing IRQ N, the next scan begins at N+1. This prevents
-     * IRQ4 (TPU_FRAME, fires every tick) from starving IRQ7 (UART). */
+    /* AUDIT FIX 2026-05-08 night : was a single-best arbitration that
+     * conflated IRQ and FIQ channels. When both an IRQ-routed and an
+     * FIQ-routed source were active simultaneously, the higher-priority
+     * winner would raise its parent line AND lower the other, killing
+     * any pending interrupt on the losing channel.
+     *
+     * In ARM, FIQ and IRQ are two independent CPU lines with separate
+     * vectors, separate disable bits (CPSR.F vs CPSR.I), and separate
+     * acknowledgement (FIQ_NUM vs IRQ_NUM registers). They MUST be
+     * arbitrated independently.
+     *
+     * Concrete failure observed under -icount auto :
+     *   SIM (line 6, ILR[6]=0x1ffc → FIQ bit set) raised the FIQ line.
+     *   UART_MODEM (line 7, IRQ-routed) was also active.
+     *   Single-best arbitration picked UART (lower prio value), raised
+     *   parent_irq, LOWERED parent_fiq → ARM never got FIQ → sim_irq_handler
+     *   never ran → rxDoneFlag never set → ARM busy-loop forever at 0x822b90.
+     *
+     * Round-robin scan within each channel separately. */
     for (int j = 0; j < CALYPSO_INTH_NUM_IRQS; j++) {
         int i = (s->rr_start + j) % CALYPSO_INTH_NUM_IRQS;
-        if (active & (1u << i)) {
-            int prio = s->ilr[i] & 0x1F;
-            if (prio < best_prio) {
-                best_prio = prio;
-                best_irq = i;
-                is_fiq = (s->ilr[i] >> 8) & 1;
-            }
+        if (!(active & (1u << i))) continue;
+        int prio = s->ilr[i] & 0x1F;
+        int is_fiq = (s->ilr[i] >> 8) & 1;
+        if (is_fiq) {
+            if (prio < best_fiq_prio) { best_fiq_prio = prio; best_fiq = i; }
+        } else {
+            if (prio < best_irq_prio) { best_irq_prio = prio; best_irq = i; }
         }
     }
 
+    /* Drive parent_irq line independently */
     if (best_irq >= 0) {
-        s->ith_v = best_irq;
-        if (is_fiq) {
-            qemu_irq_raise(s->parent_fiq);
-            qemu_irq_lower(s->parent_irq);
-        } else {
-            qemu_irq_raise(s->parent_irq);
-            qemu_irq_lower(s->parent_fiq);
-        }
+        s->ith_v = best_irq;          /* IRQ_NUM read returns this */
+        qemu_irq_raise(s->parent_irq);
     } else {
-        s->ith_v = 0;
+        if (best_fiq < 0) s->ith_v = 0;
         qemu_irq_lower(s->parent_irq);
+    }
+
+    /* Drive parent_fiq line independently */
+    if (best_fiq >= 0) {
+        s->fiq_v = best_fiq;          /* FIQ_NUM read returns this */
+        qemu_irq_raise(s->parent_fiq);
+    } else {
         qemu_irq_lower(s->parent_fiq);
     }
 }
@@ -67,6 +84,19 @@ static void calypso_inth_update(CalypsoINTHState *s)
 static void calypso_inth_set_irq(void *opaque, int irq, int level)
 {
     CalypsoINTHState *s = CALYPSO_INTH(opaque);
+
+    /* AUDIT INSTRUMENTATION 2026-05-08 night : trace SIM (irq 6) raises
+     * with current mask state — disambiguates whether SIM IRQ propagates
+     * to ARM or is blocked by mask. Cap log to avoid flood. */
+    if (irq == 6 /* SIM */) {
+        static unsigned sim_log;
+        if (sim_log++ < 60)
+            fprintf(stderr,
+                    "[INTH] LINE-SET sim(6) level=%d  mask=0x%08x  "
+                    "bit6_masked=%d  prev_levels=0x%08x  ilr[6]=0x%04x\n",
+                    level, s->mask,
+                    !!(s->mask & (1u<<6)), s->levels, s->ilr[6]);
+    }
 
     if (level) {
         s->levels |= (1u << irq);
@@ -124,7 +154,21 @@ static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
     }
     case 0x12: /* FIQ_NUM */
     case 0x82: /* FIQ_NUM (legacy) */
-        return s->ith_v;
+    {
+        /* AUDIT FIX 2026-05-08 night : returns separately-arbitrated FIQ
+         * source number (was returning ith_v, the IRQ winner — wrong for
+         * FIQ acknowledgement). Edge-clear for FIQ-routed edge sources too. */
+        uint16_t num = s->fiq_v;
+        if (num == 4 || num == 5 || num == 15) {
+            s->levels &= ~(1u << num);
+        }
+        calypso_inth_update(s);
+        static unsigned fiq_log;
+        if (fiq_log++ < 30)
+            fprintf(stderr, "[INTH] FIQ_NUM=%u read levels=0x%08x mask=0x%08x\n",
+                    num, s->levels, s->mask);
+        return num;
+    }
     case 0x14: /* IRQ_CTRL */
     case 0x84: /* IRQ_CTRL (legacy) */
         return 0;
@@ -144,13 +188,34 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
 
     switch (offset) {
     case 0x08: /* MASK_IT_REG1 */
+    {
+        uint32_t old = s->mask;
         s->mask = (s->mask & 0xFFFF0000) | (value & 0xFFFF);
+        /* AUDIT INSTRUMENTATION 2026-05-08 night : trace mask writes to
+         * disambiguate icount-vs-mask race for SIM IRQ (bit 6). */
+        static unsigned mask_log;
+        if (mask_log++ < 50)
+            fprintf(stderr,
+                    "[INTH] MASK-W LO val=0x%04x  full 0x%08x → 0x%08x  "
+                    "bit6(SIM)=%d bit7(UART)=%d levels=0x%08x\n",
+                    (unsigned)value, old, s->mask,
+                    !!(s->mask & (1u<<6)), !!(s->mask & (1u<<7)),
+                    s->levels);
         calypso_inth_update(s);
         break;
+    }
     case 0x0a: /* MASK_IT_REG2 */
+    {
+        uint32_t old = s->mask;
         s->mask = (s->mask & 0x0000FFFF) | ((value & 0xFFFF) << 16);
+        static unsigned mask_log_hi;
+        if (mask_log_hi++ < 50)
+            fprintf(stderr,
+                    "[INTH] MASK-W HI val=0x%04x  full 0x%08x → 0x%08x\n",
+                    (unsigned)value, old, s->mask);
         calypso_inth_update(s);
         break;
+    }
     case 0x14: /* IRQ_CTRL — end-of-service acknowledge */
     case 0x84:
     {
@@ -173,6 +238,13 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
              * Firmware sets IRQ7 to prio 31 which causes starvation. */
             if (idx == 7) {
                 s->ilr[7] = (s->ilr[7] & ~0x1F) | (s->ilr[4] & 0x1F);
+            }
+            /* Same fix for UART_IRDA (IRQ18) — under -icount the IRDA RX
+             * IRQ is starved by IRQ7 if left at firmware's default prio 31.
+             * IrDA is the firmware logging channel ; without it, fw-irda.log
+             * stays empty and the operator loses runtime visibility. */
+            if (idx == 18) {
+                s->ilr[18] = (s->ilr[18] & ~0x1F) | (s->ilr[4] & 0x1F);
             }
         }
         break;
@@ -210,6 +282,7 @@ static void calypso_inth_reset(DeviceState *dev)
     s->levels = 0;
     s->mask = 0x00000000;
     s->ith_v = 0;
+    s->fiq_v = 0;
     s->irq_in_service = -1;
     s->rr_start = 0;
     memset(s->ilr, 0, sizeof(s->ilr));

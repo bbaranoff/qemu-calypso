@@ -8,8 +8,10 @@
 #include <string.h>
 #include "hw/arm/calypso/calypso_iota.h"
 
+#include "hw/arm/calypso/calypso_debug.h"
 #define IOTA_LOG(fmt, ...) \
-    do { fprintf(stderr, "[iota] " fmt "\n", ##__VA_ARGS__); } while (0)
+    do { if (calypso_debug_enabled("IOTA")) \
+        fprintf(stderr, "[iota] " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* Pending BDLENA windows queued by the TPU sequencer, waiting for a
  * matching downlink burst to arrive on the BSP. Sized for one full TDMA
@@ -38,17 +40,7 @@ static int iota_pending_count(void)
 static void iota_pending_push(uint8_t tn)
 {
     if (iota_pending_count() >= IOTA_PENDING_MAX - 1) {
-        /* Saturation: BSP isn't consuming pulses fast enough (typically
-         * the DSP is stalled and the TDMA tick can't advance fn far enough
-         * to match queued bursts in calypso_bsp_deliver_buffered).
-         * Rate-limit the warning so it doesn't drown the log: first 5,
-         * then every 1000th drop, plus a periodic count summary. */
-        static uint64_t drops;
-        drops++;
-        if (drops <= 5 || (drops % 1000) == 0) {
-            IOTA_LOG("WARN pending queue full, dropping oldest "
-                     "(drops=%llu)", (unsigned long long)drops);
-        }
+        IOTA_LOG("WARN pending queue full, dropping oldest");
         iota.pending_head = (iota.pending_head + 1) % IOTA_PENDING_MAX;
     }
     iota.pending_tn[iota.pending_tail] = tn;

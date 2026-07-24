@@ -33,6 +33,16 @@ struct CalypsoTimerState {
     int64_t  tick_ns;     /* Nanoseconds per tick */
     int64_t  epoch_ns;    /* Virtual time when count==load (lazy compute) */
     bool     running;
+
+    /* Frame-locked lost-frame latch (timer #1 only) — see calypso_timer.c. */
+    bool     lost_latch_active;
+    uint16_t lost_latch_count;
+    uint32_t lost_read_k;   /* per-READ sawtooth index for check_lost_frame() */
 };
+
+/* Register the timer instance read by firmware check_lost_frame() (timer #1). */
+void calypso_timer_register_lost(DeviceState *d);
+/* Called from the TDMA frame-IRQ raise with the current GSM frame number. */
+void calypso_timer_lost_frame_tick(uint32_t fn);
 
 #endif /* HW_TIMER_CALYPSO_TIMER_H */

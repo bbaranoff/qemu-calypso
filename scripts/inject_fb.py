@@ -20,7 +20,7 @@ import struct
 import sys
 import time
 
-BRIDGE_LOG = "/tmp/bridge.log"
+(removed) = "/tmp/bridge.log"
 BSP_ADDR = ("127.0.0.1", 6702)
 LOOKAHEAD = 30          # frames ahead of cur_fn (well inside ±64 window)
 SEND_PERIOD_S = 0.004   # ~one TDMA frame
@@ -39,7 +39,7 @@ def make_fb_burst(tn, fn, rssi=20, toa=0):
 def latest_fn_from_bridge():
     """Walk bridge.log backwards looking for the most recent 'fn=N' tag."""
     try:
-        with open(BRIDGE_LOG, "rb") as f:
+        with open((removed), "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             chunk = 8192

@@ -43,6 +43,22 @@
 
 #define CALYPSO_BASE_CLK   13000000LL  /* 13 MHz */
 
+/* Domaine de temps du hwtimer. DOIT être le MÊME que le tdma_tick/frame-IRQ
+ * (calypso_trx.c calypso_tdma_clock()), sinon le firmware mesure les ticks
+ * hwtimer (une horloge) entre deux frame-IRQ (une AUTRE horloge) -> le ratio
+ * 1875 ticks/trame ne tient pas -> "LOST N!" en continu, et icount ne peut RIEN
+ * (le hwtimer sur REALTIME est immunisé à icount). Défaut VIRTUAL (single-domain,
+ * verrouillé sous icount=auto) ; opt-in wall via la MÊME gate que le tick. */
+static QEMUClockType calypso_timer_clock(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_TDMA_REALTIME");
+        cached = (e && *e == '1') ? 1 : 0;
+    }
+    return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
+}
+
 static bool calypso_timer_should_run(CalypsoTimerState *s)
 {
     return (s->ctrl & TIMER_CTRL_START) && (s->ctrl & TIMER_CTRL_CLOCK_ENABLE);
@@ -65,7 +81,7 @@ static void calypso_timer_recompute_tick(CalypsoTimerState *s)
 static uint16_t calypso_timer_current_count(CalypsoTimerState *s)
 {
     if (!s->running) return s->count;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = qemu_clock_get_ns(calypso_timer_clock());
     int64_t elapsed = now - s->epoch_ns;
     if (elapsed < 0) elapsed = 0;
     int64_t ticks = elapsed / s->tick_ns;
@@ -82,7 +98,7 @@ static void calypso_timer_schedule_wrap(CalypsoTimerState *s)
 {
     /* Schedule the next IRQ at the moment count would reach 0 from the
      * current virtual time. */
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t now = qemu_clock_get_ns(calypso_timer_clock());
     uint16_t cur = calypso_timer_current_count(s);
     int64_t ns_to_wrap = (int64_t)(cur + 1) * s->tick_ns;
     timer_mod(s->timer, now + ns_to_wrap);
@@ -98,7 +114,7 @@ static void calypso_timer_tick(void *opaque)
 
     if (s->ctrl & TIMER_CTRL_RELOAD) {
         /* Reanchor epoch to "now" so the next read sees count=load. */
-        s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock());
         s->count = s->load;
         timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
     } else {
@@ -113,8 +129,52 @@ static void calypso_timer_start(CalypsoTimerState *s)
     calypso_timer_recompute_tick(s);
     s->count = s->load;
     s->running = true;
-    s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->lost_read_k = 0;   /* restart lost-frame sawtooth phase */
+    s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock());
     timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
+}
+
+/* ---- Frame-locked lost-frame latch (timer #1 only) ----
+ * Firmware check_lost_frame() (layer1/sync.c) reads timer #1 once per TDMA
+ * frame-IRQ and expects the count to advance by exactly 1875 ticks between two
+ * IRQs (tolérance ±1). Sous CALYPSO_TDMA_REALTIME=1 + -icount auto, l'instant
+ * d'échantillonnage jitte (±~13 ticks) -> "LOST N!" en continu. On fige la
+ * valeur READ de timer #1 sur une grille dérivée du FN : count(fn) = load -
+ * (fn mod 4)*1875 ∈ {7499,5624,3749,1874}. Deux frames consécutives diffèrent
+ * de 1875 pile -> zéro LOST ; un vrai saut (fn +k) donne k*1875 -> LOST légitime
+ * conservé. timer #1 est le SEUL hwtimer lu par check_lost_frame(). */
+#define LOST_TICKS_PER_TDMA 1875
+
+static CalypsoTimerState *g_lost_timer;   /* timer #1 @ 0xFFFE3800 */
+
+static bool calypso_lost_latch_enabled(void)
+{
+    static int cached = -1;   /* défaut ON ; opt-out CALYPSO_LOST_LATCH=0 */
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_LOST_LATCH");
+        cached = (e && *e == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+void calypso_timer_register_lost(DeviceState *d)
+{
+    g_lost_timer = CALYPSO_TIMER(d);
+}
+
+void calypso_timer_lost_frame_tick(uint32_t fn)
+{
+    CalypsoTimerState *s = g_lost_timer;
+    (void)fn;   /* value now stepped per-READ, not derived from fn — see below */
+    if (!s || !s->running || !calypso_lost_latch_enabled()) {
+        return;
+    }
+    /* Arm the frame-locked latch once the TDMA frame machinery is live. The
+     * actual READ value is produced per-READ in calypso_timer_read() so the
+     * step is invariant to how many TDMA ticks / fn increments happen between
+     * two firmware reads (empirically 2 fn per serviced frame IRQ -> the old
+     * fn-derived latch produced a constant "LOST 3750!" = 2*1875). */
+    s->lost_latch_active = true;
 }
 
 /* ---- MMIO ---- */
@@ -123,10 +183,45 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTimerState *s = CALYPSO_TIMER(opaque);
 
+    {
+        static int rd_count = 0;
+        static int64_t prev_t_virt = 0;
+        if (rd_count < 0) {  /* DISABLED — re-enable by setting >0 */
+            uint16_t live = calypso_timer_current_count(s);
+            int64_t now = qemu_clock_get_ns(calypso_timer_clock());
+            int64_t dt = prev_t_virt ? (now - prev_t_virt) : 0;
+            fprintf(stderr, "[timer] RD ts=%p off=0x%02x live=%u stored=%u "
+                    "running=%d tick_ns=%" PRId64 " epoch=%" PRId64
+                    " t_virt=%" PRId64 " dt=%" PRId64 " rd#=%d\n",
+                    (void *)s, (unsigned)offset, live, s->count, s->running,
+                    s->tick_ns, s->epoch_ns, now, dt, rd_count);
+            prev_t_virt = now;
+            rd_count++;
+        }
+    }
+
     switch (offset) {
     case 0x00: return s->ctrl;
     case 0x02: return s->load;
-    case 0x04: return calypso_timer_current_count(s);
+    case 0x04:
+        /* Firmware check_lost_frame() (layer1/sync.c) is the ONLY reader of
+         * timer #1's READ register, exactly once per serviced frame IRQ, and
+         * expects the down-counter to have decreased by exactly 1875 ticks
+         * (±1) since the previous read. We synthesize that sawtooth per-READ:
+         * count(k) = load - (k*1875 mod period), k incremented each read.
+         * Consecutive reads differ by exactly 1875 -> zero "LOST N!", and it
+         * is invariant to the fn/IRQ/tdma-tick rate mismatch (s->fn advances
+         * 2 frames per serviced IRQ, which broke the old fn-derived latch).
+         * Opt-out via CALYPSO_LOST_LATCH=0 -> raw interpolated count. */
+        if (s->lost_latch_active && calypso_lost_latch_enabled() && s->running) {
+            uint32_t period = (uint32_t)s->load + 1;          /* 7500 */
+            uint32_t step   = ((uint64_t)s->lost_read_k *
+                               LOST_TICKS_PER_TDMA) % period;
+            uint16_t val    = (uint16_t)(s->load - step);
+            s->lost_read_k++;
+            return val;
+        }
+        return calypso_timer_current_count(s);
     default:   return 0;
     }
 }
@@ -149,7 +244,7 @@ static void calypso_timer_write(void *opaque, hwaddr offset, uint64_t value,
                 /* prescaler changed mid-run — re-anchor at current count */
                 s->count = calypso_timer_current_count(s);
                 calypso_timer_recompute_tick(s);
-                s->epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock()) -
                               (int64_t)(s->load - s->count) * s->tick_ns;
                 calypso_timer_schedule_wrap(s);
             }
@@ -185,7 +280,7 @@ static void calypso_timer_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
-    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, calypso_timer_tick, s);
+    s->timer = timer_new_ns(calypso_timer_clock(), calypso_timer_tick, s);
 }
 
 static void calypso_timer_reset(DeviceState *dev)
@@ -197,6 +292,9 @@ static void calypso_timer_reset(DeviceState *dev)
     s->ctrl = 0;
     s->prescaler = 0;
     s->running = false;
+    s->lost_latch_active = false;
+    s->lost_latch_count = 0;
+    s->lost_read_k = 0;
     timer_del(s->timer);
 }
 

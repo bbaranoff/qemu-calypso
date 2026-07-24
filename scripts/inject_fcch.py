@@ -3,7 +3,7 @@
 inject_fcch.py — diagnostic script: synthesize a clean FCCH (FB) burst
 and inject it into QEMU's BSP via UDP 127.0.0.1:6702 (TRXDv0 format).
 
-Purpose: validate the DSP FB-detect path independently of bridge.py /
+Purpose: validate the DSP FB-detect path independently of calypso-ipc-device /
 osmo-bts-trx by feeding a known-good FCCH burst with selectable encoding.
 
 GSM FCCH burst:
@@ -13,7 +13,7 @@ GSM FCCH burst:
 - The DSP correlator at PROM0 0x77xx-0x88xx searches for this pure-tone
   burst by computing autocorrelation peak.
 
-TRXDv0 wire format (per bridge.py + calypso_bsp.c):
+TRXDv0 wire format (per calypso-ipc-device + calypso_bsp.c):
   byte 0     : TN (timeslot 0..7)
   bytes 1-4  : FN (uint32 big-endian)
   byte 5     : RSSI (uint8, dBm offset)
@@ -38,7 +38,7 @@ import struct
 import sys
 import time
 
-BRIDGE_LOG = "/tmp/bridge.log"
+(removed) = "/tmp/bridge.log"
 BSP_ADDR = ("127.0.0.1", 6702)
 
 # GSM constants
@@ -91,7 +91,7 @@ def make_burst(tn, fn, mode, rssi=20, toa=0):
 def latest_fn_from_bridge():
     """Walk bridge.log backwards looking for the most recent 'fn=N' tag."""
     try:
-        with open(BRIDGE_LOG, "rb") as f:
+        with open((removed), "rb") as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 8192))

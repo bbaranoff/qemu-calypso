@@ -13,7 +13,7 @@
  *      side and logs it. calypso_trx owns its own FN counter; the CLK
  *      packets are purely informational here.
  *
- *      TRXC traffic is stubbed locally by bridge.py on UDP 5701 — QEMU
+ *      TRXC traffic is stubbed locally by calypso-ipc-device on UDP 5701 — QEMU
  *      never sees TRXC on UDP.
  *
  *      TRXD (burst) transport is owned by calypso_bsp.c via calypso_orch.
@@ -33,7 +33,7 @@
 #include "hw/arm/calypso/calypso_uart.h"
 #include "hw/arm/calypso/sercomm_gate.h"
 
-/* TRXC handling is NOT done by QEMU. bridge.py answers TRXC commands
+/* TRXC handling is NOT done by QEMU. calypso-ipc-device answers TRXC commands
  * locally (stub) on UDP 5701 — QEMU never sees them. The L1CTL/L23
  * path on PTY DLCI 5 is the only thing the modem UART carries. */
 
@@ -82,9 +82,10 @@ static void gate_push_to_fifo(CalypsoUARTState *s,
     { uint8_t _b = SERCOMM_FLAG; calypso_uart_inject_raw(s, &_b, 1); }
     for (int i = 0; i < len; i++) {
         uint8_t c = frame[i];
-        /* Standard sercomm: only escape FLAG and ESCAPE. Escaping
-         * 0x00 was a bug — the firmware sercomm parser doesn't
-         * expect it and would drop the frame. */
+        /* Standard sercomm HDLC byte stuffing : escape FLAG (0x7e) and
+         * ESCAPE (0x7d) so they survive in payload bytes. Mandatory for
+         * the firmware sercomm parser ; removing this corrupts every
+         * frame whose payload contains 0x7e or 0x7d. */
         if (c == SERCOMM_FLAG || c == SERCOMM_ESCAPE) {
             { uint8_t _e = SERCOMM_ESCAPE; calypso_uart_inject_raw(s, &_e, 1); }
             { uint8_t _x = c ^ SERCOMM_XOR; calypso_uart_inject_raw(s, &_x, 1); }
@@ -98,7 +99,7 @@ static void gate_push_to_fifo(CalypsoUARTState *s,
 #define SERCOMM_DLCI_TRXC 4
 
 /* Wrap a payload in sercomm DLCI 4 (TRXC) and send it back via the
- * chardev TX (→ PTY → bridge.py → osmo-bts-trx 5701). */
+ * chardev TX (→ PTY → calypso-ipc-device → osmo-bts-trx 5701). */
 static void gate_send_trxc_rsp(CalypsoUARTState *s,
                                 const uint8_t *payload, int plen)
 {
@@ -131,7 +132,7 @@ static void gate_send_trxc_rsp(CalypsoUARTState *s,
 }
 
 /* Parse a TRXC CMD string and produce a RSP string.
- * Mirrors bridge.py::trxc_response. Returns response length, or 0 if
+ * Mirrors calypso-ipc-device::trxc_response. Returns response length, or 0 if
  * the command is not a CMD (silently ignored). */
 static int gate_trxc_handle(const uint8_t *cmd_buf, int cmd_len,
                              char *rsp, int rsp_size)
@@ -244,7 +245,7 @@ void sercomm_gate_feed(CalypsoUARTState *s, const uint8_t *buf, int size)
  * 2. UDP CLK listener — informational only
  * ============================================================
  *
- * TRXC is stubbed by bridge.py on UDP 5701; QEMU never sees it.
+ * TRXC is stubbed by calypso-ipc-device on UDP 5701; QEMU never sees it.
  * TRXD (bursts) is owned by calypso_bsp.c via calypso_orch.
  */
 

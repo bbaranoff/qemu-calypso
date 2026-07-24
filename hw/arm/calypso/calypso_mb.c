@@ -25,7 +25,9 @@
 #include "sysemu/reset.h"
 
 #include "hw/arm/calypso/calypso_soc.h"
-#include "hw/arm/calypso/fw_console.h"
+#include "hw/arm/calypso/calypso_trx.h"   /* C54xState + calypso_trx_get_dsp()
+                                             + calypso_trx_set_section_paths() */
+#include "calypso_dsp_shunt.h"
 
 #define CALYPSO_XRAM_BASE     0x01000000
 #define CALYPSO_XRAM_SIZE     (8 * 1024 * 1024)
@@ -39,6 +41,16 @@ typedef struct CalypsoMachineState {
     CalypsoSoCState soc;
     MemoryRegion xram;
     MemoryRegion bootrom;
+    char *dsp_blob;          /* `-M calypso,dsp-blob=<path>` — DARAM fixture */
+    /* Explicit per-section ROM loads. Each writes raw LE 16-bit words at
+     * its silicon-correct DSP address. Bins produced by dsp_txt2bin.py. */
+    char *dsp_prom0;         /* `-M calypso,dsp-prom0=<path>` → prog[0x07000+] */
+    char *dsp_prom1;         /* `-M calypso,dsp-prom1=<path>` → prog[0x18000+] + mirror */
+    char *dsp_prom2;         /* `-M calypso,dsp-prom2=<path>` → prog[0x28000+] */
+    char *dsp_prom3;         /* `-M calypso,dsp-prom3=<path>` → prog[0x38000+] */
+    char *dsp_drom;          /* `-M calypso,dsp-drom=<path>`  → data[0x09000+] */
+    char *dsp_pdrom;         /* `-M calypso,dsp-pdrom=<path>` → data[0x0E000+] */
+    char *dsp_registers;     /* `-M calypso,dsp-registers=<path>` → MMR reset snapshot */
 } CalypsoMachineState;
 
 #define TYPE_CALYPSO_MACHINE MACHINE_TYPE_NAME("calypso")
@@ -76,6 +88,16 @@ static void calypso_machine_init(MachineState *machine)
     }
 
     /* ---- SoC ---- */
+    /* Push per-section ROM paths to the TRX layer BEFORE sysbus_realize, so
+     * that calypso_trx_init() loads each section into prog[]/data[] **before**
+     * c54x_reset(). The reset's PROM→DARAM auto-copy (0x7080..0x97FF →
+     * 0x80..0x27FF) reads from prog[]; the sections must be in place by
+     * then or the boot stub overlay ends up zero-filled. */
+    calypso_trx_set_section_paths(s->dsp_prom0, s->dsp_prom1,
+                                  s->dsp_prom2, s->dsp_prom3,
+                                  s->dsp_drom,  s->dsp_pdrom);
+    calypso_trx_set_registers_path(s->dsp_registers);
+
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_CALYPSO_SOC);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->soc), &err)) {
         error_report_err(err);
@@ -198,7 +220,44 @@ static void calypso_machine_init(MachineState *machine)
 
     }
 
-    fw_console_init();
+    /* ---- Optional DSP blob (test fixture, OFF when unset) ----
+     * `-M calypso,dsp-blob=<path>` loads a raw 16-bit LE word blob into
+     * DARAM at 0x0100 and forces the DSP to start executing there.
+     * Must run AFTER SoC realize: calypso_trx_init() (invoked inside SoC
+     * realize) calls c54x_reset(), which auto-copies PROM0[0x7080..]
+     * into DARAM[0x80..0x27FF]. Our blob load overwrites that region
+     * at 0x100+, and the PC override redirects fetch away from the
+     * default reset vector (0xFF80) to our blob. OVLY=1 (PMST default
+     * 0xFFA8) routes the fetch to DARAM. Address 0x0100 sits outside
+     * the API-RAM mirror window (0x800..0x27FF) so ARM-side writes do
+     * not clobber the blob during boot. */
+    if (s->dsp_blob) {
+        C54xState *dsp = calypso_trx_get_dsp();
+        if (!dsp) {
+            error_report("dsp-blob: DSP not initialized — cannot load '%s'",
+                         s->dsp_blob);
+            exit(1);
+        }
+        int words = c54x_load_blob_daram(dsp, s->dsp_blob, 0x0100);
+        if (words < 0) {
+            error_report("dsp-blob: load failed for '%s'", s->dsp_blob);
+            exit(1);
+        }
+        c54x_set_initial_pc(dsp, 0x0100);
+        fprintf(stderr, "[MB] dsp-blob: loaded %d words at DARAM[0x100] "
+                        "from '%s', PC=0x100 (OVLY=1)\n",
+                words, s->dsp_blob);
+    }
+
+    /* ---- DSP shunt (mock côté ARM, skip c54x) ----
+     * Activé via env CALYPSO_DSP_SHUNT=1. Ne touche au c54x que via le
+     * gate calypso_dsp_shunt_active() utilisé dans calypso_bsp.c et
+     * calypso_trx.c pour stopper les écritures DMA vers DARAM.
+     * Cf hw/arm/calypso/calypso_dsp_shunt.c. */
+    calypso_dsp_shunt_init(sysmem, &address_space_memory);
+    /* CALYPSO_DSP=c54x : relie le VRAI DSP au shunt pour la route c54x + overlay NDB
+     * (sinon g_shunt.c54x reste NULL et la branche route_c54x est morte). */
+    calypso_dsp_shunt_set_c54x(calypso_trx_get_dsp());
 
     fprintf(stderr, "[MB] === Machine ready ===\n");
     fprintf(stderr, "[MB]   Flash:  0x%08x–0x%08x (%d MiB pflash_cfi01)\n",
@@ -212,6 +271,29 @@ static void calypso_machine_init(MachineState *machine)
             CALYPSO_XRAM_SIZE / (1024*1024));
 }
 
+/* Generic string get/set macros for the DSP blob/section properties. */
+#define DEFINE_DSP_STR_PROP(name) \
+    static char *calypso_get_##name(Object *obj, Error **errp) \
+    { \
+        return g_strdup(CALYPSO_MACHINE(obj)->name); \
+    } \
+    static void calypso_set_##name(Object *obj, const char *value, \
+                                   Error **errp) \
+    { \
+        CalypsoMachineState *s = CALYPSO_MACHINE(obj); \
+        g_free(s->name); \
+        s->name = g_strdup(value); \
+    }
+
+DEFINE_DSP_STR_PROP(dsp_blob)
+DEFINE_DSP_STR_PROP(dsp_prom0)
+DEFINE_DSP_STR_PROP(dsp_prom1)
+DEFINE_DSP_STR_PROP(dsp_prom2)
+DEFINE_DSP_STR_PROP(dsp_prom3)
+DEFINE_DSP_STR_PROP(dsp_drom)
+DEFINE_DSP_STR_PROP(dsp_pdrom)
+DEFINE_DSP_STR_PROP(dsp_registers)
+
 static void calypso_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -221,6 +303,39 @@ static void calypso_machine_class_init(ObjectClass *oc, void *data)
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm946");
     mc->default_ram_size = 0;
     mc->alias = "calypso-high";
+
+    object_class_property_add_str(oc, "dsp-blob",
+                                  calypso_get_dsp_blob,
+                                  calypso_set_dsp_blob);
+    object_class_property_set_description(oc, "dsp-blob",
+        "Path to a raw DSP blob loaded into DARAM at 0x100 with PC override "
+        "(DARAM fixture; OFF when unset).");
+
+    /* Per-section explicit ROM loads. Each .bin is raw LE 16-bit words
+     * starting at the section's silicon-correct DSP address. Produced by
+     * dsp_txt2bin.py from calypso_dsp.txt (or a custom assembler). */
+#define REG_DSP_SECTION(prop, name, desc) \
+    object_class_property_add_str(oc, prop, calypso_get_##name, \
+                                  calypso_set_##name); \
+    object_class_property_set_description(oc, prop, desc)
+
+    REG_DSP_SECTION("dsp-prom0", dsp_prom0,
+        "Path to PROM0 .bin → prog[0x07000..0x0DFFF] (28K words max)");
+    REG_DSP_SECTION("dsp-prom1", dsp_prom1,
+        "Path to PROM1 .bin → prog[0x18000..0x1FFFF] (32K) "
+        "+ auto-mirror prog[0xE000..0xFFFF]");
+    REG_DSP_SECTION("dsp-prom2", dsp_prom2,
+        "Path to PROM2 .bin → prog[0x28000..0x2FFFF] (32K words max)");
+    REG_DSP_SECTION("dsp-prom3", dsp_prom3,
+        "Path to PROM3 .bin → prog[0x38000..0x39FFF] (8K words max)");
+    REG_DSP_SECTION("dsp-drom", dsp_drom,
+        "Path to DROM .bin → data[0x09000..0x0DFFF] (20K words max)");
+    REG_DSP_SECTION("dsp-pdrom", dsp_pdrom,
+        "Path to PDROM .bin → data[0x0E000..0x0FFFF] (8K words max)");
+    REG_DSP_SECTION("dsp-registers", dsp_registers,
+        "Path to Registers .bin (MMR snapshot, words 0x00..0x1F) → applied as "
+        "the DSP reset state (IMR/IFR/ST0/ST1/T/TRN/AR0-7/SP/BK/BRC/RSA/REA/PMST)");
+#undef REG_DSP_SECTION
 }
 
 static const TypeInfo calypso_machine_info = {

@@ -99,5 +99,7 @@ void l1ctl_sock_init(CalypsoUARTState *uart, const char *path);
 void l1ctl_sock_uart_tx_byte(uint8_t byte);
 void l1ctl_sock_poll(void);
 bool l1ctl_client_active(void);
+/* Hop 5 : injection directe DL SI -> mobile en L1CTL DATA_IND. */
+void l1ctl_inject_dl_si(const uint8_t *l2, int l2len, uint32_t fn);
 
 #endif /* HW_CHAR_CALYPSO_UART_H */

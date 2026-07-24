@@ -22,6 +22,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
+#include "exec/cpu-common.h"
+#include "hw/core/cpu.h"
 #include "hw/arm/calypso/calypso_sim.h"
 
 #define SIM_LOG(...) do { fprintf(stderr, "[sim] " __VA_ARGS__); fputc('\n', stderr); } while(0)
@@ -144,6 +147,9 @@ struct CalypsoSim {
     QEMUTimer  *atr_timer;
     QEMUTimer  *wt_timer;       /* fires IT_WT after RX FIFO drains
                                  * — tells firmware "no more bytes coming" */
+    /* (Removed 2026-05-27) clear_edge_timer / pending_edge_clear
+     * supprimés. Justification ground-truth dans le case CALYPSO_SIM_REG_IT
+     * du read handler (read-to-clear immédiat, pas W1C). */
     uint8_t     ki[16];         /* COMP128 secret key from mobile.cfg */
     bool        ki_valid;
 
@@ -225,6 +231,11 @@ static void fire_wt(void *opaque)
     s->it |= CALYPSO_SIM_IT_WT;
     SIM_LOG("WT timeout fired (RX FIFO empty)");
     update_irq(s);
+
+    /* rxDoneFlag side-effect : géré dans calypso_sim_reg_read SIM_IT
+     * case (fires sur chaque IT_WT observé par le firmware, couvre toutes
+     * les SIM ops ATR/SELECT/READ_BINARY/etc). Voir doc complète là-bas.
+     * Le calypso_trx kick 200 Hz complète pour invalidation cache TB. */
 }
 
 static void schedule_wt(CalypsoSim *s)
@@ -270,6 +281,8 @@ static void raise_rx_irq(CalypsoSim *s)
 {
     update_irq(s);
 }
+
+/* (Removed 2026-05-27) clear_edge_cb supprimé — voir SIM_IT read handler. */
 
 /* ---------- ATR delivery --------------------------------------------- */
 
@@ -543,16 +556,77 @@ uint16_t calypso_sim_reg_read(CalypsoSim *s, hwaddr off)
     case CALYPSO_SIM_REG_IT: {
         refresh_it_rx(s);
         uint16_t v = s->it;
-        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays. */
-        s->it &= CALYPSO_SIM_IT_RX;
+        /* Edge bits (NATR/WT/OV/TX) are read-clear; level bit RX stays.
+         *
+         * AUDIT FIX 2026-05-08 night (Claude web Q2 hardening) : was
+         *   s->it &= CALYPSO_SIM_IT_RX;
+         * which clears ANY bit set after the snapshot (race with concurrent
+         * fire_wt / IRQ handlers raising new bits). Correct semantic : clear
+         * only edge bits that were observed in `v`, so a bit raised between
+         * snapshot and clear survives. RX bit always preserved (level). */
+        /* Per OsmocomBB firmware spec (calypso/sim.c self-doc) :
+         *   NATR/WT/OV : clear on read of REG_SIM_IT  ← géré ici
+         *   TX         : clear on write to REG_SIM_DTX ← géré dans write handler
+         *   RX         : implicit (level-sensitive via refresh_it_rx)
+         * Ancien code `v & ~CALYPSO_SIM_IT_RX` clearait IT_TX par erreur. */
+        uint16_t edge_seen = v & (CALYPSO_SIM_IT_NATR |
+                                  CALYPSO_SIM_IT_WT   |
+                                  CALYPSO_SIM_IT_OV);
+        /* Read-to-clear immédiat (per OsmocomBB firmware spec).
+         *
+         * Hardware Calypso REG_SIM_IT (firmware/calypso/sim.c L245/251/257
+         * self-doc) : NATR/WT/OV cleared **on read access to REG_SIM_IT**.
+         * TX cleared on REG_SIM_DTX write. RX level-sensitive (via FIFO).
+         * sim_irq_handler L391-414 lit SIM_IT 1× et n'écrit JAMAIS d'ack
+         * — il s'appuie 100% sur le read-to-clear. NB : read-to-clear ≠
+         * W1C (W1C = write-1-to-clear, read non-destructif, comportement
+         * HW différent).
+         *
+         * (Removed 2026-05-27) Defer 1µs virtuel précédent escapait une
+         * race cpu_io_recompile TB-truncation INEXISTANTE :
+         *   - cputlb.c L1273-1274 : cpu_io_recompile longjmp via
+         *     cpu_loop_exit_noexc AVANT memory_region_dispatch_read
+         *   - Le handler MMIO fire 1× exactement par LDR (probe UART RBR
+         *     1:1 ratio + probe SIM_IT mem_io_pc identique sur 40 reads
+         *     confirment empiriquement)
+         *   - Défer cassait le RC : sous icount=auto le firmware busy-poll
+         *     SIM_IT, chaque read reschedulait le timer +1µs, clear jamais
+         *     fired, IT_WT stays raised, IRQ stays asserted, ARM en
+         *     service IRQ perpétuel jamais l'opportunité de re-LDR
+         *     rxDoneFlag → deadlock calypso_sim_powerup.
+         *   - Cf. session_20260527 dans memory. */
+        s->it &= ~edge_seen;
         update_irq(s);
+
+        /* Lighter instrumentation : just IT bits + FIFO state, no PC read.
+         * The ARM_PC access via env.regs[15] from inside an MMIO read may
+         * itself trigger TB recompile under -icount auto. Now we know all
+         * 5 reads come from PC=0x82249c (sim_irq_handler), the PC log
+         * isn't needed and removing it eliminates a potential TB-abort
+         * trigger separate from update_irq. */
+        static unsigned itrd;
+        if (itrd++ < 40) {
+            uintptr_t io_pc = current_cpu ? current_cpu->mem_io_pc : 0;
+            fprintf(stderr,
+                    "[sim] SIM_IT read=0x%04x rx_count=%d edge_cleared=0x%04x "
+                    "post_it=0x%04x mem_io_pc=0x%lx\n",
+                    v, rx_count(s), edge_seen, s->it,
+                    (unsigned long)io_pc);
+        }
         return v;
     }
     case CALYPSO_SIM_REG_DRX: {
         uint8_t b = 0;
         rx_pop(s, &b);
         update_irq(s);                                  /* maybe clear IT_RX */
-        if (rx_count(s) == 0) schedule_wt(s);           /* arm WT when FIFO drains */
+        /* (Moved 2026-05-27, probe-validated) schedule_wt déplacé dans
+         * MASKIT write handler. Avant : armé ici dès FIFO drained → WT
+         * fire pendant delay_ms(100) post-CMDSTART du firmware, AVANT le
+         * `bl calypso_sim_receive`. Handler set rxDoneFlag=1, puis
+         * sim_receive L351 écrase à 0 → poll forever.
+         * Probe [rxDone] confirme chrono : #3 WR val=1 PC=0x8228c4 vt=11ms,
+         * #4 WR val=0 PC=0x8229b4 vt=17ms (5ms après). Inversion fatale.
+         * Maintenant WT armé quand sim_receive unmask IT_WT → fire APRÈS. */
         return b | (1 << 8);                            /* parity OK */
     }
     case CALYPSO_SIM_REG_DTX:    return 0;
@@ -569,22 +643,31 @@ void calypso_sim_reg_write(CalypsoSim *s, hwaddr off, uint16_t val)
         s->cmd = val;
         if (val & CALYPSO_SIM_CMD_START) {
             s->powered = true;
-            SIM_LOG("CMDSTART → ATR scheduled");
-            schedule_atr(s);
+            SIM_LOG("CMDSTART → ATR delivered (synchronous)");
+            /* AUDIT FIX 2026-05-08 night : was schedule_atr() (1ms VIRTUAL
+             * timer). Under -icount auto, virtual time is rate-limited;
+             * the firmware's SIM driver enters a busy-loop polling
+             * rxDoneFlag (firmware data 0x830510) with IRQs masked
+             * (PSR I=1) before the timer fires, deadlocking the ARM CPU.
+             * Direct delivery: bytes in FIFO at MMIO write return time,
+             * IRQ raised immediately. Same effect as the timer being 0ns.
+             * Equivalent under icount=off (timer fires ~instantly anyway). */
+            deliver_atr(s);
         }
         if (val & CALYPSO_SIM_CMD_STOP) {
             s->powered = false;
             SIM_LOG("CMDSTOP");
         }
         if (val & (CALYPSO_SIM_CMD_CARDRST | CALYPSO_SIM_CMD_IFRST)) {
-            SIM_LOG("RESET");
+            SIM_LOG("RESET → ATR delivered (synchronous)");
             s->apdu_pos = 0;
             s->apdu_expected = 0;
             s->resp_len = 0;
             s->rx_head = s->rx_tail = 0;
             s->selected_df = 0x3F00;
             s->selected_ef = 0x3F00;
-            if (s->powered) schedule_atr(s);
+            /* Same audit fix as CMDSTART above. */
+            if (s->powered) deliver_atr(s);
         }
         break;
     case CALYPSO_SIM_REG_STAT:    s->stat   = val; break;
@@ -594,11 +677,33 @@ void calypso_sim_reg_write(CalypsoSim *s, hwaddr off, uint16_t val)
     case CALYPSO_SIM_REG_DRX:     /* read-only */      break;
     case CALYPSO_SIM_REG_DTX:
         apdu_tx_byte(s, (uint8_t)(val & 0xFF));
+        /* Per firmware spec : REG_SIM_IT_SIM_TX clears on write to DTX
+         * (firmware self-doc calypso/sim.c L264). Sans ça, IT_TX restait
+         * latched indéfiniment → TX path bloqué après le 1er byte. */
+        s->it &= ~CALYPSO_SIM_IT_TX;
+        update_irq(s);
         break;
-    case CALYPSO_SIM_REG_MASKIT:
+    case CALYPSO_SIM_REG_MASKIT: {
+        /* Arm WT timer quand firmware unmask IT_WT (= sim_receive L358 :
+         * `writew(~(MASK_RX|MASK_WT), MASKIT)`). À ce moment, sim_receive
+         * a déjà fait son rxDoneFlag=0 (L351). Le WT fire APRÈS, handler
+         * set rxDoneFlag=1, poll exit. Ordre garanti dans toutes les
+         * icount modes.
+         *
+         * Condition : WT bit UNMASKED (bit clear) + FIFO empty + IT_WT
+         * not already set. Idempotent : timer_mod_ns ré-arme si déjà armé.
+         * Pas de check sur transition prev_mask→val (MASKIT default BSS=0
+         * dans QEMU = déjà unmasked, transition jamais détectée).
+         * Probe-validated 2026-05-27. */
         s->maskit = val;
-        update_irq(s);     /* re-evaluate line after mask change */
+        update_irq(s);
+        bool wt_unmasked = (val & CALYPSO_SIM_IT_WT) == 0;
+        bool wt_not_pending = (s->it & CALYPSO_SIM_IT_WT) == 0;
+        if (wt_unmasked && wt_not_pending && rx_count(s) == 0) {
+            schedule_wt(s);
+        }
         break;
+    }
     case CALYPSO_SIM_REG_IT_CD:   s->it_cd  = val; break;
     default: break;
     }
@@ -671,6 +776,7 @@ CalypsoSim *calypso_sim_new(qemu_irq sim_irq)
     s->irq = sim_irq;
     s->atr_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, deliver_atr, s);
     s->wt_timer  = timer_new_ns(QEMU_CLOCK_VIRTUAL, fire_wt,     s);
+    /* (Removed 2026-05-27) clear_edge_timer — read-to-clear immédiat */
     s->selected_df = 0x3F00;
     s->selected_ef = 0x3F00;
 
