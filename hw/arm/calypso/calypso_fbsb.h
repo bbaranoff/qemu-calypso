@@ -28,7 +28,7 @@
  *                                                              FAIL        SUCCESS
  *
  * NDB cells we read/write (offsets in DSP data words from API base 0x0800):
- *   d_dsp_page         0x08D4    (page toggle from ARM)
+ *   d_dsp_page         0x08E2    (page toggle from ARM)
  *   d_fb_det           0x08F9    (DSP → ARM: non-zero = FB found)
  *   d_fb_mode          0x08FA    (ARM → DSP: 0 = wideband search, 1 = narrow)
  *   a_sync_demod[0]    0x08FB    D_TOA  — time-of-arrival
@@ -48,7 +48,7 @@
 /* Offsets verified against calypso_trx.c lines 575-581: ARM sees NDB
  * starting at byte 0x01A8 (= dsp_ram word 0xD4), and d_fb_det is at
  * dsp_ram[0xF8]. With api_base=0x0800 → DSP word = 0x0800 + 0xF8. */
-#define NDB_D_DSP_PAGE       0x08D4
+#define NDB_D_DSP_PAGE       0x08E2
 #define NDB_D_FB_DET         0x08F8
 #define NDB_D_FB_MODE        0x08F9
 #define NDB_A_SYNC_DEMOD_TOA 0x08FA

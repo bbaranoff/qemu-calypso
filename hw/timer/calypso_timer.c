@@ -129,6 +129,7 @@ static void calypso_timer_start(CalypsoTimerState *s)
     calypso_timer_recompute_tick(s);
     s->count = s->load;
     s->running = true;
+    s->lost_read_k = 0;   /* restart lost-frame sawtooth phase */
     s->epoch_ns = qemu_clock_get_ns(calypso_timer_clock());
     timer_mod(s->timer, s->epoch_ns + (int64_t)(s->load + 1) * s->tick_ns);
 }
@@ -164,12 +165,15 @@ void calypso_timer_register_lost(DeviceState *d)
 void calypso_timer_lost_frame_tick(uint32_t fn)
 {
     CalypsoTimerState *s = g_lost_timer;
+    (void)fn;   /* value now stepped per-READ, not derived from fn — see below */
     if (!s || !s->running || !calypso_lost_latch_enabled()) {
         return;
     }
-    uint32_t period = (uint32_t)s->load + 1;                 /* 7500 */
-    uint32_t step = ((uint64_t)fn * LOST_TICKS_PER_TDMA) % period;
-    s->lost_latch_count = (uint16_t)(s->load - step);        /* down-counter */
+    /* Arm the frame-locked latch once the TDMA frame machinery is live. The
+     * actual READ value is produced per-READ in calypso_timer_read() so the
+     * step is invariant to how many TDMA ticks / fn increments happen between
+     * two firmware reads (empirically 2 fn per serviced frame IRQ -> the old
+     * fn-derived latch produced a constant "LOST 3750!" = 2*1875). */
     s->lost_latch_active = true;
 }
 
@@ -200,8 +204,22 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
     case 0x00: return s->ctrl;
     case 0x02: return s->load;
     case 0x04:
-        if (s->lost_latch_active) {   /* frame-locked value for check_lost_frame() */
-            return s->lost_latch_count;
+        /* Firmware check_lost_frame() (layer1/sync.c) is the ONLY reader of
+         * timer #1's READ register, exactly once per serviced frame IRQ, and
+         * expects the down-counter to have decreased by exactly 1875 ticks
+         * (±1) since the previous read. We synthesize that sawtooth per-READ:
+         * count(k) = load - (k*1875 mod period), k incremented each read.
+         * Consecutive reads differ by exactly 1875 -> zero "LOST N!", and it
+         * is invariant to the fn/IRQ/tdma-tick rate mismatch (s->fn advances
+         * 2 frames per serviced IRQ, which broke the old fn-derived latch).
+         * Opt-out via CALYPSO_LOST_LATCH=0 -> raw interpolated count. */
+        if (s->lost_latch_active && calypso_lost_latch_enabled() && s->running) {
+            uint32_t period = (uint32_t)s->load + 1;          /* 7500 */
+            uint32_t step   = ((uint64_t)s->lost_read_k *
+                               LOST_TICKS_PER_TDMA) % period;
+            uint16_t val    = (uint16_t)(s->load - step);
+            s->lost_read_k++;
+            return val;
         }
         return calypso_timer_current_count(s);
     default:   return 0;
@@ -276,6 +294,7 @@ static void calypso_timer_reset(DeviceState *dev)
     s->running = false;
     s->lost_latch_active = false;
     s->lost_latch_count = 0;
+    s->lost_read_k = 0;
     timer_del(s->timer);
 }
 

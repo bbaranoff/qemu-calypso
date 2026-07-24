@@ -133,4 +133,19 @@ void calypso_trx_tx_burst_poll(void);
  * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
 uint32_t calypso_trx_get_fn(void);
 
+/* calypso_tpu.c: interpret a committed TPU RAM scenario (MOVE
+ * instructions only; AT/SYNC/WAIT/OFFSET timing unmodeled). Called
+ * from calypso_dsp_done() when TPU_CTRL_EN is written. */
+void calypso_tpu_run_scenario(uint16_t *tpu_ram, C54xState *dsp, uint32_t fn);
+/* Variant that also wires SYNCHRO/OFFSET writes back into the TPU MMIO
+ * regs[] array (pass s->tpu_regs). */
+void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
+                                    uint32_t fn, uint16_t *tpu_regs);
+
+/* calypso_tpu.c: advance the TPU sequencer's qbit-position wait
+ * (AT/WAIT instructions can pause it for N real TDMA frames). Call once
+ * per real TDMA frame tick, from calypso_tdma_tick(). No-op if no
+ * scenario is currently paused. */
+void calypso_tpu_sequencer_tick(uint32_t fn);
+
 #endif /* CALYPSO_TRX_H */

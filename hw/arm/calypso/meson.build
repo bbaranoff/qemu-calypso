@@ -21,6 +21,8 @@ arm_ss.add(when: 'CONFIG_CALYPSO', if_true: [
     'l1ctl_sock.c',
     'sercomm_gate.c',
     'calypso_tint0.c',
+    'calypso_tpu.c',
+    'calypso_tsp.c',
     'fw_console.c',
     'calypso_sim.c',
     'calypso_full_pcb.c',

@@ -217,7 +217,19 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * `toa-=23 → 0` → passe le check `toa > bits_delta`. db_r page0=0xFFD00050
      * (off 0x50) / page1=0xFFD00078 (off 0x78), struct DSP33-36 a_serv_demod
      * @word8 → D_TOA = off 0x60 (p0) / 0x88 (p1). */
+    /* [2026-07-22] Injection READ-SIDE REAL_FB/SB : PRECEDE (et court-circuite)
+     * le FORCE_TOA canned. Livre la derniere detection FCCH reelle (g_shunt.rx_*)
+     * sur le read MMIO ARM -> immunise d_fb_det/a_sync_demod/SB-TOA contre
+     * l'ordonnancement intra-trame. Gate CALYPSO_SHUNT_REAL_FB. */
+    bool real_fb_hit = false;
     if (size == 2) {
+        uint16_t rv;
+        if (calypso_dsp_shunt_real_fb_read((uint32_t)offset, &rv)) {
+            val = rv;
+            real_fb_hit = true;
+        }
+    }
+    if (!real_fb_hit && size == 2) {
         static int force_toa = -2;  /* -2 = uninit, -1 = off */
         if (force_toa == -2) {
             const char *e = getenv("CALYPSO_FORCE_TOA");
@@ -359,6 +371,33 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+    /* [2026-07-22] de-alias burst-ID : mirror d_burst_d par commande */
+    calypso_dsp_shunt_wp_burst_write((uint32_t)offset, (uint16_t)value);
+
+    /* [2026-07-22] WR-RAW (ungated, cap 60) : voir TOUS les writes ARM qui
+     * passent par ce hook -> l'ARM commande-t-il le DSP ici, ou tout bypasse ? */
+    {
+        /* [2026-07-22] cible les writes OPERATIONNELS (fn>100, hors zeroisage boot) :
+         * write-page (task_d/md 0x00-0x50) + NDB (d_dsp_page 0x1A8+). Voit-on
+         * l'ARM commander le DSP (task + B_GSM_TASK) ? */
+        static unsigned wraw = 0;
+        /* CIBLE demod-command uniquement (task_d p0=0x00/p1=0x28, task_md p0=0x08/p1=0x30,
+         * d_dsp_page 0x1A8), val!=0, TOUTES trames -> l'ARM commande-t-il jamais, et
+         * SEED5AC8 change-t-il ca ? Skip AFC/ABB (bruit). */
+        /* Elargi : toute la plage NDB (0x01A8-0x0210) non-nulle -> trouver le VRAI
+         * offset de d_dsp_page (valeur 0x0002/0x0003 = B_GSM_TASK|w_page). */
+        if (value != 0 && ((offset >= 0x01A8 && offset < 0x0210) ||
+             offset==0x0000||offset==0x0008||offset==0x0028||offset==0x0030)
+            && wraw < 80) {
+            wraw++;
+            const char *z = (value==0x0002||value==0x0003) ? " <== B_GSM_TASK! (d_dsp_page?)" :
+                            (offset == 0x01A8) ? " <== NDB+0" :
+                            (offset == 0x0000 || offset == 0x0028) ? " <== task_d" :
+                            " <== task_md";
+            fprintf(stderr, "[calypso-trx] WR-OP off=0x%04x val=0x%04x size=%u fn=%u%s\n",
+                    (unsigned)offset, (unsigned)value, size, s->fn, z);
+        }
+    }
 
     /* === Unconditional probe : count ALL writes by offset range ===
      * Gated par CALYPSO_DEBUG=DSP_WRITE_COUNT. Bucket par 0x40-byte zone
@@ -393,6 +432,26 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * MVPD-copied) value via prog_fetch. */
     if (s->dsp) {
         uint16_t dsp_word = offset/2 + 0x0800;
+        /* [2026-07-23] ARM-WRITE-0810 (READ-ONLY) : trace le mirror ARM->DSP
+         * specifiquement pour d_ctrl_system (dsp_word 0x0810, ARM offset 0x20).
+         * La sonde precedente (WATCH-0810-WR, cote C54x data_write) etait AVEUGLE
+         * aux writes ARM (ce mirror ecrit s->dsp->data[] DIRECTEMENT, sans passer
+         * par data_write()). Cette sonde-ci confirme si le mirror ARM marche
+         * reellement pour ce mot precis. */
+        if (dsp_word == 0x0810) {
+            static unsigned aw810_zero = 0, aw810_nz = 0;
+            /* val!=0 (surtout bit15=0x8000, B_TASK_ABORT) = JAMAIS cappe : c'est
+             * l'ecriture qu'on cherche (l1s_abort_cmd, deferee via tdma_schedule,
+             * peut arriver bien apres le burst de zeros du boot memset). */
+            if (value != 0)
+                fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 *** NONZERO *** #%u offset=0x%04x "
+                        "val=0x%04x size=%u dsp_word=0x0810 (avant: data[0x0810]=0x%04x) fn=%u\n",
+                        ++aw810_nz, (unsigned)offset, (unsigned)value, size,
+                        s->dsp->data[dsp_word], s->fn);
+            else if (aw810_zero++ < 5 || (aw810_zero >= 900 && aw810_zero <= 1400))
+                fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 zero #%u offset=0x%04x val=0x%04x "
+                        "size=%u fn=%u\n", aw810_zero, (unsigned)offset, (unsigned)value, size, s->fn);
+        }
         calypso_pcb_daram_lock_acquire();
         if (size == 2) {
             s->dsp->data[dsp_word] = (uint16_t)value;
@@ -437,6 +496,12 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * Écrit par dsp_end_scenario(): `ndb->d_dsp_page = B_GSM_TASK | w_page`.
      * Si jamais hit → dsp_end_scenario jamais fired → w_page stuck à 0.
      * Gated par CALYPSO_DEBUG=D_DSP_PAGE. */
+    if (offset == 0x01A8) {   /* [2026-07-22] ungated any-size : l'ARM ecrit-il d_dsp_page ? */
+        static unsigned ddp_any = 0;
+        if (ddp_any++ < 30)
+            fprintf(stderr, "[calypso-trx] DDP-ANY WR val=0x%04x size=%u (B_GSM_TASK=%d) fn=%u insn-arm\n",
+                    (unsigned)value, size, !!(value & 2), s->fn);
+    }
     if (offset == 0x01A8 && size == 2) {
         if (calypso_debug_enabled("D_DSP_PAGE")) {
             static unsigned ddp_log = 0;
@@ -751,58 +816,10 @@ static void calypso_dsp_done(void *opaque) {
         calypso_pcb_daram_lock_release();
     }
 
-    /* Execute TPU RAM micro-instructions (TSP bus commands).
-     * The firmware wrote a TPU scenario into TPU RAM. We scan it for
-     * MOVE instructions that write to TSP registers. When we see
-     * TSP_CTRL2 with WR bit, we send the TX byte to IOTA.
-     *
-     * IMPORTANT: The Calypso Rhea bus is 16-bit wide, mapped to the
-     * 32-bit ARM bus at 2-byte stride. The firmware writes 16-bit TPU
-     * instructions at ARM offsets 0, 2, 4, ..., which end up in
-     * tpu_ram[0], tpu_ram[1], tpu_ram[2], ... However, the actual
-     * physical layout has zero-padding between instructions (ARM 32-bit
-     * alignment). We must skip zero words that are just bus padding,
-     * not real SLEEP instructions. A real SLEEP (0x0000) always comes
-     * after at least one non-zero instruction. */
-    {
-        uint8_t tsp_tx1 = 0;
-        uint8_t tsp_ctrl1 = 0;
-        bool seen_any = false;
-        for (int i = 0; i < CALYPSO_TPU_RAM_SIZE / 2; i++) {
-            uint16_t insn = s->tpu_ram[i];
-            if (insn == 0x0000) {
-                /* Skip zero words: they are either Rhea bus padding
-                 * or the final SLEEP. Only break on SLEEP after we've
-                 * seen real instructions, and only if the NEXT word
-                 * is also zero (two consecutive zeros = real SLEEP). */
-                if (seen_any) {
-                    int next = i + 1;
-                    if (next >= CALYPSO_TPU_RAM_SIZE / 2 ||
-                        s->tpu_ram[next] == 0x0000)
-                        break;  /* real SLEEP — end of scenario */
-                }
-                continue;
-            }
-            seen_any = true;
-            uint8_t opcode = (insn >> 13) & 0x7;
-            if (opcode == 4) {
-                /* MOVE: addr = bits 4:0, data = bits 12:5 */
-                uint8_t addr = insn & 0x1F;
-                uint8_t data = (insn >> 5) & 0xFF;
-                if (addr == 0x04) tsp_tx1 = data;     /* TPUI_TX_1 */
-                if (addr == 0x00) tsp_ctrl1 = data;    /* TPUI_TSP_CTRL1 */
-                if (addr == 0x01 && (data & 0x02)) {   /* TPUI_TSP_CTRL2 WR bit */
-                    /* TSP write: send tsp_tx1 to the device.
-                     * Device 0 (TWL3025): 7-bit data = tsp_tx1.
-                     * This byte contains BDLON/BDLENA/BULENA bits. */
-                    uint8_t dev = (tsp_ctrl1 >> 5) & 0x07;
-                    if (dev == 0) {
-                        calypso_iota_tsp_write(tsp_tx1, 0);
-                    }
-                }
-            }
-        }
-    }
+    /* TPU sequencer scenario interpretation lives in calypso_tpu.c (full
+     * opcode set: AT/WAIT/SYNCHRO/OFFSET/MOVE/SLEEP, replayed across real
+     * TDMA frame ticks -- see calypso_tpu_sequencer_tick() below). */
+    calypso_tpu_run_scenario_regs(s->tpu_ram, s->dsp, s->fn, s->tpu_regs);
 
     qemu_irq_raise(s->irqs[CALYPSO_IRQ_API]);
 }
@@ -1166,6 +1183,11 @@ static void calypso_tdma_tick(void *opaque) {
         }
     }
 
+    /* TPU sequencer: advance any AT/WAIT-paused scenario by one real TDMA
+     * frame (the 11x tpu_enq_at(0) FB-window delay is now genuinely
+     * spread across 11 ticks instead of firing instantly). */
+    calypso_tpu_sequencer_tick(s->fn);
+
     /* TDMA tick counter — log thinned 1/1000 (~4.6s wall) pour drift detection.
      * Variables locales pour cumul DSP insn (utilisées plus bas). */
     static uint64_t tdma_ticks = 0;
@@ -1243,7 +1265,8 @@ static void calypso_tdma_tick(void *opaque) {
         bool was_idle = s->dsp->idle;
 
         bool tpu_armed = !(s->tpu_regs[TPU_INT_CTRL/2] & ICTRL_DSP_FRAME);
-        bool imr_armed = !!(s->dsp->imr & (1 << C54X_INT_FRAME_BIT));
+        static int _natfr = -1; if (_natfr < 0) _natfr = (getenv("CALYPSO_FRAME_IT_NATIVE") || getenv("CALYPSO_DSP_FRAME_VEC28")) ? 1 : 0;
+        bool imr_armed = !!(s->dsp->imr & (1 << (_natfr ? 12 : C54X_INT_FRAME_BIT)));  /* [2026-07-23] bit12 en natif (remap) */
         bool periodic_armed = tpu_armed && imr_armed;
         bool force_pulse    = !!(s->tpu_regs[TPU_CTRL/2] & TPU_CTRL_DSP_EN);
         /* FIX DOUBLE-INT3 : quand la route c54x du shunt est active, c'est
