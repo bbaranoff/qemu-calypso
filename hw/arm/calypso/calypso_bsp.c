@@ -272,18 +272,41 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
     BspBurstQueue *qq = &bsp.q[tn];
     BspBurstSlot *match = NULL;
     int32_t best_abs = INT32_MAX;
+    /* FN-PROBE (2026-07-24) : suit le burst le PLUS PROCHE, fenêtre ignorée, pour
+     * exposer l'offset/dérive burst_fn vs dispatcher_fn même quand tout est stale. */
+    uint32_t near_fn = 0; int32_t near_d = 0; int32_t near_ad = INT32_MAX; int n_valid = 0;
 
     for (int i = 0; i < BSP_QUEUE_LEN; i++) {
         BspBurstSlot *s = &qq->slot[i];
         if (!s->valid) continue;
         int32_t d = bsp_fn_delta(s->fn, current_fn);
         int32_t ad = d < 0 ? -d : d;
+        n_valid++;
+        if (ad < near_ad) { near_ad = ad; near_d = d; near_fn = s->fn; }
         if (d < -BSP_FN_MATCH_WINDOW) {
             s->valid = false;
             bsp.bursts_dropped_stale++;
         } else if (ad <= BSP_FN_MATCH_WINDOW && ad < best_abs) {
             match = s;
             best_abs = ad;
+        }
+    }
+    /* FN-PROBE (gated CALYPSO_BSP_FN_PROBE) : la FN portée par le burst le plus
+     * proche (posée à bsp_enqueue) vs la FN que le dispatcher teste ici
+     * (current_fn = calypso_trx_get_fn), côte à côte. delta CONSTANT = offset
+     * (fix = une ligne) ; delta qui DÉRIVE = problème d'horloge. Cap 300 + 1/500. */
+    {
+        static int fp = -1;
+        if (fp < 0) fp = getenv("CALYPSO_BSP_FN_PROBE") ? 1 : 0;
+        if (fp && n_valid > 0) {
+            static unsigned fpn = 0;
+            if (fpn < 300 || (fpn % 500) == 0)
+                BSP_LOG("FN-PROBE tn=%u dispatcher_fn=%u burst_fn=%u delta=%d "
+                        "n_valid=%d verdict=%s window=%d",
+                        tn, current_fn, near_fn, near_d, n_valid,
+                        match ? "MATCH" : (near_d > BSP_FN_MATCH_WINDOW ? "FUTURE" : "STALE"),
+                        BSP_FN_MATCH_WINDOW);
+            fpn++;
         }
     }
     /* Periodic stale ratio summary: a runaway ratio (e.g. 7000:1) is the
@@ -301,6 +324,27 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
         }
     }
     return match;
+}
+
+/* TPU-RX-WIRE (RANK2): take the NEAREST valid buffered burst for a TN, ignoring
+ * the FN-match window. Used when the TPU RX window fired (a BDLENA pulse was
+ * consumed) : the hardware RX window IS the timing signal, so we deliver the
+ * closest burst we have rather than waiting for a virtual-FN match that never
+ * lands in full mode (device_fn >> virtual cur_fn). Marks the slot consumed. */
+static BspBurstSlot *bsp_take_nearest(uint8_t tn, uint32_t current_fn)
+{
+    if (tn >= BSP_NUM_TN) return NULL;
+    BspBurstQueue *qq = &bsp.q[tn];
+    BspBurstSlot *best = NULL;
+    int32_t best_abs = INT32_MAX;
+    for (int i = 0; i < BSP_QUEUE_LEN; i++) {
+        BspBurstSlot *s = &qq->slot[i];
+        if (!s->valid) continue;
+        int32_t d = bsp_fn_delta(s->fn, current_fn);
+        int32_t ad = d < 0 ? -d : d;
+        if (ad < best_abs) { best = s; best_abs = ad; }
+    }
+    return best;
 }
 
 static uint16_t parse_uint_env(const char *name, uint16_t def)
@@ -412,7 +456,13 @@ static void bsp_trxd_readable(void *opaque)
         static int bsp_revive = -1;
         if (bsp_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
-            bsp_revive = (calypso_dsp_shunt_route_c54x_active() && e && *e == '1') ? 1 : 0;
+            /* [2026-07-25] read-path diag : sous shunt le buffer I/Q DARAM 0x2a00
+             * n'etait ecrit que 2x (route_c54x_active=faux) -> correlateur affame.
+             * CALYPSO_BSP_DARAM_FORCE=1 force le revive (ecrit 0x2a00) quand le vrai
+             * c54x tourne (RUN_C54X=1), independamment de route_c54x_active. */
+            bsp_revive = (e && *e == '1'
+                          && (calypso_dsp_shunt_route_c54x_active()
+                              || getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
         }
         if (calypso_dsp_shunt_active() && !bsp_revive)
             return;
@@ -927,7 +977,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         static int rb_revive = -1;
         if (rb_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
-            rb_revive = (calypso_dsp_shunt_route_c54x_active() && e && *e == '1') ? 1 : 0;
+            /* [2026-07-25] idem bsp_revive : CALYPSO_BSP_DARAM_FORCE force l'ecriture
+             * DARAM 0x2a00 (buffer correlateur) sous shunt quand RUN_C54X=1. */
+            rb_revive = (e && *e == '1'
+                         && (calypso_dsp_shunt_route_c54x_active()
+                             || getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
         }
         if (calypso_dsp_shunt_active() && !rb_revive) {
             if (bsp.bursts_seen <= 3)
@@ -1005,6 +1059,58 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
       if (bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << _fb))) {
         c54x_interrupt_ex(bsp.dsp, 19, 3);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
+      } }
+
+    /* [2026-07-25] WIRE BSP->DSP BRINT0 (direct-feed) : le chemin direct-feed
+     * (CALYPSO_BSP_DIRECT_FEED=1) livre l'I/Q en DARAM 0x2a00 mais ne levait QUE
+     * INT3 (vec19/bit3, frame). Le chemin buffered, lui, leve BRINT0 (vec21/bit5)
+     * = l'IT "buffer recu" qui reveille le handler FB-det correlateur (ISR
+     * PROM1[0xFFD4]->CALL 0xf310). Sans BRINT0 le correlateur 0x8d00 n'est JAMAIS
+     * dispatche (0 hit confirme). On le leve comme deliver_buffered (meme
+     * anti-stack gate IFR bit5). Gate CALYPSO_BSP_DIRECT_BRINT0 (defaut OFF pour
+     * tester une variable a la fois). */
+    { static int _db = -1; if (_db < 0) _db = getenv("CALYPSO_BSP_DIRECT_BRINT0") ? 1 : 0;
+      /* MISSION-GATE : ne lever BRINT0 que si le DSP est reellement sur la
+       * mission FB/SB (d_task_md), pas hors-mission -> le reveil correlateur
+       * arrive au bon moment, comme le vrai "buffer recu" du silicium.
+       * FB=5 SB=6 TCH_FB=8 TCH_SB=9 (osmo l1_environment.h). */
+      uint16_t _md = calypso_dsp_shunt_get_task_md();
+      int _fbsb = (_md == 5 || _md == 6 || _md == 8 || _md == 9);
+      if (_db && _fbsb && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 5))) {
+        c54x_interrupt_ex(bsp.dsp, 21, 5);
+        if (bsp.dsp->idle) bsp.dsp->idle = false;
+      } }
+
+    /* [2026-07-25] TEST RANK3 (WF1 boot->correlator) : le handler FB-det 0x8d00
+     * n'est JAMAIS installe dans un slot de dispatch -> le BACC/CALA calcule
+     * resout toujours vers le stub 0xab38 (le go-live arm 0xa4c7 sinon), et la
+     * LUT native 0x8341 qui l'installerait est inatteignable (0x7234 deraille
+     * vers l'overlay 0x013b via d_dsp_page garbage). Ici on INSTALLE 0x8d00
+     * dans les slots de dispatch POUR LA TRAME du burst FB/SB (mission-gate,
+     * dynamique par burst -- PAS un pin statique) + on leve IMR bit9 (route
+     * scheduler 0x7234->0x8341). Au prochain BACC(0xb40f)/CALA(0xb01e) le DSP
+     * tombe dans le correlateur. Gate CALYPSO_BSP_DISPATCH_FB (defaut OFF). */
+    { static int _di = -1; static uint16_t _tgt = 0; static int _os = -1; static int _done = 0;
+      if (_di < 0) { _di = getenv("CALYPSO_BSP_DISPATCH_FB") ? 1 : 0;
+        const char *_t = getenv("CALYPSO_BSP_DISPATCH_FB_TGT");
+        _tgt = (_t && *_t) ? (uint16_t)strtoul(_t, NULL, 0) : 0x8d00;
+        _os = getenv("CALYPSO_BSP_DISPATCH_ONESHOT") ? 1 : 0; } /* cible 0x8d00.
+        * ONESHOT (diag user "pulse") : n'installe+leve BRINT0 qu'UNE fois, au lieu
+        * de re-dispatcher chaque trame (= la congestion : correlateur re-entre en
+        * boucle sans finir). Le pulse laisse le correlateur derouler une passe. */
+      uint16_t _md2 = calypso_dsp_shunt_get_task_md();
+      int _fb2 = (_md2 == 5 || _md2 == 6 || _md2 == 8 || _md2 == 9);
+      if (_di && _fb2 && bsp.dsp && bsp.dsp->running && !(_os && _done)) {
+        _done = 1;
+        bsp.dsp->data[0x43c0] = _tgt;   /* slot terminal BACC 0xb40f (etait 0xa4c7 go-live) */
+        bsp.dsp->data[0x4387] = _tgt;   /* slot idle/CALA 0xb01e (etait stub 0xab38) */
+        bsp.dsp->data[0x43d8] = _tgt;   /* slot reseed (etait stub 0xab38) */
+        bsp.dsp->imr |= 0x0200;         /* bit9 : route frame scheduler */
+        static unsigned _dl = 0;
+        if (_dl++ < 8)
+            fprintf(stderr, "[c54x] BSP-DISPATCH-FB : install 0x%04x (LUT setup FB) "
+                    "-> slots 0x43c0/0x4387/0x43d8 + IMR|=bit9 (task_md=%u fn=%u) insn=%u\n",
+                    _tgt, _md2, (unsigned)fn, bsp.dsp->insn_count);
       } }
 
     int n = n_int16 < (int)bsp.daram_len ? n_int16 : (int)bsp.daram_len;
@@ -1134,8 +1240,15 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
 {
     /* GATE DSP_SHUNT (cf calypso_bsp_rx_burst). Idem ici : si le shunt
      * est actif, on ne livre aucun sample bufferisé — le mock owns la
-     * DARAM API region pour ses canned responses. */
-    if (calypso_dsp_shunt_active()) return;
+     * DARAM API region pour ses canned responses.
+     * HYBRIDE (RANK2, CALYPSO_TPU_RX_WIRE=1) : on lève ce gate pour laisser la
+     * chaîne RX native remplir DARAM 0x2a00 (+ d[3f92]) même sous shunt, afin
+     * d'alimenter le vrai corrélateur DSP. Réversible : sans l'env, inchangé. */
+    {
+        static int rxw = -1;
+        if (rxw < 0) rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+        if (calypso_dsp_shunt_active() && !rxw) return;
+    }
 
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
@@ -1147,8 +1260,35 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * Maintenant : drain catch-up jusqu'à plus aucun match. Bornage
          * via la fenêtre BSP_FN_MATCH_WINDOW dans bsp_take_for_fn — pas de
          * runaway. */
+        /* TPU-RX-WIRE (RANK2, gated CALYPSO_TPU_RX_WIRE=1) : consume the BDLENA
+         * pulse the TPU RX window opened (TPU scenario -> TSP MOVE -> IOTA). The
+         * native consumer calypso_iota_take_bdl_pulse() had ZERO callers, so the
+         * RX-window -> BSP transfer was never wired : DARAM 0x2a00 stayed empty
+         * and the FB correlator ran on garbage. On a pulse for this TN :
+         *   (a) queue the FB task in the DSP scheduler word : d[0x3f92] |= 0x0800
+         *       — this is "wire d[3f92] via the TPU" : the RX window hands the FB
+         *       task to the DSP scheduler (the native ORM at 0xa539 is skipped
+         *       because d[5a00]==0x88, so nothing else ever sets it) ;
+         *   (b) deliver the NEAREST buffered burst NOW (bsp_take_nearest), bypassing
+         *       the FN-match window that never lands in full mode.
+         * The loop body still does the DARAM write, INT3 and BRINT0 assert. */
+        int rxwin = 0;
+        {
+            static int en = -1;
+            if (en < 0) en = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+            if (en && calypso_iota_take_bdl_pulse((uint8_t)tn)) {
+                rxwin = 1;
+                if (bsp.dsp) bsp.dsp->data[0x3f92] |= 0x0800;
+                static unsigned rxw_log;
+                if (rxw_log++ < 12)
+                    BSP_LOG("TPU-RX-WIRE tn=%u fn=%u : BDLENA pulse consumed -> "
+                            "d[0x3f92]|=0x0800 (FB task queued) + deliver nearest",
+                            tn, current_fn);
+            }
+        }
         BspBurstSlot *sl;
-        while ((sl = bsp_take_for_fn(tn, current_fn)) != NULL) {
+        while ((sl = rxwin ? bsp_take_nearest((uint8_t)tn, current_fn)
+                           : bsp_take_for_fn(tn, current_fn)) != NULL) {
 
         /* 2026-05-29 : pas d'écriture d_dsp_page, juste INT3 (arm_done).
          * Probe read-only voir commentaire dans calypso_bsp_rx_burst. */
