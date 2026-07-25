@@ -445,12 +445,15 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
              * peut arriver bien apres le burst de zeros du boot memset). */
             if (value != 0)
                 fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 *** NONZERO *** #%u offset=0x%04x "
-                        "val=0x%04x size=%u dsp_word=0x0810 (avant: data[0x0810]=0x%04x) fn=%u\n",
+                        "val=0x%04x size=%u dsp_word=0x0810 (avant: data[0x0810]=0x%04x) fn=%u "
+                        "dsp_insn=%u\n",
                         ++aw810_nz, (unsigned)offset, (unsigned)value, size,
-                        s->dsp->data[dsp_word], s->fn);
-            else if (aw810_zero++ < 5 || (aw810_zero >= 900 && aw810_zero <= 1400))
+                        s->dsp->data[dsp_word], s->fn,
+                        s->dsp ? s->dsp->insn_count : 0);
+            else if (aw810_zero++ < 100000)
                 fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 zero #%u offset=0x%04x val=0x%04x "
-                        "size=%u fn=%u\n", aw810_zero, (unsigned)offset, (unsigned)value, size, s->fn);
+                        "size=%u fn=%u dsp_insn=%u\n", aw810_zero, (unsigned)offset, (unsigned)value,
+                        size, s->fn, s->dsp ? s->dsp->insn_count : 0);
         }
         calypso_pcb_daram_lock_acquire();
         if (size == 2) {

@@ -22,6 +22,9 @@ void calypso_dsp_shunt_on_frame_tick(void);
 
 /* True if CALYPSO_DSP_SHUNT=1 in env. Use to gate BSP/TPU DMA into DARAM. */
 bool calypso_dsp_shunt_active(void);
+/* Mission courante du DSP (d_task_md) : FB=5 SB=6 TCH_FB=8 TCH_SB=9, 0=aucune.
+ * Sert a gater les wires inter-blocs (BSP BRINT0) sur la mission FB/SB. */
+uint16_t calypso_dsp_shunt_get_task_md(void);
 
 /* Phase 2 future hook (IPC fed). */
 void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
@@ -31,10 +34,20 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * décodée depuis l'I/Q réel du BTS, écrite dans a_cd à la place du SI3 canned.
  * Point d'injection commun aux deux fronts de démod. */
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len);
+/* [2026-07-22] Mirror d_burst_d PAR COMMANDE (de-alias) : appele depuis
+ * calypso_dsp_write a chaque write ARM de la write-page. off = MMIO offset. */
+void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value);
 
 /* ENTREE du DSP shunte : la BSP pousse l'I/Q DL (cs16, n int16 entrelaces
  * I,Q) dans le buffer shm pour que gr-gsm (le DSP) la lise et la decode. */
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n);
+
+/* [2026-07-22] Injection READ-SIDE des resultats FB/SB REELS (gate
+ * CALYPSO_SHUNT_REAL_FB) : appelee depuis calypso_dsp_read sur le read MMIO
+ * ARM, immunise contre l'ordonnancement intra-trame (l'ARM lit TOUJOURS la
+ * derniere detection reelle). off = ARM byte offset dans l'API RAM.
+ * Retourne true si elle a override *out. */
+bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out);
 
 /* SONDE B : enregistre la FN TDMA reelle par RA lors dun RACH UL. */
 void calypso_dsp_shunt_record_rach(uint8_t ra);

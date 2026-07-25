@@ -37,6 +37,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "exec/memory.h"
@@ -136,7 +137,13 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
 
     g_shunt.page_idx  = page_idx;
     g_shunt.d_task_d  = shunt_read_w(wp + WP_D_TASK_D);
-    g_shunt.d_burst_d = shunt_read_w(wp + WP_D_BURST_D);
+    /* [2026-07-22] PERCMD : ne PAS ecraser d_burst_d ici (horloge scenario =
+     * aliasee, capture souvent cmd=0 debut de bloc) ; le mirror per-commande
+     * (calypso_dsp_shunt_wp_burst_write) en est le seul maitre -> X suit la
+     * vraie sequence 0,1,2,3. Gate off (=0) revient a l ancienne capture. */
+    { static int pc = -1; if (pc < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
+                                        pc = (e && *e == 0) ? 0 : 1; }
+      if (!pc) g_shunt.d_burst_d = shunt_read_w(wp + WP_D_BURST_D); }
     g_shunt.d_task_u  = shunt_read_w(wp + WP_D_TASK_U);
     g_shunt.d_task_md = shunt_read_w(wp + WP_D_TASK_MD);
     g_shunt.d_task_ra = shunt_read_w(wp + WP_D_TASK_RA);
@@ -358,7 +365,7 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
  * (0xFFD00000 / 0xFFD00028), PAS a BASE_API_NDB (0xFFD001A8). On reutilise le
  * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
  * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
- * api_ram[0x08D4 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
+ * api_ram[0x08E2 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
 /* Lecture DIRECTE de l'espace data[] du c54x pour une adresse API ARM,
  * SANS round-trip MMIO calypso_dsp_read (qui prend calypso_pcb_daram_lock,
  * mutex non-recursif -> re-lock/abort quand on est deja dans le contexte
@@ -368,7 +375,24 @@ static inline uint16_t shunt_c54x_api_rd(C54xState *dsp, uint32_t arm_addr)
     return dsp->data[((arm_addr - 0xFFD00000UL) >> 1) + 0x0800];
 }
 
-static void shunt_route_to_c54x(uint8_t page_idx)
+/* [2026-07-24] CADENCE SPLIT : shunt_route_to_c54x() etait appelee UNIQUEMENT
+ * quand g_shunt.pending (= l'ARM vient de poster un NOUVEAU d_dsp_page), soit
+ * ~1 fois toutes les ~12 trames reelles en pratique (mesure runtime : 708 insn
+ * DSP/tour mais ~57ms reels/tour -- le go-live retry loop du DSP n'a donc
+ * qu'une fraction de son temps reel pour attraper la fenetre de survie de
+ * data[0x0810]/d_ctrl_system, contrairement au natif ou c54x_run tourne a
+ * chaque trame SANS gate sur un dispatch ARM frais). Le natif ne connait pas
+ * ce probleme : calypso_tdma_tick() appelle c54x_run() inconditionnellement
+ * (gate uniquement sur running/idle/shunt_active), jamais sur "tache neuve".
+ *
+ * Fix : separer le header (partie A, a besoin de page_idx/d_fn FRAIS, donc
+ * reste gate sur pending -- cf le fix staleness du meme jour juste au-dessus)
+ * du wake+run (partie B, ne depend pas d'un dispatch frais : rejoue le
+ * dernier IQ connu, tire l'IT frame, tourne le budget DSP -- exactement ce
+ * que native fait a chaque trame). Partie B devient appelable a CHAQUE trame,
+ * pending ou pas, pour retrouver une cadence proche du natif (~217Hz au lieu
+ * de ~17Hz). */
+static void shunt_route_to_c54x_header(uint8_t page_idx)
 {
     C54xState *dsp = g_shunt.c54x;
     if (!dsp)
@@ -378,24 +402,44 @@ static void shunt_route_to_c54x(uint8_t page_idx)
     /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
      * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
      * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
-     * cote trx) pour data[0x0584] et le mirror 0x08D4. */
+     * cote trx) pour data[0x0584] et le mirror 0x08E2. */
     {
         uint32_t wbase    = wp_base(page_idx);
         fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
-        uint16_t dsp_page = shunt_c54x_api_rd(dsp, BASE_API_NDB + NDB_D_DSP_PAGE);
-        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x data=%p api_ram=%p\n", dsp_page, (void*)dsp->data, (void*)dsp->api_ram);
+        /* [2026-07-24] FIX RACE : l'ancien lisait dsp->data[NDB_D_DSP_PAGE]=data[0x08E2]
+         * ICI-MEME (mid-frame), une cellule que data[0x08E2] toggle entre ce
+         * moment et le FRAME-IT qui suit dans CETTE MEME invocation (confirme
+         * runtime : a2 voit 186/186 fois 0x0000, FRAME-IT# voit 559/559 fois
+         * 0x0003, sur la MEME cellule -- pas un bug d'adresse, un bug de
+         * timing/staleness). page_idx (parametre) est DEJA la valeur fraiche,
+         * capturee au moment de l'ecriture ARM (cf ligne ~135 :
+         * page_idx = (new_d_dsp_page & B_GSM_PAGE) ? 1 : 0). On reconstruit
+         * dsp_page depuis cette valeur connue-fraiche au lieu de relire une
+         * cellule sujette a race, evitant de repropager du perime dans
+         * data[0x0584]/api_ram[0x08E2] ci-dessous. */
+        uint16_t dsp_page = B_GSM_TASK | page_idx;
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, was: data[0x08E2]=0x%04x) "
+                "api_ram=%p\n",
+                dsp_page, (unsigned)page_idx, dsp->data[NDB_D_DSP_PAGE], (void*)dsp->api_ram);
         dsp->data[0x0584] = dsp_page;
         dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
         fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
         for (int i = 0; i < 20; i++)
             dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
         fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
-        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08D4). */
+        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08E2). */
         if (dsp->api_ram)
-            dsp->api_ram[0x08D4 - C54X_API_BASE] = dsp_page;
+            dsp->api_ram[0x08E2 - C54X_API_BASE] = dsp_page;
     }
-
     fprintf(stderr, "[c54x-route] a-daram-ok\n");
+}
+
+static void shunt_route_to_c54x_run(void)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+
     /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
     if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
         c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
@@ -403,7 +447,25 @@ static void shunt_route_to_c54x(uint8_t page_idx)
     fprintf(stderr, "[c54x-route] b-bsp-load-ok n=%d\n", g_shunt.last_iq_n);
     /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
     g_c54x_int3_src = 3;
-    c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+    /* [2026-07-22] FRAME_IT_NATIVE : tick propre — livre le scheduler frame
+     * (vec28/bit12) DIRECTEMENT au frame-tick, pas via le remap 19/3. Le
+     * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
+     * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
+    {
+        static int fin = -1;
+        if (fin < 0) fin = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
+        if (fin)
+            c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
+        else
+            c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+        /* [2026-07-23] TINT0 MASTER CLOCK sync frame : fire TINT0 vec20/bit4 au
+         * MEME tick TDMA (pas per-2000-insn). Handler 0x72d3 = driver slots op. */
+        {
+            static int _t0m = -1;
+            if (_t0m < 0) _t0m = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
+            if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
+        }
+    }
     c54x_wake(dsp);
     /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
      * idle ; en mode route_c54x le chemin trx qui posait running=true est gate
@@ -432,6 +494,26 @@ void calypso_dsp_shunt_on_frame_tick(void)
         return;
     shunt_poll_si_shm();   /* gr-gsm a-t-il ecrit un nouveau SI dans le shm ? */
     calypso_tch_dl_poll(); /* nouvelle trame FR DL dans le sideband ? (toujours, hors gate pending) */
+
+    /* [2026-07-24] CADENCE FIX : le run C54x (wake+IT-frame+c54x_run) ne
+     * depend d'AUCUNE donnee fraiche de dispatch (page_idx/d_fn) -- seul le
+     * header ci-dessous en a besoin. On le sort du gate pending pour tourner
+     * a CHAQUE trame reelle, comme le fait calypso_tdma_tick() en natif (qui
+     * appelle c54x_run() inconditionnellement, jamais sur "tache neuve").
+     * Avant ce fix : c54x_run() ne tournait qu'aux ~1/12 trames ou l'ARM
+     * venait de poster un d_dsp_page frais (mesure : 708 insn DSP/tour mais
+     * ~57ms reels/tour) -- le DSP n'avait donc qu'une fraction de son temps
+     * reel pour attraper la fenetre de survie de data[0x0810]/d_ctrl_system. */
+    if (g_shunt.c54x && shunt_route_c54x()) {
+        static int run_c54x = -1;
+        if (run_c54x < 0) {
+            const char *e = getenv("CALYPSO_DSP_RUN_C54X");
+            run_c54x = (e && *e == '1') ? 1 : 0;
+        }
+        if (run_c54x)
+            shunt_route_to_c54x_run();
+    }
+
     if (!g_shunt.pending) {
         return;
     }
@@ -459,14 +541,21 @@ void calypso_dsp_shunt_on_frame_tick(void)
                         getenv("CALYPSO_C54X_CRASHPC") ? getenv("CALYPSO_C54X_CRASHPC") : "(null)",
                         getenv("CALYPSO_DSP") ? getenv("CALYPSO_DSP") : "(null)", run_c54x);
             }
-            if (run_c54x) shunt_route_to_c54x(page);
+            if (run_c54x) shunt_route_to_c54x_header(page);
         }
-        if (md == PM_DSP_TASK)                          shunt_dispatch_pm(page);
-        else if (md == FB_DSP_TASK)                     shunt_dispatch_fb(page);
+        if (md == PM_DSP_TASK)                          do { static int nf_pm=-1; if(nf_pm<0){const char*e=getenv("CALYPSO_SHUNT_NO_FAKE_PM");nf_pm=(e&&*e=='1')?1:0;} if(!nf_pm) shunt_dispatch_pm(page); } while(0);
+        else if (md == FB_DSP_TASK) {
+            /* [2026-07-22] Gate le fake FB en revive : CALYPSO_SHUNT_NO_FAKE_FB=1
+             * -> skip le d_fb_det bidon (NDB only) pour laisser le VRAI correlateur
+             * produire le resultat (isole le go-live : d_fb_det reste 0 si bloque). */
+            static int no_fake_fb = -1;
+            if (no_fake_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_NO_FAKE_FB"); no_fake_fb = (e && *e == '1') ? 1 : 0; }
+            if (!no_fake_fb) shunt_dispatch_fb(page);
+        }
         else if (md == SB_DSP_TASK && g_shunt.sb_valid) shunt_dispatch_sb(page);
         if (td == ALLC_DSP_TASK)                        shunt_dispatch_allc(page);
     } else if (md == PM_DSP_TASK) {
-        shunt_dispatch_pm(page);
+        do { static int nf_pm=-1; if(nf_pm<0){const char*e=getenv("CALYPSO_SHUNT_NO_FAKE_PM");nf_pm=(e&&*e=='1')?1:0;} if(!nf_pm) shunt_dispatch_pm(page); } while(0);
     } else if (md == FB_DSP_TASK) {
         shunt_dispatch_fb(page);
     } else if (md == SB_DSP_TASK) {
@@ -533,6 +622,7 @@ static int g_gsmtap_fd = -1;
  * alors chan_nr=0x90 -> gsm48_rr_rx_pch_agch -> gsm48_rr_rx_imm_ass). */
 static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_AGCH"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_AGCH=1 pour reactiver */
     if (!l2 || len < 3) return;
 
     /* Priorite IMM ASSIGN : ne pas laisser un PAGING REQUEST (mt 0x21/0x22/0x24)
@@ -626,6 +716,7 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
  * UA/AUTH -> L3 (miroir de feed_agch, SANS la sonde req-ref). */
 static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SDCCH"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SDCCH=1 pour reactiver */
     if (!l2 || len < 3) return;
     int n = len < 23 ? len : 23;
     memcpy(g_shunt.sdcch_buf, l2, n);
@@ -645,6 +736,7 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len)
  * fait CESSER la fabrication SI3->SI6 (sinon SI3 du BCCH clobbe le SI5/SI6 reel). */
 static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
 {
+    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SACCH"); _ginj = (_e && *_e == '1') ? 1 : 0; } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SACCH=1 pour reactiver */
     if (!l2 || len < 7) return;
     int n = len < 23 ? len : 23;
     /* trouve le RR header (06 1d / 06 1e) pour valider que c'est bien SI5/SI6 */
@@ -794,6 +886,23 @@ static void shunt_sch_read(void *opaque)
                     "(ncc=%d bcc=%d) FN=%d TOA=%d%s\n", (int)g_shunt.sb_bsic,
                     (g_shunt.sb_bsic >> 3) & 7, g_shunt.sb_bsic & 7,
                     (int)fn, (int)g_shunt.sb_toa, first ? " [1er]" : "");
+
+        /* [2026-07-25] FN-ALIGN probe : mesure PROPRE de l'offset horloge.
+         * Le DSP suit s->fn (calypso_trx_get_fn) ; le SCH porte la FN REELLE du
+         * BTS. delta = sch_fn - trx_fn = l'offset a recaler (un vrai mobile cale
+         * son horloge sur le SCH ; ici le DSP garde l'horloge TRX offset).
+         * delta constant sur les SCH -> offset fixe pose a l'init (fix 1 ligne).
+         * toa = offset residuel intra-burst en qbits (23 = on-time). */
+        {
+            uint32_t trx_fn = calypso_trx_get_fn();
+            int32_t d = (int32_t)((uint32_t)fn - trx_fn);
+            static unsigned an = 0;
+            if (an++ < 60 || (an % 200) == 0)
+                fprintf(stderr, "[dsp-shunt] FN-ALIGN sch_fn=%u trx_fn=%u "
+                        "delta=%d sch%%51=%u toa=%d\n",
+                        (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
+                        (int)g_shunt.sb_toa);
+        }
     }
 }
 
@@ -945,6 +1054,33 @@ static void shunt_shm_init(void)
 
 /* ENTREE du DSP shunte : la BSP appelle ceci avec l'I/Q DL (cs16, n int16
  * entrelaces I,Q) qu'elle DMA dans la DARAM. Publie dans le shm pour gr-gsm. */
+/* [2026-07-22] Injection READ-SIDE FB/SB REELS. Voir header. La detection
+ * (feed_iq) met a jour g_shunt.rx_* ; c'est ICI, sur le read MMIO ARM, qu'on
+ * livre la valeur -> aucune dependance de timing write/read intra-trame.
+ *   FB  (NDB)  : 0x01F0 d_fb_det, 0x01F4 TOA, 0x01F6 PM, 0x01F8 ANGLE, 0x01FA SNR
+ *   SB  (db_r) : 0x0060 (page0) / 0x0088 (page1) a_serv_demod[D_TOA] */
+bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
+{
+    static int real_fb = -1;
+    if (real_fb < 0) {
+        const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
+        real_fb = (e && *e == '1') ? 1 : 0;
+    }
+    if (!real_fb) return false;
+    switch (off) {
+    case 0x01F0: *out = g_shunt.rx_fb_det ? 1 : 0;    return true; /* d_fb_det */
+    case 0x01F4: *out = g_shunt.rx_toa;               return true; /* a_sync TOA */
+    case 0x01F6: *out = g_shunt.last_pm;              return true; /* a_sync PM  */
+    case 0x01F8: *out = (uint16_t)g_shunt.rx_afc;     return true; /* a_sync ANGLE(AFC) */
+    case 0x01FA: *out = g_shunt.rx_snr;               return true; /* a_sync SNR */
+    /* SB via db_r a_serv_demod[D_TOA] (page0/page1) : seulement si SB reel poste */
+    case 0x0060: case 0x0088:
+        if (g_shunt.sb_valid) { *out = g_shunt.rx_toa; return true; }
+        return false;
+    default: return false;
+    }
+}
+
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
 {
     if (!iq || n <= 0)
@@ -961,6 +1097,61 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         for (int i = 0; i < n; i++) { int v = iq[i]; acc += (v < 0) ? (uint32_t)(-v) : (uint32_t)v; }
         uint32_t mav = (uint32_t)(acc / (uint32_t)n);
         g_shunt.last_pm = (mav > 0xffff) ? 0xffff : (uint16_t)mav;
+    }
+
+    /* [2026-07-22] Detection FCCH REELLE (gate CALYPSO_SHUNT_REAL_FB) : coherence
+     * + dphi sur la vraie RX -> d_fb_det/AFC/SNR/TOA reels (bypass go-live DSP). */
+    {
+        static int real_fb = -1;
+        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); real_fb = (e && *e == '1') ? 1 : 0; }
+        if (real_fb) {
+            int nc = n / 2;
+            if (nc >= 8) {
+                double ar = 0, ai = 0, den = 0;
+                for (int k = 1; k < nc; k++) {
+                    double i0 = iq[2*(k-1)], q0 = iq[2*(k-1)+1];
+                    double i1 = iq[2*k],     q1 = iq[2*k+1];
+                    ar += i1*i0 + q1*q0; ai += q1*i0 - i1*q0;
+                    den += sqrt((i0*i0+q0*q0)*(i1*i1+q1*q1));
+                }
+                double coh = (den > 0) ? sqrt(ar*ar + ai*ai) / den : 0;
+                double dphi = atan2(ai, ar);
+                double e1 = fabs(dphi - M_PI/2.0), e8 = fabs(dphi - M_PI/8.0);
+                double best = (e1 < e8) ? M_PI/2.0 : M_PI/8.0;
+                /* [2026-07-22] SERRE : seule la VRAIE FCCH (dphi ~ pi/2 @1SPS ou
+                 * pi/8 @4SPS, coherence tres haute) -> det=1 UNIQUEMENT sur la frame
+                 * FCCH (sinon l'ARM ne peut pas etablir le timing multiframe). */
+                int det = (coh > 0.95) && ((e1 < 0.10) || (e8 < 0.05));
+                g_shunt.rx_fb_det = det;
+                g_shunt.rx_snr    = (uint16_t)(coh * (double)0x7000);
+                g_shunt.rx_afc    = (int16_t)((dphi - best) * 2000.0);
+                g_shunt.rx_toa    = 23;
+                /* [2026-07-22] Ecrit d_fb_det+sync dans le NDB PAR FRAME (comme le vrai
+                 * DSP qui tourne 12 frames apres 1 dispatch) -> l'ARM lit 1 sur chaque
+                 * attempt (il le remet a 0 apres lecture, prim_fbsb.c:318). Fix desync. */
+                /* Ecrit dsp->data[] DIRECT (comme shunt_route_to_c54x l.396) : le
+                 * shunt_write_w/dma_memory_write ne mirror PAS vers dsp->data ou
+                 * l'ARM+fbsb lisent (0x08F8..). DSP-words : d_fb_det=0x08F8,
+                 * a_sync_demod TOA=0x08FA PM=0x08FB ANG=0x08FC SNR=0x08FD. */
+                static unsigned _wl = 0;
+                if (_wl++ < 12)
+                    fprintf(stderr, "[shunt] FB-WRITE-DBG det=%d c54x=%p data=%p api=%p\n",
+                            det, (void*)g_shunt.c54x,
+                            g_shunt.c54x ? (void*)g_shunt.c54x->data : (void*)0,
+                            g_shunt.c54x ? (void*)g_shunt.c54x->api_ram : (void*)0);
+                /* [2026-07-22] Write async dsp->data[] SUPPRIME : la livraison
+                 * FB/SB se fait desormais READ-SIDE (calypso_dsp_shunt_real_fb_read
+                 * appelee par calypso_dsp_read), immunisee contre l'ordonnancement
+                 * intra-trame. feed_iq ne fait QUE mettre a jour g_shunt.rx_*. */
+                static unsigned rfl = 0;
+                if (rfl < 20 || (det && rfl < 300)) {
+                    fprintf(stderr, "[shunt] REAL-FB fn=%u nc=%d coh=%.3f dphi=%.3f "
+                            "det=%d SNR=0x%04x AFC=%d\n", fn, nc, coh, dphi, det,
+                            g_shunt.rx_snr, g_shunt.rx_afc);
+                    rfl++;
+                }
+            }
+        }
     }
 
     /* CALYPSO_DSP=c54x : stash du dernier burst (cs16 I,Q) ; rejoue dans
@@ -1135,11 +1326,47 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * l'I/Q réel du BTS. Le shunt l'écrit ensuite dans a_cd (shunt_dispatch_allc)
  * à la place du SI3 canned → "sans hack", vrai signal. len doit être 23 (XCCH
  * L2). Réécrit à chaque nouveau SI (rotation SI1/2/3/4 du BCCH). */
+/* [2026-07-22] DE-ALIAS du d_burst_d. RACINE du jitter burst-ID : g_shunt.d_burst_d
+ * etait capture dans shunt_latch_task (horloge d_dsp_page/scenario) qui SOUS-
+ * ECHANTILLONNE le flux commande NB propre 0,1,2,3 -> sequence aliasee periode-12,
+ * phase figee au boot (non-deterministe). Ici on capture+mirror A CHAQUE ecriture
+ * ARM de la write-page d_burst_d (WP_D_BURST_D : offset 0x0002 page0 / 0x002A page1),
+ * 1:1 avec les commandes -> plus d'aliasing. On ecrit l'echo (avec l'offset SCHED)
+ * sur LES DEUX read-pages pour que le mobile lise toujours la commande la plus
+ * recente quel que soit r_page. Gate CALYPSO_SHUNT_BURST_PERCMD (defaut ON). */
+void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
+{
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
+                  en = (e && *e == '0') ? 0 : 1; }
+    if (!en) return;
+    if (off != 0x0002 && off != 0x002A) return;   /* WP_D_BURST_D page0/1 */
+    g_shunt.d_burst_d = (uint16_t)(value & 3);
+    uint16_t x = shunt_burst_echo();
+    shunt_write_w(BASE_API_R_PAGE_0 + RP_D_BURST_D, x);
+    shunt_write_w(BASE_API_R_PAGE_1 + RP_D_BURST_D, x);
+    { static unsigned n = 0, z = 0;
+      if ((value & 3) != 0 && n < 40) { n++;
+        fprintf(stderr, "[shunt] WP-BURST-NONZERO off=0x%04x cmd=%u -> X=%u insn\n",
+                (unsigned)off, value & 3, x); }
+      else if ((value & 3) == 0) { z++;
+        if (z % 500 == 1) fprintf(stderr, "[shunt] WP-BURST cmd=0 x%u (aucun non-zero: ARM ne commande QUE burst 0)\n", z); } }
+}
+
 void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 {
     if (!l2 || len <= 0) {
         g_shunt.si_valid = false;
         return;
+    }
+    /* [2026-07-22] Gate test natif : CALYPSO_SHUNT_FEED_SI=0 coupe l'injection du
+     * SI reel dans a_cd -> a_cd ne se remplit QUE si la demod native (corr 0x8d00
+     * -> NB) produit vraiment le bloc. Prouve natif vs plomberie. Defaut ON (=1). */
+    {
+        static int fs = -1;
+        if (fs < 0) { const char *e = getenv("CALYPSO_SHUNT_FEED_SI");
+                      fs = (e && *e == '1') ? 1 : 0; }  /* [2026-07-23] DEFAUT OFF (natif) */
+        if (!fs) { g_shunt.si_valid = false; return; }
     }
     int n = len < 23 ? len : 23;
     /* (A) range la frame dans le slot de SON type (RR PD=0x06, mt=l2[2]) :
@@ -1199,7 +1426,7 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
     {
         static int inj = -1;
         if (inj < 0) { const char *e = getenv("CALYPSO_SHUNT_DL_INJECT");
-                       inj = (e && *e == '0') ? 0 : 1; }
+                       inj = (e && *e == '1') ? 1 : 0; }  /* [2026-07-23] DEFAUT OFF (natif) */
         if (inj) l1ctl_inject_dl_si(g_shunt.si_buf, 23, calypso_trx_get_fn());
     }
     SHUNT_LOG("feed_si: SI réel %d o injecté → a_cd "
@@ -1211,6 +1438,15 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
 bool calypso_dsp_shunt_active(void)
 {
     return g_shunt.active;
+}
+
+/* Public getter — mission courante du DSP (d_task_md, lu du write-page ARM).
+ * Sert a gater les wires inter-blocs (BSP BRINT0 / TPU DSP_INT_PG) sur la
+ * mission FB/SB reelle. Valeurs (osmo l1_environment.h) : FB_DSP_TASK=5,
+ * SB_DSP_TASK=6, TCH_FB=8, TCH_SB=9. 0 = pas de tache. */
+uint16_t calypso_dsp_shunt_get_task_md(void)
+{
+    return g_shunt.d_task_md;
 }
 
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */

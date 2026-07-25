@@ -244,6 +244,41 @@ static void *clk_listener(void *arg)
             __atomic_store_n(&g_qfn_seen, 1, __ATOMIC_RELEASE);
             LOGP(DDEV, LOGL_NOTICE,
                  "clk_listener: first QEMU tick received, qfn=%u\n", fn);
+
+            /* [2026-07-24] DL-FIFO-CATCHUP (gate CALYPSO_DL_FIFO_CATCHUP_OFF,
+             * default ON) : le FIFO DL se remplit en continu depuis
+             * osmo-trx-ipc (~209 burst/s) DES LE DEMARRAGE du device, bien
+             * AVANT que QEMU ait fini de booter (ROM DSP, etc.) et emis son
+             * premier tick CLK. Sans rattrapage, on sert ce backlog un burst
+             * par qfn-tick POUR TOUJOURS (Fix D pace bien le DEBIT, mais ne
+             * corrige jamais l'OFFSET initial) -> delta constant observe
+             * (ex: -1020 trames = ~4.7s de backlog, zero derive sur 160s+,
+             * confirme que c'est un decalage fige au demarrage, pas un
+             * probleme de cadence). On rattrape UNE SEULE FOIS ici, au tout
+             * premier tick : on ne garde que les DL_PREFILL entrees les plus
+             * fraiches, on jette le reste. Le coussin DL_PREFILL (jitter)
+             * est preserve, seul le backlog de demarrage disparait. */
+            {
+                static int catchup_off = -1;
+                if (catchup_off < 0)
+                    catchup_off = getenv("CALYPSO_DL_FIFO_CATCHUP_OFF") &&
+                                  atoi(getenv("CALYPSO_DL_FIFO_CATCHUP_OFF"));
+                if (!catchup_off) {
+                    pthread_mutex_lock(&g_dl_fifo_mutex);
+                    size_t head0 = g_dl_fifo_head;
+                    size_t tail0 = g_dl_fifo_tail;
+                    size_t depth0 = tail0 - head0;
+                    if (depth0 > DL_PREFILL) {
+                        size_t dropped = depth0 - DL_PREFILL;
+                        g_dl_fifo_head = tail0 - DL_PREFILL;
+                        LOGP(DDEV, LOGL_NOTICE,
+                             "DL-FIFO-CATCHUP: dropping %zu stale backlog "
+                             "entries (depth %zu -> %u) at first qfn=%u\n",
+                             dropped, depth0, DL_PREFILL, fn);
+                    }
+                    pthread_mutex_unlock(&g_dl_fifo_mutex);
+                }
+            }
         }
 
         /* ---- Fix D : pop FIFO head, tag with qfn, send ----

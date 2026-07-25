@@ -2327,6 +2327,29 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-25] RANK1b FIX (workflow overlay, context-safe) : le prologue ISR
+     * overlay 0x013b fait POPD *(0x3fcd) = depile l'adresse de retour HW 0x72d5
+     * dans data[0x3fcd], puis 23 PSHM (sauvegarde contexte), puis PSHD *(0x3fcd)
+     * + RET qui DEPILE data[0x3fcd] = retourne a 0x72d5 -> reboucle sur le
+     * scheduler 0x7234 (self-loop). Le chemin NATIF doit retourner a 0xa4e4
+     * (init lineaire ORM/RSBX/IMR -> dispatcher 0x8341 -> LUT FB -> correlateur
+     * AR3=0x2a00). On substitue la valeur ecrite par 0x013b UNIQUEMENT (pas
+     * l'epilogue 0x011e qui ecrit aussi 0x3fcd) : les 23 PSHM s'executent, SP
+     * reste equilibre, le RET depile 0xa4e4 -> chemin natif SANS storm (vs le
+     * PC-redirect qui sautait le contexte). Gate CALYPSO_FIX_3FCD (def off). */
+    if (addr == 0x3fcd && s->pc == 0x013b) {
+        static int f3f = -1;
+        if (f3f < 0) f3f = getenv("CALYPSO_FIX_3FCD") ? 1 : 0;
+        if (f3f && val != 0xa4e4) {
+            static unsigned f3n = 0;
+            if (f3n++ < 8)
+                fprintf(stderr, "[c54x] FIX-3FCD : data[0x3fcd] 0x%04x -> 0xa4e4 "
+                        "(retour natif go-live, pas 0x72d5 self-loop) PC=0x013b insn=%u\n",
+                        val, s->insn_count);
+            val = 0xa4e4;
+        }
+    }
+
     /* WRITE-WATCH (2026-06-24, RO) : qui ECRIT 0x434f (FIFO write ptr),
      * 0x434e (FIFO read ptr), 0x3f6d (soft-vector go-live) — avec quel PC.
      * Tranche empiriquement ECRITURE-ACTIVE (par un chemin) vs residu/defaut :
@@ -3330,8 +3353,12 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
                 }
             }
             {
-                /* [2026-07-23] preservation bit12 RETIREE (hacky). IMR = ce que le
-                 * firmware ecrit (fidele) ; le timer0 fidele respecte l'IMR au take. */
+                /* [2026-07-25] Le toggle IMR bit9 (0xddf9 ANDM / 0xde84 ORM) est
+                 * PILOTE PAR LE TPU (masquage dynamique par fenetre burst), PAS a
+                 * figer statiquement -> tentative PIN-IMR retiree (diag user).
+                 * IMR = ce que le firmware/TPU ecrit (fidele). Le seul re-arm
+                 * conserve est le fix bit5/BRINT0 dynamique (voir KEEP-IMR bloc
+                 * ~13230) qui restaure bit5 uniquement quand il TOMBE. */
             }
             s->imr = val; return;
         case MMR_IFR: {
@@ -11353,8 +11380,10 @@ int c54x_run(C54xState *s, int n_insns)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u a537(CMPM d5a00,0x88) TC=%d d[5a00]=0x%04x insn=%u\n",
                             n537, !!(s->st0 & ST0_TC), s->data[0x5a00], s->insn_count);
                 if (s->pc==0xa53c && n53c++<_cap)
-                    fprintf(stderr, "[c54x] CYCLE-TRACE #%u a53c(BITF AR1+10,0x8000) AR1=0x%04x d[3f92]=0x%04x insn=%u\n",
-                            n53c, s->ar[1], s->data[0x3f92], s->insn_count);
+                    fprintf(stderr, "[c54x] CYCLE-TRACE #%u a53c(BITF AR1+10,0x8000) AR1=0x%04x d[3f92]=0x%04x "
+                            "data[0x0810]=0x%04x(B_TASK_ABORT=%d) fn=%u insn=%u\n",
+                            n53c, s->ar[1], s->data[0x3f92], s->data[0x0810],
+                            !!(s->data[0x0810] & 0x8000), s->data[0x0585], s->insn_count);
                 if (s->pc==0xa53f && n53f++<_cap)
                     fprintf(stderr, "[c54x] CYCLE-TRACE #%u a53f(BC a575 if NTC) TC=%d insn=%u\n",
                             n53f, !!(s->st0 & ST0_TC), s->insn_count);
@@ -13211,21 +13240,33 @@ int c54x_run(C54xState *s, int n_insns)
                         s->prog[(uint16_t)(exec_pc + 1)],
                         (s->st1 & ST1_INTM) ? 1 : 0, s->insn_count);
         }
-        /* [2026-07-22] KEEP-IMR (gated CALYPSO_KEEP_IMR) : 0xb37e efface IMR ~47
-         * insns apres que POKE l'a arme -> la wait-loop tourne avec IMR=0 -> l'IT
-         * frame native jamais prise. On re-arme IMR=0x3000 (bit12/vec28) tant que
-         * le DSP est dans la wait-loop go-live [0xa4ca..0xa4e2]. Casse le chicken/
-         * egg : le frame IT native (pend=ifr&imr) peut alors etre pris, atteindre
-         * 0xa582 qui arme IMR=0x52fd nativement -> self-sustain. */
+        /* [2026-07-22] KEEP-IMR (gated CALYPSO_KEEP_IMR) : 0xb37e (STM #0,IMR)
+         * efface IMR ~47 insns apres que le go-live l'a arme -> la wait-loop
+         * tourne avec IMR sans les bits d'IT -> l'IT jamais prise.
+         * [2026-07-25 FIX BIT5 — diag video user] : l'ancienne version re-armait
+         * IMR=0x3000 (bits 12/13, vec28/29) mais SANS bit5 (BRINT0/vec21). Or
+         * BRINT0 = l'IT "buffer BSP recu" qui reveille le correlateur. Resultat
+         * mesure : IMR=0x52fd (bit5=1) arme 178x par le go-live puis ECRASE par
+         * 0xb37e, KEEP_IMR restaurait 0x3050/0x0050 (bit5=0) -> BRINT0 masque a
+         * vie -> IFR bit5 pending eternel -> correlateur jamais dispatche.
+         * FIX : re-armer la VRAIE image = le shadow d[0x435b] (=0x52fd, bit5
+         * inclus), et le faire des que bit5 TOMBE (pas seulement quand imr==0),
+         * sur toute la region go-live+background [0xa4ca..0xdea0]. Valeur de
+         * repli / override : CALYPSO_KEEP_IMR_VAL (defaut 0x52fd). */
         {
-            static int ki = -1;
-            if (ki < 0) ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
-            if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xa4e2 && s->imr == 0) {
-                s->imr = 0x3000;
+            static int ki = -1; static uint16_t kiv = 0;
+            if (ki < 0) { ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
+                const char *e = getenv("CALYPSO_KEEP_IMR_VAL");
+                kiv = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0x52fd; }
+            if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xdea0 && !(s->imr & 0x0020)) {
+                uint16_t img = s->data[0x435b];            /* shadow IMR (=0x52fd) */
+                if (!(img & 0x0020)) img = kiv;            /* shadow sans bit5 -> repli */
+                s->imr = img;
                 static unsigned kil = 0;
                 if (kil++ < 8)
-                    fprintf(stderr, "[c54x] KEEP-IMR re-arme IMR=0x3000 @PC=0x%04x insn=%u\n",
-                            exec_pc, s->insn_count);
+                    fprintf(stderr, "[c54x] KEEP-IMR re-arme IMR=0x%04x (bit5/BRINT0 preserve, "
+                            "shadow d[435b]=0x%04x) @PC=0x%04x insn=%u\n",
+                            s->imr, s->data[0x435b], exec_pc, s->insn_count);
             }
         }
         if (exec_pc == 0xa4d4) {
@@ -13242,6 +13283,52 @@ int c54x_run(C54xState *s, int n_insns)
                     fprintf(stderr, "[c54x] WAIT-TEST PC=0xa4d4 data[0x3f70]=0x%04x bit1=%d "
                             "insn=%u\n", fl, !!(fl & 2), s->insn_count);
                 last = fl;
+            }
+        }
+
+        /* [2026-07-25] RANK1 : route frame ISR 0x013b -> 0x8341 (LUT FB native,
+         * setup COMPLET du correlateur : BRC/BK/data-ptr, que l'entree forcee
+         * 0x8d00 court-circuite -> boucle morte MAC diag). Le frame IT vectorise
+         * 0x00f0 -> 0x7234 (B 0x013b) -> prologue 0x013b qui deraille et n'atteint
+         * jamais 0x8341. On redirige le prologue vers 0x8341 quand l'IT vient du
+         * frame scheduler (g_prev_pc==0x7234). Gate CALYPSO_ISR_TO_8341 (def off). */
+        if (exec_pc == 0x013b) {
+            static int r8 = -1;
+            if (r8 < 0) r8 = getenv("CALYPSO_ISR_TO_8341") ? 1 : 0;
+            if (r8 && g_prev_pc == 0x7234) {
+                static unsigned r8n = 0;
+                if (r8n++ < 8)
+                    fprintf(stderr, "[c54x] ISR-TO-8341 : frame ISR 0x013b -> 0x8341 "
+                            "(LUT FB setup complet) prev=0x%04x insn=%u\n",
+                            g_prev_pc, s->insn_count);
+                s->pc = 0x8341;
+                return 0;
+            }
+        }
+
+        /* [2026-07-25] CORR-SETUP (diag user "setup AR/BK a l'entree 0x8d00,
+         * meme patch avec les constantes") : le correlateur 0x8d00 est atteint
+         * (via BSP-DISPATCH-FB) mais SANS le setup que la LUT native 0x8341 pose
+         * juste avant : STM #0x2f22,AR1 / #0x2be4,AR4 / #0x0060,AR5 (desassemble
+         * PROM0 0x8347/0x8349/0x834b). Sans ces pointeurs le MAC boucle a
+         * 0x8e8b/0x8e8c sans conclure. On INJECTE ces constantes a l'entree
+         * 0x8d00. Gate CALYPSO_CORR_SETUP ; override _AR1/_AR4/_AR5. */
+        if (exec_pc == 0x8d00) {
+            static int cs = -1; static uint16_t a1 = 0, a4 = 0, a5 = 0;
+            if (cs < 0) {
+                cs = getenv("CALYPSO_CORR_SETUP") ? 1 : 0;
+                const char *e;
+                a1 = (e = getenv("CALYPSO_CORR_AR1")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2f22;
+                a4 = (e = getenv("CALYPSO_CORR_AR4")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2be4;
+                a5 = (e = getenv("CALYPSO_CORR_AR5")) && *e ? (uint16_t)strtoul(e,0,0) : 0x0060;
+            }
+            if (cs) {
+                s->ar[1] = a1; s->ar[4] = a4; s->ar[5] = a5;
+                static unsigned csn = 0;
+                if (csn++ < 8)
+                    fprintf(stderr, "[c54x] CORR-SETUP @0x8d00 : AR1=0x%04x AR4=0x%04x "
+                            "AR5=0x%04x (setup LUT 0x8341 injecte) insn=%u\n",
+                            a1, a4, a5, s->insn_count);
             }
         }
         calypso_arm2dsp_on_dsp_step(s, exec_pc);
@@ -13343,6 +13430,32 @@ int c54x_run(C54xState *s, int n_insns)
                     fprintf(stderr, "[c54x] FORCE-098 @0x%04x data[098a/c]=0x%04x insn=%u\n",
                             exec_pc, f98v, s->insn_count);
             }
+        }
+        /* FORCE-GATE (2026-07-25, TEST) : la boucle reject go-live a53c<->a575 relit
+         * son gate a CHAQUE iteration ; les setters a539/a566 sont HORS boucle (jamais
+         * repasses) -> poker une fois ne persiste pas. On force donc a CHAQUE pas tant
+         * que le PC est dans la region go-live [0xa4ca..0xa575].
+         *   CALYPSO_FORCE_3F92=0xC000 -> d[0x3f92]   (hypothese scheduler-state)
+         *   CALYPSO_FORCE_0810=0xC000 -> data[0x0810] (operande reel du BITF *+AR1(0x10))
+         * Objectif : casser la branche a575 et voir si BRINT0 (0x8d00) se dispatche.
+         * =1 -> 0xC000 (bits14+15). Reversible, gate defaut OFF. */
+        if (exec_pc >= 0xa4ca && exec_pc <= 0xa575) {
+            static int f3 = -1; static uint16_t f3v = 0;
+            if (f3 < 0) { const char *e = getenv("CALYPSO_FORCE_3F92");
+                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
+                               f3v = (v <= 1) ? 0xC000 : (uint16_t)v; f3 = 1; } else f3 = 0; }
+            if (f3) s->data[0x3f92] = f3v;
+
+            static int f8 = -1; static uint16_t f8v = 0;
+            if (f8 < 0) { const char *e = getenv("CALYPSO_FORCE_0810");
+                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
+                               f8v = (v <= 1) ? 0xC000 : (uint16_t)v; f8 = 1; } else f8 = 0; }
+            if (f8) s->data[0x0810] |= f8v;
+
+            static unsigned flg = 0;
+            if ((f3 || f8) && flg++ < 8)
+                fprintf(stderr, "[c54x] FORCE-GATE @0x%04x d[3f92]=0x%04x data[0810]=0x%04x insn=%u\n",
+                        exec_pc, s->data[0x3f92], s->data[0x0810], s->insn_count);
         }
         /* SM-TRACE (gated CALYPSO_SM_TRACE) : trace instruction-par-instruction
          * l'etat-machine handshake 0xdde0-0xde9f (route reclear 0xde8b vs setter
