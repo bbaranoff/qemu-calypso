@@ -326,6 +326,27 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
     return match;
 }
 
+/* TPU-RX-WIRE (RANK2): take the NEAREST valid buffered burst for a TN, ignoring
+ * the FN-match window. Used when the TPU RX window fired (a BDLENA pulse was
+ * consumed) : the hardware RX window IS the timing signal, so we deliver the
+ * closest burst we have rather than waiting for a virtual-FN match that never
+ * lands in full mode (device_fn >> virtual cur_fn). Marks the slot consumed. */
+static BspBurstSlot *bsp_take_nearest(uint8_t tn, uint32_t current_fn)
+{
+    if (tn >= BSP_NUM_TN) return NULL;
+    BspBurstQueue *qq = &bsp.q[tn];
+    BspBurstSlot *best = NULL;
+    int32_t best_abs = INT32_MAX;
+    for (int i = 0; i < BSP_QUEUE_LEN; i++) {
+        BspBurstSlot *s = &qq->slot[i];
+        if (!s->valid) continue;
+        int32_t d = bsp_fn_delta(s->fn, current_fn);
+        int32_t ad = d < 0 ? -d : d;
+        if (ad < best_abs) { best = s; best_abs = ad; }
+    }
+    return best;
+}
+
 static uint16_t parse_uint_env(const char *name, uint16_t def)
 {
     const char *v = getenv(name);
@@ -1219,8 +1240,15 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
 {
     /* GATE DSP_SHUNT (cf calypso_bsp_rx_burst). Idem ici : si le shunt
      * est actif, on ne livre aucun sample bufferisé — le mock owns la
-     * DARAM API region pour ses canned responses. */
-    if (calypso_dsp_shunt_active()) return;
+     * DARAM API region pour ses canned responses.
+     * HYBRIDE (RANK2, CALYPSO_TPU_RX_WIRE=1) : on lève ce gate pour laisser la
+     * chaîne RX native remplir DARAM 0x2a00 (+ d[3f92]) même sous shunt, afin
+     * d'alimenter le vrai corrélateur DSP. Réversible : sans l'env, inchangé. */
+    {
+        static int rxw = -1;
+        if (rxw < 0) rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+        if (calypso_dsp_shunt_active() && !rxw) return;
+    }
 
     if (!bsp.dsp || bsp.daram_addr == 0) return;
 
@@ -1232,8 +1260,35 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * Maintenant : drain catch-up jusqu'à plus aucun match. Bornage
          * via la fenêtre BSP_FN_MATCH_WINDOW dans bsp_take_for_fn — pas de
          * runaway. */
+        /* TPU-RX-WIRE (RANK2, gated CALYPSO_TPU_RX_WIRE=1) : consume the BDLENA
+         * pulse the TPU RX window opened (TPU scenario -> TSP MOVE -> IOTA). The
+         * native consumer calypso_iota_take_bdl_pulse() had ZERO callers, so the
+         * RX-window -> BSP transfer was never wired : DARAM 0x2a00 stayed empty
+         * and the FB correlator ran on garbage. On a pulse for this TN :
+         *   (a) queue the FB task in the DSP scheduler word : d[0x3f92] |= 0x0800
+         *       — this is "wire d[3f92] via the TPU" : the RX window hands the FB
+         *       task to the DSP scheduler (the native ORM at 0xa539 is skipped
+         *       because d[5a00]==0x88, so nothing else ever sets it) ;
+         *   (b) deliver the NEAREST buffered burst NOW (bsp_take_nearest), bypassing
+         *       the FN-match window that never lands in full mode.
+         * The loop body still does the DARAM write, INT3 and BRINT0 assert. */
+        int rxwin = 0;
+        {
+            static int en = -1;
+            if (en < 0) en = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+            if (en && calypso_iota_take_bdl_pulse((uint8_t)tn)) {
+                rxwin = 1;
+                if (bsp.dsp) bsp.dsp->data[0x3f92] |= 0x0800;
+                static unsigned rxw_log;
+                if (rxw_log++ < 12)
+                    BSP_LOG("TPU-RX-WIRE tn=%u fn=%u : BDLENA pulse consumed -> "
+                            "d[0x3f92]|=0x0800 (FB task queued) + deliver nearest",
+                            tn, current_fn);
+            }
+        }
         BspBurstSlot *sl;
-        while ((sl = bsp_take_for_fn(tn, current_fn)) != NULL) {
+        while ((sl = rxwin ? bsp_take_nearest((uint8_t)tn, current_fn)
+                           : bsp_take_for_fn(tn, current_fn)) != NULL) {
 
         /* 2026-05-29 : pas d'écriture d_dsp_page, juste INT3 (arm_done).
          * Probe read-only voir commentaire dans calypso_bsp_rx_burst. */

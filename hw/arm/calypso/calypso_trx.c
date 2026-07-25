@@ -788,8 +788,15 @@ static void calypso_dsp_done(void *opaque) {
      *
      * GATED par CALYPSO_DSP_SHUNT : si le shunt est actif, on skip
      * complètement cette DMA — le mock écrit les résultats directement
-     * dans NDB/read-page et le c54x est inactif (pas de consommateur). */
-    if (s->dsp && s->dsp_ram[0x01A8/2] != 0 && !calypso_dsp_shunt_active()) {
+     * dans NDB/read-page et le c54x est inactif (pas de consommateur).
+     * HYBRIDE (RANK2, CALYPSO_TPU_RX_WIRE=1) : on lève ce gate pour laisser la
+     * commande de tâche ARM (task_md=5 FB) atteindre le DSP DARAM 0x0586 même
+     * sous shunt, condition pour que le vrai corrélateur DSP soit dispatché.
+     * Réversible : sans l'env, comportement inchangé. */
+    static int trx_rxw = -1;
+    if (trx_rxw < 0) trx_rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+    if (s->dsp && s->dsp_ram[0x01A8/2] != 0 &&
+        (!calypso_dsp_shunt_active() || trx_rxw)) {
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;
         uint16_t *wp = page ?
             &s->dsp_ram[DSP_API_W_PAGE1/2] : &s->dsp_ram[DSP_API_W_PAGE0/2];
@@ -815,6 +822,13 @@ static void calypso_dsp_done(void *opaque) {
             s->dsp->data[0x0586 + i] = wp[i];
         if (s->dsp->api_ram)
             s->dsp->api_ram[0x08D4 - C54X_API_BASE] = s->dsp_ram[0x01A8/2];
+        /* WIRE d[0x3f92] (RANK2, CALYPSO_TPU_RX_WIRE) : quand l'ARM commande la
+         * tâche FB (task_md=5), poser le bit tâche FB dans le task-word du
+         * scheduler DSP d[0x3f92]|=0x0800. Le setter natif (ORM 0xa539) est skippé
+         * car d[5a00]==0x88 -> sans ça d[3f92] reste 0 à vie. Fires à chaque DMA
+         * de commande FB (task_md=5), indépendant de BDLENA. */
+        if (trx_rxw && task_md == 5)
+            s->dsp->data[0x3f92] |= 0x0800;
         qemu_mutex_unlock(&calypso_pcb_api_ram_lock);
         calypso_pcb_daram_lock_release();
     }
