@@ -342,43 +342,52 @@ void shunt_dispatch_allc(uint8_t page_idx)
      * chan_nr=0x20 -> lapdm_dcch -> UA/AUTH -> L3. Gate sur shunt_l1s_fn() (FN L1
      * firmware), PAS calypso_trx_get_fn(), comme l'AGCH. Tunables :
      * CALYPSO_SHUNT_SDCCH(=1 def), _SDCCH_OFS (offset FN), _SDCCH_TTL (def 100). */
-    static int sdcch_on = -1, sdcch_ofs = 0, sdcch_ttl = 100;
+    static int sdcch_on = -1, sdcch_ofs = 0, sdcch_ttl = 4000;
     if (sdcch_on < 0) {
         const char *e = getenv("CALYPSO_SHUNT_SDCCH");     sdcch_on  = (!e || *e != '0') ? 1 : 0;
         const char *o = getenv("CALYPSO_SHUNT_SDCCH_OFS"); sdcch_ofs = o ? atoi(o) : 0;
         const char *t = getenv("CALYPSO_SHUNT_SDCCH_TTL"); if (t && *t) sdcch_ttl = atoi(t);
     }
-    if (sdcch_on && g_shunt.sdcch_valid) {
+    static int sdcch_ring_on = -1;
+    if (sdcch_ring_on < 0) { const char *e = getenv("CALYPSO_SHUNT_SDCCH_RING"); sdcch_ring_on = (!e || *e != '0') ? 1 : 0; }
+    if (sdcch_on && sdcch_ring_on) {
+        while (g_shunt.sdcch_ring_tail != g_shunt.sdcch_ring_head) {
+            uint32_t hidx = g_shunt.sdcch_ring_head % SDCCH_RING_N;
+            if ((uint32_t)(g_shunt.tick_cnt - g_shunt.sdcch_ring[hidx].tick) > (uint32_t)sdcch_ttl) {
+                g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++; continue;
+            }
+            int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
+            if (!(tc >= 22 && tc <= 28)) break;
+            uint32_t aa = BASE_API_NDB + NDB_A_CD;
+            shunt_write_w(aa + 0, 0x0000); shunt_write_w(aa + 2, 0x0000); shunt_write_w(aa + 4, 0x0000);
+            const uint8_t *m = g_shunt.sdcch_ring[hidx].l2;
+            for (int i = 0; i < 23; i += 2) { uint8_t lo = m[i], hi = (i + 1 < 23) ? m[i + 1] : 0x2B; shunt_write_w(aa + 6 + i, lo | (hi << 8)); }
+            uint32_t rpA = rp_base(page_idx);
+            shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
+            shunt_write_w(rpA + RP_D_BURST_D, shunt_burst_echo());
+            shunt_write_w(rpA + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
+            shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
+            shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
+            shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
+            static unsigned n_sdcch = 0;
+            if (n_sdcch++ < 60 || (n_sdcch % 50) == 0)
+                SHUNT_LOG("DISPATCH SDCCH[ring] #%u fn=%u c=0x%02x burst_d=%u tc=%d depth=%u\n",
+                        n_sdcch, g_shunt.sdcch_ring[hidx].fn, m[1], g_shunt.d_burst_d, tc, g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
+            if (g_shunt.d_burst_d >= 3) { g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++; }
+            if (g_shunt.sdcch_ring_tail == g_shunt.sdcch_ring_head) g_shunt.sdcch_valid = false;
+            return;
+        }
+        if (g_shunt.sdcch_ring_tail == g_shunt.sdcch_ring_head) g_shunt.sdcch_valid = false;
+    } else if (sdcch_on && g_shunt.sdcch_valid) {
         if ((uint32_t)(g_shunt.tick_cnt - g_shunt.sdcch_tick) > (uint32_t)sdcch_ttl) {
-            g_shunt.sdcch_valid = false;                  /* perime -> rendre la main aux SI */
+            g_shunt.sdcch_valid = false;
         } else {
             int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
-            /* BURST-COVERAGE FIX (#2) : le firmware (prim_rx_nb.c l1s_nb_resp) ne
-             * copie a_cd[3..14] dans L1CTL_DATA_IND qu'au 4eme burst du bloc
-             * (d_burst_d==3) et tague alors chan_nr=0x20. Le bloc SDCCH/4 SS0 dure
-             * 4 bursts (FN consecutifs) : ses bursts s'etalent sur fn%51 {25,26,27,28}
-             * pour l'alignement 5216, donc l'ancien gate {22-25} ne matchait QUE le
-             * burst_d=0 et le consume-once tc>=24 liberait le buffer AVANT le
-             * burst_d==3 -> le SI3 ecrasait a_cd au moment ou le firmware lit. On
-             * gate donc sur g_shunt.d_burst_d (le compteur de burst du firmware,
-             * deja echo dans RP_D_BURST_D) : on presente le UA sur burst_d 0..3 du
-             * bloc SDCCH/4 SS0 (un seul bloc), puis on libere APRES burst_d==3.
-             * Ainsi a_cd tient le UA quand le firmware le copie au burst_d==3, et la
-             * trame est presentee EXACTEMENT une fois (1 DATA_IND/bloc) -> pas de
-             * re-presentation sur la multitrame suivante -> pas de UNSOL_UA. tc reste
-             * une garde large {22-28} (les 4 bursts) en plus du burst_d pour ne pas
-             * empieter sur les autres blocs. */
-            int is_sdcch4_ss0 = (tc >= 22 && tc <= 28);
-            if (is_sdcch4_ss0) {
+            if (tc >= 22 && tc <= 28) {
                 uint32_t aa = BASE_API_NDB + NDB_A_CD;
-                shunt_write_w(aa + 0, 0x0000);            /* a_cd[0] FIRE = CRC pass */
-                shunt_write_w(aa + 2, 0x0000);
-                shunt_write_w(aa + 4, 0x0000);
+                shunt_write_w(aa + 0, 0x0000); shunt_write_w(aa + 2, 0x0000); shunt_write_w(aa + 4, 0x0000);
                 const uint8_t *m = g_shunt.sdcch_buf;
-                for (int i = 0; i < 23; i += 2) {
-                    uint8_t lo = m[i], hi = (i + 1 < 23) ? m[i + 1] : 0x2B;
-                    shunt_write_w(aa + 6 + i, lo | (hi << 8));
-                }
+                for (int i = 0; i < 23; i += 2) { uint8_t lo = m[i], hi = (i + 1 < 23) ? m[i + 1] : 0x2B; shunt_write_w(aa + 6 + i, lo | (hi << 8)); }
                 uint32_t rpA = rp_base(page_idx);
                 shunt_write_w(rpA + RP_D_TASK_D,  ALLC_DSP_TASK);
                 shunt_write_w(rpA + RP_D_BURST_D, shunt_burst_echo());
@@ -386,24 +395,8 @@ void shunt_dispatch_allc(uint8_t page_idx)
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM) ? SHUNT_CANNED_PM : g_shunt.last_pm);
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_ANGLE * 2, 0);
                 shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
-                static unsigned n_sdcch = 0;
-                if (n_sdcch++ < 40 || (n_sdcch % 50) == 0)
-                    SHUNT_LOG("DISPATCH SDCCH/4 SS0 #%u burst_d=%u "
-                            "tc=%d -> a_cd (chan_nr=0x20 attendu)\n",
-                            n_sdcch, g_shunt.d_burst_d, tc);
-                /* CONSUME-ONCE (corrige) : presenter le UA sur TOUS les bursts du
-                 * bloc (burst_d 0,1,2,3) pour qu'il soit TOUJOURS dans a_cd[3..14]
-                 * quand le firmware le copie au burst_d==3 (prim_rx_nb.c), PUIS
-                 * liberer APRES ce burst_d==3. Le firmware n'emet qu'UN
-                 * L1CTL_DATA_IND par bloc (au burst_d==3), donc -> 1 seul UA cote
-                 * LAPDm, et le buffer n'est PAS re-presente sur le bloc SS0 de la
-                 * multitrame suivante -> pas de UNSOL_UA. (L'ancien code liberait au
-                 * tc>=24, AVANT le burst_d==3 : le SI3 ecrasait alors a_cd.) Si le
-                 * bloc est rate, la retransmission T200 de la BTS re-alimente
-                 * feed_sdcch (et si_bridge re-forwarde le UA re-emis, FN distinct). */
-                if (g_shunt.d_burst_d >= 3)
-                    g_shunt.sdcch_valid = false;
-                return;                                   /* ce dispatch = le bloc SDCCH DL */
+                if (g_shunt.d_burst_d >= 3) g_shunt.sdcch_valid = false;
+                return;
             }
         }
     }
@@ -419,7 +412,26 @@ void shunt_dispatch_allc(uint8_t page_idx)
             long fn = shunt_l1s_fn();
             int tc    = (int)(((fn % 51) + 51) % 51);
             int mf102 = (int)(((fn / 51) % 2 + 2) % 2);
-            if (tc >= 42 && tc <= 46 && mf102 == 0) {
+            /* [2026-07-26] FIX RLF-SACCH : le gate parite dur mf102==0 est
+             * FN-phase-fragile. l1s_fn se recale a l'execution (recale -556/-552),
+             * ce qui INVERSE la parite -> la SACCH dediee SS0 n'est plus presentee
+             * pendant des secondes (prouve : gap dispatch 723.28->732.18 avec
+             * sacch_have=true + 11 feed_sacch dans le trou) -> le mobile mesure
+             * rxlev=-110 sur ~50%% des blocs SACCH -> compteur radio-link epuise ->
+             * 'Radio link is released' (RLF) = mort dominante des LU. On rend la
+             * parite REGLABLE : CALYPSO_SHUNT_SACCH_PAR = 0(pair, legacy) / 1(impair)
+             * / 2(les deux, def) ; le firmware ne consomme que sur SON vrai bloc
+             * SACCH read, donc presenter sur les deux parites ne fait que garantir
+             * la presence quelle que soit la phase FN. CALYPSO_SHUNT_SACCH_OFS decale
+             * la fenetre tc si besoin. PAR=0 restaure le comportement d'origine. */
+            static int sac_par = -1, sac_ofs = 0;
+            if (sac_par < 0) {
+                const char *e = getenv("CALYPSO_SHUNT_SACCH_PAR"); sac_par = e ? atoi(e) : 2;
+                const char *o = getenv("CALYPSO_SHUNT_SACCH_OFS"); sac_ofs = o ? atoi(o) : 0;
+            }
+            int tco = (int)((((long)fn + sac_ofs) % 51 + 51) % 51);
+            int par_ok = (sac_par == 2) || (mf102 == sac_par);
+            if (tco >= 42 && tco <= 46 && par_ok) {
                 uint32_t aa = BASE_API_NDB + NDB_A_CD;
                 shunt_write_w(aa + 0, 0x0000);
                 shunt_write_w(aa + 2, 0x0000);
@@ -443,6 +455,14 @@ void shunt_dispatch_allc(uint8_t page_idx)
             }
         }
     }
+
+    /* [FIX #3 corrige] Bloque le SI du camp UNIQUEMENT quand un SDCCH DEDIE est en
+     * attente (ring non-vide). PAS agch_valid : le PAGING (feed_agch) est continu
+     * pendant le camp et sa branche AGCH presente sur des blocs CCCH (!= blocs BCCH
+     * du SI) -> le bloquer tuait le SI -> camp casse. Le SDCCH n'est actif qu'en
+     * mode dedie (post-IMM-ASSIGN) -> sdcch_valid faux pendant le camp -> SI passe. */
+    if (g_shunt.sdcch_valid)
+        return;
 
     /* (A) ROTATION par bloc : au début du bloc (burst 0) on avance au prochain
      * type SI disponible et on le copie dans si_buf (STABLE pour les 4 bursts).

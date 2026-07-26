@@ -216,3 +216,9 @@ partout).
   Doublon, corrige : redirect silicon NEUTRALISE par defaut, bypass_bdlena inerte.
 - [archive/tic54x_hi8_map.from-src-doc.md](archive/tic54x_hi8_map.from-src-doc.md) -
   Table hi8->mnemonic. Doublon divergent.
+
+## Cartes d'adresses (2026-07-26)
+
+- [DSP_ADDRESS_MAP.md](DSP_ADDRESS_MAP.md) - carte des adresses DSP (cellules data[]/API-RAM + ROM : correlateur 0x8d00, kernel MAC 0xa076/0xa0a0, dispatcher CC @0x873a-0x8753, VERROU kernel data[0x3fad] bit15, flags handshake 0x3faa/0x3fab/0x3fae, go-live 0xa4c7(ORM IMR)/0xa4d0(RSBX INTM), wait-loop 0xa4d4 + d[0x3f70] bit1, seed mem[0x5ac8], task_md 0x0804/0x0818, DARAM IQ 0x2a00).
+- [DSP_ARM_LINKAGE.md](DSP_ARM_LINKAGE.md) - liaison adresses DSP<->ARM (deduite du mode shunt_legit : ARM byte depuis 0xFFD00000 <-> DSP word = off/2+0x0800 <-> api_ram idx = off/2 ; l'ARM lit s->data[] PAS api_ram ; mappings a_cd (0x1FC->data[0x9D2]), a_pm read-pages, a_serv_demod, FB-result api_ram[0xF8..0xFD], d_rach, a_cu, read-intercepts 0x01F0-0x01FA).
+

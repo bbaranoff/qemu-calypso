@@ -38,6 +38,8 @@
 #include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 #include "calypso_dsp_shunt.h"
 
+int calypso_rxfb_fired = 0;   /* [probe golive] 1 des que RX-FBFLAGS pose 3fad bit15 */
+
 /* calypso_trx_get_fn now provided by calypso_trx.h (included above). */
 
 /* Forward decls for env-gated helpers used in calypso_bsp_init pre-warm. */
@@ -1084,6 +1086,47 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
       if (_db && _fbsb && bsp.dsp && bsp.dsp->running && !(bsp.dsp->ifr & (1 << 5))) {
         c54x_interrupt_ex(bsp.dsp, 21, 5);
         if (bsp.dsp->idle) bsp.dsp->idle = false;
+      } }
+
+    /* [2026-07-26 WF golive-handshake] RX-FBFLAGS sur le chemin VIVANT (rx_burst /
+     * DIRECT_FEED). Modelise l'ISR BRINT0 0xf310 (jamais prise, INTM=1) qui OR les
+     * bits de handshake FB-det que le handler-dispatcher 0x8d00 poll. Le handler
+     * 0x8d00->0xa076 est POLLING PUR (BITF/BC sur RAM) : pas besoin d'IT/INTM.
+     * MASTER = data[0x3fad] bit15 : gate CC 0xa0a0 @0x8754 -> kernel 0xa076
+     * (le bloc homonyme de deliver_buffered est MORT sous shunt ET omet 3fad bit15
+     *  -> ne peut pas deboucher le noyau). Gate CALYPSO_RX_FBFLAGS, mission FB/SB. */
+    { static int _fbf = -1; if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
+      uint16_t _mdf = calypso_dsp_shunt_get_task_md();
+      int _fbsbf = (_mdf == 5 || _mdf == 6 || _mdf == 8 || _mdf == 9);
+      if (_fbf && _fbsbf && bsp.dsp) {
+          bsp.dsp->data[0x3fad] |= 0x8000;   /* MASTER kernel gate  @0x8754 */
+          calypso_rxfb_fired = 1;   /* [probe] arme la sonde 0x8753 cote c54x */
+          bsp.dsp->data[0x3faa] |= 0x0104;   /* bit2+bit8           @0x886b/85/98 */
+          bsp.dsp->data[0x3fab] |= 0x0100;   /* bit8 (FBEN)         @0x888d */
+          bsp.dsp->data[0x3fae] |= 0x0100;   /* bit8                @0x90c8/ed/28 */
+          /* [2026-07-26 POKE TACHE DSP] le CALA entre le correlateur avec
+           * task_md(0x0804/0x0818)=0 = AUCUNE mission -> il spinne sur du vide.
+           * On pose le descripteur de tache (la mission FB/SB) dans les 2 pages
+           * API-RAM que le dispatcher DSP lit. d_dsp_page(0x08e2) a deja bit1
+           * (task-ready) set -> seul task_md manquait. */
+          { static int _pt = -1; if (_pt < 0) { const char *_pe = getenv("CALYPSO_POKE_TASK_MD"); _pt = _pe ? (atoi(_pe) > 0) : 1; }  /* defaut ON, =0 pour desactiver */
+            if (_pt) { bsp.dsp->data[0x0804] = _mdf;   /* task_md page0 = mission (5=FB 6=SB) */
+                       bsp.dsp->data[0x0818] = _mdf; } /* task_md page1 */ }
+          /* [2026-07-26 POKE DISPATCH osmocom] replique dsp_end_scenario (dsp.c:480):
+           * d_task_md sur la WRITE-page courante + d_dsp_page = B_GSM_TASK(0x0002)|w_page
+           * qui ALTERNE 2<->3 (le natif fige a 2 = w_page jamais flippe). Gate. */
+          { static int _pd = -1; static uint16_t _wp = 0;
+            if (_pd < 0) { const char *_de = getenv("CALYPSO_POKE_DISPATCH"); _pd = _de ? (atoi(_de) > 0) : 0; }
+            if (_pd) {
+                bsp.dsp->data[_wp ? 0x0818 : 0x0804] = _mdf;      /* d_task_md sur write-page */
+                bsp.dsp->data[0x08e2] = (uint16_t)(0x0002 | _wp); /* d_dsp_page = B_GSM_TASK|w_page */
+                _wp ^= 1;                                         /* flip w_page (2<->3) */
+            } }
+          static unsigned _fbfn = 0;
+          if (_fbfn++ < 8)
+              fprintf(stderr, "[c54x] RX-FBFLAGS(live): 3fad|=0x8000 3faa|=0x104 "
+                      "3fab|=0x100 3fae|=0x100 (task_md=%u fn=%u)\n",
+                      _mdf, (unsigned)fn);
       } }
 
     /* [2026-07-25] TEST RANK3 (WF1 boot->correlator) : le handler FB-det 0x8d00

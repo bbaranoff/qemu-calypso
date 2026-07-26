@@ -229,3 +229,47 @@ Fichiers de reference (absolus, conteneur `osmo-operator-1`) :
 - `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/include/calypso/dsp_api.h`
 - `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/include/calypso/l1_environment.h`
 - `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/layer1/prim_fbsb.c`, `prim_pm.c`, `prim_rx_nb.c`
+---
+
+## 9. Chaine UPLINK / Location Update (2026-07-26)
+
+Le mobile s'ENREGISTRE (LU ACCEPT + TMSI + normal service) via SHUNT_LEGIT. Cellules
+et chemins de la chaine uplink + reponses dediees downlink.
+
+### Cellules UL
+
+| Champ | DSP word | ARM byte | Struct | Role | Ecrit/lu |
+|---|---|---|---|---|---|
+| **d_rach** | 0x0A3A | 0x0474 | NDB word 0x023A | RACH UL : `(ra<<8)|(bsic<<2)` | firmware ecrit -> hook trx.c |
+| **d_task_u** | write page word 2 | WP+0x04 | db_w | commande NB UL (SDCCH/SACCH UL) | firmware |
+| **d_task_ra** | write page word 7 | WP+0x0E | db_w | commande RACH (AVALEE par shunt) | firmware (inutilisee cote shunt) |
+| **a_cu** (SDCCH UL L2) | ~0x0A09 | BASE_API_NDB+0x264+ofs | NDB | 23o LAPDm UL (SABM/I-frames) | firmware ecrit -> shunt lit |
+
+- `d_rach` : hook write dans `calypso_dsp_write` (trx.c, offset 0x0474, env `CALYPSO_NDB_D_RACH_OFFSET` def 0x023A). Signal FIABLE (1 write = 1 RACH), remplace la voie `d_task_ra` avalee par le shunt.
+- `a_cu` : fenetre lue par `shunt_latch_task` (scan debut de trame LAPDm, `CALYPSO_UL_ACU_OFS` def 6) -> `calypso_sdcch_ul_publish` -> sideband `/dev/shm/calypso_sdcch_ul` -> qemu_wrap encode NB + inject osmo-bts.
+
+### Reutilisation a_cd pour le DL dedie
+
+Le meme `a_cd` (NDB_A_CD=0x1FC -> **data[0x9D2..0x9E0]**) porte, selon le bloc :
+- **BCCH** : SI1-4 (camp) — fn%51 {2-5}.
+- **AGCH/PCH** : IMM ASSIGN / PAGING — CCCH fn%51 {6-9,12-19} (`dispatch_allc` branche AGCH).
+- **SDCCH/4 SS0 DL** : UA / AUTH REQ / IDENTITY REQ / LU ACCEPT — fn%51 {22-28} sur burst_d 0..3 (`dispatch_allc` branche SDCCH).
+
+⚠️ **Garde clobber** : le bloc camp (on_frame_tick, dsp_shunt.c:577) ne reecrit PAS le SI dans data[0x9D2] quand `sdcch_valid || agch_valid` -> sinon le UA/IMM-ASSIGN est ecrase avant lecture firmware -> SABM jamais confirme.
+
+### Chemins host-side
+
+| Sens | Chemin |
+|---|---|
+| RACH/SDCCH UL | firmware -> d_rach/a_cu -> `calypso_bsp_send_ul` -> UDP 127.0.0.1:**5702** -> `qemu_wrap.c` (g_bsp_fd) -> encode Laurent/GMSK + inject g_rach_iq/g_ul -> osmo-trx-ipc -> osmo-bts |
+| AGCH/SDCCH/SACCH DL | osmo-bts -> gr-gsm `grgsm_decode -m BCCH_SDCCH4` -> si_bridge.py (GSMTAP 0x07 SDCCH4 / AGCH) -> UDP **4730** -> QEMU `feed_agch`/`feed_sdcch`/`feed_sacch` -> a_cd |
+
+Gates (fallback SHUNT_LEGIT) : `CALYPSO_INJECT_AGCH/SDCCH/SACCH`, `CALYPSO_UL_RACH_FROM_DRACH` (def=SHUNT_LEGIT), `CALYPSO_SHUNT_SDCCH_OFS` (timing bloc SDCCH DL).
+
+### Chiffrement A5/1 (piege)
+
+`/dev/shm/calypso_kc` (Kc + algo). `qemu_wrap.c` XORe les bits data UL (3-59/88-144, midamble TSC intact) si `n_a5>0`. Une LU FRAICHE (pre-auth) doit etre EN CLAIR -> **purger le Kc au demarrage** (`rm -f /dev/shm/calypso_kc` dans run.sh/run-all.sh) ; un vrai CIPHER MODE COMMAND reecrira un Kc frais legitime. `calypso_kc_read` ne testait que seq==0 -> ressortait un Kc perime -> SABM chiffre illisible -> pas de UA. Env test : `CALYPSO_CIPH_A5=0` (ne PAS laisser permanent).
+
+### Statut
+
+LU ACCEPT + registered OK, mais **INTERMITTENT** (~1 succes / 19 retries T3211). Robustesse a ameliorer : alignement bloc SDCCH DL, timing a_cu UL, fenetre de presentation.

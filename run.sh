@@ -1,4 +1,5 @@
 #!/bin/bash
+rm -f /dev/shm/calypso_kc 2>/dev/null || true  # [LU] purge Kc A5/1 perime (SABM UL en clair pour LU fraiche)
 # run.sh -- Calypso QEMU pipeline.
 #
 # Data path : osmo-bts-trx : osmo-trx-ipc : calypso-ipc-device : QEMU BSP
@@ -1143,13 +1144,11 @@ case "$CALYPSO_MODE" in
         : "${CALYPSO_IPC_RELAY:=1}"            # 1 = device RELAIE le chunk CONTINU (625 samples, guard inclus) -> 5810 -> gr-gsm gsm.receiver (pas de troncature 148)
         : "${CALYPSO_BSP_IQ_PASSTHROUGH:=1}"   # BSP interprete le payload comme I/Q cs16 (requis par feed_iq)
         : "${CALYPSO_RELAY_ALSO_BSP:=1}"       # 1 = device relaie 5810 ET nourrit le BSP (feed_iq -> cfile) -> FFT live par defaut
-        : "${CALYPSO_TWL3025_AFC_HZ:=16000}"   # force AFC FIXE 16kHz : stoppe la chasse AFC -> carrier stable (le drift que le demod constant ne peut pas suivre) -> demod
-        export CALYPSO_TWL3025_AFC_HZ
         : "${CALYPSO_SHUNT_NO_CANNED:=1}"  # PAS de SI3 canned (l'ancien bypass DSP)
         # Non-truqué : aucune injection SI legacy ne doit concurrencer le feed_si
         # gr-gsm (a_cd). Override (=) et pas default (:=) → même un env exporté
         # périmé ne peut pas les rallumer.
-        : "${CALYPSO_SHUNT_NO_CANNED:=1}"  # [2026-07-25] dé-verrouillé (:=) pour permettre camp cannÃ©+DSP via wire.env
+        CALYPSO_SHUNT_NO_CANNED=1     # canned shunt OFF (verrouillé)
         CALYPSO_DSP_L1STUB=0          # pas de PROM0 publisher SI3 baked
         CALYPSO_DSP_L1_STUB=0
         CALYPSO_FORCE_FBSB=0          # pas d'oracle FBSB_CONF
@@ -2414,9 +2413,6 @@ echo "Manual warm-start (debug, if BSC unavailable) :"
 echo "  /opt/GSM/qemu-src/scripts/populate-si.sh"
 echo
 
-# ---- Fenetre pytest : DEPLACEE vers le launcher hybrid (osmo_egprs/start-direct.sh
-# build_hybrid_tmux), pour qu'elle vive dans la session 'hybrid' du run faketrx-qemu
-# et non dans 'calypso'. Voir run_tests.sh loop. ----
 tmux select-window -t "$SESSION:all" 2>/dev/null || tmux select-window -t "$SESSION:qemu"
 
 # CALYPSO_NO_ATTACH=1 : ne pas attacher tmux (mode non-interactif, utile

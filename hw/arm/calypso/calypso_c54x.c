@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern int calypso_rxfb_fired;   /* [probe golive] defini dans calypso_bsp.c */
+
 static int g_boot_trace = 0;
 /* VEC28-STACK-TRACE (2026-07-03, gated CALYPSO_TRACE_VEC28_STACK, READ-ONLY diagnostic,
  * addendum 23). Traces the software stack from vec28 interrupt entry (2-word PC+XPC push
@@ -2292,6 +2294,33 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
             C54_LOG("H_RD [0x%04x]=0x%04x PC=0x%04x", addr, s->data[addr], s->pc);
             handler_rd_log++;
         }
+    }
+
+    /* [2026-07-26 WF golive-handshake] PROBE-3FAD-GATE : capture EXACTE de la
+     * valeur lue par le BITF *(0x3fad),#0x8000 @0x8753 (le SEUL verrou du
+     * dispatcher FB : CC 0xa0a0 -> kernel 0xa076). f930=CC (call cond, TC=1),
+     * donc les CALL 0x90b0/b8/c8/ed/914d reviennent : rien ne bloque le sweep,
+     * seul bit15 de 0x3fad decide. Si val&0x8000 ici => TC=1 => kernel PRIS.
+     * Si val&0x8000==0 alors qu'RX-FBFLAGS l'a pose => un clearer per-frame
+     * (XPC=0 0xace8/0xad04/0xad24 ou overlay XPC=2 0x28040/0x282d0 : 76f8 3fad
+     * 0000) l'a efface entre l'ecriture BSP et le sweep DSP. Cap 200, gate
+     * CALYPSO_PROBE_3FAD_GATE. Zero cout/effet quand OFF. */
+    if (addr == 0x3fad && s->pc == 0x8753 && calypso_rxfb_fired) {  /* [fix v3] gate = RX-FBFLAGS a REELLEMENT pose 3fad bit15 (definitif) */
+        static int p3_en = -1; static unsigned p3_n = 0;
+        if (p3_en < 0) p3_en = getenv("CALYPSO_PROBE_3FAD_GATE") ? 1 : 0;
+        if (p3_en && p3_n < 200) {
+            p3_n++;
+            fprintf(stderr, "[c54x] PROBE-3FAD-GATE @0x8753 val=0x%04x bit15=%d "
+                    "(=>TC/kernel) task_md0=0x%04x xpc=%d insn=%u\n",
+                    s->data[0x3fad], !!(s->data[0x3fad] & 0x8000),
+                    s->data[0x0804], s->xpc, s->insn_count);
+        }
+        /* [2026-07-26 FIX v3] le clearer per-frame (76f8 3fad 0000) efface bit15
+         * entre l ecriture BSP et ce sweep -> on le RE-POSE ici, sur le chemin de
+         * LECTURE DSP, quand RX-FBFLAGS l a arme -> le BITF @0x8753 voit TC=1 ->
+         * CC 0xa0a0 -> kernel 0xa076. Gate CALYPSO_FORCE_3FAD_KERNEL. */
+        { static int _fk = -1; if (_fk < 0) _fk = getenv("CALYPSO_FORCE_3FAD_KERNEL") ? 1 : 0;
+          if (_fk && calypso_rxfb_fired) s->data[0x3fad] |= 0x8000; }
     }
 
     return s->data[addr];
@@ -4572,6 +4601,12 @@ static int c54x_exec_one(C54xState *s)
          * progression vers 0x93a5). Dedup aussi les PC repetes consecutifs. */
         static uint16_t cf_lastpc = 0;
         if (cf && s->xpc == 0 && s->pc >= 0x8600 && s->pc <= 0xa200 && cfn < 20000
+            /* [2026-07-26 WF] ne tracer QUE quand une vraie tache FB/SB est active
+             * (task_md=5/6) -> capture la fenetre POST-fix (fn>=6866) au lieu de
+             * s epuiser sur le spinning idle pre-fix (+0.8s). */
+            && (s->data[0x0804] == 5 || s->data[0x0804] == 6
+                || s->data[0x0818] == 5 || s->data[0x0818] == 6
+                || s->pc >= 0xa000)   /* [fix] trace AUSSI le flux post-gate 0xa0xx (task_md=0) */
             && !(s->pc >= 0x8866 && s->pc <= 0x886c)
             && s->pc != cf_lastpc) {
             cf_lastpc = s->pc;

@@ -58,7 +58,7 @@
  * oscille (-700↔-162) → rotation FCCH énorme (±150 kHz) hors capture DSP
  * (±20 kHz) → FB jamais détecté/accepté → mur FBSB. */
 #define TWL3025_AFC_NORM_FACTOR_GSM     (32768.0 / 947.0)
-#define TWL3025_AFC_SLOPE               454.0
+#define TWL3025_AFC_SLOPE               287.0  /* [fix] compal_e88 = 287, PAS 454 (gta0x) -> gain boucle ~1 */
 #define TWL3025_AFC_SLOPE_HZ_PER_LSB    (TWL3025_AFC_SLOPE / TWL3025_AFC_NORM_FACTOR_GSM)
 /* ⚠️ TESTING 2026-05-29 v2 : baseline -700 + init dac=-700 (cal Compal/Pirelli).
  * osmocom : afc_reset() -> dac=afc_initial_dac_value(-700) PUIS afc_correct
