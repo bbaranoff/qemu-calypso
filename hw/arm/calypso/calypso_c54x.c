@@ -5542,6 +5542,28 @@ static int c54x_exec_one(C54xState *s)
             int is_call = (op & 1) != 0;
             uint16_t tgt = (uint16_t)((is_b ? s->b : s->a) & 0xFFFF);
             uint16_t src_pc = s->pc;
+            /* [2026-07-26 WF golive-mac] FB-ENERGY REROUTE : le dispatch FB actif
+             * (CALA @0xb01e) resout vers le correlateur SYMBOLE 0x8d00 / stub 0xab38,
+             * qui ne touche jamais le buffer IQ 0x2a00 ni le kernel 0xa076. On
+             * redirige la CALA vers l entree du correlateur ENERGIE FB : 0x94f5
+             * (0x9500 pose AR4=0x2a00 -> f274 a033 -> a040 -> f273 a076). NB : sur ce
+             * chemin AR5=0x2c00 (reference), l IQ 0x2a00 est en AR4/AR1 (PAS AR5).
+             * Gate CALYPSO_FB_ENERGY ; entree override CALYPSO_FB_CORR_ENTRY. */
+            if (is_call && src_pc == 0xb01e) {
+                static int _fbe = -1; static uint16_t _fbentry = 0x94f5;
+                if (_fbe < 0) {
+                    const char *_e = getenv("CALYPSO_FB_ENERGY"); _fbe = (_e && atoi(_e) > 0) ? 1 : 0;
+                    const char *_p = getenv("CALYPSO_FB_CORR_ENTRY");
+                    if (_p && *_p) _fbentry = (uint16_t)strtol(_p, NULL, 0);
+                }
+                if (_fbe && s->data[0x058a] == 5) {   /* d_task_md == 5 (commande FB) */
+                    static unsigned _fbn = 0;
+                    if (_fbn++ < 32)
+                        fprintf(stderr, "[c54x] FB-ENERGY-REROUTE CALA@0xb01e tgt 0x%04x -> 0x%04x insn=%u\n",
+                                tgt, _fbentry, s->insn_count);
+                    tgt = _fbentry;
+                }
+            }
             /* SURGICAL 2026-05-30 : self-CALA black-hole capture. Fire UNE
              * fois quand un CALA cible lui-même dans la zone 0x7000-0x70FF
              * (= le trou noir 0x70c3). Donne le DP hérité + le slot LUT lu

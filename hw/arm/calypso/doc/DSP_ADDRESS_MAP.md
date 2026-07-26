@@ -182,3 +182,45 @@ Or **l'émulateur définit `NDB_D_DSP_PAGE = 0x08E2`** (`calypso_fbsb.h:51`) et 
 ---
 
 > **Voir aussi** : [`DSP_ARM_LINKAGE.md`](DSP_ARM_LINKAGE.md) — correspondance ARM↔DSP↔api_ram et chemins d'écriture du shunt (mode SHUNT_LEGIT). Verrou go-live final = `data[0x3fad] bit15` (0x8000), seul CC qui ouvre l'entrée kernel MAC 0xa0a0 depuis le sweep 0x8753 (§4.1).
+
+---
+
+## Corrélateur FB & kernel MAC — carte DÉFINITIVE (workflows 2026-07-26)
+
+Reverse-engineering du ROM (`calypso_dsp.txt`, image code 2e passe) + traçage run natif.
+
+### Deux corrélateurs distincts
+| entrée | rôle | atteint le kernel FB ? |
+|---|---|---|
+| **0x8d00** | corrélateur SYMBOLE (FCCH/SCH) : BITF 3fab bit8 → réfs 0x0a27/0x3d97, worker 0x8e81 (`7660 db7b` → AR5=0xdb7b immédiat), corréle réfs 0x3d9x | **NON** — jamais 0x2a00 ni 0xa076 |
+| **0x94f5 / 0x9500** | corrélateur **ÉNERGIE FB** : `7714 2a00` (AR4=IQ) → `f274 a033` → a040 → `f273 a076` | **OUI** (le vrai) |
+
+### Le vrai kernel 0xa076
+- **Unique référence dans tout le ROM** : `f273 a076` @**0xa054** (gate conditionnel, RPTB, dans le corps corrélateur 0xa040-0xa09f ; noyau butterfly/DFT 0xa070-0xa09f, motif `3060 5a85 5f95 8e94 8f93`).
+- Setup @**0xa033** : `7719 0020` (BK=0x20 circulaire) · **`7715 2c00` → AR5 = 0x2c00 = forme d'onde de RÉFÉRENCE** · `7714 2c10` AR4 · `7713 2c18` AR3.
+- ⚠️ **CORRECTION load-bearing** : sur le vrai chemin **AR5 = 0x2c00 (référence), PAS l'IQ**. Le **buffer IQ 0x2a00 est en AR4/AR1** (posé @0x9500/0x9590/0x95f0/0x9610 : `7714/7711 2a00`). Le critère « AR5=0x2a00 » (ancienne carte) est FAUX et ne sera jamais vrai.
+
+### 0xa0a0 = FAUSSE PISTE (cul-de-sac)
+`0xa0a0-0xa0c8` = accumulateur MAC sur page **métriques 0x43xx** (AR3←0x437f) + table coeff 0x0cxx (AR2←0x0ccf), AR5 hérité 0x3fc8, RET (`fc00`) @0xa0c8. **Aucun 0x2a00, ne mène JAMAIS à 0xa076.** Le forcer via `3fad bit15` (CC 0xa0a0 @0x8753) route dans ce MAC-métriques → **ne produit jamais d_fb_det**. `CALYPSO_FORCE_3FAD_KERNEL` = abandonné pour la FB.
+
+### LE VRAI VERROU = le DISPATCH (RANK3), pas un flag
+Le handler FB actif (`data[0x43d8]`, CALA @0xb01e) résout vers le corrélateur SYMBOLE / **stub 0xab38** (observé constant), PAS le corrélateur ÉNERGIE. L'énergie n'est appelé que par un orchestrateur (site `f074 9531` : zéro 43e7-43ee, CALA `data[0x4437]`, 43ef=1) que le dispatch **ne sélectionne jamais**. = **RANK3** : le slot 0x4387/0x43c0 tient `0xf074` (base LUT → déraille) au lieu du pointeur handler FB énergie. **Le mur est un gap de WIRING de dispatch, pas un flag DSP interne.** INTM/storm/3fad bit15 = tous des red herrings.
+
+### Fix probe (reachability)
+`CALYPSO_FB_ENERGY=1` (c54x.c handler CALA ~L5545) : reroute la CALA @0xb01e → 0x94f5 (entrée énergie) quand `d_task_md(0x058a)==5`. Override entrée : `CALYPSO_FB_CORR_ENTRY=0x9500`. Prérequis : buffer 0x2a00 rempli FN-aligné (`BSP_DIRECT_FEED=1`) + table réf 0x2c00 peuplée (boot-copy `76f8 2c00`). Critères succès : `0xa076` hit + IQ en AR4/AR1=0x2a00 + `d_fb_det(0x08F8)!=0`. C'est une PROBE de reachability, PAS un fix de production — le vrai fix = réparer la cellule dispatch (RANK3), RE multi-étapes.
+
+### Cellules clés (récap)
+| addr DSP | rôle |
+|---|---|
+| 0x2a00 | buffer I/Q RX DARAM (AR4/AR1 sur le vrai chemin) |
+| 0x2c00 | forme d'onde de référence FB (AR5 @a033) |
+| 0xa076 / 0xa054 | kernel MAC FB / son gate `f273 a076` |
+| 0x94f5 / 0x9500 | entrée corrélateur énergie FB |
+| 0x8d00 | corrélateur SYMBOLE (fausse cible pour la FB énergie) |
+| 0xa0a0 | MAC-métriques (cul-de-sac) |
+| 0x43d8 / 0x43c0 / 0x4387 | slots dispatch (RANK3 : tiennent stub/0xf074 au lieu du handler FB) |
+| 0x058a | d_task_md (db_w, commande ARM ; 5=FB) |
+| 0x3fad bit15 | verrou dispatcher 0x8753→CC 0xa0a0 (mène au cul-de-sac, PAS au kernel) |
+
+Voir aussi : [DSP_ARM_LINKAGE.md](DSP_ARM_LINKAGE.md) · mémoires golive-3fad-bit15-kernel-gate, correlator-ar5-not-in-buffer-rank3.
+

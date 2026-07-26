@@ -185,3 +185,26 @@ Sources vérifiées : `calypso_c54x.h:21-22,196`, `calypso_dsp_internal.h:21-93`
 ---
 
 > **Voir aussi** : [`DSP_ADDRESS_MAP.md`](DSP_ADDRESS_MAP.md) — carte complète des adresses DSP (API RAM + cellules ROM/handshake go-live). Le verrou go-live final = `data[0x3fad] bit15` (0x8000), seul CC du sweep 0x8753 qui ouvre l'entrée kernel MAC 0xa0a0 ; hors API RAM, c'est une cellule scratch DARAM posée par le fix `RX-FBFLAGS` (`calypso_bsp.c:1100-1103`).
+
+---
+
+## Task-post ARM->DSP + dispatch (run natif 2026-07-26)
+
+L'ARM commande une tâche (`calypso/dsp.c:480`, `prim_fbsb.c:381`) :
+```c
+dsp_api.db_w->d_task_md = FB_DSP_TASK;   // 5 -> data[0x058a] (db_w) ; aussi read-pages data[0x0804]/[0x0818]
+dsp_api.ndb->d_fb_mode  = fb_mode;
+dsp_end_scenario():  dsp_api.ndb->d_dsp_page = B_GSM_TASK(0x0002) | w_page ;  w_page ^= 1;   // data[0x08e2]
+```
+| ARM (dsp_api) | DSP word | note |
+|---|---|---|
+| db_w->d_task_md | data[0x058a] (write) ; read-pages 0x0804/0x0818 | 5=FB 6=SB ; 0 en idle |
+| ndb->d_dsp_page | data[0x08e2] | B_GSM_TASK\|w_page ; fige à 2 en natif (w_page pas flippé) |
+
+### Le mur RANK3 (côté dispatch)
+Le DSP lit le pointeur de handler dans les **slots de dispatch** `data[0x43c0]` (terminal BACC 0xb40f), `data[0x4387]` (idle/CALA 0xb01e), `data[0x43d8]` (reseed). En natif ils résolvent vers le **stub 0xab38** (ou `0xf074`=base LUT → déraille) au lieu du **pointeur handler FB énergie** (0x94f5). C'est pourquoi le corrélateur énergie (→0xa076) n'est jamais exécuté. Le fix natif = l'ARM (ou la LUT 0x8341) doit semer la bonne valeur-pointeur dans ces slots — RE multi-étapes. Probe intermédiaire : `CALYPSO_FB_ENERGY=1` reroute la CALA @0xb01e → 0x94f5 (cf DSP_ADDRESS_MAP).
+
+Rappel : l'ARM lit `s->dsp->data[off/2 + 0x0800]` (calypso_trx.c), PAS `s->api_ram[]`.
+
+Voir aussi : [DSP_ADDRESS_MAP.md](DSP_ADDRESS_MAP.md).
+
