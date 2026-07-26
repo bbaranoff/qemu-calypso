@@ -22,6 +22,9 @@ void calypso_dsp_shunt_on_frame_tick(void);
 
 /* True if CALYPSO_DSP_SHUNT=1 in env. Use to gate BSP/TPU DMA into DARAM. */
 bool calypso_dsp_shunt_active(void);
+bool calypso_dsp_shunt_sb_valid(void);  /* gr-gsm a decode la SCH (detection reelle) */
+bool calypso_dsp_shunt_si_valid(void);  /* gr-gsm a decode un SI (a_cd pret) */
+uint16_t calypso_dsp_shunt_burst_d(void);  /* d_burst_d echote (gates BURST_OFS/FN) */
 /* Mission courante du DSP (d_task_md) : FB=5 SB=6 TCH_FB=8 TCH_SB=9, 0=aucune.
  * Sert a gater les wires inter-blocs (BSP BRINT0) sur la mission FB/SB. */
 uint16_t calypso_dsp_shunt_get_task_md(void);

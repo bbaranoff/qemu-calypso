@@ -56,6 +56,7 @@ bool calypso_bsp_tx_burst(uint8_t tn, uint32_t fn, uint8_t bits[148]);
  * the encoder failed. Called by calypso_trx.c when ARM L1 commits a
  * d_task_ra (RACH access). */
 bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148]);
+bool calypso_bsp_send_rach_ra(uint8_t ra, uint8_t bsic, uint32_t fn, uint8_t tn);  /* [PORT LU] RACH UL depuis d_rach */
 
 uint16_t calypso_bsp_get_daram_addr(void);
 uint16_t calypso_bsp_get_daram_len(void);

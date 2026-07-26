@@ -41,11 +41,41 @@ while IFS= read -r f; do
         only=$((only+1))
     fi
 done < <(cd "$OVERLAY" && git ls-files)
+
+# --- Passe 2 : auto-ajout du NOUVEL ARBRE Calypso ---------------------------
+# Les repertoires Calypso de l'overlay sont 100% overlay (absents de QEMU vanilla).
+# On ramene tout NOUVEAU fichier cree dans qemu-src sous ces racines (nouvelles
+# sources calypso_*, docs unifies, MASTER/STATUS/TODO) et on le `git add` dans
+# l'overlay pour qu'il soit suivi ensuite. Exclut artefacts de build et backups.
+# Racines surchargées via CALYPSO_OVERLAY_ROOTS.
+ADD_ROOTS="${CALYPSO_OVERLAY_ROOTS:-hw/arm/calypso tools/calypso-ipc-device}"
+added=0
+for root in $ADD_ROOTS; do
+    [ -d "$SRC/$root" ] || continue
+    while IFS= read -r f; do
+        case "$f" in
+            *.o|*.d|*.orig|*~|*.pyc|*.a|*.so|*.tmp|*.tmp.*|*.swp|*.rej) continue;;
+            *.bak|*.bak.*|*.bak-*|*.bak_*|*preNoCell*|*preBRINT0*|*preFNPROBE*) continue;;
+            */build/*|*/.git/*|*/meson-*|*/.ninja*) continue;;
+        esac
+        # deja tracke dans l'overlay -> gere par la passe 1, on saute
+        if (cd "$OVERLAY" && git ls-files --error-unmatch "$f" >/dev/null 2>&1); then
+            continue
+        fi
+        echo "  add   $f"
+        if [ "$DRY" = 0 ]; then
+            mkdir -p "$OVERLAY/$(dirname "$f")"
+            cp -a "$SRC/$f" "$OVERLAY/$f"
+            (cd "$OVERLAY" && git add "$f")
+        fi
+        added=$((added+1))
+    done < <(cd "$SRC" && find "$root" -type f | sort)
+done
 echo "----"
 if [ "$DRY" = 1 ]; then
-    echo "$sync file(s) WOULD sync, $same unchanged, $only overlay-only (untouched)"
+    echo "$sync file(s) WOULD sync, $added new file(s) WOULD add, $same unchanged, $only overlay-only (untouched)"
     echo "re-run without --dry-run to apply."
 else
-    echo "$sync file(s) synced, $same unchanged, $only overlay-only (untouched)"
+    echo "$sync file(s) synced, $added new file(s) added (git add), $same unchanged, $only overlay-only (untouched)"
 fi
 echo "review: cd $OVERLAY && git status -s && git diff --stat"

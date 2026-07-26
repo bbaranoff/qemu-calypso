@@ -124,6 +124,9 @@ def pytest_configure(config):
         "osmocom_clock:        alignement clock domains (VIRTUAL vs REALTIME)",
         "osmocom_bridge:       calypso-ipc-device timing et CLK IND jitter",
         "osmocom_boot:         séquence boot ARM/DSP + handshake",
+        # test_timer_physical_audit.py (enregistres 2026-07-25, fix faux-negatifs #1-4)
+        "timer_audit:          audit physique du timer (prescaler /32, periode)",
+        "timer_graph:          diagrammes temporels timer (mermaid/drift)",
     ):
         config.addinivalue_line("markers", marker)
 
@@ -190,6 +193,22 @@ def _sanitize_node_id(s: str) -> str:
     return "_".join(parts)
 
 
+def _deaccent(s: str) -> str:
+    """Translit ASCII : evite tout mojibake (Ã©/Ã¹) quel que soit l'encodage du renderer.
+    e-accent -> e, etc. ; symboles unicode -> equivalents ASCII."""
+    import unicodedata as _ud
+    m = {"\u2014": "-", "\u2013": "-", "\u00b7": "-", "\u2026": "...",
+         "\u2192": "->", "\u2190": "<-", "\u00ab": '"', "\u00bb": '"',
+         "\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"',
+         "\u00d7": "x", "\u2265": ">=", "\u2264": "<=", "\U0001f6d1": "[STOP]",
+         "\u2705": "[OK]", "\u274c": "[X]", "\U0001f534": "[X]", "\U0001f7e2": "[OK]",
+         "\U0001f7e0": "[~]", "\U0001f7e1": "[~]", "\u26a0": "[!]", "\u23ed": ">>",
+         "\ufe0f": ""}
+    for k, v in m.items():
+        s = s.replace(k, v)
+    return _ud.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
 def _label(text: str) -> str:
     """Escape user text for safe use inside Mermaid quoted labels.
 
@@ -200,11 +219,22 @@ def _label(text: str) -> str:
       - replace [ ] with ( )
       - replace ( ) keep but strip enclosing (which Mermaid uses for stadium)
     """
-    return (
-        text.replace('"', "&quot;")
-            .replace("[", "(").replace("]", ")")
-            .replace("\\", "/")
-    )
+    import unicodedata as _ud
+    # 1. defaire l'ascii-escape des IDs pytest parametrize (\xe9 -> e, etc.)
+    for _e, _c in (("\\xe9","e"),("\\xe8","e"),("\\xea","e"),("\\xc9","E"),("\\xe0","a"),
+                   ("\\xe7","c"),("\\xee","i"),("\\xef","i"),("\\xf4","o"),("\\xfb","u"),
+                   ("\\xf9","u"),("\\xe2","a"),("\\xee","i")):
+        text = text.replace(_e, _c)
+    # 2. separateurs/ponctuation unicode -> ASCII sur
+    text = (text.replace("\u00b7", "-").replace("\u2014", "-").replace("\u2013", "-")
+                .replace("\u2026", "...").replace("\u2192", "->").replace("\u2019", "'"))
+    # 3. translit accents restants -> ASCII (mermaid.js/quarto safe)
+    text = _ud.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    # 4. caracteres qui cassent le parseur mermaid dans les labels quotes
+    return (text.replace('"', "&quot;")
+                .replace("[", "(").replace("]", ")")
+                .replace("{", "(").replace("}", ")")
+                .replace("\\", "/").replace("`", "'").replace("|", "/"))
 
 
 # Hiérarchie : marker → (category, layer). Utilisée pour bâtir 3-level mermaid.
@@ -514,8 +544,9 @@ ouvrir le `.qmd` dans RStudio ou lancer `quarto render` pour le rendu).
 
 ```{{r log-timeline, fig.cap="Cadence logs (sources) + timers (dé-thinned vs nominal GSM)", fig.width=12, fig.height=9, echo=FALSE, message=FALSE, warning=FALSE}}
 if (!requireNamespace("ggplot2", quietly=TRUE) ||
-    !requireNamespace("tidyr",  quietly=TRUE)) {{
-  message("ggplot2/tidyr absent — `install.packages(c('ggplot2','tidyr'))` dans RStudio")
+    !requireNamespace("tidyr",  quietly=TRUE) ||
+    !file.exists("log_timeline.csv")) {{
+  message("ggplot2/tidyr absent OU log_timeline.csv absent dans le dossier de rendu — plot timeline saute (pas d'erreur)")
 }} else {{
   library(ggplot2); library(tidyr)
   df <- read.csv("log_timeline.csv")
@@ -1153,24 +1184,33 @@ def _gen_diag_bundle_annex() -> str:
     import subprocess as _sp
     import tarfile as _tar
     import tempfile as _tmp
-    script = Path(__file__).resolve().parent.parent / "make_diag_bundle.sh"
-    if not script.exists():
-        return "_`make_diag_bundle.sh` introuvable à la racine du repo._\n"
+    # INJECTION d'un bundle EXISTANT : si CALYPSO_DIAG_BUNDLE pointe un tar.gz
+    # (ex: /root/test_reports/test_reports/<bundle>.tar.gz), on l'embarque tel
+    # quel au lieu de re-lancer make_diag_bundle.sh.
+    _existing = _os.environ.get("CALYPSO_DIAG_BUNDLE", "").strip()
     try:
-        td = _tmp.mkdtemp(prefix="diag_bundle_annex_")
-        env = {**_os.environ, "OUT_DIR": td, "TAG": "annex"}
-        r = _sp.run(["bash", str(script)], env=env,
-                    capture_output=True, text=True, timeout=180)
-        if r.returncode != 0:
-            return (f"_make_diag_bundle.sh exit={r.returncode}._\n\n"
-                    f"```\n{r.stderr[:800]}\n```\n")
-        tar_files = sorted(Path(td).glob("*.tar.gz"))
-        if not tar_files:
-            return "_aucun tarball produit (script terminé sans erreur)._\n"
-        tarball = tar_files[0]
-        out = [f"_Bundle complet : `{tarball.name}` "
-               f"({tarball.stat().st_size:,} bytes). Régénérer à la main : "
-               f"`./make_diag_bundle.sh`._\n"]
+        if _existing and Path(_existing).exists():
+            tarball = Path(_existing)
+            out = [f"_Bundle INJECTE (CALYPSO_DIAG_BUNDLE) : `{tarball.name}` "
+                   f"({tarball.stat().st_size:,} bytes)._\n"]
+        else:
+            script = Path(__file__).resolve().parent.parent / "make_diag_bundle.sh"
+            if not script.exists():
+                return "_`make_diag_bundle.sh` introuvable ; ou poser CALYPSO_DIAG_BUNDLE=<tar.gz>._\n"
+            td = _tmp.mkdtemp(prefix="diag_bundle_annex_")
+            env = {**_os.environ, "OUT_DIR": td, "TAG": "annex"}
+            r = _sp.run(["bash", str(script)], env=env,
+                        capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                return (f"_make_diag_bundle.sh exit={r.returncode}._\n\n"
+                        f"```\n{r.stderr[:800]}\n```\n")
+            tar_files = sorted(Path(td).glob("*.tar.gz"))
+            if not tar_files:
+                return "_aucun tarball produit (script terminé sans erreur)._\n"
+            tarball = tar_files[0]
+            out = [f"_Bundle complet : `{tarball.name}` "
+                   f"({tarball.stat().st_size:,} bytes). Régénérer : "
+                   f"`./make_diag_bundle.sh`._\n"]
         with _tar.open(tarball) as tf:
             members = sorted(tf.getmembers(), key=lambda m: m.name)
             # Inventaire
@@ -1528,6 +1568,27 @@ def pytest_sessionfinish(session, exitstatus):
     folder = out_dir / f"test_results_{ts_id}"
     folder.mkdir(parents=True, exist_ok=True)
 
+    # ---- Diag bundle AUTO (a chaque run) : make_diag_bundle.sh -> tar dans le
+    #      folder (donc zippe) + copie a la racine out_dir (/root/test_reports),
+    #      et expose via CALYPSO_DIAG_BUNDLE pour que l'annexe l'injecte SANS
+    #      re-lancer le script. Skip si l'user a deja pose CALYPSO_DIAG_BUNDLE.
+    #      Opt-out : CALYPSO_SKIP_DIAG_BUNDLE=1. Best-effort (jamais fatal). ----
+    try:
+        import subprocess as _sp0
+        _bscript = Path(__file__).resolve().parent.parent / "make_diag_bundle.sh"
+        if (_bscript.exists()
+                and os.environ.get("CALYPSO_SKIP_DIAG_BUNDLE", "0") != "1"
+                and not os.environ.get("CALYPSO_DIAG_BUNDLE")):
+            _sp0.run(["bash", str(_bscript)],
+                     env={**os.environ, "OUT_DIR": str(folder), "TAG": ts_id},
+                     capture_output=True, text=True, timeout=240)
+            _tars = sorted(folder.glob("*.tar.gz"))
+            if _tars:
+                os.environ["CALYPSO_DIAG_BUNDLE"] = str(_tars[-1])
+                (out_dir / _tars[-1].name).write_bytes(_tars[-1].read_bytes())
+    except Exception:
+        pass
+
     # Derive structures (annotation `category`/`layer` sur chaque record pour
     # que results.json soit consommable par abstract.py et autres outils
     # externes qui lisent t["layer"] directement).
@@ -1627,10 +1688,10 @@ def pytest_sessionfinish(session, exitstatus):
     md = md + annex_section
 
     md_path = folder / "test_results.md"
-    md_path.write_text(md)
+    md_path.write_text(_deaccent(md), encoding="utf-8")
     # Standalone copies (top-level + per-run folder) pour collage rapide
-    (folder / "report.md").write_text(report_md)
-    (out_dir / "report.md").write_text(report_md)
+    (folder / "report.md").write_text(_deaccent(report_md), encoding="utf-8")
+    (out_dir / "report.md").write_text(_deaccent(report_md), encoding="utf-8")
 
     # Quarto report (.qmd) — uses ```{mermaid} blocks + YAML front-matter so
     # RStudio / `quarto render` produit du HTML interactif avec les diagrammes
@@ -1700,12 +1761,99 @@ def pytest_sessionfinish(session, exitstatus):
     qmd_body = _det_pat.sub(_to_callout, qmd_body)
     qmd = _QMD_FRONTMATTER + qmd_body
     qmd_path = folder / "test_results.qmd"
-    qmd_path.write_text(qmd)
+    qmd_path.write_text(_deaccent(qmd), encoding="utf-8")
     # Also a stable top-level copy
-    (out_dir / "test_results.qmd").write_text(qmd)
+    (out_dir / "test_results.qmd").write_text(_deaccent(qmd), encoding="utf-8")
+    # test_results.Rmd : miroir R Markdown. knitr N'A PAS de moteur mermaid ->
+    # on rend chaque bloc ```{mermaid} en PNG (mmdc) et on embarque l'image.
+    _rmd_front = ("---\ntitle: \"Calypso test report\"\ndate: \"`r Sys.time()`\"\n"
+                  "output:\n  html_document:\n    toc: true\n    toc_float: true\n    code_folding: hide\n---\n\n"
+                  "```{r setup, include=FALSE}\nknitr::opts_chunk$set(echo = FALSE)\n```\n\n"
+                  "<script type=\"module\">import mermaid from "
+                  "\"https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs\";"
+                  "mermaid.initialize({startOnLoad:true});</script>\n\n")
+    try:
+        _FENCE = chr(96) * 3               # ```
+        _segs = qmd_body.split(_FENCE + "{mermaid}")
+        _out = [_segs[0]]
+        for _i, _seg in enumerate(_segs[1:], 1):
+            _end = _seg.find(_FENCE)
+            if _end < 0:
+                _out.append(_FENCE + "{mermaid}" + _seg); continue
+            _content = _seg[:_end].strip("\n")
+            _rest = _seg[_end + 3:]
+            # <pre class="mermaid"> : rendu par mermaid.js (CDN) cote navigateur
+            _out.append("\n<pre class=\"mermaid\">\n" + _content + "\n</pre>\n" + _rest)
+        _body_png = "".join(_out)
+    except Exception:
+        _body_png = qmd_body
+    _tr_rmd = _deaccent(_rmd_front + _body_png)
+    (folder / "test_results.Rmd").write_text(_tr_rmd, encoding="utf-8")
+    (out_dir / "test_results.Rmd").write_text(_tr_rmd, encoding="utf-8")
+
+    # ---- RAPPORT COMPLET : structure test_results (qui rend) + GRAFCET go-live
+    #      + synthese (% pondere) en tete + conclusion dynamique en pied. -------
+    try:
+        import grafcet_gen as _gg
+        _st = _gg.derive_status()
+        _tot, _path, _rows = _gg._weighted_pct(_st)
+        _intro = (
+            "# Synthese go-live\n\n"
+            "Rapport unifie : etat du go-live DSP (GRAFCET) + resultats de tests + conclusion.\n\n"
+            "**Progression chemin (ponderee) : %d %%** — FBSB (d_fb_det) 25%% + camping 22%% = 47%% du but ; "
+            "total etapes atteintes %d %%.\n\n" % (_path, _tot)
+            + _gg._report_md_body(_st, "") + "\n\n"
+        )
+        # RESPECTE test_results.qmd : seulement flowchart/graph (rendent). sequenceDiagram/
+        # timeline cassent le mermaid de Quarto -> gardes en .mmd split + PDF (mmdc les supporte).
+        _graf = ["## GRAFCET interprete\n\n```{mermaid}\n" + _mermaid_for_quarto(_gg._mermaid(_st)) + "\n```\n"]
+        _graf.append("_(sequence go-live + timeline : voir sequence.mmd / timeline.mmd et rapport.pdf)_\n")
+        _graf_block = "# GRAFCET go-live & chaine I/Q\n\n" + "\n".join(_graf) + "\n"
+        _det = _st.get("detect"); _r3 = _st.get("rank3")
+        _wall = ("le correlateur produit d_fb_det -> camp natif possible"
+                 if _det == "ok" else
+                 "le kernel FB 0xa076 n'est jamais atteint (AR5 jamais 0x2a00) -> d_fb_det=0 -> pas de camp natif")
+        _concl = (
+            "# Conclusion\n\n"
+            "**Ce qui marche :** boot DSP, romload, SIM, go-live (IMR=0x52fd arme), LOST=0, "
+            "frame-IT servie (vec28 via PRIO), PM MEAS reel.\n\n"
+            "**Mur actuel (RANK3) :** " + _wall + ".\n\n"
+            "**Racine identifiee :** bugs du decodeur C54x de l'emulateur sur les opcodes DU correlateur "
+            "(branches 0xF8 BC decodees par nibble ; MAC 0x30-0x37 / 0x50-0x59). Fix §4-G pose gate "
+            "CALYPSO_C54X_FIX_BC ; traceur CORR-FLOW pret.\n\n"
+            "**Prochain levier :** capturer le chemin du handler 0x8d00 (CALYPSO_CORR_FLOW=1) et corriger "
+            "le decode de l'instruction qui ecarte le flux de 0xa076.\n"
+        )
+        # --- QMD unifie (Quarto : ```{mermaid}) ---
+        _rapport_qmd = (_QMD_FRONTMATTER + _intro + _graf_block
+                        + "# Pipeline & tests detailles\n\n" + qmd_body + "\n\n" + _concl)
+        (folder / "rapport.qmd").write_text(_deaccent(_rapport_qmd), encoding="utf-8")
+        (out_dir / "rapport.qmd").write_text(_deaccent(_rapport_qmd), encoding="utf-8")
+        # --- MD unifie (GitHub : ```mermaid) ---
+        _graf_md = ["# GRAFCET go-live & chaine I/Q\n",
+                    "## GRAFCET interprete\n\n```mermaid\n" + _mermaid_for_quarto(_gg._mermaid(_st)) + "\n```\n"]
+        _rapport_md = (_intro + "\n".join(_graf_md) + "\n# Pipeline & tests detailles\n\n"
+                       + report_md + "\n\n" + _concl)
+        (folder / "rapport.md").write_text(_deaccent(_rapport_md), encoding="utf-8")
+        (out_dir / "rapport.md").write_text(_deaccent(_rapport_md), encoding="utf-8")
+    except Exception:
+        pass
     # Also keep Quarto-friendly .mmd files (with \n labels) for direct paste
     (folder / "pipeline.qmd.mmd").write_text(qmd_pipeline)
     (folder / "detail.qmd.mmd").write_text(qmd_detail)
+
+    # ---- GRAFCET go-live/IQ (HTML + MD) — généré PAR DÉFAUT à chaque run --------
+    # Statut de chaque RANK dérivé des logs (qemu/osmocon/mobile) via grafcet_gen.
+    try:
+        import grafcet_gen
+        for _gd in (folder, out_dir):
+            _paths = grafcet_gen.write_grafcet(_gd, ts_id)
+        terminal.write_sep("=", f"GRAFCET -> {folder}/grafcet.{{html,md}}", purple=True)
+    except Exception as _ge:  # ne jamais faire échouer la session sur le grafcet
+        try:
+            terminal.write_line(f"grafcet skip: {_ge}")
+        except Exception:
+            pass
 
     # (results.json est écrit plus haut, avant la construction du markdown,
     # parce que `_gen_abstract_audit()` en a besoin pour son audit.)
@@ -1822,7 +1970,7 @@ def _build_detail_per_category(tree: dict) -> dict[str, str]:
             short = _label(r["name"][:38])
             marker_short = _label(",".join(r["markers"][:1]))
             layer_short = _label(r.get("layer", ""))
-            label_txt = f"{short}<br/>{layer_short} · {marker_short}<br/>{r['duration_s']:.2f}s"
+            label_txt = f"{short}<br/>{layer_short} - {marker_short}<br/>{r['duration_s']:.2f}s"
             cls = ("xfail" if r["wasxfail"]
                    else "fail" if r["outcome"] == "failed"
                    else "skip")

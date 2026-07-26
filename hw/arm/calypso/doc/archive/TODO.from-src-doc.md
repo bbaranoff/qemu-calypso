@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/TODO.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/TODO.md, conserve pour reference (unification 2026-07-26) -->
 > ⚠️ **PÉRIMÉ (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).** Ce doc décrit un état/une API qui ne correspond plus au code. Vérité-terrain : d_fb_det reste 0, DSP déraille, IMR=0x0000 jamais ré-armé, api_write_cb jamais câblé, pas de bus ORCH. Corrections ci-dessous.
 >
 > Périmés spécifiques à ce doc :

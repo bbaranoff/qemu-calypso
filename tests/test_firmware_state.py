@@ -152,6 +152,8 @@ def test_rxdoneflag_addr_resolvable():
 @pytest.mark.runtime_osmocon
 def test_osmocon_started_download():
     """osmocon a vu l'ident ack et lancé le download du firmware."""
+    if not os.path.exists(OSMOCON_LOG):
+        pytest.skip(f"{OSMOCON_LOG} absent — run osmocon non capturé")
     n = _grep_count(OSMOCON_LOG, "starting download")
     assert n >= 1, "osmocon n'a pas reçu l'ident ack du firmware"
 
@@ -160,6 +162,8 @@ def test_osmocon_started_download():
 def test_osmocon_past_romload():
     """osmocon a dépassé la phase romload — soit Layer 1 banner (kernel mode
     rare), soit messages L1CTL côté sercomm (mode normal)."""
+    if not os.path.exists(OSMOCON_LOG):
+        pytest.skip(f"{OSMOCON_LOG} absent — run osmocon non capturé")
     has_l1ctl = _grep_count(OSMOCON_LOG, "L1CTL_") >= 1
     has_layer1 = _grep_count(OSMOCON_LOG, "OsmocomBB Layer 1") >= 1
     has_fb_sb = (_grep_count(OSMOCON_LOG, "=> SB") +
@@ -192,6 +196,8 @@ def test_osmocon_no_recent_lost_spam():
 @pytest.mark.runtime_firmware
 def test_bridge_has_dl_bursts():
     """bridge.log a au moins quelques DL bursts — preuve osmo-bts-trx connecté."""
+    if not os.path.exists((removed)):
+        pytest.skip(f"{(removed)} absent — bridge non capturé")
     n = _grep_count((removed), "bridge: DL #")
     assert n >= 10, (
         f"{n} DL bursts dans bridge.log — osmo-bts-trx pas connecté ou "

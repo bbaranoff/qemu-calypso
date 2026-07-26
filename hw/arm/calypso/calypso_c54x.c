@@ -9,6 +9,9 @@
 
 #include "calypso_c54x.h"
 #include "calypso_arm2dsp.h"
+#include "hw/arm/calypso/calypso_invariants.h"
+#include "hw/arm/calypso/calypso_dsp_shunt.h"
+#include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1004,6 +1007,9 @@ static void force_intm_oneshot_check(C54xState *s)
 {
     if (g_force_intm_oneshot_enabled < 0) {
         const char *e = getenv("CALYPSO_FORCE_INTM_ONESHOT");
+        /* Gate PROPRE : ON seulement si =1 ; =0 ou unset -> OFF. (NB : ce oneshot
+         * masque le livelock vec28 en clearant INTM 1x ; utile tant que le sur-fire
+         * frame-IT n est pas corrige a la racine BSP.) */
         g_force_intm_oneshot_enabled = (e && *e == '1') ? 1 : 0;
         /* Optional PC gate : si CALYPSO_FORCE_INTM_AT_PC=0xXXXX présent,
          * fire seulement quand PC matche. Permet de départager state-
@@ -2327,6 +2333,23 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-25] WATCH-0810 (gated CALYPSO_WATCH_0810) : trace toute ecriture
+     * DSP-side a data[0x0810] (d_ctrl_system / B_TASK_ABORT bit15) avec le PC
+     * auteur. Complete ARM-WRITE-0810 (cote trx). Ensemble : QUI repose bit15
+     * apres le clear ARM ? (self-clear DSP @0xa549 attendu ; le wire CTRLSYS
+     * ecrit s->data[] directement, hors data_write -> invisible ici = c'est LUI
+     * le re-setter s'il n'apparait pas). Cap 200. */
+    if (addr == 0x0810) {
+        static int w810 = -1;
+        if (w810 < 0) w810 = getenv("CALYPSO_WATCH_0810") ? 1 : 0;
+        if (w810) {
+            static unsigned n810 = 0;
+            if (n810++ < 200)
+                fprintf(stderr, "[c54x] WATCH-0810 DSP-write data[0x0810]=0x%04x "
+                        "(was 0x%04x) PC=0x%04x insn=%u\n",
+                        val, s->data[0x0810], s->pc, s->insn_count);
+        }
+    }
     /* [2026-07-25] RANK1b FIX (workflow overlay, context-safe) : le prologue ISR
      * overlay 0x013b fait POPD *(0x3fcd) = depile l'adresse de retour HW 0x72d5
      * dans data[0x3fcd], puis 23 PSHM (sauvegarde contexte), puis PSHD *(0x3fcd)
@@ -2413,6 +2436,40 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         if (sent < 0) { const char *e = getenv("CALYPSO_FBDET_SENTINEL"); sent = e ? atoi(e) : 0;
             if (sent==1) fprintf(stderr, "[c54x] FBDET-SENTINEL=1 FORCE : data[0x08f8] forcé à 0xDEAD\n");
             else if (sent==2) fprintf(stderr, "[c54x] FBDET-SENTINEL=2 MONITOR : logge la vraie valeur écrite à 0x08f8 (pas de force)\n"); }
+        /* [2026-07-26] SHUNT_LEGIT : override le clobber natif de d_fb_det. Le DSP
+         * natif ecrit 0x08f8=0 (pas de detection, mur RANK3) et ecrase la detection
+         * gr-gsm transportee par le shunt. Quand SHUNT_LEGIT + gr-gsm a decode
+         * (sb_valid), on FORCE la valeur ecrite a 1 -> l ARM lit FB found -> vrai flux. */
+        {
+            static int _lg = -1;
+            if (_lg < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); _lg = (e && *e=='1') ? 1 : 0; }
+            if (_lg && addr == 0x08f8 && calypso_dsp_shunt_sb_valid()) {
+                val = 1;
+            }
+            /* [2026-07-26 RANK5] force a_pm (rxlev) sur le VRAI array lu par
+             * l'ARM : calypso_trx.c lit s->dsp->data[off/2+0x800], PAS api_ram.
+             * a_pm read page 0 = data[0x830..0x832], page 1 = data[0x844..0x846]
+             * (ARM off 0x60/0x88 -> /2+0x800). Le DSP les ecrit a 0 (pas de vraie
+             * mesure) -> on force la valeur calibree trf6151 -> rxlev stable. */
+            {
+                static int _tp = -1, _tgt = -60;
+                if (_tp < 0) {
+                    const char *d = getenv("CALYPSO_TRF_RXLEV");
+                    const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+                    const char *t = getenv("CALYPSO_TRF_TARGET_RF");
+                    _tp = ((d && *d=='1') || (l && *l=='1')) ? 1 : 0;
+                    if (t && *t) _tgt = atoi(t);
+                }
+                /* DSP 33-36 : db_r = {..d_task_ra(7), a_serv_demod[4](8..11),
+                 * a_pm[3](12..14), a_sch[5](15..19)}. a_pm read page 0 = word 12
+                 * = data[base0x28+12+0x800]=data[0x834..0x836] ; page 1 =
+                 * data[0x3C+12+0x800]=data[0x848..0x84A]. (0x830/0x844 = a_serv_demod!) */
+                if (_tp && ((addr >= 0x0834 && addr <= 0x0836) ||
+                            (addr >= 0x0848 && addr <= 0x084A))) {
+                    val = calypso_trf6151_apm_for_rf(_tgt);
+                }
+            }
+        }
         if (sent && addr == 0x08f8) {
             uint16_t orig = val;
             if (sent == 1) val = 0xDEAD;   /* mode FORCE (test cohérence) */
@@ -2957,6 +3014,29 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     {
         static WatchWriteState wws_coeffs;
         watch_write_zone_check(s, addr, val, "COEFFS", 0x2bc0, 0x2bff, &wws_coeffs);
+    }
+    /* INVARIANT (gate CALYPSO_INVARIANTS, defaut off) : pointeurs du correlateur.
+     * AR4 = write ptr -> doit prendre >2 valeurs distinctes (sinon boucle 2-mots).
+     * AR5 = read ptr I/Q -> doit vivre dans le buffer [0x2a00..0x2b27] (sinon le
+     * correlateur lit hors buffer = kernel 0xa076 jamais atteint, AR5=0xdb7b). */
+    if (addr >= 0x2bc0 && addr <= 0x2bff) {
+        static uint32_t pw;
+        static uint16_t ar4_seen[8];
+        static int ar4_n;
+        uint16_t a4 = s->ar[4], a5 = s->ar[5];
+        if (ar4_n < 8) {
+            int f = 0;
+            for (int i = 0; i < ar4_n; i++) { if (ar4_seen[i] == a4) { f = 1; break; } }
+            if (!f) ar4_seen[ar4_n++] = a4;
+        }
+        if (++pw == 2000) {
+            calypso_invariant("correlator_ar4_sweeps", ar4_n > 2,
+                              "AR4 (write ptr) : %d valeur(s) distincte(s) sur %u writes",
+                              ar4_n, pw);
+        }
+        calypso_invariant("correlator_ar5_in_iq_buffer",
+                          a5 >= 0x2a00 && a5 <= 0x2b27,
+                          "AR5 (read ptr I/Q) = 0x%04x HORS buffer [0x2a00..0x2b27]", a5);
     }
     /* A_CD-WR : a_cd[15] in NDB starts at DSP word 0x09D0 (= API byte 0x03A0,
      * = NDB byte offset 0x1F8). 15 words = [0x09D0..0x09DE].
@@ -4307,11 +4387,42 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
  * IFR bit latched while INTM=1 is never taken later. Real C54x re-checks pending
  * unmasked interrupts at each instruction boundary. This restores that, so an
  * armed frame IT (INT3/bit3) fires once INTM drops -> native frame ISR runs. */
+/* === Frame-IT LEVEL hold + PRIO (2026-07-25) ============================
+ * La frame-IT (bit12/vec28, scheduler 0x7234 -> kernel FB) est posee en EDGE par
+ * c54x_interrupt_ex a chaque trame. Mesure : INTM=1 ~permanent (wait-loop 0xdde6
+ * + sections critiques 0xb52x) -> la fenetre INTM=0 de 5 insns coincide rarement
+ * avec bit12 pendant -> vec28 dispatchee 80x sur ~36000 trames -> kernel FB affame
+ * (AR5 jamais 0x2a00, fb0_att=0). Deux correctifs GATES :
+ *  - LEVEL : maintenir bit12 asserte dans l IFR jusqu a ce que vec28 VECTORISE
+ *            (re-assert chaque insn), pour que la prochaine transition INTM 1->0
+ *            l attrape a coup sur (= "vectoriser a la transition, sinon garder").
+ *  - PRIO  : quand bit12 ET un bit de priorite plus basse (ex bit5/BRINT0) pendent
+ *            dans la meme fenetre, prendre bit12 (frame) en 1er au lieu du ctz brut,
+ *            sinon BRINT0 vole la fenetre rare et re-masque (INTM=1). */
+static bool g_frame_it_level = false;
+static bool frame_it_level_on(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("CALYPSO_FRAME_IT_LEVEL"); c = (e && *e == '1') ? 1 : 0; }
+    return c;
+}
+static bool frame_it_prio_on(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("CALYPSO_FRAME_IT_PRIO"); c = (e && *e == '1') ? 1 : 0; }
+    return c;
+}
+
 static bool c54x_irq_level_check(C54xState *s)
 {
     static int en = -1;
     if (en < 0) { const char *_d = getenv("CALYPSO_DSP"); en = (getenv("CALYPSO_C54X_IRQ_LEVEL") || (_d && !strcmp(_d, "c54x"))) ? 1 : 0; }  /* natif revive */
     if (!en) return false;
+    /* LEVEL hold : tant que la frame-IT n a pas ete vectorisee (vec28), garder
+     * bit12 pendant dans l IFR -> la prochaine fenetre INTM=0 la prend. */
+    if (g_frame_it_level && frame_it_level_on()) {
+        s->ifr |= (1u << 12);
+    }
     /* [2026-07-22] LEVELCHK-DBG (gated CALYPSO_AR0_DEBUG) : quand IMR!=0 (fenetre
      * armee), pourquoi l'IT frame n'est-elle pas prise ? Tranche INTM vs IPTR vs
      * pend=0. C'est le verrou du mur terminal Frontiere A. */
@@ -4372,6 +4483,11 @@ static bool c54x_irq_level_check(C54xState *s)
     uint16_t pend = (uint16_t)(s->ifr & s->imr);
     if (!pend) return false;
     int b = __builtin_ctz(pend);          /* lowest set bit = highest priority */
+    /* PRIO : la frame (bit12/vec28) prime sur les bits plus bas (BRINT0 bit5) qui
+     * voleraient la fenetre rare et re-masqueraient INTM. Gate CALYPSO_FRAME_IT_PRIO. */
+    if (frame_it_prio_on() && (pend & (1u << 12))) {
+        b = 12;
+    }
     int vec = b + 16;                     /* C54x: maskable IMR bit b -> vector b+16 */
     /* VEC28 remap (comme c54x_interrupt_ex/VEC28-EXP) : la frame IT tape sur
      * vec19/bit3 = stub RETE ; le VRAI scheduler frame est vec28 (data[0xf0]->0x7234).
@@ -4382,6 +4498,7 @@ static bool c54x_irq_level_check(C54xState *s)
         if (lv28 && b == 3) vec = 28;
     }
     s->ifr &= ~(1u << b);
+    if (b == 12) g_frame_it_level = false;   /* frame-IT vectorisee -> relache le LEVEL hold */
     s->sp--; data_write(s, s->sp, (uint16_t)s->pc);
     /* [2026-07-22] FIX DRIFT SP (racine du storm bootstub) : pousser XPC SEULEMENT
      * en mode etendu (xpc!=0). Le firmware sort l ISR via POPM ST1 + RCD (pop 1w=PC),
@@ -4413,6 +4530,63 @@ static int c54x_exec_one(C54xState *s)
         return 1;   /* per-instruction IRQ vectoring consumed this step */
     }
     uint16_t op = prog_fetch(s, s->pc);
+    /* [2026-07-25] TEST-3FAE (gated CALYPSO_FORCE_3FAE) : le handler FB poll
+     * data[0x3fae] bit8 (0x0100) via BITF @0x90c8/0x90ed/0x9128 puis BC TC -> il
+     * attend ce flag "burst pret" que RIEN n ecrit -> boucle infinie, kernel
+     * 0xa076 jamais atteint. On force le flag dans le handler pour confirmer qu il
+     * debloque vers le kernel (=> ensuite wire depuis la chaine RX/BRINT0). */
+    {
+        /* [2026-07-25] CORR-BANK2 (gated) : forcer XPC=2 dans la region corrélateur
+         * -> le handler FB tourne depuis PROM2 (overlay different) au lieu de PROM0.
+         * Test "voir si bank2 debloque". Risque derail (RET/contexte). */
+        static int cbk = -2;
+        if (cbk == -2) { const char *e = getenv("CALYPSO_CORR_BANK");
+                         cbk = (e && *e) ? atoi(e) : -1; }   /* -1=off ; 0..3 = XPC force */
+        if (cbk >= 0 && cbk <= 3 && s->pc >= 0x8d00 && s->pc <= 0xa200 && s->xpc != (uint16_t)cbk) {
+            s->xpc = (uint16_t)cbk;
+        }
+    }
+    {
+        static int f3ae = -1;
+        if (f3ae < 0) f3ae = getenv("CALYPSO_FORCE_3FAE") ? 1 : 0;
+        if (f3ae && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200) {
+            /* TOUTE la handshake FB-det que le handler poll (0x8866 + 0x90xx) :
+             * 0x3faa bit2/bit8, 0x3fab bit8, 0x3fae bit8. Decouple RANK3 du feed
+             * RX mort (RANK2) pour voir si le kernel se debloque. */
+            s->data[0x3faa] |= 0x0104;
+            s->data[0x3fab] |= 0x0100;
+            s->data[0x3fae] |= 0x0100;
+        }
+    }
+    /* [2026-07-25] CORR-FLOW (gated CALYPSO_CORR_FLOW) : trace FACTUELLE du flux du
+     * handler FB en banc0 (0x8d00..0xa200, XPC=0) — PC/opcode BRUT + flags ST0(TC,C)
+     * + A + AR0/AR4/AR5. Permet de VERIFIER nous-memes (contre SPRU172) OU/POURQUOI le
+     * flux quitte le kernel MAC 0xa076 (lit 0x2a00). Marque 0xa076/0x9a80. Cap 8000. */
+    {
+        static int cf = -1; static unsigned cfn = 0;
+        if (cf < 0) cf = getenv("CALYPSO_CORR_FLOW") ? 1 : 0;
+        /* Range ELARGIE : inclut 0x8866 (sous-routine handshake, <0x8d00) + 0xa076.
+         * Trace AUSSI AR3 (ptr CMPS/coeff) et AR1/AR2 pour voir le setup pointeurs. */
+        /* Skip la boucle de copie 0x8866-0x886c (op 8091, ~134x/appel) qui bouffait
+         * tout le budget log -> le cap est reserve au VRAI flux (state-machine +
+         * progression vers 0x93a5). Dedup aussi les PC repetes consecutifs. */
+        static uint16_t cf_lastpc = 0;
+        if (cf && s->xpc == 0 && s->pc >= 0x8600 && s->pc <= 0xa200 && cfn < 20000
+            && !(s->pc >= 0x8866 && s->pc <= 0x886c)
+            && s->pc != cf_lastpc) {
+            cf_lastpc = s->pc;
+            cfn++;
+            const char *mk = (s->pc==0xa076) ? " <<<KERNEL-a076"
+                           : (s->pc==0x9a80) ? " <<<KERNEL-9a80"
+                           : (s->pc==0x8d00) ? " [handler-entry]"
+                           : (s->pc==0x8866) ? " [subr-8866]"
+                           : (s->ar[5]==0x2a00 || s->ar[3]==0x2a00) ? " <<<PTR=0x2a00!" : "";
+            fprintf(stderr, "[c54x] CORR-FLOW PC=0x%04x op=%04x TC=%d C=%d "
+                    "AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x%s insn=%u\n",
+                    s->pc, op, !!(s->st0 & ST0_TC), !!(s->st0 & ST0_C),
+                    s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5], mk, s->insn_count);
+        }
+    }
     uint16_t op2;
     bool ind;
     uint16_t addr;
@@ -6756,6 +6930,20 @@ static int c54x_exec_one(C54xState *s)
                 int64_t acc_signed = (s->a & 0x8000000000LL)
                                      ? (s->a | ~0xFFFFFFFFFFLL) : s->a;
                 bool take = false;
+                /* [2026-07-25] §4-G FIX (gated CALYPSO_C54X_FIX_BC, def OFF) : decode
+                 * BC 0xF8 par le VRAI champ cond 8-bit (c54x_cond_true, ISA-fidele)
+                 * au lieu de l heuristique ACC dialectale. F820=cc0x20(NTC),
+                 * F830=cc0x30(TC). Corrige le flux du handler FB (branches 0x9062-
+                 * 0x90f0) qui n atteint jamais le kernel MAC 0xa076. Gate OFF car le
+                 * fix strict a casse 2x avant (TC/BITF) -> valider via chaine de tests. */
+                {
+                    static int fixbc = -1;
+                    if (fixbc < 0) fixbc = getenv("CALYPSO_C54X_FIX_BC") ? 1 : 0;
+                    if (fixbc) {
+                        if (c54x_cond_true(s, op & 0xFF)) { s->pc = op2; return 0; }
+                        return consumed + s->lk_used;
+                    }
+                }
                 /* FIX 2026-06-23 (deblocage bacc bootloader) : F820=bc ntc /
                  * F830=bc tc (SPRU172C cc=0x20 NTC, 0x30 TC). L'ancienne
                  * heuristique ACC (take=A!=0) gelait le poll @0xb427 (bc ntc
@@ -12720,8 +12908,10 @@ int c54x_run(C54xState *s, int n_insns)
                     bool _in_corr = (_tgt >= CORR_PC_LO && _tgt < CORR_PC_HI);
                     if (_in_corr) {
                         fprintf(stderr, "[c54x] CALA-WIDE *** DANS-CORRELATEUR *** pc=0x%04x op=0x%04x "
-                                "-> target=0x%04x task_md(0804)=%04x d[4357]=%04x insn=%u\n",
-                                exec_pc, _cop, _tgt, s->data[0x0804], s->data[0x4357], s->insn_count);
+                                "-> target=0x%04x task_md p0(0804)=%04x p1(0818)=%04x d_dsp_page(08e2)=%04x "
+                                "d[4357]=%04x insn=%u\n",
+                                exec_pc, _cop, _tgt, s->data[0x0804], s->data[0x0818],
+                                s->data[0x08e2], s->data[0x4357], s->insn_count);
                     } else {
                         static unsigned _ctwn = 0;
                         if (_ctwn++ < 200)
@@ -13431,31 +13621,28 @@ int c54x_run(C54xState *s, int n_insns)
                             exec_pc, f98v, s->insn_count);
             }
         }
-        /* FORCE-GATE (2026-07-25, TEST) : la boucle reject go-live a53c<->a575 relit
-         * son gate a CHAQUE iteration ; les setters a539/a566 sont HORS boucle (jamais
-         * repasses) -> poker une fois ne persiste pas. On force donc a CHAQUE pas tant
-         * que le PC est dans la region go-live [0xa4ca..0xa575].
-         *   CALYPSO_FORCE_3F92=0xC000 -> d[0x3f92]   (hypothese scheduler-state)
-         *   CALYPSO_FORCE_0810=0xC000 -> data[0x0810] (operande reel du BITF *+AR1(0x10))
-         * Objectif : casser la branche a575 et voir si BRINT0 (0x8d00) se dispatche.
-         * =1 -> 0xC000 (bits14+15). Reversible, gate defaut OFF. */
+        /* GO-LIVE FB-task hold (2026-07-25) — INTEGRATION NATIVE, remplace l'ancien
+         * FORCE poke (=0xC000, overwrite, mauvais bit). Le firmware efface d[0x3f92]
+         * par ST #0 @0xa4c4 puis DEVRAIT le re-armer par ORM #0x0800 @0xa539 — mais
+         * ce setter natif est skippe (d[5a00]==0x88), donc le bit tache-FB (0x0800)
+         * reste 0 a vie et le scheduler DSP ne dispatche jamais le correlateur. On
+         * REJOUE ici exactement ce que ferait l'ORM 0xa539, mais SEULEMENT quand l'ARM
+         * a effectivement commande le go-live (d[0x0810] bit15, pose par le wire
+         * CTRLSYS) : causalite correcte ARM->DSP, bon bit (0x0800, PAS 0xC000), OR (pas
+         * d'overwrite des autres bits scheduler). Gate CALYPSO_GOLIVE_TASKW, defaut OFF.
+         * 0x0810 est deja gere par le wire CTRLSYS (arm2dsp) -> plus de FORCE_0810. */
         if (exec_pc >= 0xa4ca && exec_pc <= 0xa575) {
-            static int f3 = -1; static uint16_t f3v = 0;
-            if (f3 < 0) { const char *e = getenv("CALYPSO_FORCE_3F92");
-                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
-                               f3v = (v <= 1) ? 0xC000 : (uint16_t)v; f3 = 1; } else f3 = 0; }
-            if (f3) s->data[0x3f92] = f3v;
-
-            static int f8 = -1; static uint16_t f8v = 0;
-            if (f8 < 0) { const char *e = getenv("CALYPSO_FORCE_0810");
-                if (e && *e) { unsigned long v = strtoul(e, NULL, 0);
-                               f8v = (v <= 1) ? 0xC000 : (uint16_t)v; f8 = 1; } else f8 = 0; }
-            if (f8) s->data[0x0810] |= f8v;
-
-            static unsigned flg = 0;
-            if ((f3 || f8) && flg++ < 8)
-                fprintf(stderr, "[c54x] FORCE-GATE @0x%04x d[3f92]=0x%04x data[0810]=0x%04x insn=%u\n",
-                        exec_pc, s->data[0x3f92], s->data[0x0810], s->insn_count);
+            static int gt = -1;
+            if (gt < 0) { const char *e = getenv("CALYPSO_GOLIVE_TASKW");
+                          gt = (e && *e == '1') ? 1 : 0; }
+            if (gt && (s->data[0x0810] & 0x8000)) {
+                s->data[0x3f92] |= 0x0800;   /* rejoue ORM #0x0800 @0xa539 */
+                static unsigned glg = 0;
+                if (glg++ < 8)
+                    fprintf(stderr, "[c54x] GO-LIVE-TASKW @0x%04x d[3f92]=0x%04x "
+                            "(ORM 0xa539 rejoue, ARM 0810 bit15 set) insn=%u\n",
+                            exec_pc, s->data[0x3f92], s->insn_count);
+            }
         }
         /* SM-TRACE (gated CALYPSO_SM_TRACE) : trace instruction-par-instruction
          * l'etat-machine handshake 0xdde0-0xde9f (route reclear 0xde8b vs setter
@@ -15226,6 +15413,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         }
     }
     s->ifr |= (1 << imr_bit);
+    if (imr_bit == 12 && frame_it_level_on()) g_frame_it_level = true;  /* arme le LEVEL hold frame */
 
     /* SONDE INT3-RATE (2026-06-24 diag sur-delivrance) : chaque dispatch INT3
      * (vec 19 = FRAME) avec le delta insn depuis le precedent. delta ~130 =
@@ -15328,6 +15516,23 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
          * mauvais contexte → over-pop SP → DP garbage → self-CALA 0x70c3.
          * IFR reste set (non clearé) → l'IT est servie au prochain appel,
          * delay_slots étant retombé à 0 (max ~2 insns plus tard). */
+        /* FRAME-IT PRIO (gated CALYPSO_FRAME_IT_PRIO) : si la frame-IT (bit12/vec28)
+         * est latchee ET demasquee mais qu on s apprete a servir une IT de priorite
+         * plus basse (ex BRINT0 vec21, sur-livree par le BSP a chaque burst -> noie
+         * la frame), servir la FRAME d abord sur cette fenetre INTM=0. Le bit de l IT
+         * demandee reste pendant (non cleare, imr_bit ecrase) -> servie au prochain
+         * edge. Draine la frame-IT affamee (5908x pendante, 1x prise) -> vec28 ->
+         * scheduler 0x7234 -> dispatcher -> kernel FB. */
+        if (vec != 28 && frame_it_prio_on() &&
+            (s->ifr & (1u << 12)) && (s->imr & (1u << 12))) {
+            static unsigned _fp = 0;
+            if (_fp++ < 30)
+                fprintf(stderr, "[c54x] FRAME-IT-PRIO override vec=%d->28 (frame latchee) "
+                        "IFR=0x%04x IMR=0x%04x PC=0x%04x insn=%u\n",
+                        vec, s->ifr, s->imr, s->pc, s->insn_count);
+            vec = 28; imr_bit = 12;
+            g_frame_it_level = false;   /* FIX livelock : relache le LEVEL hold (sinon bit12 re-asserte -> vec28 sur-fire 7x/trame -> 139k INTM-TRANS) */
+        }
         s->ifr &= ~(1 << imr_bit);
         s->sp--;
         data_write(s, s->sp, (uint16_t)s->pc);

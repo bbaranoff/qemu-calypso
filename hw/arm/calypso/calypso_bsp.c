@@ -31,6 +31,7 @@
 #include "hw/arm/calypso/calypso_bsp.h"
 #include "hw/arm/calypso/calypso_c54x.h"
 #include "hw/arm/calypso/calypso_iota.h"
+#include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
@@ -561,8 +562,11 @@ static void bsp_trxd_readable(void *opaque)
     static int iq_pt_mode = -1;
     if (iq_pt_mode < 0) {
         const char *e = getenv("CALYPSO_BSP_IQ_PASSTHROUGH");
-        iq_pt_mode = (e && *e == '1') ? 1 : 0;
-        BSP_LOG("IQ_PASSTHROUGH=%d", iq_pt_mode);
+        /* [2026-07-25] passthrough par DEFAUT (coherence feed : 0x2a00 = MEME
+         * I/Q que gr-gsm via feed_iq). Synthese cos/sin = tone incoherent ->
+         * opt-out explicite CALYPSO_BSP_IQ_PASSTHROUGH=0 seulement. */
+        iq_pt_mode = (e && *e == '0') ? 0 : 1;
+        BSP_LOG("IQ_PASSTHROUGH=%d (defaut ON ; synthese=opt-out =0)", iq_pt_mode);
     }
     int iq_bytes = (int)n - 8;  /* payload bytes after 8-byte hdr */
     /* Bridge envoie 2 int16 par bit (I,Q interleaved). 4 bytes/bit.
@@ -797,6 +801,7 @@ static size_t bsp_replay_load(const char *path)
 void calypso_bsp_init(C54xState *dsp)
 {
     bsp.dsp = dsp;
+    calypso_manifest_once();   /* dump forcages actifs (gate CALYPSO_INVARIANTS, defaut off) */
     /* 2026-05-28 : ancien commentaire "DSP reads I/Q at 0x3fb3-0x3fbe"
      * obsolete. Discovery par CALYPSO_BSP_INJECT_CANARY a confirme que
      * le vrai buffer cote DSP est 0x2a00 (PC=0x93a5 consumer, AR3 post-inc
@@ -1446,6 +1451,30 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
             c54x_interrupt_ex(bsp.dsp, 21, 5);
         }
 
+        /* RX-FBFLAGS (gated CALYPSO_RX_FBFLAGS) — GATE DEPUIS LE RX (remplace le
+         * poke c54x CALYPSO_FORCE_3FAE). Sur silicon, l'ISR BRINT0 (0xf310) OR les
+         * bits de handshake FB-det que le handler correlateur poll en boucle :
+         *   data[0x3faa] bit2 (0x0004) + bit8 (0x0100)   @0x886b/0x8885/0x8898
+         *   data[0x3fab] bit8 (0x0100)                   @0x888d
+         *   data[0x3fae] bit8 (0x0100)                   @0x90c8/0x90ed/0x9128
+         * L'ISR emulee ne les pose pas -> le handler boucle 0x90b0-0x9130 sans
+         * jamais atteindre le kernel. On les pose ICI, a la livraison du burst
+         * DARAM 0x2a00 (= "burst pret"), pour que le correlateur deroule. Le
+         * traceur CORR-FLOW dira si un gate SUIVANT apparait. */
+        {
+            static int _fbf = -1;
+            if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
+            if (_fbf && bsp.dsp) {
+                bsp.dsp->data[0x3faa] |= 0x0104;   /* bit2 + bit8 */
+                bsp.dsp->data[0x3fab] |= 0x0100;   /* bit8 (cible FBEN) */
+                bsp.dsp->data[0x3fae] |= 0x0100;   /* bit8 (gate confirme 2026-07-25) */
+                static unsigned _fbfn = 0;
+                if (_fbfn++ < 8)
+                    BSP_LOG("RX-FBFLAGS: pose 0x3faa|=0x104 0x3fab|=0x100 0x3fae|=0x100 "
+                            "(handshake FB-det depuis livraison burst)");
+            }
+        }
+
         /* RX I/Q tap : si BSP_DUMP_RX_FILE est set, append le burst brut
          * (n int16_t LE I/Q interleaved) au fichier. Header 12B par burst :
          *   magic 'IQ16' (4B) | fn (4B LE) | tn (1B) | n_int16 (2B LE) | _pad (1B)
@@ -1699,5 +1728,26 @@ bool calypso_bsp_tx_rach_burst(uint32_t fn, uint8_t bits[148])
         BSP_LOG("RACH encode #%d fn=%u ra=0x%02x bsic=0x%02x d_rach=0x%04x",
                 rach_log, fn, ra, uic_or_bsic, d_rach);
     }
+    return true;
+}
+
+/* [2026-07-26 PORT LU] Emet un access-burst RACH UL depuis un ra/bsic EXPLICITE
+ * (bypass le read DARAM d_rach). Appele par le hook write-d_rach de calypso_trx.c
+ * sous SHUNT_LEGIT : la tache DSP d_task_ra est avalee par le shunt et
+ * calypso_bsp_tx_rach_burst ne tire jamais. 1 appel = 1 vraie tentative RACH. */
+bool calypso_bsp_send_rach_ra(uint8_t ra, uint8_t bsic, uint32_t fn, uint8_t tn)
+{
+    int forced = rach_force_bsic();
+    if (forced >= 0) bsic = (uint8_t)forced;
+    uint8_t bits[148] = {0};
+    int rc = gsm0503_rach_ext_encode(bits, ra, bsic, false);
+    if (rc < 0) {
+        BSP_LOG("RACH-RA encode fail rc=%d ra=0x%02x bsic=0x%02x", rc, ra, bsic);
+        return false;
+    }
+    static int lg = 0;
+    if (++lg <= 20)
+        BSP_LOG("RACH-RA encode #%d fn=%u ra=0x%02x bsic=0x%02x (hook d_rach)", lg, fn, ra, bsic);
+    calypso_bsp_send_ul(tn, fn, bits);   /* -> 127.0.0.1:5702 -> pont g_bsp_fd */
     return true;
 }

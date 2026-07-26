@@ -236,17 +236,16 @@ def test_no_bootstub_entry(qemu_log_lines):
 
 @pytest.mark.ar_imr_invariant
 def test_tpu_frame_irq_delivered(qemu_log_lines):
-    """INT3 (TPU FRAME, vec=19, bit=3) doit être delivered périodiquement
-    sur pipeline vivant. Si 0 IRQ vec=19 → TPU pas configuré (ARM init
-    bloqué), ou bridge clock CLK_IND non émis."""
-    vec19_count = 0
+    """Frame-IT (TPU FRAME) est routée vec=28 (bit12, IMR b12) via PRIO
+    désormais — plus vec=19. Elle est délivrée par HIGHVEC-ENTRY lastvec=28.
+    Si 0 delivery vec=28 → frame-IT pas prise dans ce run (dépend de la
+    phase capturée) ; pas un fail."""
+    vec28_count = 0
     for line in qemu_log_lines:
-        m = IRQ_RE.search(line)
-        if m and int(m.group(2)) == 19:
-            vec19_count += 1
-    if vec19_count == 0:
+        if "lastvec=28" in line:
+            vec28_count += 1
+    if vec28_count == 0:
         pytest.skip(
-            "0 IRQ vec=19 (INT3 FRAME) — TPU ne fire pas. "
-            "Diagnostique : bridge CLK_IND ? ARM init TPU ? "
-            "Pas un fail (peut être déclenché par config).")
-    assert vec19_count > 0
+            "0 delivery vec=28 (frame-IT) — frame-IT pas prise dans ce run. "
+            "Pas un fail (peut dépendre de la phase capturée).")
+    assert vec28_count > 0

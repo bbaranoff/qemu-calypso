@@ -14,6 +14,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_tsp.h"
 #include "hw/arm/calypso/calypso_debug.h"
 
@@ -80,11 +81,11 @@ void calypso_tsp_move(uint8_t addr, uint8_t data, uint32_t fn)
                  * (matches the original single-byte implementation). */
                 calypso_iota_tsp_write(tsp.tx[0], 0);
             } else {
-                /* No downstream hardware model for other TSP devices (e.g.
-                 * dev 1 = RF frontend tuning words) -- decoded correctly and
-                 * made visible instead of silently dropped. */
-                TSP_LOG("WR dev=%u bitlen=%u dout=0x%08x fn=%u (no consumer)",
-                         dev_idx, bitlen, dout, fn);
+                /* dev 1 = RF frontend (trf6151) : on suit le gain programme
+                 * (REG_RX) pour caler le rxlev cote PM MEAS. */
+                calypso_trf6151_tsp_write(dev_idx, dout);
+                TSP_LOG("WR dev=%u bitlen=%u dout=0x%08x fn=%u (trf6151 gain=%d)",
+                         dev_idx, bitlen, dout, fn, calypso_trf6151_total_gain_db());
             }
         }
         break;

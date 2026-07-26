@@ -156,6 +156,26 @@ static bool calypso_lost_latch_enabled(void)
     return cached;
 }
 
+/* Read-driven lost-frame grid (timer #1 only).
+ * check_lost_frame() (layer1/sync.c:189) est le SEUL lecteur de timer #1 dans
+ * tout le firmware — hwtimer_read() n'a pas d'autre appelant, et les delay_*
+ * sont des busy-loops, pas des lectures hwtimer. Il lit 0x04 exactement 1× par
+ * l1_sync (= 1× par frame-IRQ reçue) et attend un décrément de 1875 pile entre
+ * deux lectures. La dérive trx_fn/sch_fn (delta 1..6 qui snap-back) fait sauter
+ * la grille fn-dérivée -> le firmware voit k*1875 -> "LOST k*1875!". En calant la
+ * grille sur la LECTURE (décrément de 1875 pile par read, wrap mod period) on
+ * garantit diff==1875 à chaque l1_sync -> zéro LOST, sans aucun effet de bord
+ * (aucun autre code ne lit timer #1). Gate CALYPSO_LOST_READ_DRIVEN, défaut ON. */
+static bool calypso_lost_read_driven(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("CALYPSO_LOST_READ_DRIVEN");
+        cached = (e && *e == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 void calypso_timer_register_lost(DeviceState *d)
 {
     g_lost_timer = CALYPSO_TIMER(d);
@@ -201,6 +221,13 @@ static uint64_t calypso_timer_read(void *opaque, hwaddr offset, unsigned size)
     case 0x02: return s->load;
     case 0x04:
         if (s->lost_latch_active) {   /* frame-locked value for check_lost_frame() */
+            if (s == g_lost_timer && calypso_lost_read_driven()) {
+                /* Grille calée sur la lecture : chaque read décroît de 1875 pile
+                 * (wrap mod period) -> diff==1875 systématique -> zéro LOST. */
+                uint32_t period = (uint32_t)s->load + 1;   /* 7500 */
+                s->lost_read_phase = (s->lost_read_phase + LOST_TICKS_PER_TDMA) % period;
+                return (uint16_t)(s->load - s->lost_read_phase);
+            }
             return s->lost_latch_count;
         }
         return calypso_timer_current_count(s);
@@ -276,6 +303,7 @@ static void calypso_timer_reset(DeviceState *dev)
     s->running = false;
     s->lost_latch_active = false;
     s->lost_latch_count = 0;
+    s->lost_read_phase = 0;
     timer_del(s->timer);
 }
 

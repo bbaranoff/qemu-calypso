@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/C54X_INSTRUCTIONS.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/C54X_INSTRUCTIONS.md, conserve pour reference (unification 2026-07-26) -->
 ---
 name: C54x instruction encoding from SPRU172C
 description: Key instruction encodings verified from TI SPRU172C doc, corrects emulator bugs
