@@ -37,6 +37,7 @@ struct CalypsoTimerState {
     /* Frame-locked lost-frame latch (timer #1 only) — see calypso_timer.c. */
     bool     lost_latch_active;
     uint16_t lost_latch_count;
+    uint32_t lost_read_phase;   /* read-driven grid phase (timer #1 only) */
 };
 
 /* Register the timer instance read by firmware check_lost_frame() (timer #1). */

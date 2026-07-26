@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/REGISTERS_REVIEW.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/REGISTERS_REVIEW.md, conserve pour reference (unification 2026-07-26) -->
 # DSP Register-Image (calypso_dsp.Registers.bin) — Review / Diag pour refactor
 
 > ⚠️ **PÉRIMÉ sur sa prémisse centrale (audit doc↔code 2026-07-01, voir [DOC_CODE_AUDIT.md](DOC_CODE_AUDIT.md)).**

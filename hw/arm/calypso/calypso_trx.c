@@ -147,9 +147,44 @@ extern uint16_t g_arm_taskmd5_ea;
  * re-introducing a firmware patch.
  */
 
-uint32_t calypso_trx_get_fn(void) { return g_trx ? g_trx->fn : 0; }
+uint32_t calypso_trx_get_fn(void)
+{
+    if (!g_trx) {
+        return 0;
+    }
+    /* RANK4 recale FN (gate CALYPSO_DL_FN_OFFSET, DEFAUT 0 = inerte -> identique
+     * au clean). Offset signe applique a la reference FN de tous les consumers
+     * (shunt feed, BSP match, FN-ALIGN) pour caler la FN DSP sur la SCH BTS. A
+     * -556, la FCCH tombe dans la bonne trame. NB : trop large (touche aussi la
+     * FN UL/DATA_IND) -> a n'activer que pour l'alignement correlateur. */
+    static int off = 0, off_init = 0;
+    if (!off_init) {
+        off_init = 1;
+        const char *e = getenv("CALYPSO_DL_FN_OFFSET");
+        if (e && *e) {
+            off = atoi(e);
+        }
+    }
+    return (uint32_t)((int64_t)g_trx->fn + off);
+}
 
 /* ---- DSP API RAM ---- */
+/* [2026-07-26 camp] Latch per-page du d_burst_d COMMANDE par l'ARM (db_w),
+ * pour l'echo per-burst reel (CALYPSO_SHUNT_BURST_ECHO=2). Index = parite de
+ * page : [0]=write off 0x0002 (wp p0), [1]=off 0x002A (wp p1). resp(b) (prio -4)
+ * lit AVANT cmd(b+2) (prio 0) dans la meme trame -> le latch tient le burst
+ * courant -> echo 0,1,2,3 exact, sans jitter, sans OFS. */
+uint32_t shunt_l1s_fn(void);   /* decl (calypso_dsp_internal.h) */
+/* [2026-07-26 camp] FIFO des burst_id commandes par l'ARM (db_w->d_burst_d) :
+ * push sur write WP (calypso_dsp_write), pop sur lecture d_task_d (1x/nb_resp),
+ * reset au debut de bloc BCCH (gap shunt_l1s_fn). Distingue burst 0 de burst 2
+ * (une latch/parite ne le peut pas) + immunise le double-read (pop 1x/nb_resp,
+ * valeur figee s_burst_cur). Deterministe, sans OFS/FN/ECHO. */
+static uint8_t  s_bd_ring[8];
+static unsigned s_bd_w = 0, s_bd_r = 0;
+static uint16_t s_burst_cur = 0;
+static uint32_t s_bd_last_wfn = 0xFFFFFFFF;
+
 static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
@@ -227,6 +262,45 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         if (calypso_dsp_shunt_real_fb_read((uint32_t)offset, &rv)) {
             val = rv;
             real_fb_hit = true;
+        }
+    }
+    /* [2026-07-26 camp] db_r->d_task_d (read page 0 @off 0x50 / page 1 @off 0x78,
+     * word 0) : le DSP clear la commande NB -> l1s_nb_resp lit 0 -> puts("EMPTY")
+     * et bail avant a_cd. Sous SHUNT_LEGIT + si_valid (a_cd rempli), si le firmware
+     * lit d_task_d=0, retourner ALLC_DSP_TASK(24) -> il continue vers a_cd. d_burst_d
+     * (off 0x52/0x7A) reste la valeur du firmware (db_r==db_w) -> match burst_id. */
+    if (size == 2 && (offset == 0x0050 || offset == 0x0078)) {
+        static int _cl = -1;
+        if (_cl < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); _cl = (l && *l=='1') ? 1 : 0; }
+        if (_cl && calypso_dsp_shunt_si_valid()) {
+            /* d_task_d lu 1x/nb_resp (prim_rx_nb.c:77) -> POP le prochain burst_id
+             * du FIFO. Stable pour les 1-2 lectures d_burst_d du meme nb_resp. */
+            s_burst_cur = s_bd_ring[s_bd_r++ & 7u];
+            if (val == 0) val = 24;   /* ALLC_DSP_TASK : evite EMPTY */
+        }
+    }
+    /* [2026-07-26 camp] db_r->d_burst_d (read page @off 0x52 / 0x7A) : le pipeline
+     * nb_cmd/nb_resp decale le burst_id commande vs demodule -> "BURST ID x!=y" et
+     * le firmware n'atteint jamais burst 3 (ou a_cd est lu). On retourne 3 :
+     * nb_resp(3) matche (3==3) et lit a_cd/SI ; nb_resp(0/1/2) bail (mesures
+     * non-critiques). Gate SHUNT_LEGIT + si_valid. */
+    if (size == 2 && (offset == 0x0052 || offset == 0x007A)) {
+        static int _cb = -1;
+        if (_cb < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); _cb = (l && *l=='1') ? 1 : 0; }
+        if (_cb && calypso_dsp_shunt_si_valid()) {
+            /* SOURCE UNIQUE : miroir per-page du burst_id commande par l'ARM.
+             * db_w->d_burst_d est latche par parite dans calypso_dsp_write :
+             *   write 0x0002 -> s_wp_burst_d[0] (read-page 0, off 0x0052)
+             *   write 0x002A -> s_wp_burst_d[1] (read-page 1, off 0x007A)
+             * resp(b) lit RP(b&1) AVANT que cmd(b+2) (prio 0) ne reecrive la meme
+             * parite -> valeur = burst b, FIGEE sur le double-read (line 83+113).
+             * Deterministe, sans s->fn, sans OFS, sans compteur. */
+            /* r_page = !(burst&1) (verifie runtime : resp(b) lit la read-page de
+             * PARITE OPPOSEE au burst) -> lire le latch de parite inverse a l'offset :
+             * read 0x0052 (RP0) -> latch[1] ; read 0x007A (RP1) -> latch[0]. */
+            /* -1 : le reset FIFO se cale sur le 1er cmd du bloc (souvent burst 1,
+             * burst 0=valeur 0), d'ou un offset de phase constant +1 -> on corrige. */
+            val = (uint16_t)((s_burst_cur + 3) & 3);   /* FIFO -1 (phase) */
         }
     }
     if (!real_fb_hit && size == 2) {
@@ -373,6 +447,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     if (offset >= CALYPSO_DSP_SIZE) return;
     /* [2026-07-22] de-alias burst-ID : mirror d_burst_d par commande */
     calypso_dsp_shunt_wp_burst_write((uint32_t)offset, (uint16_t)value);
+    /* [2026-07-26 camp] PUSH FIFO du burst_id commande (db_w->d_burst_d, word1 :
+     * page0 @0x0002 / page1 @0x002A). Reset au debut d'un bloc BCCH : les cmd0..3
+     * sont a frames L1 CONSECUTIVES (shunt_l1s_fn +1) ; gros trou avant cmd0 du
+     * bloc suivant -> fn != last+1 => reset FIFO -> alignement 0,1,2,3 sans OFS. */
+    if (size == 2 && ((uint32_t)offset == 0x0002 || (uint32_t)offset == 0x002A)) {
+        if (calypso_dsp_shunt_si_valid()) {
+            uint32_t wfn = shunt_l1s_fn();
+            if (wfn != s_bd_last_wfn + 1) { s_bd_w = 0; s_bd_r = 0; }  /* nouveau bloc */
+            s_bd_last_wfn = wfn;
+            s_bd_ring[s_bd_w++ & 7u] = (uint8_t)(value & 3);
+        }
+    }
 
     /* [2026-07-22] WR-RAW (ungated, cap 60) : voir TOUS les writes ARM qui
      * passent par ce hook -> l'ARM commande-t-il le DSP ici, ou tout bypasse ? */
@@ -627,6 +713,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
             uint8_t ra = (uint8_t)((value >> 8) & 0xFF);
             calypso_rach_publish(ra, (uint8_t)((value & 0xFF) >> 2), s->fn);
             calypso_dsp_shunt_record_rach(ra);   /* SONDE B : l1s.current_time.fn par RA */
+            /* [2026-07-26 PORT LU] SHUNT_LEGIT avale d_task_ra -> le poll UL natif
+             * ne tire jamais (RACH encode #0). On emet l'access-burst depuis le
+             * signal FIABLE = l'ecriture d_rach. 1 write = 1 burst (pas de sticky). */
+            {
+                static int ulr = -1;
+                if (ulr < 0) {
+                    const char *e = getenv("CALYPSO_UL_RACH_FROM_DRACH");
+                    if (e) ulr = (*e == '1');
+                    else { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); ulr = (l && *l == '1'); }
+                }
+                if (ulr) calypso_bsp_send_rach_ra(ra, (uint8_t)((value & 0xFF) >> 2), s->fn, 0);
+            }
         }
     }
 

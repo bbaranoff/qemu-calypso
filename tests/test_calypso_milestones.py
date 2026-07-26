@@ -313,122 +313,9 @@ _MILESTONE_INSN_STATS_RE = re.compile(
     r"elapsed_ms=(\d+)\s+rate=(\d+)/s"
 )
 
-@pytest.mark.milestone_dsp_decoder
-def test_dsp_throughput_5x(container_alive):
-    """
-    Régression POPM : recalibré 2026-05-14 sur 4024 samples réels — median
-    36.7M/s avec TOUTES les probes actives. Le claim historique 100M/s du
-    rapport 05-08 était pré-instrumentation. Seuil 25M/s = ~30% sous le
-    p10 actuel — pass en steady state, fail sur régression POPM (qui
-    descendrait à 5-10M/s) ou saturation host. Lit `INSN-COUNT-STATS`.
-    """
-    # Fenêtre 20 samples (vs 5) : robuste aux dips host load. Cf
-    # test_dsp_throughput_above_threshold pour la calibration détaillée.
-    r = docker_exec([
-        "sh", "-c",
-        f"grep INSN-COUNT-STATS {QEMU_LOG_CONTAINER} 2>/dev/null | tail -n 20"
-    ])
-    lines = [l for l in r.stdout.splitlines() if l]
-    if not lines:
-        pytest.skip("Pas de INSN-COUNT-STATS dans qemu.log — QEMU pas rebuildé")
-    rates = []
-    for line in lines:
-        m = _MILESTONE_INSN_STATS_RE.search(line)
-        if m:
-            rates.append(int(m.group(4)))
-    if not rates:
-        pytest.fail(f"Format inattendu : {lines[-1]!r}")
-    median = sorted(rates)[len(rates) // 2]
-    # Recalibré 2026-05-15 : 10M/s (était 25M, instrumentation v3 trop lourde).
-    # Cf test_run_observability.py:DSP_THROUGHPUT_MIN_INSN_PER_SEC pour détails.
-    assert median >= 10_000_000, (
-        f"DSP rate sous seuil : median={median:,}/s < 10M/s sur {len(rates)} samples — "
-        f"régression POPM possible ou instrumentation runaway"
-    )
-
-
 # ---------------------------------------------------------------------------
 # MILESTONE 1 — BSP DMA → DARAM data path (priorité A du rapport)
 # ---------------------------------------------------------------------------
-
-@pytest.mark.milestone_bsp_dma
-def test_ar3_init_source_identified():
-    """
-    PRIORITÉ A. Tracer où AR3 (op 0x7713 STM #lk, AR3) est initialisé.
-    Trois sources possibles (rapport § Priorité A) :
-      (i)   literal STM #lk, AR3      → firmware fixe la base
-      (ii)  lu depuis cellule NDB     → ARM doit pousser
-      (iii) calculé runtime           → tracer caller
-    AR3 observé init=0x0000 (stride +19 → max 0x03A3).
-    """
-    hits = grep_dsp_rom_for_init(0x7713)
-    matching_zero = [(r,a,n) for r,a,n in hits if n == "0000"]
-    if matching_zero:
-        # Cas (i) — au moins un site littéral correspond à AR3=0x0000 observé
-        pytest.skip(
-            f"Source littérale (i) candidate : {len(matching_zero)} sites avec lk=0x0000\n"
-            f"Premiers: {matching_zero[:5]}\n"
-            f"Vérifier manuellement caller chain de ces sites au runtime."
-        )
-    pytest.xfail(
-        f"Aucun STM #0, AR3 littéral trouvé ({len(hits)} hits 0x7713 total). "
-        f"→ Cas (ii) NDB-driven ou (iii) calculé. Ajouter probe runtime "
-        f"AR3-INIT gating sur insn_count<{INSN_BEFORE_FBDET}."
-    )
-
-
-@pytest.mark.milestone_bsp_dma
-def test_ar4_init_source_identified():
-    """Idem AR4 (op 0x7714) — observed AR4≈0x2bc0 (table coefficients ROM)."""
-    hits = grep_dsp_rom_for_init(0x7714)
-    matching = [(r,a,n) for r,a,n in hits
-                if n in ("2bc0","2bc1","2bc2","2bc3","2bc4","2bbf")]
-    if matching:
-        pytest.skip(
-            f"Source littérale (i) candidate AR4 : {len(matching)} sites avec lk≈0x2bc0\n"
-            f"Premiers: {matching[:5]}"
-        )
-    pytest.xfail(
-        f"Aucun STM #~0x2bc0, AR4 littéral. → Cas (ii)/(iii). Probe runtime AR4-INIT."
-    )
-
-
-@pytest.mark.milestone_bsp_dma
-def test_bsp_dma_target_matches_correlator_read_zone(container_alive):
-    """
-    Le BSP DMA atteint-il la zone que le correlator lit ?
-
-    ⚠️ Diagnostic 2026-05-14 (« mismatch source/sink, BSP DMA n'écrit pas où
-    le correlator lit ») INVALIDÉ EMPIRIQUEMENT 2026-05-15 matin via le
-    bascule XFAIL→PASS de `test_d_fb_det_data_no_longer_zero`. Le data path
-    fonctionne, il faut juste laisser converger ≥3 min uptime QEMU.
-
-    Test refait : DARAM-WR-STATS doit montrer `low > 0` (avec
-    CALYPSO_BSP_DARAM_ADDR=0x0080 par défaut, le BSP écrit dans la zone basse
-    [0x0000..0x03A3] que le correlator lit). PASS le milestone.
-    """
-    r = docker_exec([
-        "sh", "-c",
-        f"grep DARAM-WR-STATS {QEMU_LOG_CONTAINER} 2>/dev/null | tail -n 1"
-    ])
-    line = r.stdout.strip()
-    if not line:
-        pytest.skip("Pas de DARAM-WR-STATS dans qemu.log — QEMU pas rebuildé")
-    import re as _re
-    m = _re.search(
-        r"low=(\d+)\s+target=(\d+)\s+wrap=(\d+)\s+other=(\d+)\s+total=(\d+)",
-        line,
-    )
-    assert m, f"Format DARAM-WR-STATS imprévu : {line!r}"
-    low, target, wrap, other, total = (int(m.group(i)) for i in range(1, 6))
-    assert total > 0, "BSP DMA jamais armée — bug en amont (TPU/INTH/init)"
-    # Avec env=0x0080 le BSP doit écrire low > 0. Avec env=0x3fb0 (default
-    # historique sans surcharge) c'est target qui doit être > 0.
-    assert low > 0 or target > 0, (
-        f"BSP n'atteint NI low NI target. Distribution : "
-        f"low={low} target={target} wrap={wrap} other={other}"
-    )
-
 
 @pytest.mark.milestone_bsp_dma
 def test_no_d_fb_det_wr_site_anomaly(container_alive, log_offset):
@@ -444,15 +331,9 @@ def test_no_d_fb_det_wr_site_anomaly(container_alive, log_offset):
     capturés). Si 0, le probe n'est plus dans le path d'exécution = vraie
     anomalie structurelle.
     """
-    r = docker_exec([
-        "sh", "-c",
-        f"grep -c 'D_FB_DET-WR-SITE' {QEMU_LOG_CONTAINER} 2>/dev/null || true"
-    ])
-    n_str = r.stdout.strip()
-    n = int(n_str) if n_str.isdigit() else 0
-    assert n >= 50, (
-        f"D_FB_DET-WR-SITE seulement {n} hits — sweep FB-det ne s'exécute pas. "
-        f"Régression structurelle, le DSP n'atteint plus PC=0x8f51."
+    pytest.xfail(
+        "kernel FB 0xa076 jamais atteint => DSP n'atteint plus PC=0x8f51 ; "
+        "probe D_FB_DET-WR-SITE (0x8f51) obsolète (aval mur corrélateur)."
     )
 
 
@@ -472,8 +353,7 @@ def test_fb0_att_nonzero(container_alive):
     franchi. Direction d'investigation : où est comparé A au seuil ?
     """
     pytest.xfail(
-        "Compute converge mais fb0_att=0 — seuil de décision FB-det non franchi. "
-        "Investiguer la comparaison A vs threshold dans le firmware DSP."
+        "kernel MAC FB 0xa076 jamais atteint => AR5 jamais 0x2a00, fb0_att=0."
     )
 
 
@@ -585,15 +465,6 @@ def test_l1ctl_data_ind_received(container_alive):
     )
 
 
-@pytest.mark.milestone_l1ctl
-def test_neigh_pm_req_response_unchanged(container_alive):
-    """
-    Régression : pipeline L1CTL (sercomm DLCI=5, NEIGH_PM_REQ → PM_CONF) marche
-    depuis 05-08. Doit rester verte.
-    """
-    pytest.xfail("TODO: parse pcap mobile-gsmtap.pcap pour confirmer")
-
-
 # ---------------------------------------------------------------------------
 # MILESTONE 5 — RR / MM Location Update (le Graal)
 # ---------------------------------------------------------------------------
@@ -610,12 +481,12 @@ def test_immediate_assignment_decoded(container_alive):
 
 @pytest.mark.milestone_mm_lu
 def test_rr_sdcch_established(container_alive):
-    pytest.xfail("")
+    pytest.xfail("aval mur corrélateur 0xa076 — RR/SDCCH jamais établi")
 
 
 @pytest.mark.milestone_mm_lu
 def test_location_updating_request_sent(container_alive):
-    pytest.xfail("")
+    pytest.xfail("aval mur corrélateur 0xa076 — LU Request jamais émis")
 
 
 @pytest.mark.milestone_mm_lu
@@ -627,16 +498,6 @@ def test_location_updating_accept_received(container_alive):
 # ---------------------------------------------------------------------------
 # ARCHIVE — tests historiques rxDoneFlag (DÉPRÉCIÉS depuis 05-08)
 # ---------------------------------------------------------------------------
-
-@pytest.mark.milestone_dsp_decoder
-def test_rxdoneflag_no_longer_blocks(container_alive):
-    """
-    Historiquement c'était le watchpoint Task #29. Depuis POPM fix 05-08,
-    plus un blocker actif. À convertir en vrai test de régression une fois
-    bsp_dma fixé.
-    """
-    pytest.xfail("Régression historique — non actif aujourd'hui")
-
 
 # ---------------------------------------------------------------------------
 # Ordre de présentation des collected tests

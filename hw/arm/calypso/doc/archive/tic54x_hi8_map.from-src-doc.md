@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/opcodes/tic54x_hi8_map.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/opcodes/tic54x_hi8_map.md, conserve pour reference (unification 2026-07-26) -->
 # Tic54x C54x Opcode Map (hi8 → mnemonic)
 
 Source authoritative : `binutils-2.21.1/opcodes/tic54x-opc.c` (encoding officiel TI).

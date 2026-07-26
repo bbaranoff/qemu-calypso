@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/README.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/README.md, conserve pour reference (unification 2026-07-26) -->
 # QEMU Calypso - OsmocomBB Layer 1 Emulation
 
 Emulation TI Calypso DBB (Digital Baseband) pour QEMU 9.2, permettant de faire tourner le firmware OsmocomBB Layer 1 et de connecter `mobile` (osmocom-bb layer23).

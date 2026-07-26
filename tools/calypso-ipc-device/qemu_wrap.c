@@ -1606,6 +1606,32 @@ int32_t uhdwrap_write(void *dev, uint32_t num_chans, bool *underrun)
              * -> SDCCH/4 SACCH (SI5/SI6) decodee. Drop = TRAME entiere si ring
              * plein (continuite byte preservee). CALYPSO_RELAY_FIFOS (':'-sep).*/
             relay_fifo_push(g_relay_fbuf, (size_t)ns * 2);
+
+            /* RANK2 : forward I/Q continu -> BSP UDP:6702 (TRXDv0 passthrough),
+             * meme cs16 dense que la FIFO gr-gsm. Gate CALYPSO_BSP_CONT_FORWARD
+             * DEFAUT OFF (inerte). Requiert BSP_IQ_PASSTHROUGH=1 ; mettre
+             * RELAY_ALSO_BSP=0 pour ne pas doubler avec le ring TS0. */
+            {
+                static int cont_fwd = -1;
+                if (cont_fwd < 0) { const char *e = getenv("CALYPSO_BSP_CONT_FORWARD");
+                                    cont_fwd = (e && *e == '1') ? 1 : 0; }  /* DEFAUT OFF */
+                if (cont_fwd && g_bsp_fd >= 0) {
+                    int nc = (ns < CALYPSO_DL_BURSTLEN) ? ns : CALYPSO_DL_BURSTLEN;
+                    uint32_t bfn = (uint32_t)(ts / ((uint64_t)CALYPSO_FRAME_SAMPLES));
+                    static uint8_t cbsp_pkt[TRXD_HDR_LEN + CALYPSO_DL_BURSTLEN * 4];
+                    cbsp_pkt[0] = 0;
+                    cbsp_pkt[1] = (uint8_t)(bfn >> 24);
+                    cbsp_pkt[2] = (uint8_t)(bfn >> 16);
+                    cbsp_pkt[3] = (uint8_t)(bfn >>  8);
+                    cbsp_pkt[4] = (uint8_t)(bfn);
+                    cbsp_pkt[5] = 0;
+                    cbsp_pkt[6] = 0; cbsp_pkt[7] = 0;
+                    memcpy(cbsp_pkt + TRXD_HDR_LEN, dl_read_buf, (size_t)nc * 4u);
+                    sendto(g_bsp_fd, cbsp_pkt, TRXD_HDR_LEN + (size_t)nc * 4u,
+                           MSG_DONTWAIT, (struct sockaddr *)&g_bsp_peer,
+                           sizeof(g_bsp_peer));
+                }
+            }
             /* RELAY+BSP (#3 cfile) : si CALYPSO_RELAY_ALSO_BSP=1, on NE
              * `continue` PAS — on tombe dans l'extraction TS0→TRXDv0→BSP pour
              * alimenter feed_iq (cfile + shm ring grgsm↔BSP). Defaut: relais pur. */

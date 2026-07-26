@@ -1,3 +1,4 @@
+<!-- Archive depuis /opt/GSM/qemu-src/doc/CALYPSO_HW.md, contenu divergent du canonique /opt/GSM/qemu-src/hw/arm/calypso/doc/CALYPSO_HW.md, conserve pour reference (unification 2026-07-26) -->
 # Calypso Hardware Reference
 
 ## Chip Overview

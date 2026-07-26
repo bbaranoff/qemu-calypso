@@ -294,7 +294,7 @@ def test_efficacy_arm_reads_d_fb_det_1(gdb_session):
     after = grep_log(r"ARM RD d_fb_det.*= 0x0001")
     delta = after - before
     if delta == 0:
-        pytest.xfail(f"ARM did not poll d_fb_det during injection (firmware may be in atypical state)")
+        pytest.xfail("kernel FB 0xa076 jamais atteint => AR5 jamais 0x2a00, d_fb_det jamais mis a 1 : ARM ne poll pas d_fb_det (aval mur correlateur)")
     assert delta >= 1, f"only {delta} ARM RD d_fb_det=1 — too few"
 
 @pytest.mark.inject_frames
@@ -312,5 +312,5 @@ def test_efficacy_arm_reads_a_cd(gdb_session):
     after = grep_log(r"ARM RD a_cd")
     delta = after - before
     if delta == 0:
-        pytest.xfail("ARM L1 prim_rx_nb didn't read a_cd[] during window")
+        pytest.xfail("kernel FB 0xa076 jamais atteint => pas de camp/RX_NB : a_cd[] jamais lu par ARM (le camp depend du correlateur, aval mur 0xa076)")
     assert delta >= 1
