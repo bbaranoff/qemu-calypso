@@ -1635,6 +1635,21 @@ static int      g_fbwatch_on = -1;
 
 static uint16_t data_read(C54xState *s, uint16_t addr)
 {
+    /* [2026-07-26 golive-mac] WATCH-9F00-RD : l'etage demod deroule 0x9f00
+     * ecrit son resultat en 0x2a00 (workzone). Son ENTREE = ce qu'il LIT hors
+     * du workzone. On trace les lectures quand PC in [0x9f00..0x9fb8] et addr
+     * HORS 0x2a00..0x2b27 pour localiser le vrai buffer IQ source (a nourrir a
+     * la place de 0x2a00). Gate CALYPSO_WATCH_9F00_RD. */
+    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8) {
+        static int _r9 = -1;
+        if (_r9 < 0) _r9 = getenv("CALYPSO_WATCH_9F00_RD") ? 1 : 0;
+        if (_r9 && !(addr >= 0x2a00 && addr <= 0x2b27)) {
+            static unsigned _n9 = 0;
+            if (_n9++ < 160)
+                fprintf(stderr, "[c54x] WATCH-9F00-RD PC=0x%04x reads addr=0x%04x val=0x%04x insn=%u\n",
+                        s->pc, addr, s->data[addr], s->insn_count);
+        }
+    }
     /* Correlator read tracer (env-gated CALYPSO_CORRELATOR_TRACE=1).
      * Record addr seulement quand PC ∈ [CORR_PC_LO..CORR_PC_HI) (FB-det range).
      * Range étendu 2026-05-25 night à 0x8d00..0x9000 (cf comment block au L639).
@@ -1659,8 +1674,8 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
             int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
             int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
             fprintf(stderr, "[c54x] IQ-READ #%u addr=0x%04x val=0x%04x PC=0x%04x A=%lld B=%lld "
-                    "T=%04x | AR3=%04x[%04x] AR4=%04x[%04x] AR5=%04x[%04x] insn=%u\n",
-                    iqr, addr, val, s->pc, (long long)a, (long long)b, s->t,
+                    "T=%04x s=%p | AR3=%04x[%04x] AR4=%04x[%04x] AR5=%04x[%04x] insn=%u\n",
+                    iqr, addr, val, s->pc, (long long)a, (long long)b, s->t, (void*)s,
                     s->ar[3], s->data[s->ar[3]], s->ar[4], s->data[s->ar[4]],
                     s->ar[5], s->data[s->ar[5]], s->insn_count);
             iqr++;
@@ -2362,6 +2377,40 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-26 golive-mac] WATCH-2A00 : trace toute ecriture OPCODE vers le
+     * buffer IQ 0x2a00..0x2a07 (capture si le DSP lui-meme repose 0x12ed apres
+     * feed_iq). feed_iq ecrit s->data[] EN DIRECT (hors data_write) -> invisible
+     * ici : si 0x12ed apparait ici c'est un writer opcode DSP. s=%p pour comparer
+     * avec le pointeur feed_iq. Gate CALYPSO_WATCH_2A00. */
+    if (addr >= 0x2a00 && addr <= 0x2a07) {
+        static int _w2a = -1;
+        if (_w2a < 0) _w2a = getenv("CALYPSO_WATCH_2A00") ? 1 : 0;
+        if (_w2a) {
+            static unsigned _n2a = 0;
+            if (_n2a++ < 80)
+                fprintf(stderr, "[c54x] WATCH-2A00 opcode-write data[0x%04x]=0x%04x "
+                        "(was 0x%04x) PC=0x%04x s=%p insn=%u\n",
+                        addr, val, s->data[addr], s->pc, (void*)s, s->insn_count);
+        }
+    }
+    /* [2026-07-26 golive-mac] WATCH-RESULT : trace les ecritures OPCODE vers les
+     * cellules resultat FB natif (= adresses shunt_legit, confirmees osmocom NDB) :
+     * d_fb_det 0x08F8, a_sync_demod TOA/PM/ANGLE/SNR 0x08FA..0x08FD. Montre le
+     * SHADOW que le correlateur natif produit, meme quand d_fb_det reste 0.
+     * Gate CALYPSO_WATCH_RESULT. */
+    if (addr >= 0x08F8 && addr <= 0x08FD) {
+        static int _wr = -1;
+        if (_wr < 0) _wr = getenv("CALYPSO_WATCH_RESULT") ? 1 : 0;
+        if (_wr) {
+            static unsigned _nr = 0;
+            const char *_nm = (addr==0x08F8)?"d_fb_det":(addr==0x08F9)?"d_fb_mode":
+                              (addr==0x08FA)?"TOA":(addr==0x08FB)?"PM":
+                              (addr==0x08FC)?"ANGLE":"SNR";
+            if (_nr++ < 120)
+                fprintf(stderr, "[c54x] WATCH-RESULT data[0x%04x]=%-8s 0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
+                        addr, _nm, val, s->data[addr], s->pc, s->insn_count);
+        }
+    }
     /* [2026-07-25] WATCH-0810 (gated CALYPSO_WATCH_0810) : trace toute ecriture
      * DSP-side a data[0x0810] (d_ctrl_system / B_TASK_ABORT bit15) avec le PC
      * auteur. Complete ARM-WRITE-0810 (cote trx). Ensemble : QUI repose bit15

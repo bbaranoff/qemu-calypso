@@ -1191,13 +1191,32 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * le burst FB d'une frame atterrissait à un offset que le DSP ne lit pas
      * (fragmenté sur le wrap) → corrélateur sur données désalignées. */
     unsigned woff = 0;
+    /* [2026-07-26 golive-mac] ROOT-CAUSE d_fb_det=0 : ce writer rx_burst ecrit
+     * son iq[] (burst DC degenere = 0x12ed constant) en DARAM 0x2a00, CLOBBANT
+     * les vrais samples FCCH que feed_iq (calypso_dsp_shunt.c, coh=0.999) y a
+     * poses. Quand CALYPSO_FB_IQ_DARAM=1, feed_iq DETIENT la DARAM 0x2a00 : on
+     * SAUTE la boucle d'ecriture concurrente (mais on GARDE acquire/release :
+     * le lock enveloppe aussi le post-write log jusqu'a 0x2a00 release plus bas).
+     * Indep. de DIRECT_FEED/DARAM_FORCE. */
+    static int _fbiq_owns = -1;
+    if (_fbiq_owns < 0) {
+        const char *e = getenv("CALYPSO_FB_IQ_DARAM");
+        _fbiq_owns = (e && atoi(e) > 0) ? 1 : 0;
+    }
     calypso_pcb_daram_lock_acquire();
-    for (int i = 0; i < n; i++) {
-        uint16_t a = (uint16_t)(bsp.daram_addr + woff);
-        bsp.dsp->data[a] = (uint16_t)iq[i];
-        bsp_daram_wr_bucket(a);
-        woff++;
-        if (woff >= bsp.daram_len) woff = 0;
+    if (_fbiq_owns) {
+        static unsigned _sk = 0;
+        if (_sk++ < 8)
+            fprintf(stderr, "[BSP] FB-IQ-DARAM owns 0x2a00 : rx_burst DARAM write SKIP "
+                    "(fn=%u tn=%u) -> feed_iq authoritative\n", (unsigned)fn, (unsigned)tn);
+    } else {
+        for (int i = 0; i < n; i++) {
+            uint16_t a = (uint16_t)(bsp.daram_addr + woff);
+            bsp.dsp->data[a] = (uint16_t)iq[i];
+            bsp_daram_wr_bucket(a);
+            woff++;
+            if (woff >= bsp.daram_len) woff = 0;
+        }
     }
     bsp.bursts_written++;
 
