@@ -48,8 +48,8 @@
 *Cartes dadresses DSP↔ARM, ROM map, matériel, schémas, Sercomm.*
 
 - [`CALYPSO_HW.from-src-doc.md`](CALYPSO_HW.from-src-doc.md)
-- [`DSP_ADDRESS_MAP.md`](DSP_ADDRESS_MAP.md)
-- [`DSP_ARM_LINKAGE.md`](DSP_ARM_LINKAGE.md)
+- [`DSP_ADDRESS_MAP.md`](../DSP_ADDRESS_MAP.md) *(désarchivé → doc/)*
+- [`DSP_ARM_LINKAGE.md`](../DSP_ARM_LINKAGE.md) *(désarchivé → doc/)*
 - [`DSP_ROM_MAP.from-src-doc.md`](DSP_ROM_MAP.from-src-doc.md)
 - [`schematics.md`](schematics.md)
 - [`SERCOMM_GATE_ARCHITECTURE.from-src-doc.md`](SERCOMM_GATE_ARCHITECTURE.from-src-doc.md)
@@ -97,6 +97,7 @@
 *Instantanés historiques : sessions, statuts, TODO, state.*
 
 - [`doc_master.md`](doc_master.md)
+- [`MASTER.md`](MASTER.md) *(ancien index maître — supplanté par [../ETAT_ACTUEL.md](../ETAT_ACTUEL.md) + [../README.md](../README.md) ; liens internes obsolètes)*
 - [`project/CLAUDE.md`](project/CLAUDE.md)
 - [`project/PROJECT_STATUS.md`](project/PROJECT_STATUS.md)
 - [`project/state.md`](project/state.md)
@@ -105,6 +106,7 @@
 - [`README.from-src-doc.md`](README.from-src-doc.md)
 - [`SESSION_2026-05-29.md`](SESSION_2026-05-29.md)
 - [`SESSION_20260403.md`](SESSION_20260403.md)
+- [`SESSION_20260405_NIGHT4.md`](SESSION_20260405_NIGHT4.md) *(encodages F0xx/RSBX/RET/CALLD/IDLE — réf ISA durable, cf. ETAT_ACTUEL §7)*
 - [`SESSION_20260429.from-src-doc.md`](SESSION_20260429.from-src-doc.md)
 - [`SESSION_20260429.md`](SESSION_20260429.md)
 - [`status.md`](status.md)

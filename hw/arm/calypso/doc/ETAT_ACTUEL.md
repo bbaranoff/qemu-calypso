@@ -1,21 +1,44 @@
 # ETAT ACTUEL — QEMU-Calypso (source de verite unique)
 
 > Document de reference courant. Ancre sur la VERITE TERRAIN VERIFIEE 2026-07-27.
-> En cas de conflit, la verite terrain prime sur tout fait extrait d'un autre doc.
-> Tous les autres documents sont dans `doc/archive/` (reference durable uniquement, cf. §7).
+> **Regle de resolution de conflit :** la verite terrain 2026-07-27 (matrice §1) prime sur
+> tout fait extrait d'un autre doc. Le STATUT DEPEND DU MODE : ne jamais citer un statut
+> sans le mode. Tous les autres documents sont dans `doc/archive/` (reference durable
+> uniquement, cf. §7).
 
 ---
 
-## 1. Ce qui marche
+## 1. Statut par mode (verite terrain 2026-07-27)
 
-**Le mobile CAMPE et S'ENREGISTRE de bout en bout via la CHAINE HOST.**
+> **Il n'y a PAS de statut absolu — le statut depend du MODE de run.** L'ancienne
+> "contradiction" (« LU ACCEPT recu » vs « RACH UL bloque pour boucler la LU ») etait
+> DEUX MODES CONFONDUS : la LU MARCHE en shunt, elle est bloquee en natif. La resolution
+> n'est pas de choisir, c'est de presenter le statut PAR MODE.
 
-Preuves runtime :
-- `LOCATION UPDATING ACCEPT` recu (lai = 001-01-1).
-- MM IDLE, normal service.
-- RXLEV serving ~ -53 dBm.
+### Les modes (socle `calypso.env` + un `calypso_X.env`)
 
-Chaine operationnelle (la SEULE voie FBSB qui campe) :
+- **`SHUNT_LEGIT=1`** — base. FBSB host-side (`real_fb` + gr-gsm -> API RAM), cannes de
+  stabilisation, DSP c54x OFF. **MODE FIABLE.**
+- **`SHUNT_NO_LEGIT=1`** — injections explicites, le DSP shunte.
+- **`SHUNT_LEGIT=DSP,NO_CANNED`** (value-list) — DSP c54x tourne en // et sans cannes.
+  Plus proche du reel, plus flaky.
+- **`CALYPSO_NATIVE=1`** (NATIF) — DSP FB-STREAM -> `data[0x9213]`/`data[0x9215]`.
+- **`CALYPSO_NATIVE_HELPED=1`** (NATIF AIDE) — DSP + `feed_iq` DARAM `0x9210`.
+
+### Matrice statut x mode
+
+| Feature | SHUNT_LEGIT=1 | SHUNT_NO_LEGIT | DSP,NO_CANNED | NATIVE / NATIVE_HELPED |
+|---|---|---|---|---|
+| FB/SB sync | DONE (host gr-gsm) | DONE | DONE | WIP : correlateur DSP TOURNE (atteint `0x8d00`, DETECTOR-RUN @`0x9ac0`, `d_fb_mode=1`) mais `d_fb_det[0x08f8]=0` -> PAS de detection |
+| rxlev serving | DONE | DONE | DONE | DONE : -47 dBm reel (modele trf6151/DECAN) |
+| Camp (C3) | DONE | DONE | DONE | TODO : « No sysinfo » (FB pas detecte) |
+| LU + registration | DONE (LU ACCEPT + TMSI + On Network) | DONE | DONE | TODO (pas de camp -> pas de LU) |
+| SMS MO | DONE | DONE | WIP flaky (anti-stall ajoute) | TODO |
+| SMS MT | DONE | DONE | WIP | TODO |
+| Ctrl-C mobile recover | DONE | DONE | DONE | TODO |
+| Voix TCH/F | WIP : ASSIGNMENT COMMAND atteint -> ASSIGNMENT FAILURE (le shunt ne presente pas le TCH DL) ; call `fake_trx` = ACTIVE + audio => reseau OK | WIP | WIP | TODO |
+
+### Chaine operationnelle (la SEULE voie FBSB qui campe — modes shunt)
 
 ```
 twl3025/DECAN (AFC/PM/rxlev, gain trf6151)
@@ -26,20 +49,27 @@ gr-gsm (decode SB/SI sur I/Q continu 4 SPS)
         -> camp + Location Update
 ```
 
-Blocage restant cote camp : **RACH UL** pour boucler la LU (P0 quasi complet, C3 camped atteint).
+Preuves runtime (modes shunt) : `LOCATION UPDATING ACCEPT` recu (lai = 001-01-1) ;
+MM IDLE, normal service ; RXLEV serving ~ -47/-53 dBm.
+
+**En NATIF, le blocage restant = FB pas detecte (`d_fb_det=0`) donc pas de camp, donc pas
+de LU/RACH UL.** Voir §3.
 
 ---
 
 ## 2. Architecture reelle
 
 Deux CPU emules, colles par MMIO API RAM :
-- **ARM946** execute le firmware osmocom-bb.
+- **ARM946** (`calypso_mb.c:303`, cœur ARMv5TE de QEMU) execute le firmware osmocom-bb.
+  Il **modelise le vrai ARM7TDMI** (ARMv4T) du Calypso : v5TE est un sur-ensemble de v4T,
+  le firmware osmocom (thumb/arm v4T) tourne donc a l'identique. Choix assume et coherent —
+  quand un autre doc dit « ARM7TDMI », il parle du silicium modelise, pas du cœur QEMU.
 - **TMS320C54x** execute la vraie mask-ROM Calypso (TI).
 - Colle : `calypso_trx.c` (mirroir MMIO par ecriture) + `calypso_arm2dsp.c` (pont par instruction).
 
 Loi d'adressage (invariante) : `DSP_word = 0x0800 + (ARM_off - 0xFFD00000)/2`. L'ARM lit les resultats DSP dans `s->dsp->data[off/2 + 0x0800]` — **PAS** dans `dsp_ram[]` ni `api_ram[]` directement. C'est pourquoi les `shunt_dispatch_*` passant par `dma_memory_write` sont invisibles (ils touchent `dsp_ram[]` non mirroir) ; seules les ecritures directes `data[]`/`api_ram[]` campent.
 
-**Le correlateur DSP natif est un VRAI correlateur** (mask-ROM TI), PAS un stub. Verdict affine : son **BUFFER D'ECHANTILLONS n'est jamais alimente**. Sur silicium, ce buffer est rempli par le recepteur on-chip (DRP -> DMA), non modelise en QEMU.
+**Le correlateur DSP natif est un VRAI correlateur** (mask-ROM TI), PAS un stub. Verdict affine : son **BUFFER D'ECHANTILLONS RX n'est jamais cable au recepteur on-chip**. Sur silicium, ce buffer est rempli par le recepteur on-chip (DRP -> DMA), **non modelise en QEMU** (honnetete a garder).
 
 Preuve cote osmocom : `prim_fbsb.c` pose `d_fb_mode` puis polle `d_fb_det` ; `dsp_api.h` ne contient QUE des cellules RESULTAT — **aucun buffer IQ dans l'API RAM**. L'ARM ne fournit jamais l'IQ. Donc `d_fb_det` natif reste 0 tant que le buffer n'est pas nourri cote emulateur.
 
@@ -48,6 +78,11 @@ Preuve cote osmocom : `prim_fbsb.c` pose `d_fb_mode` puis polle `d_fb_det` ; `ds
 ---
 
 ## 3. Etat du natif
+
+**Verite terrain 2026-07-27 : le correlateur DSP TOURNE.** Il atteint le handler `0x8d00`,
+passe en DETECTOR-RUN @`0x9ac0`, `d_fb_mode=1`. Le mur a BOUGE : ce n'est plus « jamais
+dispatche / `0x8d00` 0 hit » (ancienne conclusion RANK3 perimee), c'est **`d_fb_det[0x08f8]`
+reste a 0** faute d'entree valide. rxlev natif = DONE (-47 dBm reel).
 
 **Point d'injection NATIF localise et PROUVE inscriptible :**
 - L'etage demod `0x9f00` lit ses samples en `data[0x9213]` (I) / `data[0x9215]` (Q).
@@ -59,11 +94,12 @@ Preuve cote osmocom : `prim_fbsb.c` pose `d_fb_mode` puis polle `d_fb_det` ; `ds
 - Le kernel energie `0xa076` LIT `0x2a00`.
 - **NE JAMAIS feeder `0x2a00`** (ni via rx_burst, ni via feed_iq). Feeder la source `0x9213`/`0x9215`.
 
-**Blocages restants (plomberie/cadence, PAS logique morte) :**
+**Blocages restants (plomberie/cadence, PAS logique morte) — pourquoi `d_fb_det` reste 0 :**
 - **(a) FENETRE** : feeder un STREAM de samples. Le correlateur batit sa fenetre sur N appels ; 2 cellules figees ne suffisent pas.
 - **(b) DISPATCH par-frame** : le demod ne tourne qu'~1 fois (33 lectures). Il faut le cadencer une fois par trame avec un sample frais.
 
-Tant que (a)+(b) ne sont pas resolus, `d_fb_det` natif reste 0.
+Tant que (a)+(b) ne sont pas resolus, `d_fb_det` natif reste 0 (le correlateur tourne mais
+sur une entree degeneree -> gap = 0). C'est le seul verrou entre NATIF et le camp.
 
 **Regression corrigee (commit becd439 "i should go sleeping")** : un SKIP rx_burst avait ete ajoute (`calypso_bsp.c`, gate `FB_IQ_DARAM`) affamant `0x2a00` -> perte du SHADOW-DADST. Corrige : SKIP decouple sur gate dediee `CALYPSO_FB_IQ_OWNS` (defaut OFF) -> rx_burst nourrit toujours.
 
@@ -117,7 +153,7 @@ Le grep parait s'arreter mais le kernel tourne toujours. Ne pas conclure "mort" 
 - Modele gain trf6151 : `a_pm = (target_rf + 71 + gain_trf) * 64` ; reset REG_RX 0x9E00 = 138.
 
 ### Env (extrait — 27 vars, idiome `:=`, toutes overridables CLI)
-`CALYPSO_INIT_435B_OFF`, `CALYPSO_KEEP_IMR`, `CALYPSO_ARM2DSP_BGEN`, `CALYPSO_ARM2DSP_CTRLSYS`, `CALYPSO_HACK`, `CALYPSO_FB_IQ_OWNS`, `CALYPSO_DSP_SHUNT`.
+`CALYPSO_INIT_435B_OFF`, `CALYPSO_KEEP_IMR`, `CALYPSO_ARM2DSP_BGEN`, `CALYPSO_ARM2DSP_CTRLSYS`, `CALYPSO_HACK`, `CALYPSO_FB_IQ_OWNS`, `CALYPSO_DSP_SHUNT`, `CALYPSO_NATIVE`, `CALYPSO_NATIVE_HELPED`, `SHUNT_LEGIT`, `SHUNT_NO_LEGIT`.
 
 ### Runtime
 - Tree LIVE = **`/opt/GSM/qemu-src`** (`.latest.bak`/`.bak` = anciens ; overlay `qemu-calypso` = MORT au runtime, ne pas patcher).

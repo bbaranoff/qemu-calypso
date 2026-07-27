@@ -13,3 +13,6 @@ __pycache__/
 hw/arm/calypso/calypso_tdma_hw.*
 hw/arm/calypso/calypso_tdma_hw.*
 hw/arm/calypso/calypso_tdma_hw.*
+
+# artefacts generes par full_text.sh — non versionnes
+calypso-full.txt

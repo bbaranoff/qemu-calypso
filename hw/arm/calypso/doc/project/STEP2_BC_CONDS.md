@@ -3,7 +3,7 @@
 > ✅ **FIXÉ (`calypso_c54x.c:6308-6337`, FIX 2026-06-23).** Le décodage des
 > conditions BC groupe 1 (acc-test) décrit ci-dessous comme « à faire » est
 > **déjà implémenté**. Ce document est conservé comme historique ; ne pas
-> re-proposer le patch. Voir aussi [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md).
+> re-proposer le patch. Voir aussi [DOC_CODE_AUDIT.md](../archive/DOC_CODE_AUDIT.md).
 >
 > Rappel vérité-terrain : ce fix corrige bien le décodage des branchements,
 > mais il **ne débloque pas** la détection FB — `d_fb_det` reste 0 et le DSP
@@ -83,4 +83,4 @@ Ne pas re-proposer ce patch.
   bonne branche. **MAIS** cela ne suffit pas à débloquer la détection FB :
   vérité-terrain, `d_fb_det` reste 0 et le DSP déraille (le vrai verrou est
   le handshake go-live ARM→DSP, `api_write_cb` jamais câblé — voir
-  [DOC_CODE_AUDIT.md](../DOC_CODE_AUDIT.md)).
+  [DOC_CODE_AUDIT.md](../archive/DOC_CODE_AUDIT.md)).

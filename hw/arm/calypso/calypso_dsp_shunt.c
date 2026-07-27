@@ -75,6 +75,29 @@ extern volatile uint32_t g_rach_conf_fn[256];   /* per-ra : FN exact du RACH_CON
 
 struct dsp_shunt_state g_shunt;
 
+/* [2026-07-27] Value-list CALYPSO_SHUNT_LEGIT / CALYPSO_SHUNT_NO_LEGIT :
+ *   =1              -> mode nu (rien de plus)
+ *   =DSP            -> lance AUSSI le DSP c54x en // (CALYPSO_DSP_RUN_C54X=1)
+ *   =NO_CANNED      -> mode sans cannes (CALYPSO_SHUNT_NO_CANNED=1)
+ *   =DSP,NO_CANNED  -> les deux (virgule/espace, casse libre)
+ * Normalise UNE fois au chargement (avant tout getenv cache statique) puis
+ * canonicalise la base a "1" pour que les ~20 checks existants (*e=='1') restent
+ * valides -> aucun site a modifier. */
+static void __attribute__((constructor)) shunt_env_value_list(void)
+{
+    static const char *keys[2] = { "CALYPSO_SHUNT_LEGIT", "CALYPSO_SHUNT_NO_LEGIT" };
+    for (int k = 0; k < 2; k++) {
+        const char *v = getenv(keys[k]);
+        if (!v || !*v || !strcmp(v, "0"))
+            continue;   /* absent / off */
+        if (strstr(v, "DSP") || strstr(v, "dsp"))
+            setenv("CALYPSO_DSP_RUN_C54X", "1", 1);        /* lance le c54x en // */
+        if (strstr(v, "NO_CANNED") || strstr(v, "no_canned"))
+            setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);     /* mode sans cannes */
+        setenv(keys[k], "1", 1);   /* canonicalise -> checks *e=='1' OK */
+    }
+}
+
 /* SONDE B : table RA -> FN L1 firmware (l1s.current_time.fn) au moment de la RACH.
  * Remplie par calypso_trx.c (hook write d_rach). Sert à réécrire la req-ref de
  * l'IMM ASSIGN au FN exact que le mobile a mémorisé (preuve que le FN = dernier mur). */
@@ -1042,7 +1065,7 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn
     memcpy(g_shunt.sdcch_ring[idx].l2, l2, n);
     for (int i = n; i < 23; i++) g_shunt.sdcch_ring[idx].l2[i] = 0x2B;
     g_shunt.sdcch_ring[idx].fn = fn; g_shunt.sdcch_ring[idx].tick = g_shunt.tick_cnt;
-    g_shunt.sdcch_ring[idx].used = true; g_shunt.sdcch_ring_tail++;
+    g_shunt.sdcch_ring[idx].reps = 0; g_shunt.sdcch_ring[idx].used = true; g_shunt.sdcch_ring_tail++;
     g_shunt.sdcch_valid = true;
     SHUNT_LOG("feed_sdcch: ENQUEUE fn=%u c=0x%02x [depth=%u]\n", fn, l2[1], g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
 }

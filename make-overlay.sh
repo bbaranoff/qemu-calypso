@@ -71,6 +71,28 @@ for root in $ADD_ROOTS; do
         added=$((added+1))
     done < <(cd "$SRC" && find "$root" -type f | sort)
 done
+
+# --- Passe 2b : fichiers Calypso a la RACINE de qemu-src ---------------------
+# Les env de modes (calypso.env socle + calypso_<mode>.env) vivent a la racine,
+# hors ADD_ROOTS -> la passe 2 ne les voit pas. On les auto-ajoute ici (100%%
+# Calypso, absents de QEMU vanilla). Globs surchargeables CALYPSO_OVERLAY_ROOT_GLOBS.
+ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env}"
+for pat in $ROOT_GLOBS; do
+    for f in $SRC/$pat; do
+        [ -f "$f" ] || continue
+        rel="${f#$SRC/}"
+        if (cd "$OVERLAY" && git ls-files --error-unmatch "$rel" >/dev/null 2>&1); then
+            continue   # deja tracke -> passe 1
+        fi
+        echo "  add   $rel  (racine)"
+        if [ "$DRY" = 0 ]; then
+            cp -a "$f" "$OVERLAY/$rel"
+            (cd "$OVERLAY" && git add "$rel")
+        fi
+        added=$((added+1))
+    done
+done
+
 echo "----"
 if [ "$DRY" = 1 ]; then
     echo "$sync file(s) WOULD sync, $added new file(s) WOULD add, $same unchanged, $only overlay-only (untouched)"

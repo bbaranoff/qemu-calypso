@@ -16,6 +16,8 @@ rapports d'étape, pistes closes) est rangé par thème dans **[archive/](archiv
 
 - [`SHUNT_LEGIT_ADDRESS_MAP.md`](SHUNT_LEGIT_ADDRESS_MAP.md) — mapping des cellules DSP (data/api_ram), chaîne FB/SB/rxlev/a_cd. **Réf. d'adresses.**
 - [`DSP_ROM_MAP.md`](DSP_ROM_MAP.md) — carte de la mask-ROM DSP.
+- [`DSP_ADDRESS_MAP.md`](DSP_ADDRESS_MAP.md) — carte des cellules DSP (data/api_ram) par adresse. **Réf. d'adresses.**
+- [`DSP_ARM_LINKAGE.md`](DSP_ARM_LINKAGE.md) — correspondance ARM↔DSP (loi d'adressage, MMIO). **Réf. d'adresses.**
 
 ## Référence — Matériel
 
@@ -38,8 +40,9 @@ rapports d'étape, pistes closes) est rangé par thème dans **[archive/](archiv
 
 - [`project/BUGS_AND_FIXES.md`](project/BUGS_AND_FIXES.md) — bugs connus + correctifs.
 - [`project/REPORT_CLAUDE_WEB_PIPELINE.md`](project/REPORT_CLAUDE_WEB_PIPELINE.md) — pipeline du projet.
-- [`MASTER.md`](MASTER.md) · [`TODO.md`](TODO.md) — index & tâches.
-- [`SESSION_20260405_NIGHT4.md`](SESSION_20260405_NIGHT4.md) — session de référence conservée.
+- [`TODO.md`](TODO.md) — index des tâches (P0/P1/P2).
+- [`VOIX_PLAN.md`](VOIX_PLAN.md) — plan d'implémentation voix (TCH/F), pour le P1 « Voix ».
+- Ancien index maître archivé : [`archive/MASTER.md`](archive/MASTER.md) (supplanté par ETAT_ACTUEL + ce README).
 
 ## Datasheets constructeur
 

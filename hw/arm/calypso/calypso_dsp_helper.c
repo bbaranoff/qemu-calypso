@@ -451,7 +451,15 @@ void shunt_dispatch_allc(uint8_t page_idx)
             if (n_sdcch++ < 60 || (n_sdcch % 50) == 0)
                 SHUNT_LOG("DISPATCH SDCCH[ring] #%u fn=%u c=0x%02x burst_d=%u tc=%d depth=%u\n",
                         n_sdcch, g_shunt.sdcch_ring[hidx].fn, m[1], g_shunt.d_burst_d, tc, g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
-            if (g_shunt.d_burst_d >= 3) { g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++; }
+            /* [2026-07-27] anti-stall : drop garanti apres MAXPRES presentations
+             * meme si d_burst_d reste coince (mode DSP //) -> la ring draine, le
+             * UA frais n'est plus bloque derriere les blocs perimes. */
+            static int sdcch_maxpres = -1;
+            if (sdcch_maxpres < 0) { const char *e = getenv("CALYPSO_SHUNT_SDCCH_MAXPRES"); sdcch_maxpres = (e && *e) ? atoi(e) : 8; }
+            g_shunt.sdcch_ring[hidx].reps++;
+            if (g_shunt.d_burst_d >= 3 || g_shunt.sdcch_ring[hidx].reps >= (uint16_t)sdcch_maxpres) {
+                g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++;
+            }
             if (g_shunt.sdcch_ring_tail == g_shunt.sdcch_ring_head) g_shunt.sdcch_valid = false;
             return;
         }
