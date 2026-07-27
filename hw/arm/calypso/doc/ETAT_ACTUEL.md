@@ -53,7 +53,11 @@ Preuves runtime (modes shunt) : `LOCATION UPDATING ACCEPT` recu (lai = 001-01-1)
 MM IDLE, normal service ; RXLEV serving ~ -47/-53 dBm.
 
 **En NATIF, le blocage restant = FB pas detecte (`d_fb_det=0`) donc pas de camp, donc pas
-de LU/RACH UL.** Voir §3.
+de LU/RACH UL.** Diagnostic CHIFFRE (Run B, 2026-07-27, cf [`../../../run_results.md`](../../../run_results.md)) :
+le correlateur CALCULE (accus A/B non-nuls, B2) mais son flux BOUCLE dans le bank 0
+(`0x8d00`->`0xa07x`, B4B) sans jamais atteindre l etage decision -> `data[0x08f8]` **JAMAIS
+ecrit** (watchpoint B4 = 0 write), alors que des writers de `0x08f8` **existent** dans la
+PROM (scan = 30+ refs). Mur de controle de flux, prouve instruction par instruction. Voir §3.
 
 ---
 
@@ -69,7 +73,7 @@ Deux CPU emules, colles par MMIO API RAM :
 
 Loi d'adressage (invariante) : `DSP_word = 0x0800 + (ARM_off - 0xFFD00000)/2`. L'ARM lit les resultats DSP dans `s->dsp->data[off/2 + 0x0800]` — **PAS** dans `dsp_ram[]` ni `api_ram[]` directement. C'est pourquoi les `shunt_dispatch_*` passant par `dma_memory_write` sont invisibles (ils touchent `dsp_ram[]` non mirroir) ; seules les ecritures directes `data[]`/`api_ram[]` campent.
 
-**Le correlateur DSP natif est un VRAI correlateur** (mask-ROM TI), PAS un stub. Verdict affine : son **BUFFER D'ECHANTILLONS RX n'est jamais cable au recepteur on-chip**. Sur silicium, ce buffer est rempli par le recepteur on-chip (DRP -> DMA), **non modelise en QEMU** (honnetete a garder).
+**Le correlateur DSP natif est un VRAI correlateur** (mask-ROM TI), PAS un stub. Verdict affine : son **BUFFER D'ECHANTILLONS RX n'est jamais cable au recepteur on-chip**. Sur silicium, ce buffer est rempli par le recepteur on-chip (DRP -> DMA), **non modelise en QEMU** (honnetete a garder). Verdict CHIFFRE 2026-07-27 (Run B) : meme entree nourrie (FB-STREAM `0x9213/0x9215`, rxlev -47 reel), le correlateur boucle sans atteindre l etage qui ecrit `d_fb_det` (writers presents dans la PROM mais jamais executes ; B4/B4B/SCAN). Detail : [`run_results.md`](../../../run_results.md) §Run B.
 
 Preuve cote osmocom : `prim_fbsb.c` pose `d_fb_mode` puis polle `d_fb_det` ; `dsp_api.h` ne contient QUE des cellules RESULTAT — **aucun buffer IQ dans l'API RAM**. L'ARM ne fournit jamais l'IQ. Donc `d_fb_det` natif reste 0 tant que le buffer n'est pas nourri cote emulateur.
 

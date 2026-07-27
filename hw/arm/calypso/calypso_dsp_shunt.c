@@ -1071,6 +1071,7 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn
         /* [2026-07-27] eviction d overflow TRACEE (etait silencieuse) : quand le
          * ring sature, on drope le plus vieux -> perte de bloc DL. Log + compteur
          * pour diagnostiquer un SMS/LU intermittent sans deviner. */
+        g_shunt.evict_overflow++;
         static unsigned n_ovf = 0;
         if (n_ovf++ < 40 || (n_ovf % 100) == 0)
             SHUNT_LOG("feed_sdcch: RING OVERFLOW #%u -> drop head fn=%u c=0x%02x (depth=%u/%u)\n",

@@ -2688,6 +2688,30 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * commentaire jumeau dans data_read_locked. Log tout WRITE dans
      * [0x2b80,0x2c00), cap 200 -- confirme/infirme si un boot-copy peuple
      * jamais cette region avant que le correlateur la lise. */
+    /* [2026-07-27] B4 (gated CALYPSO_B4) : watchpoint d_fb_det (0x08f8) -> distingue
+     * "le DSP ecrit 0" (correlateur conclut negatif) de "jamais ecrit" (chemin non
+     * atteint). Deux bugs differents. */
+    if (addr == 0x08f8) {
+        static int _b4 = -1; static unsigned _b4n = 0;
+        if (_b4 < 0) _b4 = getenv("CALYPSO_B4") ? 1 : 0;
+        if (_b4 && _b4n < 64) {
+            _b4n++;
+            fprintf(stderr, "[c54x] B4-DFBDET-WR data[0x08f8] 0x%04x -> 0x%04x PC=0x%04x xpc=%u insn=%u\n",
+                    s->data[0x08f8], val, s->pc, s->xpc, s->insn_count);
+        }
+    }
+    /* [2026-07-27] B1 boot-copy watch (gated CALYPSO_B1) : ecritures dans la
+     * table de reference [0x2c00,0x2c10) avec PC source -> confirme (ou non) la
+     * boot-copy 0x76f8->0x2c00 et QUI l ecrit. */
+    if (addr >= 0x2c00 && addr < 0x2c10) {
+        static int _b1w = -1; static unsigned _b1wn = 0;
+        if (_b1w < 0) _b1w = getenv("CALYPSO_B1") ? 1 : 0;
+        if (_b1w && _b1wn < 64 && val != 0) {
+            _b1wn++;
+            fprintf(stderr, "[c54x] B1-BOOTCOPY-WR data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x xpc=%u insn=%u\n",
+                    addr, s->data[addr], val, s->pc, s->xpc, s->insn_count);
+        }
+    }
     if (addr >= 0x2b80 && addr < 0x2c00) {
         static int mw2b80_wen = -1;
         if (mw2b80_wen < 0) mw2b80_wen = getenv("CALYPSO_MEM_WATCH_2B80") ? 1 : 0;
@@ -4651,6 +4675,22 @@ static int c54x_exec_one(C54xState *s)
         return 1;   /* per-instruction IRQ vectoring consumed this step */
     }
     uint16_t op = prog_fetch(s, s->pc);
+    /* [2026-07-27] B1 (gated CALYPSO_B1) : au kernel MAC 0xa076, dump la table
+     * de reference du correlateur data[0x2c00..0x2c0f] + checksum -> tranche si
+     * elle est peuplee (boot-copy 0x76f8->0x2c00 faite) ou VIDE (on correle
+     * contre du zero). Le moins cher / binaire. */
+    {
+        static int _b1 = -1; static unsigned _b1n = 0;
+        if (_b1 < 0) _b1 = getenv("CALYPSO_B1") ? 1 : 0;
+        if (_b1 && s->xpc == 0 && s->pc == 0xa076 && _b1n < 20) {
+            _b1n++;
+            uint32_t _ck = 0;
+            for (int _i = 0; _i < 0x100; _i++) _ck += s->data[0x2c00 + _i];
+            fprintf(stderr, "[c54x] B1 @0xa076 refTable[0x2c00..0f]=");
+            for (int _i = 0; _i < 16; _i++) fprintf(stderr, "%04x ", s->data[0x2c00 + _i]);
+            fprintf(stderr, "| cksum(2c00..2cff)=0x%08x insn=%u\n", _ck, s->insn_count);
+        }
+    }
     /* [2026-07-25] TEST-3FAE (gated CALYPSO_FORCE_3FAE) : le handler FB poll
      * data[0x3fae] bit8 (0x0100) via BITF @0x90c8/0x90ed/0x9128 puis BC TC -> il
      * attend ce flag "burst pret" que RIEN n ecrit -> boucle infinie, kernel
@@ -14466,6 +14506,44 @@ int c54x_run(C54xState *s, int n_insns)
          * freq FCCH (0x9ac0). Pourquoi ne tourne-t-il qu'1× au boot ? Loggue
          * insn + d_fb_mode (0x08f9, large vs étroit) + d_task_md (0x0804/0x0818)
          * à chaque passage. */
+        /* [2026-07-27] B4-bis (gated CALYPSO_B4B) : trace du flux APRES le
+         * detecteur 0x9ac0 -> 0xec07 (decision freq + ecriture 0x08f8) ou boucle.
+         * + dump one-shot des opcodes 0x9ac0.. pour desassemblage. */
+        {
+            /* [2026-07-27] SCAN-08F8 (gated CALYPSO_SCAN_08F8) : one-shot, cherche
+             * les instructions dont un mot == 0x08f8 (adr d_fb_det) dans tout le
+             * bank courant -> writer de d_fb_det existe-t-il, et a quel PC ? */
+            static int _sc = -1; static int _scdone = 0;
+            if (_sc < 0) _sc = getenv("CALYPSO_SCAN_08F8") ? 1 : 0;
+            if (_sc && !_scdone && exec_pc == 0x9ac0) {
+                _scdone = 1;
+                unsigned _hits = 0;
+                for (uint32_t _p = 0x7000; _p <= 0xfffe; _p++) {
+                    if (prog_fetch(s, (uint16_t)_p) == 0x08f8) {
+                        fprintf(stderr, "[c54x] SCAN-08F8 word@0x%04x=0x08f8  prev=0x%04x prev2=0x%04x\n",
+                                _p, prog_fetch(s, (uint16_t)(_p-1)), prog_fetch(s, (uint16_t)(_p-2)));
+                        if (++_hits > 40) break;
+                    }
+                }
+                fprintf(stderr, "[c54x] SCAN-08F8 total hits(bank%u)=%u\n", s->xpc, _hits);
+            }
+            static int _b4b = -1; static int _armed = 0; static unsigned _b4bn = 0; static int _opd = 0;
+            if (_b4b < 0) _b4b = getenv("CALYPSO_B4B") ? 1 : 0;
+            if (_b4b && exec_pc == 0x9ac0) {
+                _armed = 1;
+                if (!_opd) { _opd = 1;
+                    fprintf(stderr, "[c54x] B4B-OPDUMP 0x9ac0..0x9adf:");
+                    for (int _k = 0; _k < 32; _k++) fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(0x9ac0 + _k)));
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (_b4b && _armed && _b4bn < 600) {
+                _b4bn++;
+                fprintf(stderr, "[c54x] B4B-FLOW pc=0x%04x xpc=%u op=0x%04x A=%lld insn=%u\n",
+                        s->pc, s->xpc, prog_fetch(s, s->pc), (long long)(s->a & 0xFFFFFFFFFFULL), s->insn_count);
+                if ((s->pc == 0xec07) || (s->pc >= 0x8d00 && s->pc <= 0x8d10)) _armed = 0;
+            }
+        }
         if (exec_pc == 0x9ac0) {
             static unsigned dr = 0;
             if (dr < 30 || (dr % 200) == 0)
@@ -14473,6 +14551,23 @@ int c54x_run(C54xState *s, int n_insns)
                         "d_fb_det[08f8]=0x%04x insn=%u\n",
                         dr, s->data[0x08f9], s->data[0x08f8], s->insn_count);
             dr++;
+            /* [2026-07-27] B2 (gated CALYPSO_B2) : module accu A/B + max/indice
+             * sur les 296 mots entree(0x2a00) & workspace(0x2c00). Tranche nul vs
+             * plat-sans-pic. */
+            {
+                static int _b2 = -1; static unsigned _b2n = 0;
+                if (_b2 < 0) _b2 = getenv("CALYPSO_B2") ? 1 : 0;
+                if (_b2 && _b2n < 24) {
+                    _b2n++;
+                    int64_t A = ((int64_t)(s->a & 0xFFFFFFFFFFULL) << 24) >> 24;
+                    int64_t B = ((int64_t)(s->b & 0xFFFFFFFFFFULL) << 24) >> 24;
+                    uint16_t mi = 0, mw = 0; int xi = 0, xw = 0;
+                    for (int i = 0; i < 296; i++) { int16_t v = (int16_t)s->data[0x2a00 + i]; uint16_t a = v < 0 ? (uint16_t)(-v) : (uint16_t)v; if (a > mi) { mi = a; xi = i; } }
+                    for (int i = 0; i < 296; i++) { int16_t v = (int16_t)s->data[0x2c00 + i]; uint16_t a = v < 0 ? (uint16_t)(-v) : (uint16_t)v; if (a > mw) { mw = a; xw = i; } }
+                    fprintf(stderr, "[c54x] B2 @0x9ac0 |A|=%lld |B|=%lld  in(2a00):max=%u@%d  ws(2c00):max=%u@%d\n",
+                            (long long)(A < 0 ? -A : A), (long long)(B < 0 ? -B : B), mi, xi, mw, xw);
+                }
+            }
         }
         if (exec_pc == 0xec07) {
             static unsigned cr = 0;

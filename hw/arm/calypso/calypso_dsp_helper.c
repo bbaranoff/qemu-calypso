@@ -432,6 +432,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
         while (g_shunt.sdcch_ring_tail != g_shunt.sdcch_ring_head) {
             uint32_t hidx = g_shunt.sdcch_ring_head % SDCCH_RING_N;
             if ((uint32_t)(g_shunt.tick_cnt - g_shunt.sdcch_ring[hidx].tick) > (uint32_t)sdcch_ttl) {
+                g_shunt.evict_ttl++;
                 g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++; continue;
             }
             int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
@@ -449,15 +450,20 @@ void shunt_dispatch_allc(uint8_t page_idx)
             shunt_write_w(rpA + RP_A_SERV_DEMOD + D_SNR   * 2, SHUNT_CANNED_SNR);
             static unsigned n_sdcch = 0;
             if (n_sdcch++ < 60 || (n_sdcch % 50) == 0)
-                SHUNT_LOG("DISPATCH SDCCH[ring] #%u fn=%u c=0x%02x burst_d=%u tc=%d depth=%u\n",
-                        n_sdcch, g_shunt.sdcch_ring[hidx].fn, m[1], g_shunt.d_burst_d, tc, g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head);
+                SHUNT_LOG("DISPATCH SDCCH[ring] #%u fn=%u c=0x%02x burst_d=%u tc=%d depth=%u delta=%d\n",
+                        n_sdcch, g_shunt.sdcch_ring[hidx].fn, m[1], g_shunt.d_burst_d, tc, g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head,
+                        (int)((int32_t)g_shunt.sdcch_ring[hidx].fn - (int32_t)shunt_l1s_fn()));
+            if ((n_sdcch % 20) == 0)
+                SHUNT_LOG("EVICT-STATS overflow=%u ttl=%u reps=%u\n", g_shunt.evict_overflow, g_shunt.evict_ttl, g_shunt.evict_reps);
             /* [2026-07-27] anti-stall : drop garanti apres MAXPRES presentations
              * meme si d_burst_d reste coince (mode DSP //) -> la ring draine, le
              * UA frais n'est plus bloque derriere les blocs perimes. */
             static int sdcch_maxpres = -1;
             if (sdcch_maxpres < 0) { const char *e = getenv("CALYPSO_SHUNT_SDCCH_MAXPRES"); sdcch_maxpres = (e && *e) ? atoi(e) : 8; }
             g_shunt.sdcch_ring[hidx].reps++;
-            if (g_shunt.d_burst_d >= 3 || g_shunt.sdcch_ring[hidx].reps >= (uint16_t)sdcch_maxpres) {
+            int _by_reps = (g_shunt.sdcch_ring[hidx].reps >= (uint16_t)sdcch_maxpres);
+            if (g_shunt.d_burst_d >= 3 || _by_reps) {
+                if (_by_reps && g_shunt.d_burst_d < 3) g_shunt.evict_reps++;
                 g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++;
             }
             if (g_shunt.sdcch_ring_tail == g_shunt.sdcch_ring_head) g_shunt.sdcch_valid = false;

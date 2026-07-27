@@ -22,6 +22,12 @@ qui décode le downlink réel et alimente l'API RAM du DSP au format natif. Le m
 
 👉 **[QUICK_START.md](QUICK_START.md)** — build, lancer, modes, vérifications.
 
+## 📊 Résultats chiffrés
+
+**[`run_results.md`](run_results.md)** — mesures reproductibles (profondeur ring,
+débits, temps LU, éviction), chaque chiffre confronté à une règle de décision.
+C'est là que se trouve le dur, pas dans les affirmations.
+
 ## État — TODO / DONE
 
 > ⚠️ **Le statut DÉPEND DU MODE.** Les ✅ ci-dessous valent pour la **famille shunt**
