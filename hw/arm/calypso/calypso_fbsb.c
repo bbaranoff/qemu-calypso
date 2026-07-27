@@ -3,7 +3,8 @@
  *
  * 2026-05-28 cleanup : all host-side synthesis (publish_fb_found /
  * publish_sb_found / clear_fb / W1C latches / on_frame_tick state
- * machine) removed. fbsb.c now only logs DSP task changes. FB/SB
+ * machine) removed. fbsb.c logs DSP task changes ; fb0_attempt/sb_attempt sont des compteurs REELS
+ * de dispatch (2026-07-27, avant : figes a 0 = red herring qui trompait le diag). FB/SB
  * detection is driven entirely by the DSP (real ROM or L1 stub via
  * CALYPSO_DSP_L1_STUB=1) writing NDB cells, and ARM reads them
  * directly. The only env-gated hack on this path is
@@ -51,11 +52,13 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
     if (!s) return;
     switch (d_task_md) {
     case DSP_TASK_FB:
+        s->fb0_attempt++;   /* [2026-07-27] compteur REEL : nb de dispatch tache FB (etait fige a 0 = red herring) */
         s->state       = FBSB_FB0_SEARCH;
         s->fn_started  = fn;
         calypso_fbsb_dump(s, "FB0_SEARCH (real DSP path)");
         break;
     case DSP_TASK_SB:
+        s->sb_attempt++;    /* [2026-07-27] compteur REEL : nb de dispatch tache SB */
         s->state      = FBSB_SB_SEARCH;
         s->fn_started = fn;
         calypso_fbsb_dump(s, "SB_SEARCH (real DSP path)");

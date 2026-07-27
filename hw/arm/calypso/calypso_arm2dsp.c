@@ -31,6 +31,7 @@
  *   CALYPSO_ARM2DSP_BGEN_ONESHOT=1  post exactly once (single go-live transition)
  */
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_dsp_shunt.h"
 #include "calypso_arm2dsp.h"
 
 #include <stdlib.h>
@@ -168,6 +169,14 @@ void calypso_arm2dsp_on_arm_write(uint16_t offset, uint16_t value)
     if (offset == A2D_DSP_PAGE_OFF && (value & A2D_B_GSM_TASK)) {
         a2d_pending = 1;
     }
+    /* [2026-07-27] Ctrl-C mobile / L1CTL_RESET_REQ FULL : le firmware fait
+     * l1s_reset_hw() -> ecrit d_dsp_page = 0 (sync.c:168). Signal UNIQUE de reset
+     * L1 (jamais 0 en operation = B_GSM_TASK|w_page). On re-arme le go-live BGEN
+     * -> le DSP re-produit FBSB/SI apres la relance mobile (sinon rien ne revient). */
+    if (offset == A2D_DSP_PAGE_OFF && value == 0) {
+        a2d_bgen_done = 0;
+        calypso_dsp_shunt_l1_reset();   /* clear IMM-ASSIGN/SDCCH latches (SMS) -> SI revient */
+    }
 }
 
 /* Once per DSP instruction step (calypso_c54x.c). When the ARM has posted the
@@ -204,6 +213,11 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
      * them (exec_pc == pollpc), gated on the ARM having commanded the task (the
      * dispatcher bit is set in the task-ready word). One-shot by default: a
      * SINGLE go-live transition, not a per-frame re-fire. */
+    /* [2026-07-27] RE-ARM go-live sur reset L1 : un L1CTL_RESET_REQ FULL
+     * (re-sync post-dedie SMS, OU relance du process mobile) fait re-clear
+     * d[0x098a]/d[0x098c] par le firmware -> l'oneshot bloquait le re-post ->
+     * DSP L1S stale -> pas de FBSB completion -> sync timeout. On re-arme des
+     * que la cellule enable est revue a 0 au poll (= go-live re-demande). */
     if (a2d_bgen && exec_pc == a2d_bgen_pollpc &&
         (!a2d_bgen_oneshot || !a2d_bgen_done)) {
         uint16_t taskw = (a2d_word >= A2D_API_BASE && s->api_ram)

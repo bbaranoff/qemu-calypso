@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_arm2dsp.h"
 #include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -271,7 +272,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * (off 0x52/0x7A) reste la valeur du firmware (db_r==db_w) -> match burst_id. */
     if (size == 2 && (offset == 0x0050 || offset == 0x0078)) {
         static int _cl = -1;
-        if (_cl < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); _cl = (l && *l=='1') ? 1 : 0; }
+        if (_cl < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _cl = ((l && *l=='1') || (nl && *nl=='1')) ? 1 : 0; }
         if (_cl && calypso_dsp_shunt_si_valid()) {
             /* d_task_d lu 1x/nb_resp (prim_rx_nb.c:77) -> POP le prochain burst_id
              * du FIFO. Stable pour les 1-2 lectures d_burst_d du meme nb_resp. */
@@ -286,7 +287,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * non-critiques). Gate SHUNT_LEGIT + si_valid. */
     if (size == 2 && (offset == 0x0052 || offset == 0x007A)) {
         static int _cb = -1;
-        if (_cb < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); _cb = (l && *l=='1') ? 1 : 0; }
+        if (_cb < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _cb = ((l && *l=='1') || (nl && *nl=='1')) ? 1 : 0; }
         if (_cb && calypso_dsp_shunt_si_valid()) {
             /* SOURCE UNIQUE : miroir per-page du burst_id commande par l'ARM.
              * db_w->d_burst_d est latche par parite dans calypso_dsp_write :

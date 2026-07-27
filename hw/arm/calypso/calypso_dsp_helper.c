@@ -46,12 +46,80 @@ void shunt_write_w(uint32_t addr, uint16_t v)
  * C'est LE FN que le firmware utilise pour ses blocs (BCCH/CCCH) et mémorise pour
  * la RACH. On gate la présentation a_cd dessus (et NON s->fn = calypso_trx_get_fn,
  * qui diffère de l1s d'un offset run-variant -> blocs CCCH décalés -> AGCH raté). */
+/* [2026-07-27] Resolution DYNAMIQUE d'un symbole du firmware ELF (robuste aux
+ * rebuilds). Chemin = env CALYPSO_FIRMWARE_ELF, sinon l'arg -kernel de
+ * /proc/self/cmdline. Parse ELF32 LE .symtab. Retourne 0 si introuvable. */
+static uint32_t shunt_fw_sym(const char *want)
+{
+    char path[1024]; path[0] = 0;
+    const char *env = getenv("CALYPSO_FIRMWARE_ELF");
+    if (env && *env) { snprintf(path, sizeof(path), "%s", env); }
+    else {
+        FILE *cf = fopen("/proc/self/cmdline", "rb");
+        if (cf) {
+            static char cl[16384];
+            size_t nr = fread(cl, 1, sizeof(cl) - 1, cf);
+            fclose(cf);
+            cl[nr] = 0;
+            for (size_t i = 0; i < nr; ) {
+                size_t l = strlen(cl + i);
+                if (!strcmp(cl + i, "-kernel") && i + l + 1 < nr) {
+                    snprintf(path, sizeof(path), "%s", cl + i + l + 1);
+                    break;
+                }
+                i += l + 1;
+            }
+        }
+    }
+    if (!path[0]) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 52 || sz > (64L << 20)) { fclose(f); return 0; }
+    uint8_t *b = g_malloc((size_t)sz);
+    size_t got = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    uint32_t ret = 0;
+    if (got == (size_t)sz && b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F' && b[4] == 1) {
+#define R16(o) ((uint32_t)b[o] | ((uint32_t)b[(o)+1] << 8))
+#define R32(o) ((uint32_t)b[o] | ((uint32_t)b[(o)+1] << 8) | ((uint32_t)b[(o)+2] << 16) | ((uint32_t)b[(o)+3] << 24))
+        uint32_t shoff = R32(0x20), shent = R16(0x2e), shnum = R16(0x30);
+        for (uint32_t si = 0; si < shnum; si++) {
+            uint32_t sh = shoff + si * shent;
+            if ((long)(sh + 40) > sz) break;
+            if (R32(sh + 4) == 2) { /* SHT_SYMTAB */
+                uint32_t symoff = R32(sh + 0x10), symsz = R32(sh + 0x14);
+                uint32_t link = R32(sh + 0x18), entsz = R32(sh + 0x24);
+                uint32_t strsh = shoff + link * shent;
+                if ((long)(strsh + 40) > sz || entsz < 16) break;
+                uint32_t stroff = R32(strsh + 0x10), strsz = R32(strsh + 0x14);
+                for (uint32_t o = 0; o + 16 <= symsz && (long)(symoff + o + 16) <= sz; o += entsz) {
+                    uint32_t ni = R32(symoff + o);
+                    uint32_t val = R32(symoff + o + 4);
+                    if (ni < strsz) {
+                        const char *nm = (const char *)(b + stroff + ni);
+                        if (!strcmp(nm, want)) { ret = val; break; }
+                    }
+                }
+                break;
+            }
+        }
+#undef R16
+#undef R32
+    }
+    g_free(b);
+    return ret;
+}
+
 uint32_t shunt_l1s_fn(void)
 {
     static uint32_t addr = 0;
     if (!addr) {
         const char *e = getenv("CALYPSO_L1S_FN_ADDR");
-        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836508;
+        if (e && *e) addr = (uint32_t)strtoul(e, NULL, 0);
+        else { addr = shunt_fw_sym("l1s"); if (!addr) addr = 0x836508; }
     }
     uint32_t v = 0;
     dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
@@ -71,7 +139,8 @@ uint32_t shunt_last_rach_fn(void)
     static uint32_t addr = 0;
     if (!addr) {
         const char *e = getenv("CALYPSO_LAST_RACH_FN_ADDR");
-        addr = (e && *e) ? (uint32_t)strtoul(e, NULL, 0) : 0x836500;
+        if (e && *e) addr = (uint32_t)strtoul(e, NULL, 0);
+        else { addr = shunt_fw_sym("last_rach"); if (!addr) addr = 0x836500; }
     }
     uint32_t v = 0;
     dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
@@ -350,6 +419,15 @@ void shunt_dispatch_allc(uint8_t page_idx)
     }
     static int sdcch_ring_on = -1;
     if (sdcch_ring_on < 0) { const char *e = getenv("CALYPSO_SHUNT_SDCCH_RING"); sdcch_ring_on = (!e || *e != '0') ? 1 : 0; }
+    /* [2026-07-27] g_shunt.sdcch_ss contient DIRECTEMENT la base DL fn%%51 de la
+     * voie dediee assignee (SDCCH/4 ou /8), calculee dans feed_agch. Fenetre DL =
+     * base..base+3 (NB_QUAD = 4 bursts). Remplace le hardcode SS0 (22-28). */
+    /* [2026-07-27] fenetre-UNION : shunt_dispatch_allc n'est appele que quand le
+     * firmware poste ALLC = a la sous-voie REELLE du mobile. On accepte donc l'UA
+     * sur toute la region SDCCH du type de canal (pas besoin de deviner SS) :
+     *   SDCCH/4 : fn%%51 [22,39] (SS0-3) ; SDCCH/8 : [0,31] (SS0-7). */
+    int _lo = g_shunt.sdcch_ch8 ? 0  : 22;
+    int _hi = g_shunt.sdcch_ch8 ? 31 : 39;
     if (sdcch_on && sdcch_ring_on) {
         while (g_shunt.sdcch_ring_tail != g_shunt.sdcch_ring_head) {
             uint32_t hidx = g_shunt.sdcch_ring_head % SDCCH_RING_N;
@@ -357,7 +435,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
                 g_shunt.sdcch_ring[hidx].used = false; g_shunt.sdcch_ring_head++; continue;
             }
             int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
-            if (!(tc >= 22 && tc <= 28)) break;
+            if (!(tc >= _lo && tc <= _hi)) break;
             uint32_t aa = BASE_API_NDB + NDB_A_CD;
             shunt_write_w(aa + 0, 0x0000); shunt_write_w(aa + 2, 0x0000); shunt_write_w(aa + 4, 0x0000);
             const uint8_t *m = g_shunt.sdcch_ring[hidx].l2;
@@ -383,7 +461,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
             g_shunt.sdcch_valid = false;
         } else {
             int tc = (int)((((long)shunt_l1s_fn() + sdcch_ofs) % 51 + 51) % 51);
-            if (tc >= 22 && tc <= 28) {
+            if (tc >= _lo && tc <= _hi) {
                 uint32_t aa = BASE_API_NDB + NDB_A_CD;
                 shunt_write_w(aa + 0, 0x0000); shunt_write_w(aa + 2, 0x0000); shunt_write_w(aa + 4, 0x0000);
                 const uint8_t *m = g_shunt.sdcch_buf;

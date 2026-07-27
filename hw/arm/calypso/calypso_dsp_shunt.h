@@ -44,6 +44,7 @@ void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value);
 /* ENTREE du DSP shunte : la BSP pousse l'I/Q DL (cs16, n int16 entrelaces
  * I,Q) dans le buffer shm pour que gr-gsm (le DSP) la lise et la decode. */
 void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n);
+bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ); /* FB-STREAM */
 
 /* [2026-07-22] Injection READ-SIDE des resultats FB/SB REELS (gate
  * CALYPSO_SHUNT_REAL_FB) : appelee depuis calypso_dsp_read sur le read MMIO
@@ -58,6 +59,7 @@ void calypso_dsp_shunt_record_rach(uint8_t ra);
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP au shunt (type opaque pour
  * ne pas tirer calypso_c54x.h). Appelé depuis calypso_mb.c après l'init. */
 struct C54xState;
+void calypso_dsp_shunt_l1_reset(void);
 void calypso_dsp_shunt_set_c54x(struct C54xState *s);
 bool calypso_dsp_shunt_route_c54x_active(void);
 bool calypso_dsp_shunt_early_booted(void);

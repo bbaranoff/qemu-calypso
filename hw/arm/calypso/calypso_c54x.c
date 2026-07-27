@@ -1640,12 +1640,31 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
      * du workzone. On trace les lectures quand PC in [0x9f00..0x9fb8] et addr
      * HORS 0x2a00..0x2b27 pour localiser le vrai buffer IQ source (a nourrir a
      * la place de 0x2a00). Gate CALYPSO_WATCH_9F00_RD. */
+    /* [2026-07-27] FB-STREAM : injecte un echantillon FCCH FRAIS a chaque lecture
+     * de la cellule sample du demod (0x9213 I / 0x9215 Q) -> vraie fenetre dans
+     * 0x2a00, sans dependre de la cadence. Modelise le DMA on-chip. Gate CALYPSO_FB_STREAM. */
+    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == 0x9213 || addr == 0x9215)) {
+        static int _fs = -1;
+        if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
+        if (_fs) {
+            static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
+            if (addr == 0x9213) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
+            else { _rv = _hv ? _sq : s->data[addr]; }
+            static unsigned _sl = 0;
+            if (_sl++ < 24)
+                fprintf(stderr, "[c54x] FB-STREAM addr=0x%04x -> 0x%04x (cell 0x%04x) hv=%d PC=0x%04x\n",
+                        addr, _rv, s->data[addr], _hv, s->pc);
+            return _rv;
+        }
+    }
     if (s->pc >= 0x9f00 && s->pc <= 0x9fb8) {
         static int _r9 = -1;
         if (_r9 < 0) _r9 = getenv("CALYPSO_WATCH_9F00_RD") ? 1 : 0;
-        if (_r9 && !(addr >= 0x2a00 && addr <= 0x2b27)) {
+        if (_r9) {
+            /* Lectures du chemin actif (0x9f00..0x9fb8) SANS exclusion : localise les
+             * cellules SOURCE lues avant le fill workzone 0x2a00 (0x9213/0x9215 IQ ?). */
             static unsigned _n9 = 0;
-            if (_n9++ < 160)
+            if (_n9++ < 200)
                 fprintf(stderr, "[c54x] WATCH-9F00-RD PC=0x%04x reads addr=0x%04x val=0x%04x insn=%u\n",
                         s->pc, addr, s->data[addr], s->insn_count);
         }
@@ -2377,6 +2396,16 @@ static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 
 static void data_write(C54xState *s, uint16_t addr, uint16_t val)
 {
+    /* [2026-07-27] WATCH-ACD : le DSP (opcode) ecrit-il a_cd (0x9D2..0x9E0) et
+     * clobbe-t-il l ecriture DIRECTE du shunt (SI1-4) apres un reset ? Gate CALYPSO_WATCH_ACD. */
+    if (addr >= 0x09D2 && addr <= 0x09E0) {
+        static int _wac = -1;
+        if (_wac < 0) _wac = getenv("CALYPSO_WATCH_ACD") ? 1 : 0;
+        if (_wac) { static unsigned _nac = 0;
+            if (_nac++ < 60)
+                fprintf(stderr, "[c54x] WATCH-ACD DSP-opcode-write data[0x%04x]=0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
+                        addr, val, s->data[addr], s->pc, s->insn_count); }
+    }
     /* [2026-07-26 golive-mac] WATCH-2A00 : trace toute ecriture OPCODE vers le
      * buffer IQ 0x2a00..0x2a07 (capture si le DSP lui-meme repose 0x12ed apres
      * feed_iq). feed_iq ecrit s->data[] EN DIRECT (hors data_write) -> invisible
@@ -2391,6 +2420,20 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                 fprintf(stderr, "[c54x] WATCH-2A00 opcode-write data[0x%04x]=0x%04x "
                         "(was 0x%04x) PC=0x%04x s=%p insn=%u\n",
                         addr, val, s->data[addr], s->pc, (void*)s, s->insn_count);
+        }
+    }
+    /* [2026-07-27 golive-mac] WATCH-9200 : les cellules 0x9210-0x9218 / 0x9260-0x9261
+     * sont lues par le demod (0x9fab-0x9fb5) comme source IQ mais restent CONSTANTES
+     * (0xff06/0x04a3) -> workzone 0x2a00 plat. Trace TOUTE ecriture opcode vers cette
+     * region pour voir si qqun l'alimente per-frame (et d'ou). Gate CALYPSO_WATCH_9200. */
+    if ((addr >= 0x9210 && addr <= 0x9220) || (addr >= 0x9260 && addr <= 0x9262)) {
+        static int _w92 = -1;
+        if (_w92 < 0) _w92 = getenv("CALYPSO_WATCH_9200") ? 1 : 0;
+        if (_w92) {
+            static unsigned _n92 = 0;
+            if (_n92++ < 80)
+                fprintf(stderr, "[c54x] WATCH-9200 opcode-write data[0x%04x]=0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
+                        addr, val, s->data[addr], s->pc, s->insn_count);
         }
     }
     /* [2026-07-26 golive-mac] WATCH-RESULT : trace les ecritures OPCODE vers les
@@ -2520,7 +2563,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
          * (sb_valid), on FORCE la valeur ecrite a 1 -> l ARM lit FB found -> vrai flux. */
         {
             static int _lg = -1;
-            if (_lg < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); _lg = (e && *e=='1') ? 1 : 0; }
+            if (_lg < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _lg = ((e && *e=='1') || (nl && *nl=='1')) ? 1 : 0; }
             if (_lg && addr == 0x08f8 && calypso_dsp_shunt_sb_valid()) {
                 val = 1;
             }

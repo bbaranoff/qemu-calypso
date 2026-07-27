@@ -1200,7 +1200,13 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * Indep. de DIRECT_FEED/DARAM_FORCE. */
     static int _fbiq_owns = -1;
     if (_fbiq_owns < 0) {
-        const char *e = getenv("CALYPSO_FB_IQ_DARAM");
+        /* [2026-07-27] DECOUPLE : le SKIP rx_burst ne se declenche QUE sur opt-in
+         * explicite CALYPSO_FB_IQ_OWNS (defaut OFF). Avant gate sur FB_IQ_DARAM ->
+         * quand feed_iq n'ecrit pas 0x2a00 (marker=0), le buffer restait affame ->
+         * kernel correle du vide -> SHADOW-DADST PERDU. Par defaut rx_burst nourrit
+         * toujours 0x2a00 (kernel vivant). Mettre FB_IQ_OWNS=1 seulement quand le
+         * feed_iq->0x2a00 est prouve fonctionnel. */
+        const char *e = getenv("CALYPSO_FB_IQ_OWNS");
         _fbiq_owns = (e && atoi(e) > 0) ? 1 : 0;
     }
     calypso_pcb_daram_lock_acquire();

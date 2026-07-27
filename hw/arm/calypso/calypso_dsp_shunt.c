@@ -131,6 +131,19 @@ static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm
 static void shunt_latch_task(uint16_t new_d_dsp_page)
 {
     if (!(new_d_dsp_page & B_GSM_TASK)) {
+        /* [2026-07-27] d_dsp_page=0 = l1s_reset_hw() (fermeture canal dedie SMS/LU
+         * ou Ctrl-C mobile). Clear les latches IMM-ASS/SDCCH -> le gate SI se rouvre.
+         * CHEMIN VIVANT (l'ancien hook arm2dsp/trx.c 0x01A8 etait mort : d_dsp_page
+         * vit en API-RAM, pas en MMIO). Desactivable CALYPSO_L1_RESET_WIRE=0. */
+        if (new_d_dsp_page == 0) {
+            static int l1rst_on = -1;
+            if (l1rst_on < 0) { const char *e = getenv("CALYPSO_L1_RESET_WIRE"); l1rst_on = (e && *e == '0') ? 0 : 1; }
+            if (l1rst_on) {
+                static unsigned nrst = 0;
+                if (nrst++ < 30) SHUNT_LOG("L1-RESET: d_dsp_page=0 -> clear latches (SI revient)\n");
+                calypso_dsp_shunt_l1_reset();
+            }
+        }
         return; /* not a real task signal (might be d_dsp_page=0 reset) */
     }
 
@@ -563,7 +576,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
      * d_fb_det -> deroule le vrai flux FBSB->SB->BSIC->sysinfo. Thread DSP = safe. */
     {
         static int legit = -1;
-        if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); legit = (e && *e == '1') ? 1 : 0; }
+        if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); legit = ((e && *e == '1') || (nl && *nl=='1')) ? 1 : 0; }
         if (legit && g_shunt.c54x && g_shunt.sb_valid) {
             /* L'ARM lit d_fb_det/snr/toa via calypso_dsp_shunt_real_fb_read
              * (0x01F0/0x01FA/0x01F4) qui retourne g_shunt.rx_*. On pose ces
@@ -650,6 +663,21 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * qui tourne en continu en idle et affamait le SI3 (SI3 livre que pendant
              * l'acquisition -> moniteur famine -> no-cell-info chaque seconde).
              * agch_buf[2] = mt du dernier AGCH. LU intact (IMM ASSIGN protege). */
+            /* [2026-07-27 MT-SMS fix] EXPIRE l'IMM-ASSIGN latche : sans clear,
+             * agch_valid poisonnait le SI (gate ci-dessous) ET le paging (feed_agch)
+             * a vie -> no-cell-info permanent apres un canal dedie. Meme TTL que le
+             * drop paging (CALYPSO_SHUNT_AGCH_TTL, def 100). SI + paging reprennent. */
+            {
+                /* [2026-07-27] OPT-IN (defaut OFF apres regression MO-SMS shunt_legit) :
+                 * l'expiry agch corrige le no-cell-info post-dedie MAIS clear le grant
+                 * IMM-ASSIGN -> peut casser l'etablissement SDCCH. Activer via
+                 * CALYPSO_SHUNT_AGCH_EXPIRE=1 (no-legit / experiences). */
+                static int _agex_on = -1, _agex = 100;
+                if (_agex_on < 0) { const char *e = getenv("CALYPSO_SHUNT_AGCH_EXPIRE"); _agex_on = (e && atoi(e) > 0) ? 1 : 0;
+                    const char *t = getenv("CALYPSO_SHUNT_AGCH_TTL"); if (t && *t) _agex = atoi(t); }
+                if (_agex_on && g_shunt.agch_valid && (uint32_t)(g_shunt.tick_cnt - g_shunt.agch_tick) > (uint32_t)_agex)
+                    g_shunt.agch_valid = false;
+            }
             if (g_shunt.si_valid && !g_shunt.sdcch_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
@@ -660,7 +688,13 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * sinon si_rr FIGE une fois came et SI3 n'est plus livre en idle ->
                  * moniteur cellule servante famine -> no-cell-info chaque seconde. */
                 static unsigned si_rot = 0;
-                if ((si_rot++ & 7) == 0) {
+                /* [2026-07-27] rotation SI accELErEe : avance si_rr a chaque bloc
+                 * (mask 0) au lieu de tous les 8 -> le mobile re-collecte SI1+SI2+SI3
+                 * VITE apres un dedie (sinon sync timeout -> No service post-SMS).
+                 * Tunable CALYPSO_SHUNT_SI_ROT_MASK (0=chaque bloc, 7=ancien). */
+                static int _rotmask = -1;
+                if (_rotmask < 0) { const char *e = getenv("CALYPSO_SHUNT_SI_ROT_MASK"); _rotmask = (e && *e) ? atoi(e) : 7; }
+                if ((si_rot++ & (unsigned)_rotmask) == 0) {
                     for (int k = 1; k <= 6; k++) {
                         int si = (g_shunt.si_rr + k) % 6;
                         if (g_shunt.si_set_have[si]) { g_shunt.si_rr = si; break; }
@@ -721,9 +755,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
                     }
                 }
                 static unsigned _acd = 0;
-                if (_acd++ < 12)
-                    SHUNT_LOG("CAMP: a_cd<-SI type_slot=%d (data[0x9D2..], firmware read path) tick=%u",
-                              g_shunt.si_rr, g_shunt.tick_cnt);
+                if (_acd++ < 5000)
+                    SHUNT_LOG("CAMP: a_cd<-SI type_slot=%d have[0-5]=%d%d%d%d%d%d tick=%u",
+                              g_shunt.si_rr, g_shunt.si_set_have[0],g_shunt.si_set_have[1],g_shunt.si_set_have[2],g_shunt.si_set_have[3],g_shunt.si_set_have[4],g_shunt.si_set_have[5], g_shunt.tick_cnt);
             }
             static unsigned _lg = 0;
             if (_lg++ < 12)
@@ -775,7 +809,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * gr-gsm a decode). Pas de fake : l'ARM L1 deroule alors le VRAI flux
              * FBSB->SB->BSIC->sysinfo natif, on court-circuite juste l'etage MAC. */
             static int legit = -1;
-            if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); legit = (e && *e == '1') ? 1 : 0; }
+            if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); legit = ((e && *e == '1') || (nl && *nl=='1')) ? 1 : 0; }
             if (legit && !no_fake_fb) {   /* [2026-07-26] NO_FAKE_FB=1 retire le fake FB MEME en shunt_legit (isole le go-live natif) */
                 if (g_shunt.sb_valid) {
                     shunt_dispatch_fb(page);
@@ -889,6 +923,33 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
     int n = len < 23 ? len : 23;
     memcpy(g_shunt.agch_buf, l2, n);
     for (int i = n; i < 23; i++) g_shunt.agch_buf[i] = 0x2B;
+    /* [2026-07-27] SONDE sous-voie SDCCH de l IMM-ASS (channel desc [4..6]) :
+     * confirme le mismatch SS0-hardcode vs sous-voie assignee (cause rejet SMS flaky). */
+    if (g_shunt.agch_buf[2] == 0x3f) {
+        uint8_t cd0 = g_shunt.agch_buf[4];
+        /* [2026-07-27] Base DL fn%%51 de la voie dediee assignee (GSM 05.02, cf
+         * firmware mframe_sched.c). chan_desc.chan_nr = cd0. Le RESEAU ICI assigne
+         * du SDCCH/8 (01SSS, DL base=SS*4) et parfois SDCCH/4 (001SS). On calcule
+         * la base DL et on la memorise pour presenter l'UA sur la BONNE fenetre. */
+        int _ss = -1, _base = -1; const char *_ct = "?";
+        if ((cd0 & 0xE0) == 0x20) {            /* SDCCH/4 combined : 001SS */
+            _ss = (cd0 >> 3) & 0x03; _ct = "SDCCH/4";
+            static const int b4[4] = { 22, 26, 32, 36 };
+            _base = b4[_ss];
+        } else if ((cd0 & 0xC0) == 0x40) {     /* SDCCH/8 : 01SSS, DL base = SS*4 */
+            _ss = (cd0 >> 3) & 0x07; _ct = "SDCCH/8";
+            _base = _ss * 4;                    /* 0,4,8,12,16,20,24,28 (mod 51) */
+        }
+        if (_base >= 0) { g_shunt.sdcch_ss = (uint8_t)_base; g_shunt.sdcch_ss_set = true;
+                          g_shunt.sdcch_ch8 = ((cd0 & 0xC0) == 0x40); }  /* base + type /4|/8 */
+        static unsigned _iac = 0;
+        if (_iac++ < 80) {
+            fprintf(stderr, "[dsp-shunt] IMM-ASS chan_desc=[%02x %02x %02x] %s SS=%d base=%d TN=%u req-ref=[%02x %02x %02x]\n",
+                    g_shunt.agch_buf[4], g_shunt.agch_buf[5], g_shunt.agch_buf[6],
+                    _ct, _ss, _base, cd0 & 0x07,
+                    g_shunt.agch_buf[7], g_shunt.agch_buf[8], g_shunt.agch_buf[9]);
+        }
+    }
 
     /* FN-FIX (le vrai fix, ON par defaut ; CALYPSO_REQREF_REWRITE=0 pour A/B) :
      * reecrit la request-reference de l'IMM ASSIGN (octets L2 [8],[9]) au FN EXACT que
@@ -916,8 +977,15 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
         if (rr_adj == -99999) { const char *e = getenv("CALYPSO_REQREF_ADJ");     rr_adj = e ? atoi(e) : 0; }
         if ((reqref_perra || reqref_rw) && n >= 10 && g_shunt.agch_buf[2] == 0x3f) {
             uint8_t ra = g_shunt.agch_buf[7];
-            uint32_t memo_fn = (reqref_perra && g_rach_conf_fn[ra]) ? g_rach_conf_fn[ra]
-                             : (reqref_rw ? g_last_rach_conf_fn : 0);   /* per-ra exact, sinon fallback global */
+            /* [2026-07-27] FIX SMS (mt-sms-works) : prefere last_rach.fn@0x836500
+             * (FN EXACT memorise par le firmware = match req-ref garanti), defaut ON.
+             * Fallback auto sur g_rach_conf_fn[ra] si lecture=0. Gate CALYPSO_REQREF_LAST_RACH=0. */
+            static int use_lr = -1;
+            if (use_lr < 0) { const char *e = getenv("CALYPSO_REQREF_LAST_RACH"); use_lr = (e && *e == '0') ? 0 : 1; }
+            uint32_t lr = use_lr ? shunt_last_rach_fn() : 0;
+            uint32_t memo_fn = lr ? lr
+                             : (reqref_perra && g_rach_conf_fn[ra]) ? g_rach_conf_fn[ra]
+                             : (reqref_rw ? g_last_rach_conf_fn : 0);   /* last_rach exact, sinon per-ra, sinon global */
             { static unsigned dbg = 0;
               if (dbg++ < 40)
                   SHUNT_LOG("FN-FIX probe RA=0x%02x "
@@ -1218,6 +1286,12 @@ struct dsp_shunt_shm {
 };
 
 static struct dsp_shunt_shm *g_shm;
+/* [2026-07-27] FB-STREAM : ring d'echantillons FCCH decimes (I/Q entrelaces)
+ * que le DSP consomme via intercept de lecture 0x9213/0x9215 (c54x.c).
+ * Remplit une VRAIE fenetre dans le workzone 0x2a00. FBS_RING = pow2. */
+#define FBS_RING 16384
+static int16_t  g_fbs[FBS_RING];
+static uint32_t g_fbs_wr, g_fbs_rd;
 static uint32_t              g_shm_last_si_seq;
 static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
 static int                   g_iq_fd      = -1;   /* fd brut I/Q : fichier ou FIFO live */
@@ -1324,28 +1398,6 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
         if (!real_fb) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); real_fb = (l && *l == '1') ? 1 : 0; }
     }
     if (!real_fb) return false;
-    /* [2026-07-26 golive-mac] SHADOW-WIRE (gate CALYPSO_FB_SHADOW_WIRE) : au lieu
-     * de retourner les valeurs host g_shunt.rx_* (gr-gsm/modele), retourne le VRAI
-     * shadow calcule par le correlateur DSP NATIF, lu aux cellules resultat NDB.
-     * Mapping ARM->DSP : data[off/2 + 0x0800] (confirme osmocom : 0x01F0->0x08F8
-     * d_fb_det, 0x01F4/F6/F8/FA -> a_sync_demod[TOA/PM/ANGLE/SNR] 0x08FA..0x08FD).
-     * = le retour DSP->ARM du FBSB, cable sur les adresses shunt_legit. Honnete :
-     * si le DSP n'a rien detecte, l'ARM lit 0 (pas de fake). */
-    {
-        static int _sw = -1;
-        if (_sw < 0) _sw = getenv("CALYPSO_FB_SHADOW_WIRE") ? 1 : 0;
-        if (_sw && g_shunt.c54x && g_shunt.c54x->data &&
-            (off == 0x01F0 || off == 0x01F4 || off == 0x01F6 ||
-             off == 0x01F8 || off == 0x01FA)) {
-            uint16_t v = g_shunt.c54x->data[(off >> 1) + 0x0800];
-            *out = v;
-            static unsigned _swn = 0;
-            if (_swn++ < 40)
-                fprintf(stderr, "[shadow-wire] ARM read off=0x%04x -> DSP data[0x%04x]=0x%04x\n",
-                        off, (unsigned)((off >> 1) + 0x0800), v);
-            return true;
-        }
-    }
     switch (off) {
     case 0x01F0: *out = g_shunt.rx_fb_det ? 1 : 0;    return true; /* d_fb_det */
     case 0x01F4: *out = g_shunt.rx_toa;               return true; /* a_sync TOA */
@@ -1393,6 +1445,18 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             if (_decim < 1) _decim = 1;
             const char *f = getenv("CALYPSO_FB_IQ_FCCH_ONLY"); _fcch = (f && atoi(f) > 0) ? 1 : 0;
         }
+        static uint16_t _iqbase = 0;
+        if (_iqbase == 0) {
+            const char *b = getenv("CALYPSO_FB_IQ_BASE");
+            _iqbase = (b && *b) ? (uint16_t)strtol(b, NULL, 0) : 0x2a00;
+        }
+        /* [2026-07-27 diag] HUNK-ENTER : prouve si feed_iq atteint le hunk marker,
+         * et expose les gardes (fid/c54x/data) qui decident l ecriture 0x2a00. */
+        { static unsigned _he = 0;
+          if (_he++ < 20)
+            fprintf(stderr, "[feed-daram-dsp] HUNK-ENTER fid=%d c54x=%p data=%p n=%d fn=%u\n",
+                    _fid, (void*)g_shunt.c54x,
+                    g_shunt.c54x ? (void*)g_shunt.c54x->data : (void*)0, n, fn); }
         int _p = (int)(fn % 51);
         /* [2026-07-26] FCCH positions {1,11,21,31,41} (offset +1 vs canon 0/10/20/30/40,
          * confirme par FN-ALIGN sch%51=1,21,31,41). */
@@ -1403,7 +1467,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* TEST REACHABILITE : ecrit une RAMPE 0x1000+woff a CHAQUE frame (ignore
              * iq + fcch). Si IQ-READ voit la rampe -> feed_iq atteint bien la vue
              * DARAM du kernel (probleme = contenu iq). Sinon -> mismatch objet/mapping. */
-            uint16_t base = 0x2a00; int dl = 0x128;
+            uint16_t base = _iqbase; int dl = 0x128;
             for (int woff = 0; woff < dl; woff++)
                 g_shunt.c54x->data[base + woff] = (uint16_t)(0x1000 + woff);
             static unsigned _lm = 0;
@@ -1412,7 +1476,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         "base[0]=0x%04x base[1]=0x%04x base[2]=0x%04x\n", fn, (void*)g_shunt.c54x,
                         g_shunt.c54x->data[base], g_shunt.c54x->data[base+1], g_shunt.c54x->data[base+2]);
         } else if (_fid && g_shunt.c54x && g_shunt.c54x->data && (!_fcch || _is_fcch)) {
-            uint16_t base = 0x2a00; int dl = 0x128; int woff = 0;
+            uint16_t base = _iqbase; int dl = 0x128; int woff = 0;
             for (int k = 0; 2*(k*_decim)+1 < n && woff < dl; k++) {
                 g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)];
                 if (woff < dl)
@@ -1424,6 +1488,20 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         "s0=0x%04x s1=0x%04x s2=0x%04x\n", fn, _p, woff, _decim,
                         g_shunt.c54x->data[base], g_shunt.c54x->data[base+1],
                         g_shunt.c54x->data[base+2]);
+        }
+    }
+
+    /* [2026-07-27] FB-STREAM push : pousse l'IQ FCCH decime dans le ring que
+     * l'intercept 0x9213/0x9215 (c54x.c) sert au demod. Gate CALYPSO_FB_STREAM. */
+    {
+        static int _fs = -1, _fsd = 4;
+        if (_fs < 0) { const char *e = getenv("CALYPSO_FB_STREAM"); _fs = (e && atoi(e) > 0) ? 1 : 0;
+            const char *d = getenv("CALYPSO_FB_STREAM_DECIM"); if (d && *d) _fsd = atoi(d); if (_fsd < 1) _fsd = 1; }
+        if (_fs) {
+            for (int k = 0; 2*(k*_fsd)+1 < n; k++) {
+                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)];
+                g_fbs[g_fbs_wr++ & (FBS_RING-1)] = iq[2*(k*_fsd)+1];
+            }
         }
     }
 
@@ -1820,6 +1898,28 @@ uint16_t calypso_dsp_shunt_get_task_md(void)
 /* CALYPSO_DSP=c54x : relie le handle du VRAI DSP (depuis calypso_mb.c). */
 static bool g_c54x_early_booted = false;
 bool calypso_dsp_shunt_early_booted(void) { return g_c54x_early_booted; }
+
+/* [2026-07-27] FB-STREAM : pop la prochaine paire I/Q du ring. false = underrun. */
+bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
+{
+    if (g_fbs_rd + 1 >= g_fbs_wr) return false;
+    *outI = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
+    *outQ = (uint16_t)g_fbs[g_fbs_rd++ & (FBS_RING-1)];
+    return true;
+}
+
+/* [2026-07-27] Reset L1 (Ctrl-C mobile / L1CTL_RESET_REQ FULL) : clear l'etat
+ * transitoire du shunt (IMM-ASSIGN / SDCCH-DL latches par un SMS) qui sinon
+ * supprime le SI apres la relance -> le mobile ne re-campe pas. Appele depuis
+ * calypso_arm2dsp.c quand l'ARM ecrit d_dsp_page=0 (l1s_reset_hw). */
+void calypso_dsp_shunt_l1_reset(void)
+{
+    g_shunt.agch_valid  = false;
+    g_shunt.sdcch_valid = false;
+    g_shunt.sdcch_ss_set = false;   /* reset -> defaut base 22 (SDCCH/4 SS0) */
+    /* PAS de si_rr=0 : d_dsp_page=0 fire aussi sur les mesures (l23_api.c:414) /
+     * FBSB -> reset si_rr figerait la rotation SI en no_canned. */
+}
 
 void calypso_dsp_shunt_set_c54x(C54xState *s)
 {
