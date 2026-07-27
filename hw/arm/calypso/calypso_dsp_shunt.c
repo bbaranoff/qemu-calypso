@@ -96,6 +96,16 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
             setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);     /* mode sans cannes */
         setenv(keys[k], "1", 1);   /* canonicalise -> checks *e=='1' OK */
     }
+    /* Manifeste de run : dump les CALYPSO_* EFFECTIVES (post value-list) en tete
+     * de log. Reproductibilite : ce constructeur fait des setenv() AVANT main()
+     * -> la config effective differe de celle tapee ; on la trace. */
+    {
+        fprintf(stderr, "[calypso-manifest] ===== CALYPSO_* effectives (post value-list) =====\n");
+        for (char **e = environ; e && *e; e++)
+            if (!strncmp(*e, "CALYPSO_", 8))
+                fprintf(stderr, "[calypso-manifest] %s\n", *e);
+        fprintf(stderr, "[calypso-manifest] =================================================\n");
+    }
 }
 
 /* SONDE B : table RA -> FN L1 firmware (l1s.current_time.fn) au moment de la RACH.
@@ -1058,6 +1068,15 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn
     if (fn && fn == g_shunt.sdcch_last_fn) return;
     g_shunt.sdcch_last_fn = fn;
     if (g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head >= SDCCH_RING_N) {
+        /* [2026-07-27] eviction d overflow TRACEE (etait silencieuse) : quand le
+         * ring sature, on drope le plus vieux -> perte de bloc DL. Log + compteur
+         * pour diagnostiquer un SMS/LU intermittent sans deviner. */
+        static unsigned n_ovf = 0;
+        if (n_ovf++ < 40 || (n_ovf % 100) == 0)
+            SHUNT_LOG("feed_sdcch: RING OVERFLOW #%u -> drop head fn=%u c=0x%02x (depth=%u/%u)\n",
+                    n_ovf, g_shunt.sdcch_ring[g_shunt.sdcch_ring_head % SDCCH_RING_N].fn,
+                    g_shunt.sdcch_ring[g_shunt.sdcch_ring_head % SDCCH_RING_N].l2[1],
+                    g_shunt.sdcch_ring_tail - g_shunt.sdcch_ring_head, SDCCH_RING_N);
         g_shunt.sdcch_ring[g_shunt.sdcch_ring_head % SDCCH_RING_N].used = false;
         g_shunt.sdcch_ring_head++;
     }

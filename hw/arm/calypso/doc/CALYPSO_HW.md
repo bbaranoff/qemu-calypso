@@ -2,7 +2,7 @@
 
 ## Chip Overview
 TI Calypso (TWL3014/DBB) — GSM baseband processor
-- ARM7TDMI CPU (ARM926EJ-S in QEMU, close enough)
+- ARM7TDMI CPU (ARMv4T) — modelise par le coeur **arm946** de QEMU (ARMv5TE, sur-ensemble de v4T ; cf calypso_mb.c:303, ETAT_ACTUEL.md)
 - TMS320C54x DSP core
 - Shared API RAM between ARM and DSP
 - TPU (Time Processing Unit) for radio timing

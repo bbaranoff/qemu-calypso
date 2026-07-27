@@ -76,7 +76,7 @@ done
 # Les env de modes (calypso.env socle + calypso_<mode>.env) vivent a la racine,
 # hors ADD_ROOTS -> la passe 2 ne les voit pas. On les auto-ajoute ici (100%%
 # Calypso, absents de QEMU vanilla). Globs surchargeables CALYPSO_OVERLAY_ROOT_GLOBS.
-ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env}"
+ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md}"
 for pat in $ROOT_GLOBS; do
     for f in $SRC/$pat; do
         [ -f "$f" ] || continue
