@@ -28,6 +28,12 @@ qui décode le downlink réel et alimente l'API RAM du DSP au format natif. Le m
 débits, temps LU, éviction), chaque chiffre confronté à une règle de décision.
 C'est là que se trouve le dur, pas dans les affirmations.
 
+**[`RAPPORT_DFBDET.md`](RAPPORT_DFBDET.md)** — enquête multi-agents sur la cause
+racine de `d_fb_det = 0` en mode natif : chaîne causale citée ligne à ligne,
+hypothèses écartées **avec leur preuve d'écartement**, test décisif à règle posée
+d'avance, et recoupement avec le firmware osmocom-bb réel. Diagnostic en lecture
+seule — rien n'a été corrigé sur la foi de ce rapport.
+
 ## État — TODO / DONE
 
 > ⚠️ **Le statut DÉPEND DU MODE.** Les ✅ ci-dessous valent pour la **famille shunt**

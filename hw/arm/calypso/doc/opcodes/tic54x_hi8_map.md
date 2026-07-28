@@ -1,5 +1,23 @@
 # Tic54x C54x Opcode Map (hi8 → mnemonic)
 
+> **Source d'autorité : `binutils tic54x-opc.c`.**
+> Présent sur la machine hôte (hors conteneur) :
+> `/home/nirvana/gnuarm/src/binutils-2.21.1/opcodes/tic54x-opc.c`
+> Format d'une entrée : `{ "mnémo", MOTS, cycles, classe, OPCODE, MASQUE, {opérandes}, flags }`.
+> **Le premier champ après le mnémonique est le NOMBRE DE MOTS** — c'est l'information la plus
+> critique de toutes : une longueur fausse ne donne pas un résultat faux, elle **désynchronise
+> tout le décodage en aval**.
+>
+> Corrigé le 2026-07-28 : l'entrée `0xF4..0xF7` indiquait « add (2-mot) », ce qui est faux.
+> binutils donne `{ "add", 1,1,3, 0xF400, 0xFCE0, ... }` = **1 mot** (registre-registre) ;
+> les formes à long immédiat (2 mots) sont en `0xF0..0xF3` (`{ "add", 2,2,4, 0xF000, 0xFCF0 }`).
+> Vérifié aussi au runtime : `0xf600` = `ADD A,0,B`, et la trace montre `B` décroître
+> exactement de la valeur de `A`.
+>
+> En cas de désaccord entre ce tableau, `spru172c.pdf` et le code : **binutils fait foi pour
+> l'encodage et la longueur**, SPRU172C pour la sémantique d'exécution.
+
+
 Source authoritative : `binutils-2.21.1/opcodes/tic54x-opc.c` (encoding officiel TI).
 
 Cross-référence à utiliser pour vérifier le décodage `c54x_exec_one()` dans
@@ -138,7 +156,8 @@ chaque entrée tic54x doit être respecté.
 | 0xED | `ld` (k5,ASM) | 0xED00 / 0xFFE0 (ED20+ = autre famille) |
 | 0xEE | `frame` | 0xEE00 / 0xFF00 |
 | 0xF0..0xF3 | `add` (2-mot) | 0xF000 / 0xFCF0 (sous-formes ADD/SUB/AND/OR/XOR/MAC #lk) |
-| 0xF4..0xF7 | `add` (2-mot) + special | 0xF400 / 0xFCE0 + cas spéciaux : |
+| 0xF0..0xF3 | `add`/`and`/`or`/`xor`/`ld` **#lk (2 MOTS)** | 0xF000 / 0xFCF0 ; `and` 0xF030, `ld` 0xF020 |
+| 0xF4..0xF7 | `add`/`sub`/`ld`/`sfta` **src,SHIFT,dst — 1 MOT, registre-registre** + spéciaux | 0xF400 / 0xFCE0 + cas spéciaux : |
 |  | `rsbx N,SBIT` | 0xF4B0 / 0xFDF0 |
 |  | `ssbx N,SBIT` | 0xF5B0 / 0xFDF0 |
 |  | `bacc/cala` | 0xF4E2/F4E3 / 0xFEFF |

@@ -47,6 +47,10 @@ static uint32_t d_rach_word_offset(void);
 static int rach_force_bsic(void);
 
 #include "hw/arm/calypso/calypso_debug.h"
+
+/* [2026-07-27] DARAM-FNSTAMP : publiees pour le dump c54x (diag). */
+unsigned calypso_daram_last_fn;
+unsigned calypso_daram_wr_count;
 #define BSP_LOG(fmt, ...) \
     do { if (calypso_debug_enabled("BSP")) \
         fprintf(stderr, "[BSP] " fmt "\n", ##__VA_ARGS__); } while (0)
@@ -1153,7 +1157,14 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
         bsp.dsp->data[0x43c0] = _tgt;   /* slot terminal BACC 0xb40f (etait 0xa4c7 go-live) */
         bsp.dsp->data[0x4387] = _tgt;   /* slot idle/CALA 0xb01e (etait stub 0xab38) */
         bsp.dsp->data[0x43d8] = _tgt;   /* slot reseed (etait stub 0xab38) */
-        bsp.dsp->imr |= 0x0200;         /* bit9 : route frame scheduler */
+        { /* [2026-07-27] NOIMR : le demasquage IMR est separable de l install
+           * du handler — il preempte la routine FB 6 instructions apres son
+           * entree (IT vers vec21/0x00d4). CALYPSO_BSP_DISPATCH_NOIMR=1 pour
+           * installer le handler SANS toucher l IMR. */
+          static int _noimr = -1;
+          if (_noimr < 0) _noimr = getenv("CALYPSO_BSP_DISPATCH_NOIMR") ? 1 : 0;
+          if (!_noimr) bsp.dsp->imr |= 0x0200;   /* bit9 : route frame scheduler */
+        }
         static unsigned _dl = 0;
         if (_dl++ < 8)
             fprintf(stderr, "[c54x] BSP-DISPATCH-FB : install 0x%04x (LUT setup FB) "
@@ -1216,13 +1227,26 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
             fprintf(stderr, "[BSP] FB-IQ-DARAM owns 0x2a00 : rx_burst DARAM write SKIP "
                     "(fn=%u tn=%u) -> feed_iq authoritative\n", (unsigned)fn, (unsigned)tn);
     } else {
+        /* [2026-07-27] CALYPSO_BSP_IQ_SHIFT : voir en-tete du patch (instrument). */
+        static int _iqsh = -1;
+        if (_iqsh < 0) {
+            const char *e = getenv("CALYPSO_BSP_IQ_SHIFT");
+            _iqsh = (e && *e) ? atoi(e) : 0;
+            if (_iqsh < 0) _iqsh = 0;
+            if (_iqsh > 12) _iqsh = 12;
+            if (_iqsh) BSP_LOG("IQ_SHIFT=%d (echantillons >>%d avant DARAM : test saturation)", _iqsh, _iqsh);
+        }
         for (int i = 0; i < n; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);
-            bsp.dsp->data[a] = (uint16_t)iq[i];
+            bsp.dsp->data[a] = (uint16_t)(int16_t)(_iqsh ? (iq[i] >> _iqsh) : iq[i]);
             bsp_daram_wr_bucket(a);
             woff++;
             if (woff >= bsp.daram_len) woff = 0;
         }
+        /* [2026-07-27] DARAM-FNSTAMP : publie le fn et le nombre d'ecritures
+         * pour que le dump c54x estampille CE QU'IL LIT (voir en-tete patch). */
+        calypso_daram_last_fn = (unsigned)fn;
+        calypso_daram_wr_count++;
     }
     bsp.bursts_written++;
 
@@ -1319,7 +1343,19 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
      * d'alimenter le vrai corrélateur DSP. Réversible : sans l'env, inchangé. */
     {
         static int rxw = -1;
-        if (rxw < 0) rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+        if (rxw < 0) {
+            /* [2026-07-28] coherence avec les gates :474 et :997, qui se levent
+             * deja avec CALYPSO_BSP_DARAM_FORCE. Sans ca, DARAM_FORCE=1 ouvrait
+             * 2 verrous sur 3 et la livraison restait bloquee ici -> entree du
+             * correlateur (0x4c00) gelee (mesure corr_iq : 3 lectures identiques).
+             * Defaut inchange : sans env, comportement strictement identique. */
+            const char *rc = getenv("CALYPSO_DSP_RUN_C54X");
+            rxw = (getenv("CALYPSO_TPU_RX_WIRE")
+                   || (rc && *rc == '1' && getenv("CALYPSO_BSP_DARAM_FORCE"))) ? 1 : 0;
+            if (rxw)
+                fprintf(stderr, "[bsp] deliver: gate shunt LEVE (rxw=1) — "
+                        "livraison DARAM active\n");
+        }
         if (calypso_dsp_shunt_active() && !rxw) return;
     }
 

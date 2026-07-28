@@ -31,6 +31,8 @@ const char *shunt_tag(void)
 uint16_t shunt_read_w(uint32_t addr)
 {
     uint16_t v = 0;
+    /* [2026-07-27] AS-NULL guard : le shunt peut etre inactif (g_shunt.as jamais affecte) et des appelants natifs non gardes passent quand meme ici -> SIGSEGV. */
+    if (!g_shunt.as) return 0;
     dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
     return le16_to_cpu(v);
 }
@@ -38,6 +40,8 @@ uint16_t shunt_read_w(uint32_t addr)
 void shunt_write_w(uint32_t addr, uint16_t v)
 {
     uint16_t le = cpu_to_le16(v);
+    /* [2026-07-27] AS-NULL guard : le shunt peut etre inactif (g_shunt.as jamais affecte) et des appelants natifs non gardes passent quand meme ici -> SIGSEGV. */
+    if (!g_shunt.as) return;
     dma_memory_write(g_shunt.as, addr, &le, sizeof(le), MEMTXATTRS_UNSPECIFIED);
 }
 
@@ -122,6 +126,8 @@ uint32_t shunt_l1s_fn(void)
         else { addr = shunt_fw_sym("l1s"); if (!addr) addr = 0x836508; }
     }
     uint32_t v = 0;
+    /* [2026-07-27] AS-NULL guard : le shunt peut etre inactif (g_shunt.as jamais affecte) et des appelants natifs non gardes passent quand meme ici -> SIGSEGV. */
+    if (!g_shunt.as) return 0;
     dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
     return le32_to_cpu(v);
 }
@@ -143,6 +149,8 @@ uint32_t shunt_last_rach_fn(void)
         else { addr = shunt_fw_sym("last_rach"); if (!addr) addr = 0x836500; }
     }
     uint32_t v = 0;
+    /* [2026-07-27] AS-NULL guard : le shunt peut etre inactif (g_shunt.as jamais affecte) et des appelants natifs non gardes passent quand meme ici -> SIGSEGV. */
+    if (!g_shunt.as) return 0;
     dma_memory_read(g_shunt.as, addr, &v, sizeof(v), MEMTXATTRS_UNSPECIFIED);
     return le32_to_cpu(v);
 }

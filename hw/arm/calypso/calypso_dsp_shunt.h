@@ -22,6 +22,8 @@ void calypso_dsp_shunt_on_frame_tick(void);
 
 /* True if CALYPSO_DSP_SHUNT=1 in env. Use to gate BSP/TPU DMA into DARAM. */
 bool calypso_dsp_shunt_active(void);
+/* le shunt REMPLACE le DSP (mock) — seul ce predicat doit gater les c54x_run */
+bool calypso_dsp_shunt_substitutes(void);
 bool calypso_dsp_shunt_sb_valid(void);  /* gr-gsm a decode la SCH (detection reelle) */
 bool calypso_dsp_shunt_si_valid(void);  /* gr-gsm a decode un SI (a_cd pret) */
 uint16_t calypso_dsp_shunt_burst_d(void);  /* d_burst_d echote (gates BURST_OFS/FN) */

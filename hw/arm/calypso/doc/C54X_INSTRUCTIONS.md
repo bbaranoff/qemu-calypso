@@ -1,8 +1,16 @@
 ---
-name: C54x instruction encoding from SPRU172C
-description: Key instruction encodings verified from TI SPRU172C doc, corrects emulator bugs
+name: C54x instruction encoding from SPRU172C + binutils
+description: Encodages verifies contre binutils tic54x-opc.c (autorite pour encodage/longueur) et SPRU172C (autorite pour la semantique)
 type: project
 ---
+
+> **Ordre d'autorite** (pose le 2026-07-28, apres plusieurs fausses pistes) :
+> 1. `doc/opcodes/tic54x-opc.c` — la table binutils, copiee dans le depot. Format :
+>    `{ "mnemo", MOTS, cycles, classe, OPCODE, MASQUE, {operandes}, flags }`.
+>    **Le champ MOTS fait foi** : une longueur fausse desynchronise tout le decodage en aval.
+> 2. `doc/spru172c.pdf` — le manuel TI, autorite pour la SEMANTIQUE d'execution.
+> 3. le code, puis ce fichier.
+> Ne jamais conclure depuis un commentaire de code : plusieurs se sont averes perimes.
 
 ## XC (Execute Conditionally) — SPRU172C p.4-198
 - Opcode: `1111 11N1 CCCCCCCC` (1 word)
@@ -36,13 +44,24 @@ type: project
 - Pushes PC+1, branches to interrupt vector K
 - Not affected by INTM
 
-## 0xEA = BANZ (confirmed, not XC)
+## 0xEA00 = LD #k9, DP  (PAS BANZ, PAS XC) — rectifie 2026-07-28
+- `binutils tic54x-opc.c` : `{ "ld", 1,2,2, 0xEA00, 0xFE00, {OP_k9,OP_DP} }` = **1 mot**,
+  charge le **Data Page pointer** (DP = ST0[8:0]) avec un immediat 9 bits.
+- Ce n'est donc ni BANZ ni XC. L'ancienne ligne « 0xEA = BANZ (confirmed) » etait FAUSSE
+  et contredisait la section BANZ ci-dessous du meme fichier.
+- `calypso_c54x.c` est **correct** sur ce point (handler `(op & 0xFE00) == 0xEA00`) : il
+  ecrit bien DP dans ST0. Aucune correction de code necessaire.
+- Enjeu : DP gouverne tout l'adressage DIRECT. Un DP faux fait tomber chaque acces direct
+  sur la mauvaise page — symptome typique : pointeurs aberrants et lectures de zones
+  arbitraires.
 
 **How to apply:** Fix XC (0xFD/0xFF), FRET (2 pops), FCALL (2 pushes) in calypso_c54x.c
 
 ## BANZ — SPRU172C p.4-16
 - Opcode: `0111 1Z0I AAAA AAAA` + 16-bit pmad (2 words)
-- BANZ = 0x78xx, BANZD = 0x7Axx
+- ⚠️ RECTIFIE 2026-07-28 par binutils tic54x-opc.c : `banz` = **0x6C00**/0xFF00 et
+  `banzd` = **0x6E00**/0xFF00, **2 mots** — ni 0x78xx ni 0xEA. (0x78xx est autre chose.)
+- (ancienne note, fausse : « BANZ = 0x78xx, BANZD = 0x7Axx »)
 - Sind encodes indirect addressing (which AR and modify mode)
 - Execution: if (AR[x] != 0) then pmad→PC, else PC+2→PC
 - AR[x] is always decremented (even when condition is false)

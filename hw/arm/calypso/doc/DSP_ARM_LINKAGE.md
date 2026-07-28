@@ -208,3 +208,113 @@ Rappel : l'ARM lit `s->dsp->data[off/2 + 0x0800]` (calypso_trx.c), PAS `s->api_r
 
 Voir aussi : [DSP_ADDRESS_MAP.md](DSP_ADDRESS_MAP.md).
 
+
+---
+
+## `d_error_status` — mecanique complete (mesuree 2026-07-28)
+
+### Adressage
+
+| Quoi | Valeur | Comment c'est etabli |
+|---|---|---|
+| Base NDB | `BASE_API_NDB = 0xFFD001A8` | `osmocom-bb/.../include/calypso/dsp_api.h:18` |
+| Type des champs | `typedef unsigned short API;` (**16 bits**) | `include/calypso/l1_environment.h:3` |
+| Variante de structure active | `#if (DSP == 34)||(35)||(36)` — **`#define DSP 36`** | `l1_environment.h:9` ; 4 variantes existent dans le header, les champs different |
+| `d_dsp_page` | NDB+0 -> ARM `0xFFD001A8` -> **mot DSP `0x08D4`** | struct : 1er champ |
+| **`d_error_status`** | NDB+1 mot -> ARM **`0xFFD001AA`** -> **mot DSP `0x08D5`** | struct : suit immediatement `d_dsp_page` |
+
+⚠️ `calypso_fbsb.h:51` definit `NDB_D_DSP_PAGE = 0x08E2`. **Ce n'est pas la base NDB** (qui
+est le mot `0x08D4`). Ne pas s'en servir pour deriver les offsets des champs voisins.
+
+### Ce que fait le firmware DSP
+
+Le DSP ne *calcule* pas un code d'erreur : il **recopie son mot d'etat interne**, masque
+sur 12 bits, dans la cellule que l'ARM lit. Desassemblage (`CALYPSO_TRACEFROM=0xb0f6`) :
+
+```
+0xb106:  10f8 3f92     LD   *(0x3f92), A     ; mot d'etat interne DSP
+0xb108:  f030 0fff     AND  #0x0fff, A       ; masque 12 bits
+0xb10a:  80f8 08d5     STL  A, *(0x08d5)     ; -> d_error_status
+0xb10c:  fc00          RET
+```
+
+> **`d_error_status == data[0x3f92] & 0x0FFF`**
+
+### Ce que fait le firmware ARM
+
+`osmocom-bb/.../layer1/sync.c:249-252` — a chaque trame :
+
+```c
+if (dsp_api.ndb->d_error_status) {
+    printf("DSP Error Status: %u
+", dsp_api.ndb->d_error_status);
+    dsp_api.ndb->d_error_status = 0;      /* l'ARM EFFACE apres lecture */
+}
+```
+
+L'ARM efface donc la cellule a chaque tour ; si le message revient, c'est que le DSP la
+**repose** — la condition est persistante, pas un evenement unique. Le firmware ne fait
+qu'imprimer : **il ne change pas de comportement**. Un `DSP Error Status` n'est donc pas
+en soi un blocage, c'est un temoin.
+
+### Signification des bits (`enum dsp_error`, `dsp_api.h:1541`)
+
+| Bit | Valeur | Nom |
+|---|---|---|
+| 0 | `0x0001` | `DSP_ERR_RHEA` |
+| 2 | `0x0004` | `DSP_ERR_IQ_SAMPLES` |
+| 3 | `0x0008` | `DSP_ERR_DMA_PROG` |
+| 4 | `0x0010` | `DSP_ERR_DMA_TASK` |
+| **5** | **`0x0020`** | **`DSP_ERR_DMA_PEND`** |
+| 7 | `0x0080` | `DSP_ERR_VM` |
+| 8 | `0x0100` | `DSP_ERR_DMA_UL_TASK` |
+| 9 | `0x0200` | `DSP_ERR_DMA_UL_PROG` |
+| 10 | `0x0400` | `DSP_ERR_DMA_UL_PEND` |
+| 11 | `0x0800` | `DSP_ERR_STACK_OV` |
+
+### Observations mesurees (2026-07-28)
+
+- **`0x0800` STACK_OV** : apparaissait en boucle tant que le DSP tournait a la cadence du
+  routeur d'assist. **Eteint** par le split `active()`/`substitutes()` (le DSP tourne a la
+  cadence trame). Reapparu temporairement quand l'excursion `SHUNT_DSP_FB` ecrasait la
+  pile du DSP -> corrige par une **pile dediee** (`CALYPSO_SHUNT_DSP_FB_SP`).
+- **`0x0020` DMA_PEND** : `data[0x3f92] = 0x0020` (670 relevés) apparait vers `fn~1300`
+  (+6 s). **Pose par le firmware DSP, pas par nous** : notre code n'ecrit QUE le bit 11
+  (`data[0x3f92] |= 0x0800` — `calypso_bsp.c:1378`, `calypso_c54x.c:13985`,
+  `calypso_trx.c:990`), et ce bit n'apparait meme pas dans les valeurs relevees.
+
+### Piege de mesure (paye 4 fois cette nuit)
+
+L'adresse `0x08D5` etait correcte des la premiere deduction ; ce sont les **fenetres de
+sonde** qui ont fait echouer trois tentatives :
+
+1. sonde sur `0x08E3` (mauvais offset derive de `NDB_D_DSP_PAGE`) -> muette ;
+2. sonde sur `0x08D4..0x08E4`, plafond 40 -> **consomme par les ecritures de ZERO du boot** ;
+3. idem, filtre sur non-nul -> **consomme par `data[0x08dc]`** (autre cellule, ecrite en
+   boucle a `PC=0xb530`) ;
+4. sonde sur **`0x08D5` seul, non-nul seulement** -> resultat immediat.
+
+**Regle** : une sonde se concoit par sa **condition de declenchement**, pas par son
+adresse. Et « pas de log » n'est jamais « pas d'evenement » tant qu'on n'a pas verifie que
+la sonde est vivante et que sa fenetre couvre l'instant vise.
+
+### Reproduire
+
+```bash
+# qui pose la valeur (cote DSP)
+CALYPSO_ERRWATCH=1 ./start-clean.sh          # ecritures non nulles de data[0x08D5]
+# ce que l'ARM lit (les deux vues du miroir api_ram)
+CALYPSO_ERRREAD=1 ./start-clean.sh           # compare dsp_ram[] et dsp->data[]
+# recherche par la VALEUR plutot que par l'adresse
+CALYPSO_FIND32=1 [CALYPSO_FIND32_VAL=0x20]   # quel offset ARM porte cette valeur
+# le code qui recopie
+CALYPSO_TRACEFROM=0xb0f6 CALYPSO_TRACEFROM_N=32
+```
+
+### Question ouverte
+
+Quel PC pose le **bit 5 de `data[0x3f92]`** ? Meme sonde, transposee d'une adresse :
+watchpoint sur les ecritures de `0x3f92` filtrees sur `val & 0x20`, avec le PC.
+⚠️ Priorite a evaluer : `d_error_status` est un **temoin**, pas un blocage — le firmware
+ARM l'imprime et l'efface sans changer de comportement. L'indicateur qui compte reste
+`d_fb_det`.

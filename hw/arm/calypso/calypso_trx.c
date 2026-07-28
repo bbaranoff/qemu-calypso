@@ -190,6 +190,40 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
+    {   /* [2026-07-28] FIND32 : voir en-tete du patch. */
+        static int _f3 = -1; static unsigned _f3n = 0; static uint16_t _f3v = 0x0020;
+        if (_f3 < 0) { _f3 = getenv("CALYPSO_FIND32") ? 1 : 0;
+                       const char *v = getenv("CALYPSO_FIND32_VAL");
+                       if (v && *v) _f3v = (uint16_t)strtol(v, NULL, 0); }
+        if (_f3 && _f3n < 40 && s->dsp_ram && (offset & 1) == 0) {
+            uint16_t _v = s->dsp_ram[offset / 2];
+            if (_v == _f3v) {
+                _f3n++;
+                unsigned _dspw = 0x0800 + (unsigned)(offset / 2);
+                fprintf(stderr, "[calypso-trx] FIND32 off=0x%04x (mot DSP 0x%04x) = 0x%04x "
+                        "| NDB+%d mots | fn=%u\n", (unsigned)offset, _dspw, _v,
+                        (int)(((int)offset - 0x01A8) / 2), s->fn);
+            }
+        }
+    }
+    {   /* [2026-07-28] ERRREAD : voir en-tete du patch. */
+        static int _er = -1; static unsigned _ern = 0;
+        if (_er < 0) _er = getenv("CALYPSO_ERRREAD") ? 1 : 0;
+        if (_er && offset >= 0x01A8 && offset <= 0x01AE && _ern < 40) {
+            _ern++;
+            unsigned _w = (unsigned)(offset / 2);
+            unsigned _dspw = 0x0800 + _w;
+            uint16_t _arm = s->dsp_ram ? s->dsp_ram[_w] : 0xDEAD;
+            uint16_t _dsp = (s->dsp && _dspw < C54X_DATA_SIZE) ? s->dsp->data[_dspw] : 0xDEAD;
+            fprintf(stderr, "[calypso-trx] ERRREAD off=0x%04x (mot DSP 0x%04x, %s) "
+                    "vue_ARM=0x%04x vue_DSP=0x%04x %s fn=%u\n",
+                    (unsigned)offset, _dspw,
+                    offset == 0x01A8 ? "d_dsp_page" :
+                    offset == 0x01AA ? "d_error_status" : "(voisin)",
+                    _arm, _dsp,
+                    (_arm != _dsp) ? "<<<< LES DEUX VUES DIVERGENT" : "(coherent)", s->fn);
+        }
+    }
 
     /* === Hypothesis #4 probe : ARM reads R_PAGE_X (= DSP responses) ===
      * ARM lit a_pm via R_PAGE_X. R_PAGE_0 = 0x0050, R_PAGE_1 = 0x0078.
@@ -446,6 +480,32 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+    {   /* [2026-07-28] BOOTCMD cote ARM : commande bootloader DSP (voir en-tete). */
+        static int _bc = -1; static unsigned _bcn = 0;
+        if (_bc < 0) _bc = getenv("CALYPSO_BOOTCMD") ? 1 : 0;
+        if (_bc && offset >= 0x0FF8 && offset <= 0x0FFF && _bcn < 40) {
+            _bcn++;
+            const char *_nm = (offset == 0x0FFE) ? "BL_CMD_STATUS (2/4=download)" :
+                              (offset == 0x0FFC) ? "BL_ADDR_LO" :
+                              (offset == 0x0FFA) ? "BL_SIZE" :
+                              (offset == 0x0FF8) ? "BL_ADDR_HI" : "(autre)";
+            fprintf(stderr, "[calypso-trx] BOOTCMD ARM off=0x%04x %s <- 0x%04x fn=%u\n",
+                    (unsigned)offset, _nm, (unsigned)value, s->fn);
+        }
+    }
+    {   /* [2026-07-28] FBDET-API (b) cote ARM : ecriture MMIO de d_fb_det
+         * (mot DSP 0x08F8 -> offset 0x01F0) et du bloc a_sync_demod. */
+        static int _fb = -1; static unsigned _fbn = 0;
+        if (_fb < 0) _fb = getenv("CALYPSO_FBDET_API") ? 1 : 0;
+        if (_fb && offset >= 0x01F0 && offset <= 0x01FB && _fbn < 40) {
+            _fbn++;
+            fprintf(stderr, "[calypso-trx] FBDET-API ARM off=0x%04x (mot 0x%04x, %s)"
+                    " <- 0x%04x size=%u fn=%u\n", (unsigned)offset,
+                    (unsigned)(0x0800 + offset / 2),
+                    offset == 0x01F0 ? "d_fb_det" : "a_sync_demod",
+                    (unsigned)value, size, s->fn);
+        }
+    }
     /* [2026-07-22] de-alias burst-ID : mirror d_burst_d par commande */
     calypso_dsp_shunt_wp_burst_write((uint32_t)offset, (uint16_t)value);
     /* [2026-07-26 camp] PUSH FIFO du burst_id commande (db_w->d_burst_d, word1 :
@@ -1344,14 +1404,14 @@ static void calypso_tdma_tick(void *opaque) {
      * la DSP. Skip TOUS les c54x_run -> le c54x emule n'execute aucune
      * instruction, ne touche pas a la DARAM, ne fabrique pas de d_dsp_page
      * concurrent avec le mock. */
-    if (s->dsp && s->dsp->running && !s->dsp_init_done && !calypso_dsp_shunt_active()) {
+    if (s->dsp && s->dsp->running && !s->dsp_init_done && !calypso_dsp_shunt_substitutes()) {
         if (!s->dsp->idle)
             dsp_n_exec_2 = c54x_run(s->dsp, dsp_budget);
         if (s->dsp->idle) {
             s->dsp_init_done = true;
             TRX_LOG("DSP init complete (first IDLE reached)");
         }
-    } else if (calypso_dsp_shunt_active() && !s->dsp_init_done) {
+    } else if (calypso_dsp_shunt_substitutes() && !s->dsp_init_done) {
         /* En shunt mode, on saute l'init DSP "boot" — le mock prend le relais. */
         s->dsp_init_done = true;
     }
@@ -1401,7 +1461,7 @@ static void calypso_tdma_tick(void *opaque) {
          * compute RX critique (Claude web review 2026-05-16).
          *
          * GATE DSP_SHUNT : skip si shunt actif (cf section 2 commentaire). */
-        if (!s->dsp->idle && !calypso_dsp_shunt_active()) {
+        if (!s->dsp->idle && !calypso_dsp_shunt_substitutes()) {
             dsp_n_exec_5 = c54x_run(s->dsp, dsp_budget);
         }
 

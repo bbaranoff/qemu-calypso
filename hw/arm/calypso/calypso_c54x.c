@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>   /* DARAM-SANITY : coherence/dphi du buffer corr */
+/* [2026-07-27] DARAM-FNSTAMP : publiees par calypso_bsp.c. */
+extern unsigned calypso_daram_last_fn;
+extern unsigned calypso_daram_wr_count;
 
 extern int calypso_rxfb_fired;   /* [probe golive] defini dans calypso_bsp.c */
 
@@ -1625,6 +1629,9 @@ static void nop_guard_dump(C54xState *s, uint16_t pc, uint8_t xpc)
 }
 
 static uint16_t data_read_locked(C54xState *s, uint16_t addr);
+/* [2026-07-28] DEMODIO : prototype — le helper est defini plus bas mais
+ * data_read, qui l appelle, vient avant. */
+static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val);
 
 /* FBWATCH (2026-05-30 soir) : sonde FB-dispatch gatée par une env DÉDIÉE
  * (CALYPSO_FBWATCH=1), résolue UNE fois en static int → check int cheap, PAS
@@ -1643,12 +1650,19 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     /* [2026-07-27] FB-STREAM : injecte un echantillon FCCH FRAIS a chaque lecture
      * de la cellule sample du demod (0x9213 I / 0x9215 Q) -> vraie fenetre dans
      * 0x2a00, sans dependre de la cadence. Modelise le DMA on-chip. Gate CALYPSO_FB_STREAM. */
-    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == 0x9213 || addr == 0x9215)) {
+    /* [2026-07-27] cellules I/Q du demod configurables : WATCH-9F00-RD a montre
+     * que le demod lit 0x9260/0x9261 (pas 0x9213/0x9215). CALYPSO_FB_STREAM_CELL(Q). */
+    static uint16_t _fscI = 0, _fscQ = 0;
+    if (_fscI == 0) {
+        const char *c = getenv("CALYPSO_FB_STREAM_CELL");  _fscI = c ? (uint16_t)strtol(c, NULL, 0) : 0x9213;
+        const char *q = getenv("CALYPSO_FB_STREAM_CELLQ"); _fscQ = q ? (uint16_t)strtol(q, NULL, 0) : 0x9215;
+    }
+    if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == _fscI || addr == _fscQ)) {
         static int _fs = -1;
         if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
-            if (addr == 0x9213) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
+            if (addr == _fscI) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
             else { _rv = _hv ? _sq : s->data[addr]; }
             static unsigned _sl = 0;
             if (_sl++ < 24)
@@ -1720,11 +1734,122 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     qemu_mutex_lock(&calypso_pcb_daram_lock);
     uint16_t v = data_read_locked(s, addr);
     qemu_mutex_unlock(&calypso_pcb_daram_lock);
+    dio_note(s, "R", addr, v);
     return v;
+}
+
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn);
+
+/* [2026-07-28] RMAP : carte agregee des adresses LUES par les PC d une plage.
+ * Symetrique de WMAP. Voir en-tete du patch rmap.py. */
+#define RMAP_PCS 48
+static struct { uint16_t pc; uint32_t n; uint16_t a[8]; uint8_t na;
+                uint16_t amn, amx; } g_rmap[RMAP_PCS];
+static int      g_rmap_n;
+static uint32_t g_rmap_tot;
+static int      g_rmap_on = -1;
+static uint16_t g_rmap_pclo, g_rmap_pchi;
+
+static void rmap_dump(void)
+{
+    fprintf(stderr, "[c54x] RMAP PC 0x%04x..0x%04x  lectures=%u  PCs=%d%s\n",
+            g_rmap_pclo, g_rmap_pchi, g_rmap_tot, g_rmap_n,
+            g_rmap_n >= RMAP_PCS ? "  *** SATUREE ***" : "");
+    for (int i = 0; i < g_rmap_n; i++) {
+        fprintf(stderr, "[c54x] RMAP   PC=0x%04x n=%-7u lit 0x%04x..0x%04x  ex:",
+                g_rmap[i].pc, g_rmap[i].n, g_rmap[i].amn, g_rmap[i].amx);
+        for (int k = 0; k < g_rmap[i].na && k < 8; k++)
+            fprintf(stderr, " %04x", g_rmap[i].a[k]);
+        fprintf(stderr, "\n");
+    }
+}
+
+static void rmap_note(uint16_t addr, uint16_t pc)
+{
+    if (g_rmap_on < 0) {
+        const char *e = getenv("CALYPSO_RMAP");
+        g_rmap_on = (e && atoi(e) > 0) ? 1 : 0;
+        const char *lo = getenv("CALYPSO_RMAP_PCLO"), *hi = getenv("CALYPSO_RMAP_PCHI");
+        g_rmap_pclo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x9f00;
+        g_rmap_pchi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x9fff;
+        if (g_rmap_on)
+            fprintf(stderr, "[c54x] RMAP armed PC 0x%04x..0x%04x\n", g_rmap_pclo, g_rmap_pchi);
+    }
+    if (!g_rmap_on || pc < g_rmap_pclo || pc > g_rmap_pchi) return;
+
+    int i;
+    for (i = 0; i < g_rmap_n; i++) if (g_rmap[i].pc == pc) break;
+    if (i == g_rmap_n) {
+        if (g_rmap_n >= RMAP_PCS) return;
+        g_rmap_n++;
+        g_rmap[i].pc = pc; g_rmap[i].n = 0; g_rmap[i].na = 0;
+        g_rmap[i].amn = 0xffff; g_rmap[i].amx = 0;
+    }
+    g_rmap[i].n++;
+    if (addr < g_rmap[i].amn) g_rmap[i].amn = addr;
+    if (addr > g_rmap[i].amx) g_rmap[i].amx = addr;
+    if (g_rmap[i].na < 8) {
+        int seen = 0;
+        for (int k = 0; k < g_rmap[i].na; k++) if (g_rmap[i].a[k] == addr) { seen = 1; break; }
+        if (!seen) g_rmap[i].a[g_rmap[i].na++] = addr;
+    }
+    if (++g_rmap_tot % 5000 == 0) rmap_dump();
 }
 
 static uint16_t data_read_locked(C54xState *s, uint16_t addr)
 {
+    rmap_note(addr, s->pc);
+    {   /* [2026-07-28] WZREAD : voir en-tete du patch (gate CALYPSO_WZWRITE). */
+        static int _wr = -1; static unsigned _wrn = 0;
+        if (_wr < 0) _wr = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wr && addr == 0x2c00 && s->pc == 0xa07c && _wrn < 40) {
+            /* v3 : seule la lecture du noyau MAC nous interesse (0x9aba = boucle
+             * de normalisation, bruyante et deja caracterisee en B4B). */
+            _wrn++;
+            fprintf(stderr, "[c54x] WZREAD  data[0x%04x] = 0x%04x PC=0x%04x op=0x%04x "
+                    "AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                    addr, s->data[addr], s->pc, prog_fetch(s, s->pc),
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] DMAWATCH (lecture) : voir en-tete du patch. */
+        static int _dw2 = -1; static unsigned _dwr = 0;
+        if (_dw2 < 0) _dw2 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw2 && addr >= 0x0054 && addr <= 0x0057 && _dwr < 40) {
+            _dwr++;
+            const char *_nm = (addr==0x0054) ? "DMPREC?(modele:DMSA)" :
+                              (addr==0x0055) ? "DMSA?(modele:DMSDI)" :
+                              (addr==0x0056) ? "DMSDI?" : "DMSDN";
+            fprintf(stderr, "[c54x] DMAWATCH RD 0x%04x %-20s = 0x%04x PC=0x%04x insn=%u\n",
+                    addr, _nm, s->data[addr], s->pc, s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] DEMODRD : voir en-tete du patch. */
+        static int _dr = -1; static unsigned _drn = 0;
+        if (_dr < 0) _dr = getenv("CALYPSO_DEMODRD") ? 1 : 0;
+        if (_dr && _drn < 60 && s->pc == 0x9fb5) {   /* seule la lecture des echantillons */
+            _drn++;
+            fprintf(stderr, "[c54x] DEMODRD PC=0x%04x XPC=%u op=0x%04x lit data[0x%04x]=0x%04x "
+                    "AR0=%04x AR1=%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x AR6=%04x AR7=%04x "
+                    "BK=%04x | 5 mots: %04x %04x %04x %04x %04x | insn=%u\n",
+                    s->pc, (unsigned)s->xpc, prog_fetch(s, s->pc), addr, s->data[addr],
+                    s->ar[0], s->ar[1], s->ar[2], s->ar[3], s->ar[4], s->ar[5],
+                    s->ar[6], s->ar[7], s->bk,
+                    s->data[(uint16_t)(addr+0)], s->data[(uint16_t)(addr+1)],
+                    s->data[(uint16_t)(addr+2)], s->data[(uint16_t)(addr+3)],
+                    s->data[(uint16_t)(addr+4)], s->insn_count);
+        }
+    }
+    {   /* [2026-07-27] SLOTSRC-RD : quelle adresse contient le stub 0xab38 ? */
+        static int _sr = -1; static unsigned _srn = 0;
+        if (_sr < 0) _sr = getenv("CALYPSO_SLOTSRC") ? 1 : 0;
+        if (_sr && _srn < 40 && s->data[addr] == 0xab38) {
+            _srn++;
+            fprintf(stderr, "[c54x] SLOTSRC-RD data[0x%04x] = 0xab38 (STUB) lu PC=0x%04x insn=%u\n",
+                    addr, s->pc, s->insn_count);
+        }
+    }
+    flow_log("R", addr, s->data[addr], s->pc, s->insn_count);
     read_stats_record(addr);
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : le correlateur
      * FB (PC=0xee38) lit data[0x2b97] via AR3 (STM hardcode ROM), region
@@ -2682,8 +2807,234 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
     qemu_mutex_unlock(&calypso_pcb_daram_lock);
 }
 
+/* [2026-07-27] FLOWTRACE : voir en-tete du patch. */
+static FILE *g_flow_f = NULL;
+static long  g_flow_budget = -2;
+static int   g_flow_armed = 0;
+static void flow_log(const char *rw, uint16_t addr, uint16_t val, uint16_t pc, unsigned insn)
+{
+    if (g_flow_budget == -2) {
+        const char *e = getenv("CALYPSO_FLOWTRACE");
+        g_flow_budget = (e && *e) ? atol(e) : -1;
+        if (g_flow_budget > 0) {
+            g_flow_f = fopen("/tmp/calypso_flow.txt", "w");
+            fprintf(stderr, "[c54x] FLOWTRACE armed budget=%ld -> /tmp/calypso_flow.txt\n", g_flow_budget);
+        }
+    }
+    if (g_flow_budget <= 0 || !g_flow_f || !g_flow_armed) return;
+    if (addr < 0x2800 || addr >= 0x3000) return;
+    fprintf(g_flow_f, "%s %04x %04x pc=%04x insn=%u\n", rw, addr, val, pc, insn);
+    if (--g_flow_budget == 0) { fflush(g_flow_f); fclose(g_flow_f); g_flow_f = NULL;
+        fprintf(stderr, "[c54x] FLOWTRACE done -> /tmp/calypso_flow.txt\n"); }
+}
+
+
+/* [2026-07-28] WMAP : carte agregee des ecrivains d une plage data[].
+ * Voir en-tete du patch wmap.py — un agregat, pas un flux : aucun plafond de
+ * lignes, donc aucune fenetre a rater (les 3 sondes precedentes ont toutes ete
+ * tronquees). Sortie periodique : PC, n, valeurs distinctes, min/max. */
+#define WMAP_PCS 64
+static struct { uint16_t pc; uint32_t n; uint16_t v[8]; uint8_t nv;
+                uint16_t mn, mx; uint16_t addr0; uint32_t n0; } g_wmap[WMAP_PCS];
+static int      g_wmap_n;
+static uint32_t g_wmap_tot;
+static int      g_wmap_on = -1;
+static uint16_t g_wmap_lo, g_wmap_hi, g_wmap_lo2, g_wmap_hi2;
+
+static void wmap_dump(void)
+{
+    fprintf(stderr, "[c54x] WMAP plages 0x%04x..0x%04x + 0x%04x..0x%04x  ecritures=%u  ecrivains=%d%s\n",
+            g_wmap_lo, g_wmap_hi, g_wmap_lo2, g_wmap_hi2, g_wmap_tot, g_wmap_n,
+            g_wmap_n >= WMAP_PCS ? "  *** TABLE SATUREE, ecrivains manquants ***" : "");
+    for (int i = 0; i < g_wmap_n; i++) {
+        fprintf(stderr, "[c54x] WMAP   PC=0x%04x n=%-7u @0x%04x(n=%u) distinct=%s%d  min=0x%04x max=0x%04x  ex:",
+                g_wmap[i].pc, g_wmap[i].n, g_wmap[i].addr0, g_wmap[i].n0,
+                g_wmap[i].nv >= 8 ? ">=" : "", g_wmap[i].nv,
+                g_wmap[i].mn, g_wmap[i].mx);
+        for (int k = 0; k < g_wmap[i].nv && k < 8; k++)
+            fprintf(stderr, " %04x", g_wmap[i].v[k]);
+        fprintf(stderr, "%s\n", g_wmap[i].n0 < 2 ? "   <= (trop peu d echantillons)"
+                : g_wmap[i].nv == 1 ? "   <= CONSTANTE dans le temps"
+                                    : "   <= VARIE dans le temps = PORTE DE LA DONNEE");
+    }
+}
+
+/* v3 : battement — prouve que la sonde est VIVANTE meme a zero ecriture.
+ * Appele sur chaque write hors plage ; n imprime qu une fois par tranche de
+ * 5e6 writes globaux, en rappelant le total DANS la plage (0 = vrai zero). */
+static void wmap_heartbeat(void)
+{
+    static uint64_t k;
+    if (!g_wmap_on) return;
+    if (++k % 5000000ULL) return;
+    fprintf(stderr, "[c54x] WMAP heartbeat: writes DSP=%llu, dans plages=%u"
+            " (0 = la plage n est jamais ecrite par une instruction DSP)\n",
+            (unsigned long long)k, g_wmap_tot);
+}
+
+static void wmap_note(uint16_t addr, uint16_t val, uint16_t pc)
+{
+    if (g_wmap_on < 0) {
+        const char *e = getenv("CALYPSO_WMAP");
+        g_wmap_on = (e && atoi(e) > 0) ? 1 : 0;
+        const char *lo = getenv("CALYPSO_WMAP_LO"), *hi = getenv("CALYPSO_WMAP_HI");
+        g_wmap_lo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x2c00;
+        g_wmap_hi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x2c1f;
+        const char *lo2 = getenv("CALYPSO_WMAP_LO2"), *hi2 = getenv("CALYPSO_WMAP_HI2");
+        g_wmap_lo2 = lo2 ? (uint16_t)strtoul(lo2, NULL, 0) : 0xffff;
+        g_wmap_hi2 = hi2 ? (uint16_t)strtoul(hi2, NULL, 0) : 0x0000;
+        if (g_wmap_on)
+            fprintf(stderr, "[c54x] WMAP armed 0x%04x..0x%04x\n", g_wmap_lo, g_wmap_hi);
+    }
+    if (!g_wmap_on) return;
+    if (!((addr >= g_wmap_lo  && addr <= g_wmap_hi) ||
+          (addr >= g_wmap_lo2 && addr <= g_wmap_hi2))) { wmap_heartbeat(); return; }
+
+    int i;
+    for (i = 0; i < g_wmap_n; i++) if (g_wmap[i].pc == pc) break;
+    if (i == g_wmap_n) {
+        if (g_wmap_n >= WMAP_PCS) return;
+        g_wmap_n++;
+        g_wmap[i].pc = pc; g_wmap[i].n = 0; g_wmap[i].nv = 0;
+        g_wmap[i].mn = 0xffff; g_wmap[i].mx = 0;
+        g_wmap[i].addr0 = addr; g_wmap[i].n0 = 0;   /* v2 : cellule temoin figee */
+    }
+    g_wmap[i].n++;
+    if (val < g_wmap[i].mn) g_wmap[i].mn = val;
+    if (val > g_wmap[i].mx) g_wmap[i].mx = val;
+    /* v2 : le critere de SIGNAL est la variation dans le TEMPS a adresse FIXE. */
+    if (addr != g_wmap[i].addr0) return;
+    g_wmap[i].n0++;
+    if (g_wmap[i].nv < 8) {
+        int seen = 0;
+        for (int k = 0; k < g_wmap[i].nv; k++) if (g_wmap[i].v[k] == val) { seen = 1; break; }
+        if (!seen) g_wmap[i].v[g_wmap[i].nv++] = val;
+    }
+    /* v3 : seuil bas + tick temporel, pour que l ABSENCE soit mesurable. */
+#define WMAP_TICK 2000
+    if (++g_wmap_tot % WMAP_TICK == 0) wmap_dump();
+}
+
+
+/* [2026-07-28] DEMODIO : voir en-tete du patch demodio.py. */
+static int      g_dio_on = -1;
+static uint64_t g_dio_after;
+static unsigned g_dio_n;
+static uint16_t g_dio_pclo, g_dio_pchi;
+
+static void dio_init(void)
+{
+    const char *e = getenv("CALYPSO_DEMODIO");
+    g_dio_on = (e && atoi(e) > 0) ? 1 : 0;
+    const char *a = getenv("CALYPSO_DEMODIO_AFTER");
+    g_dio_after = a && *a ? strtoull(a, NULL, 0) : 40000000ULL;
+    const char *lo = getenv("CALYPSO_DEMODIO_PCLO"), *hi = getenv("CALYPSO_DEMODIO_PCHI");
+    g_dio_pclo = lo ? (uint16_t)strtoul(lo, NULL, 0) : 0x9f95;
+    g_dio_pchi = hi ? (uint16_t)strtoul(hi, NULL, 0) : 0x9fe2;
+    if (g_dio_on)
+        fprintf(stderr, "[c54x] DEMODIO armed PC 0x%04x..0x%04x apres insn=%llu\n",
+                g_dio_pclo, g_dio_pchi, (unsigned long long)g_dio_after);
+}
+
+static void dio_note(C54xState *s, const char *rw, uint16_t addr, uint16_t val)
+{
+    if (g_dio_on < 0) dio_init();
+    if (!g_dio_on) return;
+    if (s->pc < g_dio_pclo || s->pc > g_dio_pchi) return;
+    if (s->insn_count < g_dio_after) return;
+    if (g_dio_n >= 160) return;
+    int64_t a = (s->a & 0x8000000000LL) ? (int64_t)(s->a | ~0xFFFFFFFFFFLL) : (int64_t)s->a;
+    int64_t b = (s->b & 0x8000000000LL) ? (int64_t)(s->b | ~0xFFFFFFFFFFLL) : (int64_t)s->b;
+    fprintf(stderr, "[c54x] DEMODIO %s PC=0x%04x op=0x%04x addr=0x%04x val=0x%04x "
+            "A=%lld B=%lld T=0x%04x AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+            rw, s->pc, prog_fetch(s, s->pc), addr, val, (long long)a, (long long)b,
+            s->t, s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+    g_dio_n++;
+}
+
 static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
 {
+    dio_note(s, "W", addr, val);
+    wmap_note(addr, val, s->pc);
+    flow_log("W", addr, val, s->pc, s->insn_count);
+    {   /* [2026-07-28] WZWRITE : qui remplit l entree du noyau ? (voir en-tete) */
+        static int _wz = -1; static unsigned _wzn = 0;
+        if (_wz < 0) _wz = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wz && addr == 0x2c00 && (s->pc == 0x9fd5 || s->pc == 0x9ab1) && _wzn < 40) {
+            /* v3 : filtre par PC PRODUCTEUR — 0xa03d/a042/a079 (init MAC) exclus,
+             * ils saturaient le plafond et masquaient les bursts suivants. */
+            _wzn++;
+            fprintf(stderr, "[c54x] WZWRITE data[0x%04x] <- 0x%04x PC=0x%04x op=0x%04x "
+                    "A=0x%010llx AR2=%04x AR3=%04x AR4=%04x AR5=%04x insn=%u\n",
+                    addr, val, s->pc, prog_fetch(s, s->pc),
+                    (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                    s->ar[2], s->ar[3], s->ar[4], s->ar[5], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] ERRWATCH : qui pose d_error_status ? (voir en-tete) */
+        static int _ew = -1; static unsigned _ewn = 0;
+        if (_ew < 0) _ew = getenv("CALYPSO_ERRWATCH") ? 1 : 0;
+        /* v3 : sur d_error_status (0x08D5) on ignore les ecritures de 0 —
+         * elles sont le nettoyage de boot et consommaient tout le plafond. */
+        if (_ew && addr == 0x08D5 && val != 0 && _ewn < 60) {
+            _ewn++;
+            const char *_b = (val & 0x0800) ? "STACK_OV" : (val & 0x0400) ? "DMA_UL_PEND" :
+                             (val & 0x0200) ? "DMA_UL_PROG" : (val & 0x0100) ? "DMA_UL_TASK" :
+                             (val & 0x0080) ? "VM" : (val & 0x0020) ? "DMA_PEND" :
+                             (val & 0x0010) ? "DMA_TASK" : (val & 0x0008) ? "DMA_PROG" :
+                             (val & 0x0004) ? "IQ_SAMPLES" : (val & 0x0001) ? "RHEA" : "(clear)";
+            fprintf(stderr, "[c54x] ERRWATCH data[0x%04x] 0x%04x -> 0x%04x [%s] "
+                    "PC=0x%04x op=0x%04x A=0x%06llx AR1=%04x AR2=%04x AR6=%04x insn=%u\n",
+                    addr, s->data[addr], val, _b, s->pc, prog_fetch(s, s->pc),
+                    (unsigned long long)(s->a & 0xFFFFFFULL),
+                    s->ar[1], s->ar[2], s->ar[6], s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] DMAWATCH (ecriture). */
+        static int _dw3 = -1; static unsigned _dww = 0;
+        if (_dw3 < 0) _dw3 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw3 && addr >= 0x0054 && addr <= 0x0057 && _dww < 40) {
+            _dww++;
+            fprintf(stderr, "[c54x] DMAWATCH WR 0x%04x <- 0x%04x (etait 0x%04x) PC=0x%04x insn=%u\n",
+                    addr, val, s->data[addr], s->pc, s->insn_count);
+        }
+    }
+    {   /* [2026-07-28] BOOTCMD cote DSP : qui ecrase la commande ? */
+        static int _bc2 = -1; static unsigned _bc2n = 0;
+        if (_bc2 < 0) _bc2 = getenv("CALYPSO_BOOTCMD") ? 1 : 0;
+        if (_bc2 && addr >= 0x0FFC && addr <= 0x0FFF && _bc2n < 40) {
+            _bc2n++;
+            fprintf(stderr, "[c54x] BOOTCMD DSP data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x insn=%u%s\n",
+                    addr, s->data[addr], val, s->pc, s->insn_count,
+                    (addr == 0x0FFF) ? "   <<<< CELLULE DE COMMANDE" : "");
+        }
+    }
+    {   /* [2026-07-27] DISPTAB-WR : qui remplit la table de dispatch ? */
+        static int _dt = -1; static unsigned _dtn = 0;
+        if (_dt < 0) _dt = getenv("CALYPSO_DISPTAB") ? 1 : 0;
+        if (_dt && addr >= 0x4380 && addr <= 0x43cf && _dtn < 60) {
+            _dtn++;
+            fprintf(stderr, "[c54x] DISPTAB-WR data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
+                    addr, val, s->pc, s->insn_count);
+        }
+    }
+    /* [2026-07-27] DEMOD-NOCLOBBER (gated CALYPSO_DEMOD_NOCLOBBER) : l etage
+     * demod emule (PC 0x9fb8=I / 0x9fe2=Q) remplit le buffer d entree du
+     * correlateur avec des paires CONSTANTES (0000,52ed) — prouve par la trace
+     * de flux — ecrasant la vraie FCCH deposee par feed_iq (FB_IQ_DARAM=1).
+     * On ignore ces ecritures : feed_iq devient autoritaire sur 0x2a00. */
+    {
+        static int _nc = -1;
+        if (_nc < 0) { const char *e = getenv("CALYPSO_DEMOD_NOCLOBBER"); _nc = (e && atoi(e) > 0) ? 1 : 0; }
+        if (_nc && addr >= 0x2a00 && addr < 0x2b28 &&
+            (s->pc == 0x9fb8 || s->pc == 0x9fe2)) {
+            static unsigned _ncn = 0;
+            if (_ncn++ < 8)
+                fprintf(stderr, "[c54x] DEMOD-NOCLOBBER skip PC=0x%04x data[0x%04x] <- 0x%04x "
+                        "(ecriture demod ignoree ; l alimentation vient de rx_burst sauf si FB_IQ_OWNS=1)\n", s->pc, addr, val);
+            return;
+        }
+    }
     /* MEM-WATCH-2B80 (2026-07-02, gated CALYPSO_MEM_WATCH_2B80) : voir le
      * commentaire jumeau dans data_read_locked. Log tout WRITE dans
      * [0x2b80,0x2c00), cap 200 -- confirme/infirme si un boot-copy peuple
@@ -3790,6 +4141,17 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
         uint16_t woff = addr - C54X_API_BASE;
         if (s->api_ram)
             s->api_ram[woff] = val;
+        {   /* [2026-07-28] FBDET-API (a) cote DSP : voir en-tete du patch. */
+            static int _fa = -1; static unsigned _fan = 0;
+            if (_fa < 0) _fa = getenv("CALYPSO_FBDET_API") ? 1 : 0;
+            if (_fa && woff >= 0xF8 && woff <= 0xFD && _fan < 40) {
+                _fan++;
+                fprintf(stderr, "[c54x] FBDET-API DSP api_ram[0x%02x] (mot 0x%04x, %s)"
+                        " <- 0x%04x PC=0x%04x insn=%u\n", woff, addr,
+                        woff == 0xF8 ? "d_fb_det" : "a_sync_demod",
+                        val, s->pc, s->insn_count);
+            }
+        }
         /* === DSP→ARM STATUS / DEMOD probe (CCCH chain tracing) ===
          * Track DSP writes to the four critical mailbox regions :
          *   (1) a_pm[3]  + a_serv_demod[4]  on read page 0  : woff 0x30..0x36
@@ -5682,6 +6044,16 @@ static int c54x_exec_one(C54xState *s)
              * chemin AR5=0x2c00 (reference), l IQ 0x2a00 est en AR4/AR1 (PAS AR5).
              * Gate CALYPSO_FB_ENERGY ; entree override CALYPSO_FB_CORR_ENTRY. */
             if (is_call && src_pc == 0xb01e) {
+                /* [2026-07-27] CALA-FB : cible NATIVE du dispatcher + d_task_md,
+                 * loggee AVANT tout reroute (voir en-tete du patch). */
+                { static int _cf = -1; static unsigned _cfn = 0;
+                  if (_cf < 0) _cf = getenv("CALYPSO_CALA_FB") ? 1 : 0;
+                  if (_cf && _cfn < 40) { _cfn++;
+                      fprintf(stderr, "[c54x] CALA-FB tgt=0x%04x md0804=%u md0818=%u md058a=%u "
+                              "(0x7700=routine resultat FB, 0xab38=?, 0x8d00=corr symbole) "
+                              "A=0x%06llx insn=%u\n", tgt, (unsigned)s->data[0x0804],
+                              (unsigned)s->data[0x0818], (unsigned)s->data[0x058a],
+                              (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count); } }
                 static int _fbe = -1; static uint16_t _fbentry = 0x94f5;
                 if (_fbe < 0) {
                     const char *_e = getenv("CALYPSO_FB_ENERGY"); _fbe = (_e && atoi(_e) > 0) ? 1 : 0;
@@ -5905,7 +6277,7 @@ static int c54x_exec_one(C54xState *s)
                         g_vec28_tracing = false;
                     }
                 }
-            if (nx > 2)
+            if (nx > 3)   /* PROM0..3 = 4 pages ; page 3 legitime (masque & 3) */
                 C54_DBG("XPC-OOR", "FRET xpc=0x%04x PC=0x%04x SP=0x%04x insn=%u",
                         nx, s->pc, s->sp, s->insn_count);
             s->xpc = nx & 3;
@@ -8982,6 +9354,39 @@ static int c54x_exec_one(C54xState *s)
             if (dst) s->b = sext40(v); else s->a = sext40(v);
             return consumed + s->lk_used;
         }
+        /* [2026-07-28] sub 4..7 : la moitie LOGIQUE de la famille tombait dans le
+         * `default` ci-dessous et etait exécutée comme un LD. Encodages : table
+         * projet doc/opcodes/tic54x_hi8_map.md + SPRU172C (tableaux 2-7/2-8/2-9
+         * et SUBC p.4-192). Smem est ZERO-etendu sur 40 bits : l exemple TI de
+         * AND (p.4-12) donne A=00 00FF 1200 & Smem=0x1500 -> A=00 0000 1000.
+         * Impact mesure : 0x1860 (AND) lu comme LD mettait A=15 au lieu de A&15,
+         * d ou T=31 et un `LD Smem,TS` decalant de +31 qui saturait l accumulateur
+         * (A=0x80000000) et aplatissait la sortie du demod. */
+        case 0x4: { /* 0x1800: AND Smem, src — src = src & Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur & (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x5: { /* 0x1A00: OR Smem, src — src = src | Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur | (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x6: { /* 0x1C00: XOR Smem, src — src = src ^ Smem */
+            uint64_t cur = (uint64_t)(dst ? s->b : s->a) & 0xFFFFFFFFFFULL;
+            uint64_t r = cur ^ (uint64_t)(uint16_t)val;
+            if (dst) s->b = sext40((int64_t)r); else s->a = sext40((int64_t)r);
+            return consumed + s->lk_used;
+        }
+        case 0x7: { /* 0x1E00: SUBC Smem, src — soustraction conditionnelle (division) */
+            int64_t src = dst ? sext40((int64_t)s->b) : sext40((int64_t)s->a);
+            int64_t d = src - ((int64_t)(uint16_t)val << 15);
+            int64_t r = (d >= 0) ? ((d << 1) + 1) : (src << 1);
+            if (dst) s->b = sext40(r); else s->a = sext40(r);
+            return consumed + s->lk_used;
+        }
         default:
             v = (s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val;
             break;
@@ -9780,8 +10185,16 @@ static int c54x_exec_one(C54xState *s)
          * Per tic54x-opc.c + SPRU172C :
          *   stl 0x8000 / 0xFE00 → 0x80..0x81 STL src,Smem (no shift)
          *   sth 0x8200 / 0xFE00 → 0x82..0x83 STH src,Smem (no shift)
-         *   stl 0x8400 / 0xFE00 → 0x84..0x85 STL src,ASM,Smem (with shift) [TODO]
-         *   sth 0x8600 / 0xFE00 → 0x86..0x87 STH src,ASM,Smem (with shift) [TODO]
+         *   stl 0x8400 / 0xFE00 → 0x84..0x85 STL src,ASM,Smem (with shift) [FAIT]
+         *   sth 0x8600 / 0xFE00 → 0x86..0x87 STH src,ASM,Smem (with shift) [FAIT]
+         * [2026-07-28] les deux variantes ASM sont IMPLEMENTEES (handlers hi8==0x84
+         * et hi8==0x86/0x87 ci-dessus, tous deux via asm_shift()), et asm_shift()
+         * est conforme au manuel (ASM = ST1[4:0] signe, -16 <= ASM <= 15). Le
+         * "[TODO]" precedent etait perime et a coute une fausse piste en remontant
+         * la sortie du demod (0x8694 = STH A,ASM,*AR4+ ecrit data[0x2a00]) : le
+         * decalage EST applique. Le vrai bug de ce chemin etait ailleurs — les
+         * opcodes logiques 0x1800/1A00/1C00/1E00 (AND/OR/XOR/SUBC) decodes comme
+         * un LD, cf. le case 0x1 plus haut.
          * bit 8 = src (0=A, 1=B). Old code applied asm_shift incorrectly
          * to 0x81/0x82 (basic variants — no shift) AND used s->a for 0x81
          * (should be s->b). Le bug causait toutes les STL B / STH * vers
@@ -14544,13 +14957,607 @@ int c54x_run(C54xState *s, int n_insns)
                 if ((s->pc == 0xec07) || (s->pc >= 0x8d00 && s->pc <= 0x8d10)) _armed = 0;
             }
         }
+        if (exec_pc == 0xa076) {   /* kernel MAC = LECTURE des operandes (I/Q + coeffs) */
+            g_flow_armed = 1;   /* FLOWTRACE : arme la fenetre autour du detecteur */
+            static int _b2k = -1; static unsigned _b2kn = 0;
+            if (_b2k < 0) _b2k = getenv("CALYPSO_B2AR") ? 1 : 0;
+            /* [fix] compteur HORS gate : le min/max doit couvrir TOUT le run
+             * (la version precedente se bloquait a la 1ere iteration). */
+            static uint16_t _ar5min = 0xffff, _ar5max = 0;
+            static unsigned _ar5seen = 0, _ar5in = 0;
+            if (s->ar[5] < _ar5min) _ar5min = s->ar[5];
+            if (s->ar[5] > _ar5max) _ar5max = s->ar[5];
+            _ar5seen++;
+            if (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28) _ar5in++;
+            if (_b2k && (_ar5seen % 20000) == 0)
+                fprintf(stderr, "[c54x] B2AR5-RANGE n=%u min=0x%04x max=0x%04x IN_BUF=%u (buf=0x2a00..0x2b27)\n",
+                        _ar5seen, _ar5min, _ar5max, _ar5in);
+            if (_b2k && _b2kn < 16) {
+                _b2kn++;
+                #define _INB(a) (((a) >= 0x2a00 && (a) < 0x2b28) ? "IN" : "oob")
+                fprintf(stderr, "[c54x] B2KERN @0xa076 AR2=%04x[%d]%s AR3=%04x[%d]%s AR4=%04x[%d]%s AR5=%04x[%d]%s\n",
+                        s->ar[2],(int)(int16_t)s->data[s->ar[2]],_INB(s->ar[2]),
+                        s->ar[3],(int)(int16_t)s->data[s->ar[3]],_INB(s->ar[3]),
+                        s->ar[4],(int)(int16_t)s->data[s->ar[4]],_INB(s->ar[4]),
+                        s->ar[5],(int)(int16_t)s->data[s->ar[5]],_INB(s->ar[5]));
+                #undef _INB
+            }
+        }
+        {   /* [2026-07-27] ARWATCH : voir en-tete du patch. */
+            static int _aw = -1; static unsigned _awn = 0;
+            if (_aw < 0) _aw = getenv("CALYPSO_ARWATCH") ? 1 : 0;
+            if (_aw && _awn < 60 &&
+                (exec_pc == 0x8d00 || exec_pc == 0x8d1a || exec_pc == 0x8e5f ||
+                 exec_pc == 0x8e8c || exec_pc == 0x8e97)) {
+                _awn++;
+                char _in[9]; int _k;
+                for (_k = 0; _k < 8; _k++)
+                    _in[_k] = (s->ar[_k] >= 0x2a00 && s->ar[_k] < 0x2b28) ? '*' : '.';
+                _in[8] = 0;
+                fprintf(stderr, "[c54x] ARWATCH pc=0x%04x AR0=%04x AR1=%04x AR2=%04x AR3=%04x "
+                        "AR4=%04x AR5=%04x AR6=%04x AR7=%04x [%s] A=0x%06llx insn=%u\n",
+                        exec_pc, s->ar[0], s->ar[1], s->ar[2], s->ar[3],
+                        s->ar[4], s->ar[5], s->ar[6], s->ar[7], _in,
+                        (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+            }
+        }
+        {   /* [2026-07-27] TRACEFROM : voir en-tete du patch. */
+            static int _tf = -1; static uint16_t _tfpc = 0; static int _tfd = 0;
+            static int _tfn2 = 24;   /* CALYPSO_TRACEFROM_N : longueur du dump */
+            static int _tfarm = 0; static unsigned _tfn = 0, _tfr = 0; static uint16_t _tfp = 0;
+            if (_tf < 0) { const char *e = getenv("CALYPSO_TRACEFROM");
+                _tf = (e && *e) ? 1 : 0;
+                if (_tf) _tfpc = (uint16_t)strtol(e, NULL, 0);
+                const char *n = getenv("CALYPSO_TRACEFROM_N");
+                if (n && *n) _tfn2 = atoi(n); }
+            if (_tf) {
+                if (exec_pc == _tfpc) {
+                    if (!_tfd) { _tfd = 1;
+                        fprintf(stderr, "[c54x] TRACEFROM-OPDUMP 0x%04x..+23:", _tfpc);
+                        for (int _k = 0; _k < _tfn2; _k++) {
+                            if ((_k % 8) == 0) fprintf(stderr, "\n  0x%04x:", _tfpc + _k);
+                            fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(_tfpc + _k)));
+                        }
+                        fprintf(stderr, "\n"); }
+                    if (_tfr < 3) { _tfr++; _tfarm = 1; _tfn = 0;
+                        fprintf(stderr, "[c54x] TRACEFROM === entree 0x%04x #%u (task_md=%u) ===\n",
+                                _tfpc, _tfr, (unsigned)(s->data[0x0804] ? s->data[0x0804] : s->data[0x0818])); }
+                }
+                if (_tfarm) {
+                    if (++_tfn > 4000) { _tfarm = 0;
+                        fprintf(stderr, "[c54x] TRACEFROM fin (4000 insn)\n"); }
+                    else {
+                        int _d = (int)s->pc - (int)_tfp;
+                        if ((_d > 3 || _d < 0) && _tfn < 3000)
+                            fprintf(stderr, "[c54x] TRACEFROM 0x%04x -> 0x%04x op=0x%04x A=0x%06llx\n",
+                                    _tfp, s->pc, prog_fetch(s, s->pc),
+                                    (unsigned long long)(s->a & 0xFFFFFFULL));
+                        if (s->pc == 0xa076 || s->pc == 0x79e4 || s->pc == 0x9ac0) {
+                            fprintf(stderr, "[c54x] TRACEFROM *** ATTEINT 0x%04x %s ***\n", s->pc,
+                                    s->pc == 0xa076 ? "(kernel MAC)" :
+                                    s->pc == 0x79e4 ? "(publisher d_fb_det)" : "(detecteur)");
+                            _tfarm = 0; }
+                    }
+                }
+                _tfp = s->pc;
+            }
+        }
+        {   /* [2026-07-28] CORROUT : voir en-tete du patch. */
+            static int _co = -1; static int _in_k = 0; static unsigned _con = 0;
+            if (_co < 0) _co = getenv("CALYPSO_CORROUT") ? 1 : 0;
+            if (_co) {
+                if (exec_pc >= 0xa070 && exec_pc <= 0xa0a0) { _in_k = 1; }
+                else if (_in_k) {   /* on vient de QUITTER le noyau MAC */
+                    _in_k = 0;
+                    if (_con < 40) {
+                        _con++;
+                        fprintf(stderr, "[c54x] CORROUT sortie noyau -> PC=0x%04x "
+                                "A=0x%010llx B=0x%010llx T=%04x "
+                                "AR3=%04x AR4=%04x AR5=%04x AR6=%04x insn=%u\n",
+                                exec_pc,
+                                (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
+                                (unsigned long long)(s->b & 0xFFFFFFFFFFULL),
+                                s->t, s->ar[3], s->ar[4], s->ar[5], s->ar[6],
+                                s->insn_count);
+                        fprintf(stderr, "[c54x] CORROUT   wz[2c00..0f]=");
+                        for (int _k = 0; _k < 16; _k++)
+                            fprintf(stderr, " %04x", s->data[0x2c00 + _k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+        {   /* [2026-07-28] VECTAB : voir en-tete du patch. */
+            static int _vt = -1; static int _vtdone = 0; static int _vtseen = 0;
+            if (_vt < 0) _vt = getenv("CALYPSO_VECTAB") ? 1 : 0;
+            if (_vt && !_vtdone && exec_pc == 0xb01c && ++_vtseen >= 2) {
+                _vtdone = 1;
+                fprintf(stderr, "[c54x] VECTAB table de vecteurs 0x0080..0x00FF "
+                        "(f880=B long, f4eb=RETE stub, f495=NOP)\n");
+                for (int _v = 0; _v < 32; _v++) {
+                    uint16_t _a = (uint16_t)(0x0080 + _v * 4);
+                    uint16_t _w0 = s->data[_a], _w1 = s->data[_a + 1];
+                    const char *_kind = (_w0 == 0xf4eb) ? "RETE (STUB)" :
+                                        ((_w0 & 0xFF80) == 0xF880) ? "B long" :
+                                        (_w0 == 0xf495) ? "NOP" : "?";
+                    int _fb = ((_w0 & 0xFF80) == 0xF880) &&
+                              (_w1 >= 0x7600 && _w1 <= 0x7a00);
+                    fprintf(stderr, "[c54x] VECTAB   vec%-2d @0x%04x  w0=0x%04x w1=0x%04x  %-12s"
+                            "%s%s\n", _v, _a, _w0, _w1, _kind,
+                            _v == 19 ? "  [FRAME]" : _v == 21 ? "  [BRINT0]" : "",
+                            _fb ? "   <<<< CIBLE DANS LA ZONE FB" : "");
+                }
+                fprintf(stderr, "[c54x] VECTAB fin ; code juste AVANT 0x76f8 "
+                        "(0x76e8..0x76f7):");
+                for (int _k = 0; _k < 16; _k++)
+                    fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(0x76e8 + _k)));
+                fprintf(stderr, "\n");
+            }
+        }
+        {   /* [2026-07-28] SCANDATA : voir en-tete du patch. */
+            static int _sd2 = -1; static int _sddone = 0; static unsigned _sdhit = 0;
+            static uint16_t _lo = 0x76f8, _hi = 0x79f0;
+            if (_sd2 < 0) {
+                _sd2 = getenv("CALYPSO_SCANDATA") ? 1 : 0;
+                const char *a = getenv("CALYPSO_SCANDATA_LO");
+                const char *b = getenv("CALYPSO_SCANDATA_HI");
+                if (a && *a) _lo = (uint16_t)strtol(a, NULL, 0);
+                if (b && *b) _hi = (uint16_t)strtol(b, NULL, 0);
+            }
+            if (_sd2 && !_sddone && exec_pc == 0xb01c) {
+                static int _seen = 0;
+                if (++_seen >= 2) {   /* apres l init des tables */
+                    _sddone = 1;
+                    fprintf(stderr, "[c54x] SCANDATA cellules data[] pointant dans "
+                            "[0x%04x..0x%04x] (routine FB) :\n", _lo, _hi);
+                    for (uint32_t _a = 0; _a < C54X_DATA_SIZE; _a++) {
+                        uint16_t _v = s->data[_a];
+                        if (_v < _lo || _v > _hi) continue;
+                        fprintf(stderr, "[c54x] SCANDATA   data[0x%04x] = 0x%04x%s\n",
+                                (unsigned)_a, _v,
+                                (_a >= 0x4380 && _a <= 0x43ff) ? "   <<<< DANS LA TABLE DE DISPATCH" :
+                                (_a >= 0x0800 && _a <  0x2800) ? "   (API RAM)" : "");
+                        if (++_sdhit > 60) break;
+                    }
+                    fprintf(stderr, "[c54x] SCANDATA total=%u  (0 = routine FB inatteignable "
+                            "par dispatch calcule dans cette image)\n", _sdhit);
+                }
+            }
+        }
+        {   /* [2026-07-28] DISPWATCH : voir en-tete du patch. */
+            static int _dw = -1; static unsigned _dwn = 0, _dwfb = 0;
+            if (_dw < 0) _dw = getenv("CALYPSO_DISPWATCH") ? 1 : 0;
+            if (_dw && (exec_pc == 0xb40f || exec_pc == 0xb01c || exec_pc == 0xb01e ||
+                        exec_pc == 0xb0f0 || exec_pc == 0xb0f6)) {
+                unsigned _md = s->data[0x0804] ? s->data[0x0804] : s->data[0x0818];
+                int _isfb = (_md == 5 || _md == 6 || _md == 8 || _md == 9);
+                int _emit = 0;
+                if (_isfb) { if (_dwfb < 60) { _dwfb++; _emit = 1; } }
+                else       { if (_dwn  < 20) { _dwn++;  _emit = 1; } }
+                if (_emit) {
+                    const char *_site = (exec_pc == 0xb40f) ? "BACC-terminal" :
+                                        (exec_pc == 0xb01c) ? "LD-slot" :
+                                        (exec_pc == 0xb01e) ? "CALA" :
+                                        (exec_pc == 0xb0f0) ? "idx-calc" : "idx-LD";
+                    fprintf(stderr, "[c54x] DISPWATCH %s pc=0x%04x A=0x%06llx "
+                            "slot43c0=0x%04x slot4387=0x%04x slot43d8=0x%04x "
+                            "task_md=%u%s insn=%u\n", _site, exec_pc,
+                            (unsigned long long)(s->a & 0xFFFFFFULL),
+                            s->data[0x43c0], s->data[0x4387], s->data[0x43d8],
+                            _md, _isfb ? "  <<<< TACHE FB" : "", s->insn_count);
+                }
+            }
+        }
+        {   /* [2026-07-28] SCANREF : voir en-tete du patch. */
+            static int _sr = -1; static uint16_t _srt = 0; static int _srd = 0;
+            if (_sr < 0) { const char *e = getenv("CALYPSO_SCANREF");
+                _sr = (e && *e) ? 1 : 0;
+                if (_sr) _srt = (uint16_t)strtol(e, NULL, 0); }
+            if (_sr && !_srd && exec_pc == 0xb01c) {
+                _srd = 1;
+                uint16_t _sx = s->xpc; unsigned _tot = 0;
+                fprintf(stderr, "[c54x] SCANREF cible=0x%04x (f074=CALL f272=RPTBD f820/f880=B "
+                        "76f8=ST#imm 10f8=LD)\n", _srt);
+                for (unsigned _bk = 0; _bk < 4; _bk++) {
+                    s->xpc = (uint16_t)_bk; unsigned _h = 0;
+                    for (uint32_t _p = 0x7000; _p <= 0xfffe; _p++) {
+                        if (prog_fetch(s, (uint16_t)_p) != _srt) continue;
+                        if (_p >= (uint32_t)_srt - 2 && _p <= (uint32_t)_srt + 2) continue;
+                        fprintf(stderr, "[c54x] SCANREF bank%u @0x%04x prev2=0x%04x prev1=0x%04x\n",
+                                _bk, _p, prog_fetch(s, (uint16_t)(_p-2)), prog_fetch(s, (uint16_t)(_p-1)));
+                        _tot++;
+                        if (++_h > 15) break;
+                    }
+                }
+                s->xpc = _sx;
+                fprintf(stderr, "[c54x] SCANREF total=%u sur 4 banks ; code @0x%04x..+15:", _tot, _srt);
+                for (int _k = 0; _k < 16; _k++)
+                    fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(_srt + _k)));
+                fprintf(stderr, "\n");
+            }
+        }
+        {   /* [2026-07-27] SCANFB : voir en-tete du patch. */
+            static int _sf = -1; static int _sfd = 0;
+            if (_sf < 0) _sf = getenv("CALYPSO_SCANFB") ? 1 : 0;
+            if (_sf && !_sfd && exec_pc == 0xb01c) {
+                _sfd = 1;
+                const uint16_t _tg[4] = { 0x7708, 0x76fb, 0x770d, 0x795f };
+                const char *_nm[4] = { "corps FB", "stub entree", "sous-prog", "correlation" };
+                uint16_t _sx = s->xpc;
+                for (unsigned _bk = 0; _bk < 4; _bk++) {
+                    s->xpc = (uint16_t)_bk;
+                    for (int _t = 0; _t < 4; _t++) {
+                        unsigned _h = 0;
+                        for (uint32_t _p = 0x7000; _p <= 0xfffe; _p++) {
+                            if (prog_fetch(s, (uint16_t)_p) == _tg[_t]) {
+                                if (_p >= _tg[_t] - 2 && _p <= _tg[_t] + 2) continue;
+                                fprintf(stderr, "[c54x] SCANFB bank%u ref 0x%04x (%s) @0x%04x "
+                                        "prev2=0x%04x prev1=0x%04x\n", _bk, _tg[_t], _nm[_t], _p,
+                                        prog_fetch(s, (uint16_t)(_p-2)), prog_fetch(s, (uint16_t)(_p-1)));
+                                if (++_h > 12) break;
+                            }
+                        }
+                    }
+                }
+                s->xpc = _sx;
+                fprintf(stderr, "[c54x] SCANFB fin (f074=CALL, f272=BD, fc00=RET, 76f8=ST #imm)\n");
+            }
+        }
+        {   /* [2026-07-27] FBENTRY : voir en-tete du patch. */
+            static int _fe = -1; static int _dmp = 0; static int _in = 0; static int _after = 0;
+            static unsigned _n = 0;
+            if (_fe < 0) _fe = getenv("CALYPSO_FBENTRY") ? 1 : 0;
+            if (_fe) {
+                if (exec_pc >= 0x75e0 && exec_pc <= 0x79f0) {   /* inclut le sous-prog 0x75e8 */
+                    if (!_dmp) { _dmp = 1;
+                        fprintf(stderr, "[c54x] FBENTRY-OPDUMP 0x76f8..0x7730:");
+                        for (int _k = 0; _k < 57; _k++)
+                            fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(0x76f8 + _k)));
+                        fprintf(stderr, "\n"); }
+                    _in = 1;
+                    if (_n < 250) { _n++;
+                        fprintf(stderr, "[c54x] FBENTRY pc=0x%04x op=0x%04x op2=0x%04x A=0x%06llx "
+                                "TC=%u AR1=%04x AR2=%04x ST0=0x%04x ST1=0x%04x\n",
+                                exec_pc, prog_fetch(s, exec_pc), prog_fetch(s, (uint16_t)(exec_pc+1)),
+                                (unsigned long long)(s->a & 0xFFFFFFULL), (unsigned)((s->st0 >> 12) & 1),
+                                s->ar[1], s->ar[2], s->st0, s->st1); }
+                } else if (_in) { _in = 0; _after = 10;
+                    if (_n < 250) { _n++;
+                        fprintf(stderr, "[c54x] FBENTRY *** SORTIE vers 0x%04x *** (op=0x%04x) "
+                                "SP=0x%04x pile[SP]=0x%04x pile[SP+1]=0x%04x%s\n",
+                                exec_pc, prog_fetch(s, exec_pc), s->sp,
+                                s->data[s->sp], s->data[(uint16_t)(s->sp + 1)],
+                                (exec_pc >= 0x0080 && exec_pc <= 0x00ff)
+                                    ? "  [VECTEUR IT]" : ""); }
+                } else if (_after > 0) { _after--;
+                    if (_n < 250) { _n++;
+                        fprintf(stderr, "[c54x] FBENTRY   apres-sortie pc=0x%04x op=0x%04x SP=0x%04x%s\n",
+                                exec_pc, prog_fetch(s, exec_pc), s->sp,
+                                (exec_pc == 0x7707 || exec_pc == 0x7708)
+                                    ? "  <<<< RETOUR DANS LA ROUTINE FB" : ""); }
+                }
+            }
+        }
+        {   /* [2026-07-27] SCAN43D8 : voir en-tete du patch. */
+            static int _s4 = -1; static int _s4done = 0;
+            if (_s4 < 0) _s4 = getenv("CALYPSO_SCAN43D8") ? 1 : 0;
+            if (_s4 && !_s4done && exec_pc == 0xb01c) {
+                _s4done = 1;
+                unsigned _h = 0;
+                uint16_t _savedxpc = s->xpc;
+                for (unsigned _bk = 0; _bk < 4; _bk++) {
+                s->xpc = (uint16_t)_bk;
+                fprintf(stderr, "[c54x] SCAN43D8 --- bank %u ---\n", _bk);
+                for (uint32_t _p = 0x7000; _p <= 0xfffe; _p++) {
+                    if (prog_fetch(s, (uint16_t)_p) == 0x43d8) {
+                        uint16_t _o2 = prog_fetch(s, (uint16_t)(_p-2));
+                        uint16_t _o1 = prog_fetch(s, (uint16_t)(_p-1));
+                        const char *_k = (_o2 == 0x76f8) ? "ST #imm -> INSTALLE"
+                                       : (_o2 == 0x10f8) ? "LD -> LIT"
+                                       : (_o1 == 0x76f8) ? "ST #imm (dec) -> INSTALLE" : "?";
+                        fprintf(stderr, "[c54x] SCAN43D8 @0x%04x prev2=0x%04x prev1=0x%04x  %s\n",
+                                _p, _o2, _o1, _k);
+                        if (++_h > 60) break;
+                    }
+                }
+                }
+                s->xpc = _savedxpc;
+                fprintf(stderr, "[c54x] SCAN43D8 total=%u sur 4 banks\n", _h);
+                fprintf(stderr, "[c54x] SCAN43D8 code @0xbaf8..0xbb10:");
+                for (int _k2 = 0; _k2 < 25; _k2++)
+                    fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(0xbaf8 + _k2)));
+                fprintf(stderr, "\n");
+            }
+        }
+        {   /* [2026-07-27] SLOTSRC : voir en-tete du patch. */
+            static int _ss = -1; static unsigned _ssn = 0;
+            if (_ss < 0) _ss = getenv("CALYPSO_SLOTSRC") ? 1 : 0;
+            if (_ss && _ssn < 120 && exec_pc >= 0xaff0 && exec_pc <= 0xb01d) {
+                _ssn++;
+                fprintf(stderr, "[c54x] SLOTSRC pc=0x%04x op=0x%04x op2=0x%04x "
+                        "A=0x%06llx AR1=%04x AR2=%04x AR3=%04x ST0=0x%04x insn=%u\n",
+                        exec_pc, prog_fetch(s, exec_pc), prog_fetch(s, (uint16_t)(exec_pc+1)),
+                        (unsigned long long)(s->a & 0xFFFFFFULL),
+                        s->ar[1], s->ar[2], s->ar[3], (unsigned)s->st0, s->insn_count);
+            }
+        }
+        {   /* [2026-07-27] FBCALL : voir en-tete du patch. */
+            static int _fc = -1;
+            if (_fc < 0) _fc = getenv("CALYPSO_FBCALL") ? 1 : 0;
+            if (_fc) {
+                static uint16_t _pmd = 0xffff, _ppc = 0; static int _arm = 0;
+                static unsigned _steps = 0, _logged = 0, _rounds = 0;
+                uint16_t _md = s->data[0x0804] ? s->data[0x0804] : s->data[0x0818];
+                if (_md != _pmd) {
+                    if (_md == 5 && _rounds < 3) {
+                        _rounds++; _arm = 1; _steps = 0;
+                        fprintf(stderr, "[c54x] FBCALL === tache FB #%u (d_task_md=5) ===\n", _rounds);
+                    }
+                    _pmd = _md;
+                }
+                if (_arm) {
+                    if (++_steps > 20000) { _arm = 0;
+                        fprintf(stderr, "[c54x] FBCALL fin (20000 insn) sans 0x7700\n"); }
+                    else {
+                        int _d = (int)s->pc - (int)_ppc;
+                        if ((_d > 3 || _d < 0) && _logged < 300) {
+                            _logged++;
+                            fprintf(stderr, "[c54x] FBCALL 0x%04x -> 0x%04x op=0x%04x A=0x%06llx\n",
+                                    _ppc, s->pc, prog_fetch(s, s->pc),
+                                    (unsigned long long)(s->a & 0xFFFFFFULL));
+                        }
+                        if (s->pc >= 0x76f0 && s->pc <= 0x79f0) {
+                            fprintf(stderr, "[c54x] FBCALL *** ROUTINE FB ATTEINTE 0x%04x ***\n", s->pc);
+                            _arm = 0; }
+                    }
+                }
+                _ppc = s->pc;
+            }
+        }
+        {   /* [2026-07-27] DISPIDX : voir en-tete du patch. */
+            static int _di = -1; static unsigned _din = 0; static unsigned _idx = 0;
+            if (_di < 0) _di = getenv("CALYPSO_DISPIDX") ? 1 : 0;
+            if (_di) {
+                if (exec_pc == 0xb0f0) _idx = (unsigned)(s->a & 0xFFFF);
+                if (exec_pc == 0xb0f6 && _din < 80) {
+                    _din++;
+                    unsigned _slotaddr = 0x4387 + _idx;
+                    unsigned _slot = (_slotaddr < 0x10000) ? s->data[_slotaddr] : 0;
+                    unsigned _md = s->data[0x0804] ? s->data[0x0804] : s->data[0x0818];
+                    fprintf(stderr, "[c54x] DISPIDX idx=%u slot=data[0x%04x]=0x%04x "
+                            "d_task_md=%u%s insn=%u\n", _idx, _slotaddr, _slot, _md,
+                            (_md == 5) ? "  <<<< TACHE FB" : "", s->insn_count);
+                }
+            }
+        }
+        {   /* [2026-07-27] DISPTAB-DUMP : contenu de la table au dispatcher. */
+            static int _dd2 = -1; static unsigned _ddn2 = 0;
+            if (_dd2 < 0) _dd2 = getenv("CALYPSO_DISPTAB") ? 1 : 0;
+            if (_dd2 && exec_pc == 0xb0f1 && _ddn2 < 4) {
+                _ddn2++;
+                fprintf(stderr, "[c54x] DISPTAB-DUMP #%u data[0x4380..0x43cf] :", _ddn2);
+                for (int _k = 0; _k < 80; _k++) {
+                    if ((_k % 16) == 0) fprintf(stderr, "\n  0x%04x:", 0x4380 + _k);
+                    fprintf(stderr, " %04x", s->data[0x4380 + _k]);
+                }
+                fprintf(stderr, "\n  (0xab38 = handler par defaut ; on cherche le slot FB)\n");
+            }
+        }
+        {   /* [2026-07-27] TASKGO : voir en-tete du patch. */
+            static int _tg = -1;
+            if (_tg < 0) _tg = getenv("CALYPSO_TASKGO") ? 1 : 0;
+            if (_tg) {
+                static uint16_t _prev = 0xffff; static int _armed = 0;
+                static unsigned _n = 0, _rounds = 0, _hi = 0;
+                uint16_t _md = s->data[0x0804] ? s->data[0x0804] : s->data[0x0818];
+                if (_md != _prev) {
+                    if (_md == 5 && _rounds < 4) {
+                        _rounds++; _armed = 1; _n = 0; _hi = 0;
+                        fprintf(stderr, "[c54x] TASKGO front d_task_md -> 5 (FB) "
+                                "md0804=%u md0818=%u PC=0x%04x insn=%u\n",
+                                (unsigned)s->data[0x0804], (unsigned)s->data[0x0818],
+                                s->pc, s->insn_count);
+                    }
+                    _prev = _md;
+                }
+                if (_armed && _n < 250) { _n++;
+                    if (s->pc > _hi) _hi = s->pc;
+                    fprintf(stderr, "[c54x] TASKGO-FLOW pc=0x%04x xpc=%u op=0x%04x A=0x%06llx\n",
+                            s->pc, s->xpc, prog_fetch(s, s->pc),
+                            (unsigned long long)(s->a & 0xFFFFFFULL));
+                    if (s->pc >= 0x7700 && s->pc <= 0x79f0) {
+                        fprintf(stderr, "[c54x] TASKGO *** ATTEINT LA ROUTINE FB 0x%04x ***\n", s->pc);
+                        _armed = 0; }
+                } else if (_armed) { _armed = 0;
+                    fprintf(stderr, "[c54x] TASKGO fin (250 pas) sans 0x7700 ; PC max vu=0x%04x\n", _hi); }
+            }
+        }
+        {   /* [2026-07-27] AB38 : voir en-tete du patch. */
+            static int _ab = -1;
+            if (_ab < 0) _ab = getenv("CALYPSO_AB38") ? 1 : 0;
+            if (_ab) {
+                static int _dumped = 0, _armed = 0; static unsigned _n = 0, _rounds = 0;
+                if (exec_pc == 0xab38) {
+                    if (!_dumped) { _dumped = 1;
+                        fprintf(stderr, "[c54x] AB38-OPDUMP 0xab38..0xab4f:");
+                        for (int _k = 0; _k < 24; _k++)
+                            fprintf(stderr, " %04x", prog_fetch(s, (uint16_t)(0xab38 + _k)));
+                        fprintf(stderr, "\n"); }
+                    if (_rounds < 3) { _rounds++; _armed = 1; _n = 0; }
+                }
+                if (_armed && _n < 120) { _n++;
+                    fprintf(stderr, "[c54x] AB38-FLOW pc=0x%04x xpc=%u op=0x%04x A=0x%06llx insn=%u\n",
+                            s->pc, s->xpc, prog_fetch(s, s->pc),
+                            (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count);
+                    if (s->pc >= 0x7700 && s->pc <= 0x79f0) {
+                        fprintf(stderr, "[c54x] AB38-FLOW *** ATTEINT LA ROUTINE FB 0x%04x ***\n", s->pc);
+                        _armed = 0; }
+                } else if (_armed) { _armed = 0;
+                    fprintf(stderr, "[c54x] AB38-FLOW fin de fenetre (120 pas) sans atteindre 0x7700\n"); }
+            }
+        }
+        {   /* [2026-07-27] FBROUTE : voir en-tete du patch. */
+            static int _fr = -1;
+            if (_fr < 0) _fr = getenv("CALYPSO_FBROUTE") ? 1 : 0;
+            if (_fr) {
+                static unsigned _in = 0, _hi = 0, _n76fb = 0;
+                if (exec_pc >= 0x7700 && exec_pc <= 0x79f0) {
+                    _in++;
+                    if (exec_pc > _hi) {
+                        _hi = exec_pc;
+                        fprintf(stderr, "[c54x] FBROUTE high-water PC=0x%04x (hits=%u) "
+                                "[0x7725=CALL corr, 0x798c=SNR incond, 0x79e4=ORM d_fb_det]\n",
+                                exec_pc, _in);
+                    }
+                }
+                if (exec_pc == 0x76fb && _n76fb < 10) {
+                    _n76fb++;
+                    fprintf(stderr, "[c54x] FBROUTE ENTER @0x76fb (BD 0x7700) #%u insn=%u\n",
+                            _n76fb, s->insn_count);
+                }
+                static unsigned _ms[5] = {0,0,0,0,0};
+                const uint16_t _mpc[5] = {0x7720, 0x7725, 0x798c, 0x79e3, 0x79e4};
+                for (int _k = 0; _k < 5; _k++) {
+                    if (exec_pc == _mpc[_k] && _ms[_k]++ < 6) {
+                        unsigned _dp = (unsigned)(s->st0 & 0x1FF);
+                        unsigned _ea = _dp * 0x80 + 0x7e;   /* dma(0x7e) DP-relatif */
+                        fprintf(stderr, "[c54x] FBROUTE jalon PC=0x%04x #%u A=0x%06llx "
+                                "DP=0x%03x dma(0x7e)=data[0x%04x]=0x%04x (garde veut 4) insn=%u\n",
+                                exec_pc, _ms[_k], (unsigned long long)(s->a & 0xFFFFFFULL),
+                                _dp, _ea, (_ea < 0x10000) ? s->data[_ea] : 0, s->insn_count);
+                    }
+                }
+            }
+        }
+        if (exec_pc == 0x93a5) {   /* consommateur DARAM 0x2a00 (AR3 post-inc) = VRAIE entree corr */
+            static int _b2c = -1; static unsigned _b2cn = 0;
+            if (_b2c < 0) _b2c = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+            if (_b2c && _b2cn < 8) { _b2cn++;
+                fprintf(stderr, "[c54x] B2SEQ-IN 0x2a00@0x93a5 (I,Q)x16:");
+                for (int _i = 0; _i < 16; _i++)
+                    fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                fprintf(stderr, "\n"); }
+        }
+        {
+            /* [2026-07-27] DARAM-DUMP (gated CALYPSO_DARAM_DUMP) : voir en-tete.
+             * Ecrit le buffer d entree corr en binaire IQ16 -> mesurable par
+             * tools/corr_iq.py --src bursts (coh/dphi), pas juge a l oeil. */
+            static int _dd = -1; static FILE *_ddf = NULL; static unsigned _ddn = 0;
+            static uint16_t _ddpc = 0x9ac0; static unsigned _ddmax = 200;
+            if (_dd < 0) {
+                const char *e = getenv("CALYPSO_DARAM_DUMP");
+                _dd = (e && *e && strcmp(e, "0")) ? 1 : 0;
+                if (_dd) {
+                    const char *path = (strcmp(e, "1") == 0) ? "/dev/shm/daram_2a00.cfile" : e;
+                    const char *p = getenv("CALYPSO_DARAM_DUMP_PC");
+                    if (p && *p) _ddpc = (uint16_t)strtol(p, NULL, 0);
+                    const char *m = getenv("CALYPSO_DARAM_DUMP_MAX");
+                    if (m && *m) _ddmax = (unsigned)atoi(m);
+                    _ddf = fopen(path, "wb");
+                    fprintf(stderr, "[c54x] DARAM-DUMP armed pc=0x%04x max=%u -> %s (%s)\n",
+                            _ddpc, _ddmax, path, _ddf ? "ok" : "FOPEN FAILED");
+                }
+            }
+            /* [2026-07-27] C2 : ne filmer QUE les passages en recherche FCCH.
+             * Sans ce garde, le cap _ddmax etait consomme des le boot, pendant
+             * que d_fb_mode[0x08f9]==0 -> le dump ne montrait pas la phase FB et
+             * on en concluait a tort « le buffer ne contient jamais de FCCH ».
+             * Override CALYPSO_DARAM_DUMP_ANYMODE=1 pour revenir a l ancien. */
+            static int _ddany = -1;
+            if (_ddany < 0) { const char *e = getenv("CALYPSO_DARAM_DUMP_ANYMODE");
+                              _ddany = (e && atoi(e) > 0) ? 1 : 0; }
+            if (_dd && _ddf && exec_pc == _ddpc && _ddn < _ddmax &&
+                (_ddany || s->data[0x08f9] != 0)) {
+                unsigned char hdr[12];
+                unsigned nw = 296;   /* 0x2a00..0x2b27 = 296 mots = 148 paires I/Q */
+                hdr[0]='I'; hdr[1]='Q'; hdr[2]='1'; hdr[3]='6';
+                unsigned _fnv = calypso_daram_last_fn;   /* fn GSM reel du dernier depot */
+                hdr[4]=(unsigned char)(_fnv & 0xff); hdr[5]=(unsigned char)((_fnv >> 8) & 0xff);
+                hdr[6]=(unsigned char)((_fnv >> 16) & 0xff); hdr[7]=(unsigned char)((_fnv >> 24) & 0xff);
+                hdr[8]=0;
+                hdr[9]=(unsigned char)(nw & 0xff); hdr[10]=(unsigned char)((nw >> 8) & 0xff);
+                hdr[11]=0;
+                fwrite(hdr, 1, 12, _ddf);
+                for (unsigned _k = 0; _k < nw; _k++) {
+                    uint16_t _v = s->data[0x2a00 + _k];
+                    unsigned char _b[2]; _b[0]=(unsigned char)(_v & 0xff); _b[1]=(unsigned char)(_v >> 8);
+                    fwrite(_b, 1, 2, _ddf);
+                }
+                /* [2026-07-27] DARAM-SANITY : verdict en run sur ce qu'on vient
+                 * de dumper. coh = |Sum z[k+1].conj(z[k])| / Sum|z[k+1]||z[k]| ;
+                 * dphi = arg(Sum ...). Le kernel FB veut du FCCH @1SPS => dphi
+                 * = +pi/2 (+1.571). +0.393 = 4 SPS non decime (remede nomme). */
+                if (_ddn == 0 || (_ddn % 50) == 0) {
+                    double ar = 0, ai = 0, dn = 0, en = 0;
+                    unsigned np = nw / 2;
+                    for (unsigned _k = 1; _k < np; _k++) {
+                        double i0 = (int16_t)s->data[0x2a00 + 2*(_k-1)];
+                        double q0 = (int16_t)s->data[0x2a00 + 2*(_k-1) + 1];
+                        double i1 = (int16_t)s->data[0x2a00 + 2*_k];
+                        double q1 = (int16_t)s->data[0x2a00 + 2*_k + 1];
+                        ar += i1*i0 + q1*q0; ai += q1*i0 - i1*q0;
+                        dn += sqrt((i0*i0 + q0*q0) * (i1*i1 + q1*q1));
+                        en += i1*i1 + q1*q1;
+                    }
+                    double coh  = dn > 0 ? sqrt(ar*ar + ai*ai) / dn : 0.0;
+                    double dphi = atan2(ai, ar);
+                    double rms  = np > 1 ? sqrt(en / (double)(np - 1)) : 0.0;
+                    double ad   = fabs(dphi);
+                    const char *v;
+                    if (rms < 1.0)                        v = "VIDE (buffer non alimente)";
+                    else if (coh > 0.90 && ad > 1.37 && ad < 1.77)
+                        v = (dphi > 0) ? "FCCH @1SPS OK -- c est ce que le kernel cherche"
+                                       : "FCCH @1SPS MIROIR -> CALYPSO_DL_IQ_CONJ=1";
+                    else if (coh > 0.90 && ad > 0.29 && ad < 0.49)
+                        v = "4 SPS NON DECIME -> CALYPSO_BSP_IQ_DECIM=4 (et FB_IQ_OWNS=0)";
+                    else if (coh > 0.90 && ad < 0.29)
+                        v = "sur-echantillonne (>4 SPS) ou pas un ton -> verifier la source";
+                    else                                  v = "BRUIT/DATA -- pas un ton FCCH";
+                    static unsigned _prevwr = 0;
+                    unsigned _dwr = calypso_daram_wr_count - _prevwr;
+                    _prevwr = calypso_daram_wr_count;
+                    fprintf(stderr, "[c54x] DARAM-SANITY rec=%u fn=%u depots_depuis=%u coh=%.3f "
+                            "dphi=%+.3f (%+.2fxpi/2) rms=%.0f : %s%s\n", _ddn,
+                            calypso_daram_last_fn, _dwr, coh, dphi, dphi / (M_PI/2), rms, v,
+                            _dwr == 0 ? "  [BUFFER FIGE : aucun depot BSP depuis le dump precedent]" : "");
+                }
+                if (++_ddn >= _ddmax) {
+                    fflush(_ddf); fclose(_ddf); _ddf = NULL;
+                    fprintf(stderr, "[c54x] DARAM-DUMP done : %u records de %u mots\n", _ddn, nw);
+                } else if ((_ddn % 20) == 0) {
+                    fflush(_ddf);
+                    fprintf(stderr, "[c54x] DARAM-DUMP rec=%u\n", _ddn);
+                }
+            }
+        }
         if (exec_pc == 0x9ac0) {
+            /* [2026-07-27] B2SEQ (gated CALYPSO_B2SEQ) : dump 16 paires (I,Q) de
+             * 0x2a00 (VRAIE entree corr, depot BSP/ADC). Pattern Fs/4 = FCCH :
+             * (a,0)(0,a)(-a,0)(0,-a).. ; quasi-constant = DC sans ton (entree vide). */
+            { static int _b2s = -1; static unsigned _b2sn = 0;
+              if (_b2s < 0) _b2s = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+              if (_b2s && _b2sn < 8) { _b2sn++;
+                  fprintf(stderr, "[c54x] B2SEQ 0x2a00 (I,Q)x16:");
+                  for (int _i = 0; _i < 16; _i++)
+                      fprintf(stderr, " (%d,%d)", (int)(int16_t)s->data[0x2a00 + 2*_i], (int)(int16_t)s->data[0x2a00 + 2*_i + 1]);
+                  fprintf(stderr, "\n"); } }
             static unsigned dr = 0;
             if (dr < 30 || (dr % 200) == 0)
                 fprintf(stderr, "[c54x] DETECTOR-RUN #%u @0x9ac0 d_fb_mode[08f9]=0x%04x "
                         "d_fb_det[08f8]=0x%04x insn=%u\n",
                         dr, s->data[0x08f9], s->data[0x08f8], s->insn_count);
             dr++;
+            /* [2026-07-27] B2AR (gated CALYPSO_B2AR) : ou pointent les AR du corr
+             * + valeur lue. AR5/AR3 dans [0x2a00..0x2b27] => lit la FCCH ; hors =>
+             * lit a cote (RANK3, pointeur mal initialise). */
+            { static int _b2a = -1; static unsigned _b2an = 0;
+              if (_b2a < 0) _b2a = getenv("CALYPSO_B2AR") ? 1 : 0;
+              if (_b2a && _b2an < 12) { _b2an++;
+                  int _a3in = (s->ar[3] >= 0x2a00 && s->ar[3] < 0x2b28);
+                  int _a5in = (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28);
+                  fprintf(stderr, "[c54x] B2AR @0x9ac0 AR2=%04x AR3=%04x[%d]%s AR4=%04x AR5=%04x[%d]%s\n",
+                          s->ar[2], s->ar[3], (int)(int16_t)s->data[s->ar[3]], _a3in?"IN":"OOB",
+                          s->ar[4], s->ar[5], (int)(int16_t)s->data[s->ar[5]], _a5in?"IN":"OOB"); } }
             /* [2026-07-27] B2 (gated CALYPSO_B2) : module accu A/B + max/indice
              * sur les 296 mots entree(0x2a00) & workspace(0x2c00). Tranche nul vs
              * plat-sans-pic. */

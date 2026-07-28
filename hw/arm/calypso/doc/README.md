@@ -1,53 +1,144 @@
-# Documentation — QEMU-Calypso
+# QEMU-Calypso — documentation
 
-> ⭐ **[ETAT_ACTUEL.md](ETAT_ACTUEL.md)** est la **source de vérité unique** (ce qui marche,
-> l'architecture réelle, l'état du DSP natif, les fausses pistes). En cas de conflit, il prime.
->
-> Démarrage rapide : **[QUICK_START.md](../../../../QUICK_START.md)** (racine du dépôt).
-
-Les docs ci-dessous sont la **référence courante durable**. L'historique (sessions datées,
-rapports d'étape, pistes closes) est rangé par thème dans **[archive/](archive/README.md)**.
+Ce README **oriente**. Il n'explique rien et ne fait autorité sur rien : chaque fait détaillé
+vit dans un document qui, lui, fait autorité (§3). Si ce README contredit
+[`ETAT_ACTUEL.md`](ETAT_ACTUEL.md), c'est ce README qui a tort.
 
 ---
 
-## Référence — Adresses & DSP
+## 1. Ce que c'est
 
-*Cartes canoniques ARM↔DSP↔API RAM, mask-ROM.*
+Ce dépôt est une émulation QEMU du baseband GSM **TI Calypso** — le SoC des téléphones
+Openmoko/Motorola C1xx ciblés par osmocom-bb. Le Calypso est un **bi-processeur** : un **ARM7**
+qui exécute le firmware Layer 1 (osmocom-bb), et un **DSP TMS320C54x** qui exécute un firmware
+propriétaire en mask-ROM et fait tout le traitement du signal (corrélation FCCH, démodulation,
+égalisation). Les deux communiquent par une **API RAM** partagée (le DSP écrit `data[0x08f8]`,
+l'ARM lit le MMIO `0xFFD001F0`). L'émulation modélise l'ARM, le DSP, la TPU/TSP, le BSP (chemin
+I/Q) et la RF (trf6151/twl3025), et fait tourner ce mobile émulé **face à une vraie pile Osmocom**
+(osmo-bts-trx, osmo-bsc, osmo-msc) — le mobile doit donc réellement se synchroniser, camper,
+faire une Location Update et des SMS, pas simuler qu'il le fait.
 
-- [`SHUNT_LEGIT_ADDRESS_MAP.md`](SHUNT_LEGIT_ADDRESS_MAP.md) — mapping des cellules DSP (data/api_ram), chaîne FB/SB/rxlev/a_cd. **Réf. d'adresses.**
-- [`DSP_ROM_MAP.md`](DSP_ROM_MAP.md) — carte de la mask-ROM DSP.
-- [`DSP_ADDRESS_MAP.md`](DSP_ADDRESS_MAP.md) — carte des cellules DSP (data/api_ram) par adresse. **Réf. d'adresses.**
-- [`DSP_ARM_LINKAGE.md`](DSP_ARM_LINKAGE.md) — correspondance ARM↔DSP (loi d'adressage, MMIO). **Réf. d'adresses.**
+---
 
-## Référence — Matériel
+## 2. Où on en est
 
-*SoC Calypso, périphériques, canal Sercomm.*
+**En une phrase :** le mode **shunt** (FBSB fait côté hôte) campe, fait la LU et les SMS ; le mode
+**natif** (le DSP c54x fait le FBSB) reçoit bien le signal — l'entrée du démodulateur est vivante —
+mais sa sortie est du DC plat et `d_fb_det` reste 0.
 
-- [`CALYPSO_HW.md`](CALYPSO_HW.md) — carte matérielle du SoC.
-- [`hardware-map.md`](hardware-map.md) — plan mémoire / périphériques.
-- [`SERCOMM_GATE_ARCHITECTURE.md`](SERCOMM_GATE_ARCHITECTURE.md) — canal Sercomm / L1CTL.
+Le statut n'existe **pas dans l'absolu** : il dépend du mode. Ne jamais citer un statut sans son mode.
 
-## Référence — ISA C54x
+| Fonction | `SHUNT_LEGIT=1` | `SHUNT_NO_LEGIT=1` | `SHUNT_LEGIT=DSP,NO_CANNED` | `NATIVE` / `NATIVE_HELPED` | Instrument de vérification |
+|---|---|---|---|---|---|
+| FB/SB sync | OK (host) | OK | OK | **KO** : `d_fb_det=0` | `grep DETECTOR-RUN /root/qemu.log` ; `grep REAL-FB` |
+| rxlev serving | OK (−47 dBm) | OK | OK | OK mais **mocké** (`shunt_dispatch_pm` non gaté) | `grep "MON: f=" /root/mobile.log` |
+| Camp (C3) + sysinfo | OK | OK | OK | **KO** « No sysinfo » | `grep -c sysinfo /root/mobile.log` |
+| LU + TMSI | OK | OK | OK | KO | `grep -icE "LOCATION UPDATING ACCEPT" /root/mobile.log` |
+| SMS MO / MT | OK | OK | **WIP flaky** | KO | log SMSC |
+| Ctrl-C mobile → ré-acquisition | OK | OK | OK | non testé | hook `on_arm_write(d_dsp_page,0)` |
+| Voix TCH/F | **WIP** : ASSIGNMENT FAILURE | WIP | WIP | KO | [`VOIX_PLAN.md`](VOIX_PLAN.md) |
+| c54x exécuté à la cadence trame | non | non | **oui** | **oui** | `dsp_n_exec_2/5` ; absence de `DSP Error Status: 2048` |
+| Entrée du démod alimentée | s.o. | s.o. | non mesuré | **OK** : `data[0x4c00]`, stride 5 | `CALYPSO_WATCH_9F00_RD=1` (PC `0x9fb5`) |
+| Sortie du démod exploitable | s.o. | s.o. | non mesuré | **KO** : DC plat (\|DC\|≈rms, dφ≈0) | `CALYPSO_DARAM_DUMP=1` + `tools/corr_iq.py --src ddump` |
 
-*Jeu d'instructions TMS320C54x (décodeur QEMU).*
+Le mode **`CALYPSO_L1=c`** (Layer 1 haut niveau en C) est **inexécutable en l'état** : il s'auto-annule
+(`calypso_layer1_tick` n'est appelé que si le shunt est inactif, or `L1=c` arme le shunt). Ne pas
+s'en servir comme référence.
 
-- [`C54X_INSTRUCTIONS.md`](C54X_INSTRUCTIONS.md) — jeu d'instructions.
-- [`opcodes/`](opcodes/) — cartes d'opcodes (`0x68_0x6F`, `0xF3`, `tic54x_hi8_map`).
-- [`project/AUDIT_DECODER_20260508.md`](project/AUDIT_DECODER_20260508.md) — audit du décodeur.
-- [`project/STEP2_BC_CONDS.md`](project/STEP2_BC_CONDS.md) — conditions de branchement (BC).
+**Chiffre à ne pas mal citer :** les compteurs `REAL-FB` sont plafonnés par le logger
+(`calypso_dsp_shunt.c:1670`) — « 280/300 » décrit le contenu des 300 premières lignes loguées,
+**pas** un taux de détection sur le run.
 
-## Bugs, index & suivi
+---
 
-- [`project/BUGS_AND_FIXES.md`](project/BUGS_AND_FIXES.md) — bugs connus + correctifs.
-- [`project/REPORT_CLAUDE_WEB_PIPELINE.md`](project/REPORT_CLAUDE_WEB_PIPELINE.md) — pipeline du projet.
-- [`TODO.md`](TODO.md) — index des tâches (P0/P1/P2).
-- [`VOIX_PLAN.md`](VOIX_PLAN.md) — plan d'implémentation voix (TCH/F), pour le P1 « Voix ».
-- Ancien index maître archivé : [`archive/MASTER.md`](archive/MASTER.md) (supplanté par ETAT_ACTUEL + ce README).
+## 3. Où est la vérité : quel document ouvre quoi
 
-## Datasheets constructeur
+Un seul document fait autorité par sujet. En cas de conflit, celui de la colonne « autorité sur »
+prime sur toute citation faite ailleurs, y compris ici.
 
-- [`datasheets/`](datasheets/) — PDF TI (SPRU131/172/288…), FreeCalypso, dumps DSP-ROM.
+| Document | Autorité sur | Quand l'ouvrir |
+|---|---|---|
+| **[`ETAT_ACTUEL.md`](ETAT_ACTUEL.md)** | **l'état courant** : matrice statut × mode, architecture réelle, fausses pistes closes | **toujours en premier.** Prime sur tout autre doc en cas de conflit |
+| [`TODO.md`](TODO.md) | **la suite** : quoi faire, par mode et par priorité (P1/P2/P3), et ce qui est déjà fait | avant de choisir sur quoi travailler |
+| [`../../../../RAPPORT_DFBDET.md`](../../../../RAPPORT_DFBDET.md) | **l'enquête `d_fb_det`** : pourquoi le corrélateur natif ne publie pas, publisher `0x79e4`, bancarisation | pour toute question sur le blocage natif |
+| [`../../../../QUICK_START.md`](../../../../QUICK_START.md) | **le démarrage** : lancer la pile, choisir un mode | première session, ou pour rejouer un run |
+| [`../../../../run_results.md`](../../../../run_results.md) | **les runs datés et chiffrés** | pour citer un chiffre plutôt qu'une impression |
+| [`C54X_INSTRUCTIONS.md`](C54X_INSTRUCTIONS.md) + [`opcodes/`](opcodes/) | **la sémantique des instructions C54x** ; `opcodes/tic54x_hi8_map.md` fait foi sur le décodage hi8 | avant de toucher au décodeur, et pour arbitrer « le firmware fait X » |
+| [`DSP_ADDRESS_MAP.md`](DSP_ADDRESS_MAP.md), [`DSP_ARM_LINKAGE.md`](DSP_ARM_LINKAGE.md), [`DSP_ROM_MAP.md`](DSP_ROM_MAP.md), [`SHUNT_LEGIT_ADDRESS_MAP.md`](SHUNT_LEGIT_ADDRESS_MAP.md) | **les cartes mémoire** : cellules DSP, loi d'adressage ARM↔DSP↔API RAM, mask-ROM | dès qu'une adresse est en jeu — ne jamais deviner une adresse |
+| [`CALYPSO_HW.md`](CALYPSO_HW.md), [`hardware-map.md`](hardware-map.md), [`SERCOMM_GATE_ARCHITECTURE.md`](SERCOMM_GATE_ARCHITECTURE.md) | le SoC, les périphériques, le canal Sercomm/L1CTL | travail sur un périphérique ou sur le lien hôte |
+| [`VOIX_PLAN.md`](VOIX_PLAN.md) | la voix TCH/F | P1 voix |
+| [`project/`](project/) | audit du décodeur, conditions `BC`, bugs et correctifs | dette et régressions du décodeur |
+| [`datasheets/`](datasheets/), `datasheets/TI_SPRU172C_C54x_Mnemonic_Instruction_Set.pdf` | la documentation constructeur TI | arbitrage final sur une sémantique d'instruction |
+| [`archive/`](archive/) | l'**historique** (sessions datées, pistes closes) | **n'est plus la vérité courante** — n'y chercher qu'un contexte, jamais un statut |
 
-## Archive
+Il n'y a **pas** de document faisant autorité sur les variables `CALYPSO_*`. La liste vraie se
+regénère (≈ 300 variables, 375 sites) :
 
-- [`archive/`](archive/README.md) — **doc historique, navigation par thème**. N'est plus la vérité courante.
+```bash
+docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/hw/arm/calypso && \
+  grep -rhoE "getenv\(\"CALYPSO_[A-Z0-9_]+\"\)" *.c | grep -oE "CALYPSO_[A-Z0-9_]+" | sort -u'
+```
+
+Un `grep CALYPSO_` nu renvoie un sur-ensemble bruité (macros d'IRQ, registres SIM, gardes d'include).
+`CALYPSO_DEBUG` est un **namespace séparé** (≈ 98 tokens) :
+`grep -rhoE '(calypso_debug_enabled|cdbg_env)\("[^"]*"' .`
+
+---
+
+## 4. Règles de travail non négociables
+
+**4.1 — Le runtime est DANS le conteneur.** L'arbre vivant est `/opt/GSM/qemu-src` **à l'intérieur**
+de `osmo-operator-1`. Tout accès passe par `docker exec osmo-operator-1 bash -lc '...'`. Un éditeur
+qui voit un fichier depuis l'hôte ne voit **pas** le runtime.
+
+**4.2 — `/opt/GSM/qemu-calypso` est un overlay MORT au runtime.** Ne rien y écrire : la modification
+n'aura aucun effet sur le run. Après toute écriture dans `doc/`, propager :
+`cd /opt/GSM/qemu-src && ./make-overlay.sh`.
+
+**4.3 — On ne change pas un défaut de configuration.** Documenter, pas modifier. Toute variation se
+fait **en CLI** (l'idiome `: "${VAR:=…}"` du projet garantit que la CLI gagne sur les `.env`).
+Exception connue à cette garantie : `CALYPSO_MODE=full-grgsm` verrouille cinq variables avec `=`
+et non `:=` (`SHUNT_NO_CANNED`, `DSP_L1STUB`, `DSP_L1_STUB`, `FORCE_FBSB`, `FORCE_AGCH`) —
+« variable posée » n'y est pas « variable effective ».
+
+**4.4 — Toute sonde est gatée par une variable d'environnement, OFF par défaut.** Une sonde ne doit
+jamais changer le comportement d'un run qui ne la demande pas. Attention : **le projet contient
+quatre idiomes de gate incompatibles** — `getenv(X) ? 1 : 0` (que `unset` désactive, pas `X=0`),
+`atoi(e) > 0`, `*e == '1'`, et des gates **ON par défaut** qu'on coupe par `X=0` ou par une variable
+`X_OFF=1`. Vérifier l'idiome avant de conclure qu'une sonde est éteinte.
+
+**4.5 — Ne pas relancer la pile, ne pas toucher à git.** L'utilisateur relance lui-même
+(`start-clean.sh`, qemu, osmocon, mobile) ; sur les logs, lecture seule. Le dépôt est déjà commité.
+
+**4.6 — Distinguer explicitement MESURE / HYPOTHÈSE / INVALIDÉ**, et nommer l'**instrument** ou la
+**commande** de chaque affirmation technique. Trois pièges d'hygiène déjà payés :
+- `BUILD-STAMP` **ne dit pas** la fraîcheur du binaire (c'est le `__DATE__` de `calypso_dsp_shunt.c`,
+  pas de l'unité modifiée). Instrument correct : mtime du `.o` recompilé + `lstart` du process.
+- Toute mesure prise via le **monitor QMP** est hors fenêtre API RAM et *racy*. Les mesures valides
+  se prennent **de l'intérieur** (log au point d'écriture, ou dump interne `ddump`).
+- Comparer le **mtime des artefacts** (`/dev/shm/*.cfile`) au `lstart` du process avant de les
+  interpréter : un fichier périmé d'un run antérieur ne mesure pas le run courant.
+
+### La méthode de sonde — quatre règles
+
+Payées quatre fois. À appliquer **avant** d'écrire une nouvelle sonde.
+
+1. **Une sonde se conçoit par sa CONDITION DE DÉCLENCHEMENT, pas par son adresse.** Un plafond global
+   est mangé par le PC le plus bruyant.
+2. **Préférer un AGRÉGAT** (compte tout le run, imprime un tableau) **à un flux plafonné**, et
+   **prévoir un témoin de saturation** (heartbeat) — c'est lui qui distingue « pas d'événement » de
+   « sonde morte ».
+3. **Distinguer « varie dans l'espace » de « varie dans le temps ».** Une courbe sur N cellules n'est
+   pas un signal ; seule la variation temporelle **à cellule figée** en est un.
+4. **« Pas de log » n'est jamais « pas d'événement »** tant que la sonde n'est pas vérifiée VIVANTE et
+   sa fenêtre vérifiée COUVRANTE. Causes déjà rencontrées : plafond saturé ; seuil de dump trop haut ;
+   plage écrite **côté hôte** donc invisible du chemin d'écriture DSP ; variable absente du run.
+
+---
+
+## 5. Lancer
+
+Voir **[`../../../../QUICK_START.md`](../../../../QUICK_START.md)** — choix du mode, commandes de
+démarrage, et où lire les logs. Pour un premier run qui marche, prendre le mode fiable
+(`CALYPSO_SHUNT_LEGIT=1`) ; pour travailler le corrélateur natif, prendre le run de référence
+documenté dans [`ETAT_ACTUEL.md`](ETAT_ACTUEL.md) et [`../../../../RAPPORT_DFBDET.md`](../../../../RAPPORT_DFBDET.md).
