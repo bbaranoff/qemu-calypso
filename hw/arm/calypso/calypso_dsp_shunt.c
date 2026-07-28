@@ -83,6 +83,21 @@ struct dsp_shunt_state g_shunt;
  * Normalise UNE fois au chargement (avant tout getenv cache statique) puis
  * canonicalise la base a "1" pour que les ~20 checks existants (*e=='1') restent
  * valides -> aucun site a modifier. */
+/* @BEQUILLE — SHUNT_LEGIT / SHUNT_NO_LEGIT (parapluies)  (CALYPSO_SHUNT_LEGIT,
+ *              CALYPSO_SHUNT_NO_LEGIT ; EQ1 apres canonicalisation)
+ *   masque  : le mur RANK3 — le correlateur natif n'ecrit jamais d_fb_det. Les
+ *             deux parapluies transportent la detection reelle de gr-gsm vers le
+ *             resultat DSP (api_ram[0x08F8..0x08FD]), forcent d_fb_det et a_pm cote
+ *             c54x, falsifient d_task_d / d_burst_d cote lecture ARM, et servent de
+ *             FALLBACK implicite a une dizaine d'autres gates (INJECT_*, FEED_SI,
+ *             TRF_RXLEV, UL_RACH_FROM_DRACH, SHUNT_REAL_FB).
+ *   retirer : quand le correlateur natif pose d_fb_det (RANK3 leve).
+ *   ATTENTION : ce constructeur fait des setenv() AVANT main() — "=DSP" cree
+ *             CALYPSO_DSP_RUN_C54X=1 et "=NO_CANNED" cree CALYPSO_SHUNT_NO_CANNED=1.
+ *             Ces variables apparaissent au manifeste sans avoir ete tapees.
+ *   NB      : SHUNT_NO_LEGIT n'est PAS un synonyme — seuls 5 sites l'acceptent,
+ *             les autres ne retombent que sur SHUNT_LEGIT.
+ */
 static void __attribute__((constructor)) shunt_env_value_list(void)
 {
     static const char *keys[2] = { "CALYPSO_SHUNT_LEGIT", "CALYPSO_SHUNT_NO_LEGIT" };
@@ -150,6 +165,14 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
      * En ne publiant QUE les trames signalisantes (ctrl != 0x03), tout nouveau seq est
      * porteur et ne peut plus etre clobbere par le fill -> la SABM tient jusqu'a ce que
      * le consommateur sticky la capture. CALYPSO_UL_PUB_IDLE=1 retablit l'ancien comportement. */
+    /* @BEQUILLE — UL_PUB_IDLE  (CALYPSO_UL_PUB_IDLE, EQ1, defaut OFF = filtre ACTIF)
+     *   masque  : la profondeur du sideband UL (slot unique, 1 pread/frame cote
+     *             qemu_wrap). Le filtre par defaut (ne pas publier les trames de fill
+     *             ctrl==0x03) empeche l'ecrasement de la SABM transitoire — il compense
+     *             l'absence de file.
+     *   retirer : quand le sideband UL est une file (ring) et non un slot unique ;
+     *             alors publier l'idle redevient sans risque.
+     */
     static int pub_idle = -1;
     if (pub_idle < 0) { const char *e = getenv("CALYPSO_UL_PUB_IDLE"); pub_idle = (e && *e == '1') ? 1 : 0; }
     if (!pub_idle && l2[1] == 0x03) return;   /* trame de fill (UI) : ne pas ecraser la signalisation */
@@ -176,6 +199,14 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
          * CHEMIN VIVANT (l'ancien hook arm2dsp/trx.c 0x01A8 etait mort : d_dsp_page
          * vit en API-RAM, pas en MMIO). Desactivable CALYPSO_L1_RESET_WIRE=0. */
         if (new_d_dsp_page == 0) {
+            /* @BEQUILLE — L1_RESET_WIRE  (CALYPSO_L1_RESET_WIRE, ON-sauf-0, defaut ON)
+             *   masque  : la remise a zero d'etat que le DSP reel subit sur l1s_reset_hw().
+             *             Ici il n'y a pas d'etat DSP a reinitialiser, seulement des latches
+             *             FABRIQUES par le shunt (IMM-ASSIGN, SDCCH) qui, non nettoyes,
+             *             bloquent la reouverture du gate SI apres un Ctrl-C mobile.
+             *   retirer : avec les latches eux-memes, c'est-a-dire avec les injections
+             *             INJECT_AGCH / INJECT_SDCCH.
+             */
             static int l1rst_on = -1;
             if (l1rst_on < 0) { const char *e = getenv("CALYPSO_L1_RESET_WIRE"); l1rst_on = (e && *e == '0') ? 0 : 1; }
             if (l1rst_on) {
@@ -196,6 +227,16 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
      * aliasee, capture souvent cmd=0 debut de bloc) ; le mirror per-commande
      * (calypso_dsp_shunt_wp_burst_write) en est le seul maitre -> X suit la
      * vraie sequence 0,1,2,3. Gate off (=0) revient a l ancienne capture. */
+    /* @BEQUILLE — SHUNT_BURST_PERCMD (capture latch)  (CALYPSO_SHUNT_BURST_PERCMD)
+     *   masque  : la derivation de d_burst_d (0..3) depuis la fenetre TPU. Le shunt
+     *             la synthetise (echo de la commande ARM ou l1s_fn) au lieu de la lire
+     *             du materiel.
+     *   retirer : quand la fenetre RX TPU/BDLENA cadence le burst-id cote DSP (RANK2).
+     *   PIEGE   : idiome divergent entre les deux sites — ICI "(e && *e == 0) ? 0 : 1"
+     *             (seule la chaine VIDE coupe) et dans wp_burst_write "*e == '0'"
+     *             (la valeur "0" coupe). Poser =0 desarme le miroir ET laisse la
+     *             capture desarmee : etat ni-l'un-ni-l'autre.
+     */
     { static int pc = -1; if (pc < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
                                         pc = (e && *e == 0) ? 0 : 1; }
       if (!pc) g_shunt.d_burst_d = shunt_read_w(wp + WP_D_BURST_D); }
@@ -319,6 +360,14 @@ static int can_tok_eq(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
+/* @BEQUILLE — CANNED  (CALYPSO_CANNED, LISTE ; vide/NONE = rien canne ;
+ *              defaut effectif = 0 dans tous les profils livres)
+ *   masque  : les sorties du correlateur/demodulateur DSP non produites —
+ *             d_fb_det, TOA, PM, SNR, ANGLE, statut CRC — remplacees par des
+ *             constantes plausibles (CAN_* dans calypso_dsp_internal.h).
+ *   retirer : quand le correlateur natif produit ces six valeurs. La variable est
+ *             deja a 0 partout : la retirer ne change que le vocabulaire.
+ */
 static unsigned shunt_parse_canned(void)
 {
     const char *e = getenv("CALYPSO_CANNED");
@@ -507,6 +556,14 @@ static void shunt_route_to_c54x_run(void)
      * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
      * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
     {
+        /* @BEQUILLE — FRAME_IT_NATIVE  (CALYPSO_FRAME_IT_NATIVE, EXISTS ; :=1 en
+         *              native / native_helped / wire)
+         *   masque  : l'absence de cablage frame-TPU -> vecteur DSP. On appelle
+         *             directement c54x_interrupt_ex(dsp,28,12) au frame-tick au lieu de
+         *             19/3 (le stub vec19 est un RETE).
+         *   retirer : quand le TPU delivre l'IT frame sur le bon vecteur tout seul
+         *             (idem VEC28_REMAP cote calypso_c54x.c).
+         */
         static int fin = -1;
         if (fin < 0) fin = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
         if (fin)
@@ -516,6 +573,13 @@ static void shunt_route_to_c54x_run(void)
         /* [2026-07-23] TINT0 MASTER CLOCK sync frame : fire TINT0 vec20/bit4 au
          * MEME tick TDMA (pas per-2000-insn). Handler 0x72d3 = driver slots op. */
         {
+            /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
+             *              defaut OFF hors profil WIRE)
+             *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
+             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT0
+             *             (vec20/bit4) a la cadence trame.
+             *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
+             */
             static int _t0m = -1;
             if (_t0m < 0) _t0m = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
             if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
@@ -554,6 +618,14 @@ static int    g_rx_raw_valid = 0;
  * (modele trf6151). Ancrage MAV_REF->RF_REF (def 20929->-60 = niveau courant) faute
  * de reference hardware ; la valeur SUIT desormais le signal reel (fading/niveau).
  * Gate CALYPSO_DECAN_PM (ou master CALYPSO_DECAN). OFF -> apm_for_rf(fallback). */
+/* @BEQUILLE — DECAN_PM (+ _MAV_REF / _RF_REF)  (CALYPSO_DECAN_PM ou master
+ *              CALYPSO_DECAN, EQ1 ; OFF = bequille de stabilisation)
+ *   masque  : la mesure de puissance du DSP. ON : rf_dbm derive de la magnitude
+ *             MAV via un ancrage arbitraire (MAV_REF -> RF_REF). OFF : a_pm fige a
+ *             apm_for_rf(-60), une constante decretee.
+ *   retirer : quand a_pm est produit par le DSP depuis l'I/Q (les deux branches
+ *             disparaissent alors, ON comme OFF).
+ */
 static uint16_t shunt_pm_decan_apm(int fallback_target)
 {
     static int dc = -1;
@@ -621,6 +693,13 @@ void calypso_dsp_shunt_on_frame_tick(void)
      * dispatch natif (qui ne pose jamais d_fb_det -- mur RANK3). L'ARM L1 lit
      * d_fb_det -> deroule le vrai flux FBSB->SB->BSIC->sysinfo. Thread DSP = safe. */
     {
+        /* @BEQUILLE — SHUNT_LEGIT (transport du resultat FB au frame-tick)
+         *              (CALYPSO_SHUNT_LEGIT ou CALYPSO_SHUNT_NO_LEGIT =1)
+         *   masque  : le correlateur natif qui ne pose jamais d_fb_det. On ecrit
+         *             directement api_ram[0x08F8..0x08FD] (d_fb_det=1, TOA/PM/ANGLE/SNR)
+         *             et a_pm des que gr-gsm a decode la SCH (sb_valid).
+         *   retirer : quand data[0x08f8] est ecrit par le DSP (RANK3 leve).
+         */
         static int legit = -1;
         if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); legit = ((e && *e == '1') || (nl && *nl=='1')) ? 1 : 0; }
         if (legit && g_shunt.c54x && g_shunt.sb_valid) {
@@ -718,6 +797,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * l'expiry agch corrige le no-cell-info post-dedie MAIS clear le grant
                  * IMM-ASSIGN -> peut casser l'etablissement SDCCH. Activer via
                  * CALYPSO_SHUNT_AGCH_EXPIRE=1 (no-legit / experiences). */
+                /* @BEQUILLE — SHUNT_AGCH_EXPIRE (+ SHUNT_AGCH_TTL)  (CALYPSO_SHUNT_AGCH_EXPIRE,
+                 *              atoi>0, defaut OFF ; shunt_no_legit.env:=1)
+                 *   masque  : rien de reel — c'est le correctif d'une autre bequille : le latch
+                 *             IMM-ASSIGN fabrique par feed_agch empoisonne le gate SI et le paging
+                 *             a vie. On le fait expirer au bout d'un TTL.
+                 *   retirer : avec l'injection AGCH elle-meme (INJECT_AGCH) — quand a_cd est
+                 *             alimente par le decodeur natif, il n'y a plus de latch a expirer.
+                 *   NB      : SHUNT_AGCH_TTL a 3 consommateurs de semantiques differentes.
+                 */
                 static int _agex_on = -1, _agex = 100;
                 if (_agex_on < 0) { const char *e = getenv("CALYPSO_SHUNT_AGCH_EXPIRE"); _agex_on = (e && atoi(e) > 0) ? 1 : 0;
                     const char *t = getenv("CALYPSO_SHUNT_AGCH_TTL"); if (t && *t) _agex = atoi(t); }
@@ -738,6 +826,12 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * (mask 0) au lieu de tous les 8 -> le mobile re-collecte SI1+SI2+SI3
                  * VITE apres un dedie (sinon sync timeout -> No service post-SMS).
                  * Tunable CALYPSO_SHUNT_SI_ROT_MASK (0=chaque bloc, 7=ancien). */
+                /* @BEQUILLE — SHUNT_SI_ROT_MASK  (CALYPSO_SHUNT_SI_ROT_MASK, VALEUR, defaut 7)
+                 *   masque  : l'ordonnancement mf-51 des SI que le DSP devrait produire : on fait
+                 *             tourner a la main les slots si_set[] pour re-livrer SI1..SI4.
+                 *   retirer : quand a_cd est alimente par la demodulation native (les SI arrivent
+                 *             alors a leur place dans le multiframe).
+                 */
                 static int _rotmask = -1;
                 if (_rotmask < 0) { const char *e = getenv("CALYPSO_SHUNT_SI_ROT_MASK"); _rotmask = (e && *e) ? atoi(e) : 7; }
                 if ((si_rot++ & (unsigned)_rotmask) == 0) {
@@ -769,6 +863,17 @@ void calypso_dsp_shunt_on_frame_tick(void)
                      * modele emule (feed_iq / trf6151 / gr-gsm) pour verifier s'il
                      * tient le camp. rx_snr/rx_afc exigent CALYPSO_SHUNT_REAL_FB=1
                      * (sinon rx_snr reste 0x7000 canne et rx_afc reste 0). */
+                    /* @BEQUILLE — DECAN_TOA / DECAN_SNR / DECAN_ANGLE / DECAN_PM  (CALYPSO_DECAN_*
+                     *              ou master CALYPSO_DECAN ; l'ETAT OFF est la bequille)
+                     *   masque  : OFF -> a_serv_demod des read-pages recoit des constantes cannees :
+                     *             TOA=23, SNR=0x7000, ANGLE=0, PM=apm_for_rf(-60), a la place de la
+                     *             sortie du modele (sb_toa gr-gsm, rx_snr / rx_afc de feed_iq, MAV).
+                     *             Elles masquent l'absence de mesure DSP native.
+                     *   retirer : quand le correlateur natif ecrit lui-meme a_sync_demod
+                     *             [TOA/PM/ANGLE/SNR].
+                     *   NB      : dc_pm calcule ici n'alimente que la condition du fprintf ; le gate
+                     *             PM effectif est dans shunt_pm_decan_apm().
+                     */
                     static int dc_toa = -1, dc_pm, dc_snr, dc_ang;
                     if (dc_toa < 0) {
                         const char *M = getenv("CALYPSO_DECAN");
@@ -939,6 +1044,11 @@ static int g_gsmtap_fd = -1;
  * alors chan_nr=0x90 -> gsm48_rr_rx_pch_agch -> gsm48_rr_rx_imm_ass). */
 static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
 {
+    /* @BEQUILLE — INJECT_AGCH  (CALYPSO_INJECT_AGCH=1, fallback CALYPSO_SHUNT_LEGIT=1)
+     *   masque  : la reception AGCH par le DSP — l'IMM ASSIGN est capte hors bande
+     *             (GSMTAP gr-gsm) puis presente dans a_cd sur un bloc CCCH.
+     *   retirer : quand le decodage AGCH natif alimente a_cd.
+     */
     { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_AGCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_AGCH=1 pour reactiver */
     if (!l2 || len < 3) return;
 
@@ -1017,6 +1127,14 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
      *   [8] = (T1'<<3) | (T3>>3) ; [9] = ((T3&7)<<5) | T2 ; T1'=(FN/1326)%32.
      * adj=0 par defaut (last_rach.fn EST le memo) ; surchargeable CALYPSO_REQREF_ADJ. */
     {
+        /* @BEQUILLE — REQREF_LAST_RACH / REQREF_PERRA / REQREF_REWRITE / REQREF_ADJ
+         *   masque  : la coherence FN entre l'horloge L1 du mobile et la req-ref emise par
+         *             la BTS. On REECRIT agch_buf[8..9] (T1'/T2/T3) de l'IMM-ASSIGN recu
+         *             pour qu'il matche last_rach.fn lu dans la RAM ARM — c'est-a-dire
+         *             qu'on falsifie le message reseau pour compenser un skew local.
+         *   retirer : quand shunt_l1s_fn() et calypso_trx_get_fn() sont alignees sur la
+         *             SCH sans recale residuel (RANK4) — la req-ref native matche alors.
+         */
         static int reqref_rw = -1, reqref_perra = -1, rr_adj = -99999;
         if (reqref_rw < 0)    { const char *e = getenv("CALYPSO_REQREF_REWRITE"); reqref_rw = (e && *e == '1') ? 1 : 0; }  /* defaut OFF : ancien rewrite GLOBAL (50% multi-RACH) */
         if (reqref_perra < 0) { const char *e = getenv("CALYPSO_REQREF_PERRA");   reqref_perra = (e && *e == '0') ? 0 : 1; } /* defaut ON : req-ref PER-RA (FN exact du RACH_CONF keye par ra) */
@@ -1067,6 +1185,11 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
  * UA/AUTH -> L3 (miroir de feed_agch, SANS la sonde req-ref). */
 static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn)
 {
+    /* @BEQUILLE — INJECT_SDCCH  (CALYPSO_INJECT_SDCCH=1, fallback CALYPSO_SHUNT_LEGIT=1)
+     *   masque  : la demodulation du SDCCH DL par le DSP (UA/AUTH/L3), remplacee par
+     *             les blocs L2 forwardes par si_bridge.
+     *   retirer : quand le chemin natif demodule le SDCCH.
+     */
     { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SDCCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }
     if (!l2 || len < 3) return;
     static int ring_on = -1;
@@ -1111,6 +1234,11 @@ static void calypso_dsp_shunt_feed_sdcch(const uint8_t *l2, int len, uint32_t fn
  * fait CESSER la fabrication SI3->SI6 (sinon SI3 du BCCH clobbe le SI5/SI6 reel). */
 static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
 {
+    /* @BEQUILLE — INJECT_SACCH  (CALYPSO_INJECT_SACCH=1, fallback CALYPSO_SHUNT_LEGIT=1)
+     *   masque  : la demodulation SACCH par le DSP (SI5/SI6 du canal dedie),
+     *             remplacee par les blocs gr-gsm avec header L1 zerote.
+     *   retirer : quand le chemin natif demodule la SACCH.
+     */
     { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SACCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_SACCH=1 pour reactiver */
     if (!l2 || len < 7) return;
     int n = len < 23 ? len : 23;
@@ -1460,10 +1588,26 @@ static void shunt_shm_init(void)
  * livre la valeur -> aucune dependance de timing write/read intra-trame.
  *   FB  (NDB)  : 0x01F0 d_fb_det, 0x01F4 TOA, 0x01F6 PM, 0x01F8 ANGLE, 0x01FA SNR
  *   SB  (db_r) : 0x0060 (page0) / 0x0088 (page1) a_serv_demod[D_TOA] */
+/* @BEQUILLE — DECAN (effet de bord : allume SHUNT_REAL_FB)  (CALYPSO_DECAN=1)
+ *   masque  : DECAN=1 suffit a allumer l'intercept ci-dessous, et cette fonction
+ *             n'a AUCUNE garde g_shunt.active : elle est appelee depuis
+ *             calypso_trx.c sur chaque read MMIO ARM 16 bits. Or calypso_native.env
+ *             et calypso_native_helped.env posent DECAN:=1 -> en mode "natif", le
+ *             d_fb_det lu par l'ARM vient de l'HOTE, jamais de l'API-RAM native.
+ *             Le mode natif ne mesure donc pas le natif.
+ *   retirer : DECAN!=1 ET SHUNT_REAL_FB!=1 ET SHUNT_LEGIT!=1 (les 3 fallbacks),
+ *             ou ajouter une garde g_shunt.active en tete de fonction.
+ */
 bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
 {
     static int real_fb = -1;
     if (real_fb < 0) {
+        /* @BEQUILLE — SHUNT_REAL_FB (intercept du resultat)  (CALYPSO_SHUNT_REAL_FB, defaut OFF)
+         *   masque  : le correlateur DSP natif. Le resultat FB est calcule COTE HOTE
+         *             et court-circuite ce que le DSP aurait produit.
+         *   retirer : quand d_fb_det natif est ecrit par le DSP.
+         *   ⚠️ Cette bequille MASQUE le natif : ne jamais l activer pour juger de
+         *   l etat du mode natif. Seule data[0x08f8] via DETECTOR-RUN le mesure. */
         const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
         const char *dm = getenv("CALYPSO_DECAN");  /* master DECAN implique REAL_FB */
         real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0;
@@ -1513,6 +1657,14 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
      * Gate CALYPSO_FB_IQ_DARAM ; FCCH-only si CALYPSO_FB_IQ_FCCH_ONLY.
      * (Mettre CALYPSO_BSP_DIRECT_FEED=0 pour tuer le writer 0x12ed concurrent.) */
     {
+        /* @BEQUILLE — FB_IQ_DARAM (+ _BASE, _FCCH_ONLY)  (CALYPSO_FB_IQ_DARAM, atoi>0,
+         *              defaut OFF ; native_helped.env:=1)
+         *   masque  : le DMA on-chip RX -> DARAM. feed_iq ecrit 0x128 mots d'IQ decime
+         *             DIRECTEMENT dans g_shunt.c54x->data[base..], hors data_write — donc
+         *             invisible de WATCH_2A00 / WATCH_9200 / WMAP.
+         *   retirer : quand la chaine BSP -> BDLENA -> DARAM alimente le buffer seule
+         *             (writer 0x12ed non degenere).
+         */
         static int _fid = -1, _decim = 4, _fcch = 0;
         if (_fid < 0) {
             const char *e = getenv("CALYPSO_FB_IQ_DARAM"); _fid = (e && atoi(e) > 0) ? 1 : 0;
@@ -1536,6 +1688,12 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         /* [2026-07-26] FCCH positions {1,11,21,31,41} (offset +1 vs canon 0/10/20/30/40,
          * confirme par FN-ALIGN sch%51=1,21,31,41). */
         int _is_fcch = (_p % 10 == 1) && (_p <= 41);
+        /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
+         *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
+         *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
+         *             IQ reelle (else if) et ignore FCCH_ONLY.
+         *   retirer : des que la reachabilite est etablie ; ne jamais laisser en run.
+         */
         static int _mark = -1;
         if (_mark < 0) { const char *m = getenv("CALYPSO_FB_IQ_MARKER"); _mark = (m && atoi(m) > 0) ? 1 : 0; }
         if (_fid && _mark && g_shunt.c54x && g_shunt.c54x->data) {
@@ -1570,6 +1728,10 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
      * l'intercept 0x9213/0x9215 (c54x.c) sert au demod. Gate CALYPSO_FB_STREAM. */
     {
         static int _fs = -1, _fsd = 4;
+        /* @BEQUILLE — FB_STREAM (alimentation du ring)  (CALYPSO_FB_STREAM, defaut OFF)
+         *   masque  : cote emetteur du meme contournement — pousse l IQ decime dans
+         *             le ring que l intercept de lecture sert au demod.
+         *   retirer : en meme temps que l intercept de lecture. */
         if (_fs < 0) { const char *e = getenv("CALYPSO_FB_STREAM"); _fs = (e && atoi(e) > 0) ? 1 : 0;
             const char *d = getenv("CALYPSO_FB_STREAM_DECIM"); if (d && *d) _fsd = atoi(d); if (_fsd < 1) _fsd = 1; }
         if (_fs) {
@@ -1590,6 +1752,15 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
     /* [2026-07-22] Detection FCCH REELLE (gate CALYPSO_SHUNT_REAL_FB) : coherence
      * + dphi sur la vraie RX -> d_fb_det/AFC/SNR/TOA reels (bypass go-live DSP). */
     {
+        /* @BEQUILLE — SHUNT_REAL_FB (calcul hote de rx_fb_det/AFC/SNR/TOA)
+         *              (CALYPSO_SHUNT_REAL_FB=1 ou master CALYPSO_DECAN=1)
+         *   masque  : le correlateur DSP. Coherence + dphi calcules cote hote sur l'I/Q RX
+         *             -> g_shunt.rx_* -> livres a l'ARM par real_fb_read.
+         *   retirer : quand data[0x08f8] est ecrit par le DSP.
+         *   ATTENTION : DECAN=1 SUFFIT a l'allumer, et native/native_helped/shunt_legit/
+         *             shunt_no_legit posent tous DECAN=1 : mettre SHUNT_REAL_FB=0 ne coupe
+         *             RIEN.
+         */
         static int real_fb = -1;
         if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); const char *dm = getenv("CALYPSO_DECAN"); real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0; }  /* master DECAN implique REAL_FB */
         if (real_fb) {
@@ -1675,6 +1846,16 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                 }
                 /* [2026-07-28] SHUNT_DSP_FB : voir en-tete du patch. */
                 {
+                    /* @BEQUILLE — SHUNT_DSP_FB (+ _ENTRY / _BUDGET / _MAX / _SP)
+                     *              (CALYPSO_SHUNT_DSP_FB, EQ1, defaut OFF)
+                     *   masque  : l'ORDONNANCEMENT natif du correlateur. Le shunt sauvegarde le
+                     *             contexte c54x, force PC=ENTRY et SP=scratch, execute BUDGET
+                     *             instructions hors trame, puis restaure — le DSP n'a jamais decide
+                     *             d'entrer la.
+                     *   retirer : quand le dispatcher natif (frame-IT -> 0x8341 -> correlateur) atteint
+                     *             l'entree seul.
+                     *   NB      : niche dans le bloc real_fb : inerte si DECAN=0 ET SHUNT_REAL_FB!=1.
+                     */
                     static int _sdf = -1; static uint16_t _entry = 0x94f5;
                     static int _budget = 20000; static unsigned _sdfn = 0;
                     static unsigned _sdfmax = 40;   /* borne totale d excursions */
@@ -1842,6 +2023,14 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
      * dans le shunt -> on l'arme aussi pour fournir le chemin réception prouvé
      * (FB+SB+SI) qui va jusqu'au LU accept. Le shunt on_frame_tick tourne ~1ms
      * après le tick L1=c, donc ses écritures d_fb_det/a_sch/a_cd priment. */
+    /* @BEQUILLE — DSP_SHUNT (armement du mock)  (CALYPSO_DSP_SHUNT, EQ1 ; defaut 1 via
+     *              CALYPSO_MODE=full-grgsm dans run.sh, PAS via un calypso*.env)
+     *   masque  : le DSP entier. Un mock cote ARM ecrit d_fb_det / a_sch / a_cd a sa
+     *             place. NB : le shunt s'arme AUSSI via CALYPSO_L1=c ou simplement
+     *             CALYPSO_DSP=c54x (shunt_route_c54x) — donc il est arme meme dans les
+     *             profils dits "natifs".
+     *   retirer : quand le correlateur natif produit d_fb_det seul (RANK3 leve).
+     */
     const char *env = getenv("CALYPSO_DSP_SHUNT");
     bool shunt_env_on = (env && strcmp(env, "1") == 0);
     if (!shunt_env_on && !calypso_l1_c_active() && !shunt_route_c54x()) {
@@ -1925,6 +2114,14 @@ void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
      * shunt_write_w() segfault (backtrace gdb : address_space_write as=0x0).
      * C est une feature du shunt : hors shunt, elle ne doit rien faire. */
     if (!g_shunt.active) return;
+    /* @BEQUILLE — SHUNT_BURST_PERCMD (miroir per-commande)  (CALYPSO_SHUNT_BURST_PERCMD,
+     *              ON-sauf-0, defaut ON)
+     *   masque  : la derivation materielle de d_burst_d. On capture chaque ecriture ARM
+     *             de la write-page et on MIROITE l'echo sur LES DEUX read-pages, parce
+     *             que le r_page du mobile n'est pas modelise.
+     *   retirer : quand la fenetre RX TPU cadence le burst-id et que r_page est
+     *             modelise fidelement.
+     */
     static int en = -1;
     if (en < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
                   en = (e && *e == '0') ? 0 : 1; }
@@ -1952,6 +2149,12 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
      * SI reel dans a_cd -> a_cd ne se remplit QUE si la demod native (corr 0x8d00
      * -> NB) produit vraiment le bloc. Prouve natif vs plomberie. Defaut ON (=1). */
     {
+        /* @BEQUILLE — SHUNT_FEED_SI  (CALYPSO_SHUNT_FEED_SI=1, fallback CALYPSO_SHUNT_LEGIT=1)
+         *   masque  : la production des blocs SI par la demodulation native (correlateur
+         *             0x8d00 -> NB -> a_cd). Le SI vient de gr-gsm, est range par type dans
+         *             si_set[0..5], avec fabrication d'un SI6 seed depuis le SI3.
+         *   retirer : quand a_cd se remplit par la demodulation native.
+         */
         static int fs = -1;
         if (fs < 0) { const char *e = getenv("CALYPSO_SHUNT_FEED_SI");
                       fs = (e && *e == '1') ? 1 : 0;
@@ -2015,6 +2218,15 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
     /* Hop 5 : injecte AUSSI directement en L1CTL DATA_IND -> mobile (gated
      * CALYPSO_SHUNT_DL_INJECT, defaut ON). FN reelle via calypso_trx_get_fn. */
     {
+        /* @BEQUILLE — SHUNT_DL_INJECT  (CALYPSO_SHUNT_DL_INJECT, EQ1, defaut OFF ;
+         *              shunt_no_legit.env:=1)
+         *   masque  : TOUT le chemin descendant a_cd -> L1 firmware -> UART -> L1CTL. Le SI
+         *             est pousse directement en L1CTL_DATA_IND vers le mobile ; aucune
+         *             partie de la chaine emulee n'est exercee. C'est la bequille la plus
+         *             intrusive du modele.
+         *   retirer : des que le SI atteint le mobile via a_cd (deja le cas par defaut :
+         *             seul calypso_shunt_no_legit.env la repose a 1).
+         */
         static int inj = -1;
         if (inj < 0) { const char *e = getenv("CALYPSO_SHUNT_DL_INJECT");
                        inj = (e && *e == '1') ? 1 : 0; }  /* [2026-07-23] DEFAUT OFF (natif) */
@@ -2040,6 +2252,13 @@ bool calypso_dsp_shunt_active(void)
  * substitutes() = le shunt REMPLACE le DSP (mock ARM) -> et LUI SEUL doit
  *                 gater les c54x_run natifs. FAUX en mode assist, ou le vrai
  *                 DSP execute son firmware et doit tourner a la cadence trame. */
+/* @BEQUILLE — DSP_SHUNT (substitution du DSP)  (CALYPSO_DSP_SHUNT, EQ1, ou
+ *              CALYPSO_L1=c)
+ *   masque  : l'execution du DSP. Quand cette fonction retourne vrai, TOUS les
+ *             c54x_run natifs (calypso_trx.c) sont gates : le mock remplace le
+ *             processeur de signal.
+ *   retirer : quand le correlateur natif produit d_fb_det seul (RANK3 leve).
+ */
 bool calypso_dsp_shunt_substitutes(void)
 {
     if (!g_shunt.active) return false;

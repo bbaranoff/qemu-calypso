@@ -310,3 +310,41 @@ non-DC. L'ordre est celui de la chaine, chaque etape a son oracle.
    jamais « pas d'evenement »** tant que la sonde n'est pas verifiee VIVANTE et sa fenetre
    COUVRANTE (plafond sature, seuil de dump trop haut, plage ecrite cote HOTE donc
    invisible depuis `data_write_locked`, variable d'env absente du run).
+
+
+---
+
+## PRIORITES au 2026-07-28 (fin de journee) — recadrees par la mesure du mode natif
+
+### P0 — Verrou natif : BRINT0 (vec 21 / IMR bit 5) jamais demasquee
+Mesure sans bequille : le DSP tourne (100 M insn), le BSP alimente (266 depots), l'IT est
+PENDANTE (`IFR=0x0028`) mais MASQUEE (`imr_bit=5 unmasked=0`), `IMR` oscille `0x3000`↔`0x3200`
+sans le bit 5, `d[0x435b]=0`, le DSP boucle dans `0xddf5..0xde86` et l'etage demod n'est
+**jamais atteint** (`CALYPSO_WATCH_9F00_RD` = 0).
+- [ ] **P0.a — Le vecteur 21 est-il installe ?** `VEC-INSTALL vec21@0x00d6/0x00d7 <- 0x0000`.
+      Un vecteur a zero rendrait le demasquage inutile : la racine serait l'installation.
+      **A trancher avant tout correctif d'armement.**
+- [ ] **P0.b — 0x6881 / 0x6981 sont-ils bien decodes ?** Ce sont les deux ecritures d'`IMR`
+      (famille `0x68..0x6F`). Si elles sont fausses, l'audit d'opcodes explique le verrou.
+- [ ] **P0.c — Test de diagnostic** (bequille assumee, gate env, defaut OFF) : demasquer
+      artificiellement le bit 5 pour savoir si BRINT0 est le DERNIER verrou ou seulement le
+      PROCHAIN. A faire AVANT d'implementer, le resultat change les priorites.
+- [ ] **P0.d — Implementer la branche manquante** : qui, sur le silicium, arme ce bit, et quel
+      maillon de notre modele ne le fait pas. **Pas une bequille de plus.**
+
+### P1 — Correctifs d'opcodes issus de l'audit (`RAPPORT_OPCODES.md`)
+~40 findings confirmes, ~15 de gravite 1 (longueur fausse -> desynchronisation du decode).
+**Rien d'applique.** Un correctif a la fois, non-regression `SHUNT_LEGIT` obligatoire entre chaque.
+Deux plages (`0x60-0x8F`, `0xC0-0xFF`) sans passe de refutation : verification manuelle exigee.
+
+### FAIT le 2026-07-28
+- [x] `0x1800/1A00/1C00/1E00` AND/OR/XOR/SUBC executes comme un LD — corrige, valide, non-regression OK
+- [x] `0x47` RPT Smem ecrivait BRC au lieu de RC (les boucles ne tournaient qu'une fois)
+- [x] `0x06/07` ADDC (+C), `0x0E/0F` SUBB (-C), `0x38/39` SQURA (T = Smem)
+- [x] 3e gate BSP (la livraison) aligne sur `CALYPSO_BSP_DARAM_FORCE`
+- [x] `CALYPSO_BSP_IQ_DECIM=4` + `DARAM_LEN=296` (DECIM=1 = regression mesuree)
+- [x] Entree demod = `data[0x4c00]` confirmee par mesure (stride 5, polyphase 6 taps)
+- [x] `FB_STREAM` / cellules `0x9260-61` : ecarte (jamais lues dans cette configuration)
+- [x] Deux tables d'opcodes du projet rectifiees (`0xF4..0xF7` = 1 mot ; `0xEA00` = `LD #k9,DP`)
+- [x] `doc/opcodes/tic54x-opc.c` (binutils) verse au depot comme source d'autorite
+- [x] `make-overlay.sh` : `ROOT_GLOBS` elargi a `RAPPORT_*.md PLAN_*.md`

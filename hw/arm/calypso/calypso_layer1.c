@@ -48,6 +48,13 @@
 #define L1_E_MIN         1.0e6       /* énergie min pour considérer un burst présent */
 #define AFC_SNR_THRESHOLD 2560       /* afc.h : 2.5 dB en fx6.10 */
 
+/* @BEQUILLE — L1  (CALYPSO_L1=c*, defaut absent)
+ *   masque  : le DSP entier. calypso_l1_c_active() rend substitutes() vrai
+ *             (calypso_dsp_shunt.c) -> un modele L1 haut-niveau en C remplace la
+ *             couche 1 et gate les c54x_run natifs.
+ *   retirer : quand le DSP emule tient la couche 1. Variable posee dans aucun
+ *             profil livre : candidate au retrait pur et simple.
+ */
 int calypso_l1_c_active(void)
 {
     static int v = -1;

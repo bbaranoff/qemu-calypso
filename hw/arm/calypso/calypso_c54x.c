@@ -1009,6 +1009,14 @@ static uint64_t g_force_intm_oneshot_insn = 0;
  * = pas de restriction PC (= comportement v1 = première opportunité). */
 static uint16_t g_force_intm_at_pc = 0xFFFF;
 
+/* @BEQUILLE — FORCE_INTM_ONESHOT (+ FORCE_INTM_AT_PC)  (CALYPSO_FORCE_INTM_ONESHOT=1,
+ *              CALYPSO_FORCE_INTM_AT_PC=0xXXXX ; defaut OFF ; calypso_wire.env:=1)
+ *   masque  : le RSBX INTM 0xa51b que le firmware ne joue pas. Avec le PC-gate le
+ *             bloc POSE EN PLUS l'IT (s->ifr |= s->imr & 0x3000) : il fabrique
+ *             l'evenement, il n'ouvre pas seulement la fenetre.
+ *   retirer : quand INTM passe a 0 par le chemin ROM (trace INTM-TRANS).
+ *   NB      : run.sh le signale deja comme "NON-nominal".
+ */
 static void force_intm_oneshot_check(C54xState *s)
 {
     if (g_force_intm_oneshot_enabled < 0) {
@@ -1659,6 +1667,13 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     }
     if (s->pc >= 0x9f00 && s->pc <= 0x9fb8 && (addr == _fscI || addr == _fscQ)) {
         static int _fs = -1;
+        /* @BEQUILLE — FB_STREAM (lecture)  (CALYPSO_FB_STREAM, defaut OFF)
+         *   masque  : l absence de DMA on-chip. On INJECTE un echantillon frais a
+         *             chaque lecture de la cellule au lieu qu un peripherique
+         *             remplisse le tampon.
+         *   retirer : quand le tampon est alimente par le vrai chemin (BSP -> DARAM).
+         *   Note : inerte avec CORR_ENTRY=0x94f5 — les cellules 0x9260/61 n y sont
+         *   jamais lues (mesure 2026-07-28, WATCH-9F00-RD). */
         if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
@@ -2478,6 +2493,14 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
          * entre l ecriture BSP et ce sweep -> on le RE-POSE ici, sur le chemin de
          * LECTURE DSP, quand RX-FBFLAGS l a arme -> le BITF @0x8753 voit TC=1 ->
          * CC 0xa0a0 -> kernel 0xa076. Gate CALYPSO_FORCE_3FAD_KERNEL. */
+        /* @BEQUILLE — FORCE_3FAD_KERNEL  (CALYPSO_FORCE_3FAD_KERNEL, EXISTS, defaut OFF)
+         *   masque  : le producteur du flag "burst pret" data[0x3fad] bit15. Un clearer
+         *             per-frame (76f8 3fad 0000) l'efface entre l'ecriture BSP et le sweep
+         *             DSP ; on le RE-POSE sur le chemin de lecture @0x8753.
+         *   retirer : quand le poseur natif (chaine RX/BRINT0) tient bit15 jusqu'au BITF
+         *             @0x8753 — c.-a-d. quand PROBE_3FAD_GATE voit bit15=1 sans ce gate.
+         *   NB      : conditionne par calypso_rxfb_fired, pose par CALYPSO_RX_FBFLAGS.
+         */
         { static int _fk = -1; if (_fk < 0) _fk = getenv("CALYPSO_FORCE_3FAD_KERNEL") ? 1 : 0;
           if (_fk && calypso_rxfb_fired) s->data[0x3fad] |= 0x8000; }
     }
@@ -2607,6 +2630,13 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * reste equilibre, le RET depile 0xa4e4 -> chemin natif SANS storm (vs le
      * PC-redirect qui sautait le contexte). Gate CALYPSO_FIX_3FCD (def off). */
     if (addr == 0x3fcd && s->pc == 0x013b) {
+        /* @BEQUILLE — FIX_3FCD  (CALYPSO_FIX_3FCD, EXISTS, defaut OFF ; calypso_wire.env:=1)
+         *   masque  : le prologue ISR overlay 0x013b depile une adresse de retour HW
+         *             (0x72d5) au lieu de 0xa4e4 ; la branche reelle = un vectoring
+         *             d'interruption qui empile la bonne adresse de retour.
+         *   retirer : des que le frame-IT vectorise vers 0xa4e4 sans substitution
+         *             (data[0x3fcd] vaut 0xa4e4 sans le gate).
+         */
         static int f3f = -1;
         if (f3f < 0) f3f = getenv("CALYPSO_FIX_3FCD") ? 1 : 0;
         if (f3f && val != 0xa4e4) {
@@ -2687,6 +2717,13 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
          * gr-gsm transportee par le shunt. Quand SHUNT_LEGIT + gr-gsm a decode
          * (sb_valid), on FORCE la valeur ecrite a 1 -> l ARM lit FB found -> vrai flux. */
         {
+            /* @BEQUILLE — SHUNT_LEGIT (force d_fb_det cote ecriture DSP)  (CALYPSO_SHUNT_LEGIT
+             *              ou CALYPSO_SHUNT_NO_LEGIT =1)
+             *   masque  : le mur RANK3 — le correlateur natif ecrit data[0x08f8]=0 et ecrase
+             *             la detection transportee depuis gr-gsm. On FORCE a 1 toute ecriture
+             *             DSP de d_fb_det des que sb_valid.
+             *   retirer : quand le correlateur natif pose d_fb_det lui-meme.
+             */
             static int _lg = -1;
             if (_lg < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _lg = ((e && *e=='1') || (nl && *nl=='1')) ? 1 : 0; }
             if (_lg && addr == 0x08f8 && calypso_dsp_shunt_sb_valid()) {
@@ -2698,6 +2735,17 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
              * (ARM off 0x60/0x88 -> /2+0x800). Le DSP les ecrit a 0 (pas de vraie
              * mesure) -> on force la valeur calibree trf6151 -> rxlev stable. */
             {
+                /* @BEQUILLE — TRF_RXLEV + TRF_TARGET_RF  (CALYPSO_TRF_RXLEV=1, fallback
+                 *              CALYPSO_SHUNT_LEGIT=1 ; cible CALYPSO_TRF_TARGET_RF, defaut -60)
+                 *   masque  : a_pm que le DSP ecrit a 0 (aucune mesure de puissance). On substitue
+                 *             apm_for_rf(TARGET_RF) sur le tableau reellement lu par l'ARM
+                 *             (data[0x834-0x836] / [0x848-0x84A]). Le niveau RF cible est une
+                 *             constante decretee, pas une mesure.
+                 *   retirer : quand a_pm natif est non nul. Le modele trf6151 (gain suivi par TSP)
+                 *             reste legitime — seule la CIBLE figee est la bequille.
+                 *   NB      : ce site ne teste PAS SHUNT_NO_LEGIT ; c'est shunt_no_legit.env qui
+                 *             pose TRF_RXLEV=1 explicitement.
+                 */
                 static int _tp = -1, _tgt = -60;
                 if (_tp < 0) {
                     const char *d = getenv("CALYPSO_TRF_RXLEV");
@@ -3024,6 +3072,15 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * de flux — ecrasant la vraie FCCH deposee par feed_iq (FB_IQ_DARAM=1).
      * On ignore ces ecritures : feed_iq devient autoritaire sur 0x2a00. */
     {
+        /* @BEQUILLE — DEMOD_NOCLOBBER  (CALYPSO_DEMOD_NOCLOBBER, atoi>0, defaut OFF)
+         *   masque  : l'etage demod emule ecrit des paires constantes dans le buffer
+         *             d'entree correlateur [0x2a00,0x2b28) et ecrase la FCCH reelle
+         *             deposee par feed_iq ; la vraie branche = un demod qui consomme
+         *             l'I/Q RX au lieu de produire des constantes. Ici on SUPPRIME
+         *             l'ecriture (return) au lieu de corriger le producteur.
+         *   retirer : des que l'etage demod 0x9f95-0x9fe2 lit une source I/Q reelle, ou
+         *             des que FB_IQ_OWNS=1 rend feed_iq seul proprietaire de 0x2a00.
+         */
         static int _nc = -1;
         if (_nc < 0) { const char *e = getenv("CALYPSO_DEMOD_NOCLOBBER"); _nc = (e && atoi(e) > 0) ? 1 : 0; }
         if (_nc && addr >= 0x2a00 && addr < 0x2b28 &&
@@ -4604,6 +4661,15 @@ static uint16_t resolve_smem(C54xState *s, uint16_t opcode, bool *indirect)
          * DROP expérimental (env CALYPSO_AR2_FLOOR_DROP=1) redirige l'accès
          * vers un scratch pour voir si le corrélateur converge sans le crash. */
         if (cur_arp == 2 && addr < 0x0820) {
+            /* @BEQUILLE — AR2_FLOOR_DROP  (CALYPSO_AR2_FLOOR_DROP, EQ1, defaut OFF)
+             *   masque  : le calcul d'adresse d'AR2 dans le correlateur, qui sous-deborde le
+             *             buffer DARAM 0x0800 jusqu'a l'espace MMR (0x00=IMR, 0x1E=XPC) et le
+             *             clobbe. Le drop redirige l'acces vers 0xFFFF au lieu de corriger le
+             *             pointeur. NB : le LOG est gate par le jeton DEBUG=AR2-FLOOR, le DROP
+             *             ne l'est PAS.
+             *   retirer : quand AR2 reste dans [0x0800,0x2b28) sur tout le kernel FB
+             *             (compteur du jeton AR2-FLOOR a 0 sur un run complet).
+             */
             static int ar2_drop = -1;
             if (ar2_drop < 0) {
                 const char *e = getenv("CALYPSO_AR2_FLOOR_DROP");
@@ -4907,12 +4973,25 @@ static bool c54x_cond_true(C54xState *s, uint8_t cc)
  *            dans la meme fenetre, prendre bit12 (frame) en 1er au lieu du ctz brut,
  *            sinon BRINT0 vole la fenetre rare et re-masque (INTM=1). */
 static bool g_frame_it_level = false;
+/* @BEQUILLE — FRAME_IT_LEVEL  (CALYPSO_FRAME_IT_LEVEL, EQ1, defaut OFF)
+ *   masque  : la fenetre INTM=0 trop rare du firmware. Re-assert IFR bit12 a CHAQUE
+ *             insn tant que vec28 n'a pas vectorise — l'IFR c54x est a latch
+ *             d'evenement, il n'a pas de mode "level".
+ *   retirer : quand la cadence INTM du firmware suffit a attraper l'IT au vol.
+ */
 static bool frame_it_level_on(void)
 {
     static int c = -1;
     if (c < 0) { const char *e = getenv("CALYPSO_FRAME_IT_LEVEL"); c = (e && *e == '1') ? 1 : 0; }
     return c;
 }
+/* @BEQUILLE — FRAME_IT_PRIO  (CALYPSO_FRAME_IT_PRIO, EQ1, defaut OFF)
+ *   masque  : la priorite d'interruption. Force b=12 au lieu de ctz(pend) pour que
+ *             la frame passe devant BRINT0/bit5 — sur c54x la priorite est fixee
+ *             par le numero de vecteur, elle n'est pas configurable.
+ *   retirer : quand BRINT0 et la frame ne se disputent plus la meme fenetre
+ *             (livraison BSP a la bonne cadence).
+ */
 static bool frame_it_prio_on(void)
 {
     static int c = -1;
@@ -5000,6 +5079,12 @@ static bool c54x_irq_level_check(C54xState *s)
      * vec19/bit3 = stub RETE ; le VRAI scheduler frame est vec28 (data[0xf0]->0x7234).
      * Gated CALYPSO_DSP_FRAME_VEC28. On consomme le bit3 de l IFR mais on vectorise 28. */
     {
+        /* @BEQUILLE — DSP_FRAME_VEC28 (chemin IRQ-LEVEL)  (CALYPSO_DSP_FRAME_VEC28, EXISTS)
+         *   masque  : le mapping ligne-frame-TPU -> vecteur DSP. Le modele livre l'IT frame
+         *             sur vec19/bit3 (= stub RETE) ; on la reroute vers vec28/bit12.
+         *   retirer : quand calypso_tpu.c cable la ligne frame sur le bon vecteur a la source.
+         *   PIEGE   : allumee sans etre demandee des que CALYPSO_DSP=c54x (test ci-dessous).
+         */
         static int lv28 = -1;
         if (lv28 < 0) { const char *_d = getenv("CALYPSO_DSP"); lv28 = (getenv("CALYPSO_DSP_FRAME_VEC28") || (_d && !strcmp(_d, "c54x"))) ? 1 : 0; }  /* natif revive */
         if (lv28 && b == 3) vec = 28;
@@ -5029,6 +5114,46 @@ static bool c54x_irq_level_check(C54xState *s)
                 "IPTR=0x%03x IMR=0x%04x IFR=0x%04x insn=%u\n",
                 b, vec, s->pc, iptr, s->imr, s->ifr, s->insn_count);
     return true;
+}
+
+
+/* [2026-07-28] GATE UNIFIE DES CORRECTIFS D EMULATION.
+ *   CALYPSO_FIXES=FIX_UN,FIX_DEUX   active des correctifs nommes
+ *   CALYPSO_FIXES=all               les active tous
+ *   (absent)                        aucun — comportement d origine strictement inchange
+ *
+ * PROTOCOLE : on pose TOUS les correctifs surs derriere ce gate d un coup, on teste
+ * SOUS CHARGE MAXIMALE (camp + LU + SMS, pas un simple boot), et DES QU UN CORRECTIF
+ * EST CONFIRME on efface **la CONDITION**, pas le correctif : on retire le
+ * `if (calypso_fix_enabled("FIX_...")) {` et ses accolades, le code reste et devient
+ * inconditionnel. Son nom disparait alors de la liste des gates.
+ * Ce gate est un SAS TEMPORAIRE, jamais une option de configuration : une bequille
+ * reste, un sas se vide. Ne jamais y laisser vieillir un correctif valide. */
+static bool calypso_fix_enabled(const char *name)
+{
+    static char buf[1024];
+    static int  init = 0;
+    if (!init) {
+        const char *e = getenv("CALYPSO_FIXES");
+        snprintf(buf, sizeof(buf), "%s", e ? e : "");
+        init = 1;
+        if (buf[0])
+            fprintf(stderr, "[c54x] CALYPSO_FIXES=%s (sas temporaire — effacer le gate "
+                            "de chaque correctif confirme)\n", buf);
+    }
+    if (!buf[0]) return false;
+    if (strcmp(buf, "all") == 0) return true;
+    size_t n = strlen(name);
+    const char *p = buf;
+    while ((p = strstr(p, name)) != NULL) {
+        char before = (p == buf) ? ',' : p[-1];
+        char after  = p[n];
+        if ((before == ',' || before == ' ') &&
+            (after == '\0' || after == ',' || after == ' '))
+            return true;
+        p += n;
+    }
+    return false;
 }
 
 static int c54x_exec_one(C54xState *s)
@@ -5062,6 +5187,14 @@ static int c54x_exec_one(C54xState *s)
         /* [2026-07-25] CORR-BANK2 (gated) : forcer XPC=2 dans la region corrélateur
          * -> le handler FB tourne depuis PROM2 (overlay different) au lieu de PROM0.
          * Test "voir si bank2 debloque". Risque derail (RET/contexte). */
+        /* @BEQUILLE — CORR_BANK  (CALYPSO_CORR_BANK, VALEUR, defaut -1/OFF)
+         *   masque  : la selection d'overlay/banque du handler FB. On ECRASE s->xpc a
+         *             chaque instruction de [0x8d00..0xa200] au lieu que le dispatcher
+         *             natif pose la bonne banque.
+         *   retirer : quand le dispatcher CALA @0xb01e resout la banque correcte lui-meme
+         *             (XPC observe == banque attendue sans forcage).
+         *   PIEGE   : la valeur "0" N'ETEINT PAS — elle force XPC=0. Seul unset coupe.
+         */
         static int cbk = -2;
         if (cbk == -2) { const char *e = getenv("CALYPSO_CORR_BANK");
                          cbk = (e && *e) ? atoi(e) : -1; }   /* -1=off ; 0..3 = XPC force */
@@ -5070,6 +5203,12 @@ static int c54x_exec_one(C54xState *s)
         }
     }
     {
+        /* @BEQUILLE — FORCE_3FAE  (CALYPSO_FORCE_3FAE, EXISTS, defaut OFF)
+         *   masque  : l'ecriture des flags de handshake FB que RIEN n'implemente —
+         *             data[0x3faa] bit2/bit8, [0x3fab] bit8, [0x3fae] bit8. Poses a CHAQUE
+         *             instruction du handler (xpc=0, pc 0x8d00..0xa200).
+         *   retirer : quand la chaine RX/BRINT0 ecrit ces flags (RANK2 resolu).
+         */
         static int f3ae = -1;
         if (f3ae < 0) f3ae = getenv("CALYPSO_FORCE_3FAE") ? 1 : 0;
         if (f3ae && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200) {
@@ -5253,6 +5392,148 @@ static int c54x_exec_one(C54xState *s)
     uint8_t hi4 = (op >> 12) & 0xF;
     uint8_t hi8 = (op >> 8) & 0xFF;
 
+    /* [2026-07-28] LOT DE CORRECTIFS DE LONGUEUR — gate CALYPSO_FIXES (voir
+     * calypso_fix_enabled). Chaque entree cite binutils tic54x-opc.c, dont le 2e
+     * champ EST le nombre de mots. Le decodeur consommait 2 mots la ou ces
+     * instructions n en font qu 1, ce qui desynchronise tout le decodage suivant. */
+    {   /* [2026-07-28] Les correctifs ci-dessous sans appel a calypso_fix_enabled()
+         * sont VALIDES et INCONDITIONNELS (verifies en SHUNT_LEGIT sous charge et en
+         * NATIVE_HELPED avec retour du SHADOW-DADST). Ceux qui portent encore un
+         * calypso_fix_enabled("FIX_...") sont dans le SAS : formellement corrects mais
+         * INFIRMES PAR LA MESURE, voir leur commentaire. */
+        /* LD Xmem, SHFT, dst — binutils { "ld", 1,3,3, 0x9400, 0xFE00, {OP_Xmem,OP_SHFT,OP_DST} }
+         * (etait decode MVDK/MVKD sur 2 mots) */
+        if ((op & 0xFE00) == 0x9400) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int shft = op & 0xF, d = (op >> 8) & 1;
+            int64_t x = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v;
+            x <<= shft;
+            if (d) s->b = sext40(x); else s->a = sext40(x);
+            return 1;
+        }
+        /* BIT Xmem, BITC : TC = Xmem(15-BITC) — binutils { "bit", 1,2,2, 0x9600, 0xFF00 }
+         * (etait decode MVDP sur 2 mots) */
+        if ((op & 0xFF00) == 0x9600) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int bitc = op & 0xF;
+            if ((v >> (15 - bitc)) & 1) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
+            return 1;
+        }
+        /* SUB Xmem, Ymem, dst : dst = (Xmem - Ymem) << 16 — binutils { "sub", 1,..., 0xA200, 0xFE00 }
+         * (etait decode ADD/SUB #lk sur 2 mots) */
+        if ((op & 0xFE00) == 0xA200) {
+            uint16_t xa = resolve_xmem(s, op);
+            uint8_t ym = op & 0xF; int yar = (ym & 3) + 2, ymod = (ym & 0xC) >> 2;
+            uint16_t ya = s->ar[yar];
+            switch (ymod) {
+            case 1: s->ar[yar] = ya - 1; break;
+            case 2: s->ar[yar] = ya + 1; break;
+            case 3: s->ar[yar] = c54x_circ_ref(ya, +(int16_t)s->ar[0], s->bk); break;
+            default: break;
+            }
+            int64_t xv = (int16_t)data_read(s, xa), yv = (int16_t)data_read(s, ya);
+            int64_t r = (xv - yv) << 16;
+            if ((op >> 8) & 1) s->b = sext40(r); else s->a = sext40(r);
+            return 1;
+        }
+        /* LD Xmem, dst || MAC/MAS/MASR Ymem — binutils { "ld", 1,..., 0xA800/0xAC00/0xAE00, 0xFE00 }
+         * (etaient decodes AND #lk / MACP / MACD sur 2 mots).
+         * On execute la partie LD et on laisse la partie parallele : approximatif sur le
+         * RESULTAT, mais la LONGUEUR redevient juste et le flux cesse de deriver. */
+        if (((op & 0xFE00) == 0xA800 || (op & 0xFE00) == 0xAC00 || (op & 0xFE00) == 0xAE00)
+            && calypso_fix_enabled("FIX_LD_PARALLEL")) {
+            uint16_t a = resolve_xmem(s, op);
+            uint16_t v = data_read(s, a);
+            int64_t x = (s->st1 & ST1_SXM) ? (int64_t)(int16_t)v : (int64_t)(uint16_t)v;
+            if ((op >> 8) & 1) s->b = sext40(x << 16); else s->a = sext40(x << 16);
+            return 1;
+        }
+
+        /* LDM MMR, dst — binutils { "ldm", 1,2,2, 0x4800, 0xFE00, {OP_MMR,OP_DST} }.
+         * Un MMR est une valeur 16 bits NON SIGNEE (un pointeur, un compteur, un
+         * registre d etat) : le sign-etendre transforme AR=0x8000 en une valeur
+         * negative de 40 bits. SPRU172C : « LDM MMR, dst : dst = MMR », sans
+         * extension de signe (LDU porte explicitement « uns », LDM n a pas de
+         * variante signee). */
+        if ((op & 0xFE00) == 0x4800 && calypso_fix_enabled("FIX_LDM_ZEROEXT")) {
+            int mmr = op & 0x7F;
+            uint16_t v = data_read(s, mmr);
+            if ((op >> 8) & 1) s->b = (int64_t)(uint16_t)v; else s->a = (int64_t)(uint16_t)v;
+            return 1 + s->lk_used;
+        }
+        /* DST src, Lmem — binutils { "dst", 1,2,2, 0x4E00, 0xFE00, {OP_SRC1,OP_Lmem} }.
+         * Lmem est un operande LONG (2 mots) : le pointeur doit donc avancer de 2, pas
+         * de 1. Une post-modification de 1 decale tout le balayage d un tableau de mots
+         * longs — l erreur est silencieuse et cumulative. */
+        if ((op & 0xFE00) == 0x4E00) {
+            int src = (op >> 8) & 1;
+            int64_t v = src ? s->b : s->a;
+            uint8_t sm = op & 0xFF;
+            if (sm & 0x80) {                       /* indirect : *ARx avec post-modif */
+                int ar = sm & 0x7, mod = (sm >> 3) & 0xF;
+                uint16_t a = s->ar[ar];
+                data_write(s, a,     (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, a + 1, (uint16_t)(v & 0xFFFF));
+                if (mod == 0x2) s->ar[ar] = a + 2;        /* *ARx+ : +2, pas +1 */
+                else if (mod == 0x1) s->ar[ar] = a - 2;   /* *ARx- : -2, pas -1 */
+                return 1;
+            }
+            {   /* direct : DP:offset */
+                uint16_t a = (uint16_t)(((s->st0 & ST0_DP_MASK) << 7) | (sm & 0x7F));
+                data_write(s, a,     (uint16_t)((v >> 16) & 0xFFFF));
+                data_write(s, a + 1, (uint16_t)(v & 0xFFFF));
+                return 1;
+            }
+        }
+        /* STL/STH src, SHFT, Xmem — binutils { "stl"/"sth", 1,.., 0x9800/0x9A00, 0xFE00,
+         * {OP_SRC1,OP_SHFT,OP_Xmem} }. Le champ SHFT (bits 3-0) etait ignore : la valeur
+         * stockee n avait pas la bonne echelle. */
+        if (((op & 0xFE00) == 0x9800 || (op & 0xFE00) == 0x9A00)
+            && calypso_fix_enabled("FIX_STL_STH_SHFT")) {
+            uint16_t a = resolve_xmem(s, op);
+            int shft = op & 0xF;
+            int src = (op >> 8) & 1;
+            int64_t v = src ? s->b : s->a;
+            v <<= shft;
+            uint16_t w = ((op & 0xFE00) == 0x9A00) ? (uint16_t)((v >> 16) & 0xFFFF)
+                                                   : (uint16_t)(v & 0xFFFF);
+            data_write(s, a, w);
+            return 1;
+        }
+        /* SUB Smem, 16, src [, dst] — binutils { "sub", 1,.., 0x4000, 0xFC00,
+         * {OP_Smem,OP_16,OP_SRC,OPT|OP_DST} }. Deux champs distincts : bit 9 = SRC
+         * (l accumulateur source) et bit 8 = DST. Le bit 9 etait ignore, donc la
+         * soustraction partait toujours du meme accumulateur. */
+        if ((op & 0xFC00) == 0x4000) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            uint16_t v = data_read(s, a);
+            int srcb = (op >> 9) & 1, dstb = (op >> 8) & 1;
+            int64_t sv = srcb ? s->b : s->a;
+            int64_t r  = sv - (((int64_t)(int16_t)v) << 16);
+            if (dstb) s->b = sext40(r); else s->a = sext40(r);
+            return 1 + s->lk_used;
+        }
+        /* STL B, ASM, Smem — binutils { "stl", 1,..., 0x8400, 0xFE00 } couvre 0x85 (src = B)
+         * (etait decode MVPD sur 2 mots). Miroir exact du handler 0x84 deja valide. */
+        if ((op & 0xFF00) == 0x8500) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            int shift = asm_shift(s);
+            int64_t v = s->b;
+            if (shift >= 0) v <<= shift; else v >>= (-shift);
+            data_write(s, a, (uint16_t)(v & 0xFFFF));
+            return 1 + s->lk_used;
+        }
+        /* ST TRN, Smem — binutils { "st", 1,..., 0x8D00, 0xFF00 }
+         * (etait decode MVDD sur 2 mots) */
+        if ((op & 0xFF00) == 0x8D00) {
+            bool ind2; uint16_t a = resolve_smem(s, op, &ind2);
+            data_write(s, a, s->trn);
+            return 1 + s->lk_used;
+        }
+    }
+
     /* DISP-ENTRY (CALYPSO_DEBUG=DISP-ENTRY, c web 2026-05-29) : discriminateur
      * préemption-IT vs clobber. Logge UNIQUEMENT l'entrée dispatcher 0x8341,
      * avec DP/ST0/SP/AR2 + état IT (INTM/IFR/INT3-pending) + contexte de la
@@ -5285,6 +5566,14 @@ static int c54x_exec_one(C54xState *s)
                             s->prog[(uint16_t)(a+2)], s->prog[(uint16_t)(a+3)]);
             }
         }
+        /* @BEQUILLE — FORCE_DISPATCH  (CALYPSO_FORCE_DISPATCH, atoi>0, defaut OFF ;
+         *              calypso_wire.env:=1)
+         *   masque  : le scheduler frame 0x7234 est atteint avec DP garbage et d_dsp_page
+         *             a 0, donc la LUT 0x8341 ne resout pas et la tache GSM/FB n'est jamais
+         *             dispatchee. On force DP=0x124 + data[0x08E2]=data[0x0584]=0x0002.
+         *   retirer : des que le prologue 0x013b restaure un DP valide et que le producteur
+         *             de d_dsp_page ecrit B_GSM_TASK (bit1) par le chemin ARM.
+         */
         static int fd = -1;
         if (fd < 0) { const char *e = getenv("CALYPSO_FORCE_DISPATCH"); fd = (e && atoi(e) > 0) ? 1 : 0; }
         if (fd) {
@@ -5303,6 +5592,13 @@ static int c54x_exec_one(C54xState *s)
         }
     }
     if (s->pc == 0x8341) {
+        /* @BEQUILLE — FORCE_DP (+ FORCE_DP_FROM comme scope)  (CALYPSO_FORCE_DP, VALEUR,
+         *              defaut OFF)
+         *   masque  : le champ DP de ST0 a l'entree du dispatcher est un residu de pile
+         *             (over-pop / ST0 non restaure) et non la page de donnees attendue.
+         *   retirer : des que la sonde DISP-ENTRY montre le dispatcher OK sans forcage,
+         *             c.-a-d. quand l'equilibre de pile ST0 push/pop est sain.
+         */
         static int inited = 0, force_dp = -1, force_from = -1;
         if (!inited) {
             inited = 1;
@@ -6056,6 +6352,16 @@ static int c54x_exec_one(C54xState *s)
                               (unsigned long long)(s->a & 0xFFFFFFULL), s->insn_count); } }
                 static int _fbe = -1; static uint16_t _fbentry = 0x94f5;
                 if (_fbe < 0) {
+                    /* @BEQUILLE — FB_ENERGY + FB_CORR_ENTRY  (CALYPSO_FB_ENERGY,
+                     *                CALYPSO_FB_CORR_ENTRY, defaut OFF)
+                     *   masque  : l absence de DISPATCH NATIF vers le correlateur.
+                     *             On REROUTE l execution vers 0x9500 / 0x94f5 au lieu
+                     *             de laisser le firmware y arriver par son chemin.
+                     *   retirer : quand BRINT0 (vec 21) est servie et que le chemin
+                     *             natif atteint le correlateur seul.
+                     *   ⚠️ Toute mesure prise sous ce reroute est une mesure SOUS
+                     *   BEQUILLE : en natif pur, cet etage n est JAMAIS execute
+                     *   (mesure 2026-07-28 : CALYPSO_WATCH_9F00_RD = 0). */
                     const char *_e = getenv("CALYPSO_FB_ENERGY"); _fbe = (_e && atoi(_e) > 0) ? 1 : 0;
                     const char *_p = getenv("CALYPSO_FB_CORR_ENTRY");
                     if (_p && *_p) _fbentry = (uint16_t)strtol(_p, NULL, 0);
@@ -12049,6 +12355,14 @@ int c54x_run(C54xState *s, int n_insns)
          * lui (cf ancien commentaire) : à 0xb410 le CC saute le STM #0x5AC8,SP
          * → SP reste 0x1100 → over-pop. C'est CE bug qu'on trace, pas qu'on
          * contourne. */
+        /* @BEQUILLE — REDIR_LEGACY  (CALYPSO_REDIR_LEGACY, EXISTS, defaut OFF)
+         *   masque  : le reset vector reel 0xff80 -> 0xb410 est detourne pour simuler le
+         *             mask-ROM TI absent du dump (le commentaire ci-dessus l'assume).
+         *   retirer : des que le vrai reset handler 0xb410 pose SP=0x5AC8 lui-meme
+         *             (STM #0x5AC8,SP correctement decode) et que le boot deroule sans
+         *             over-pop — c'est le bug a tracer, pas a contourner.
+         *   NB      : maitre de INITTAB et REDIR7000 ; exclut MASKROM_INIT.
+         */
         static int redir_legacy = -1;
         if (redir_legacy < 0) redir_legacy = getenv("CALYPSO_REDIR_LEGACY") ? 1 : 0;
         if (redir_legacy && s->pc == 0xFF80 && s->sp == 0x1100) {
@@ -12058,6 +12372,12 @@ int c54x_run(C54xState *s, int n_insns)
              * boot stub → dispatch dormant. Test : poser SP=0x5AC8 (mask-ROM) +
              * rediriger vers 0x7000 (init COMPLÈTE : tables + A) pour que BACC A
              * atteigne la vraie entrée firmware. cf SESSION_2026-05-29 fix#2. */
+            /* @BEQUILLE — REDIR7000  (CALYPSO_REDIR7000, EXISTS, defaut OFF)
+             *   masque  : l'init des tables BACC-A (d[0x4c5b]/d[0x3fe1]) que le point d'entree
+             *             0x7120 suppose deja faite : on redirige le reset vers 0x7000.
+             *   retirer : identique a INITTAB (table peuplee par le chemin firmware).
+             *   NB      : imbriquee dans REDIR_LEGACY, et ecrasee par INITTAB (else if).
+             */
             static int redir7000 = -1;
             if (redir7000 < 0) redir7000 = getenv("CALYPSO_REDIR7000") ? 1 : 0;
             if (redirect_log < 3) {
@@ -12071,6 +12391,13 @@ int c54x_run(C54xState *s, int n_insns)
              * 0xc704 (table-init) → peuple data[0x4c24-0x4c5d] → RET vers 0x7120 →
              * boot normal continue AVEC table peuplée → BACC A atteint les vrais
              * handlers. Débloque FB → root+fix prouvés ; sinon → table pas le seul. */
+            /* @BEQUILLE — INITTAB  (CALYPSO_INITTAB, EXISTS, defaut OFF)
+             *   masque  : l'absence du mask-ROM TI qui peuple la table de handlers de tache
+             *             0x4c24-0x4c5d au reset ; sans elle 0x7120 fait BACC d[0x4c5b]=null.
+             *   retirer : des que la table est peuplee par un chemin firmware (0xc704 atteint
+             *             nativement apres le clear 0x8869) — sonde INSTALL-TRACE d[4c5c]!=0.
+             *   NB      : sans CALYPSO_REDIR_LEGACY, ce gate n'est jamais evalue.
+             */
             static int inittab = -1;
             if (inittab < 0) inittab = getenv("CALYPSO_INITTAB") ? 1 : 0;
             if (inittab) {
@@ -12090,6 +12417,13 @@ int c54x_run(C54xState *s, int n_insns)
          * a prouve que peupler la table debloque FB. OFF via CALYPSO_MASKROM_INIT_OFF=1.
          * Exclusif avec redir_legacy (qui gere deja 0xff80). */
         if (!redir_legacy && s->pc == 0xFF80 && s->sp == 0x1100) {
+            /* @BEQUILLE — MASKROM_INIT  (CALYPSO_MASKROM_INIT, EXISTS, defaut OFF)
+             *   masque  : identique a INITTAB — mask-ROM TI absent qui pose SP=0x5AC8 et
+             *             peuple la table de handlers au cold-reset.
+             *   retirer : meme condition qu'INITTAB (table peuplee par chemin firmware).
+             *   NB      : le commentaire ci-dessus renvoie a CALYPSO_MASKROM_INIT_OFF, variable
+             *             qui N'EXISTE PAS — le gate reel est opt-in CALYPSO_MASKROM_INIT.
+             */
             static int mrti = -1;
             if (mrti < 0) mrti = getenv("CALYPSO_MASKROM_INIT") ? 1 : 0;   /* [2026-07-23] OPT-IN (default OFF) : le forcing boot-op derail (etat froid) ; garde pour A/B */
             if (mrti) {
@@ -12115,6 +12449,18 @@ int c54x_run(C54xState *s, int n_insns)
          * boot-init 0xb3e4 (état prêt : SP=0x5AC8, cellules seedées), one-shot run 0xd247
          * (RET @0xd25f -> revient à 0xb3e4). OFF via CALYPSO_D247_OFF=1. */
         if (s->pc == 0xb3e4) {
+            /* @BEQUILLE — D247  (CALYPSO_D247, EXISTS, defaut OFF)
+             *   masque  : l'absence du bootstrap mask-ROM TI qui, sur silicium, appelle le
+             *             sous-systeme operationnel 0xd247 (install table handlers 0xc704 +
+             *             slots TDMA 0xc867 + vecteurs) ; en QEMU 0xd247 n'a d'appelant natif
+             *             qu'a PROM0 0x7102, bloc jamais atteint au boot froid. On PUSH le
+             *             retour et on detourne le PC.
+             *   retirer : des que le bloc appelant natif 0x70ce-0x7106 est atteint (sonde
+             *             D247-TRACE site 0x7102 non nulle), OU des que la table d[4c5c] est
+             *             peuplee par le chemin firmware.
+             *   NB      : le commentaire ci-dessus annonce CALYPSO_D247_OFF=1 — cette variable
+             *             n'existe pas, le gate reel est opt-in CALYPSO_D247.
+             */
             static int _d247 = -1;
             if (_d247 < 0) _d247 = getenv("CALYPSO_D247") ? 1 : 0;   /* [2026-07-23] OPT-IN OFF : bootstrap pousse dans 0xc6a5 (init coeffs) mais boucle sur source vide. Garde A/B */
             static int _d247_done = 0;
@@ -12126,6 +12472,13 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
         if (s->pc == 0x886a && s->data[0x4c5c] == 0) {
+            /* @BEQUILLE — REPOPULATE  (CALYPSO_REPOPULATE, EXISTS, defaut OFF)
+             *   masque  : le memset RPTB 0x8866-0x886a wipe la table de handlers apres son
+             *             peuplement, sans que le firmware rappelle 0xc704 ; la branche reelle
+             *             = l'ordre firmware clear -> populate. On detourne le PC vers 0xc704.
+             *   retirer : des que 0xc704 est atteint APRES le clear par le flot natif
+             *             (D247-TRACE : d[4c41]/d[4c46] non nuls en fin de boot).
+             */
             static int mrti2 = -1;
             if (mrti2 < 0) mrti2 = getenv("CALYPSO_REPOPULATE") ? 1 : 0;   /* [2026-07-23] OPT-IN OFF : peupler 0x4c5c ne debloque PAS l acquisition FB (teste : fb0_att reste 0). Garde pour A/B */
             if (mrti2) {
@@ -13434,6 +13787,14 @@ int c54x_run(C54xState *s, int n_insns)
              * data[0x3fcd]==0, le derive de data[0x3fce] -> RET saute au handler.
              * Prouve/refute que 0xdf82 est la bonne cible (table vecteurs decalee). */
             if (exec_pc == 0x0154) {
+                /* @BEQUILLE — TEST_3FCD  (CALYPSO_TEST_3FCD, EXISTS, defaut OFF)
+                 *   masque  : data[0x3fcd] (adresse depilee par le RET @0x0157) n'est jamais
+                 *             ecrite ; le firmware installe un handler au voisin data[0x3fce].
+                 *             On derive l'un de l'autre.
+                 *   retirer : des que la table de vecteurs overlay est installee au bon offset
+                 *             (data[0x3fcd] non nul sans forcage) — ou immediatement si FIX_3FCD
+                 *             (meme cellule, PC 0x013b) est retenu comme mecanisme unique.
+                 */
                 static int t3 = -1;
                 if (t3 < 0) t3 = getenv("CALYPSO_TEST_3FCD") ? 1 : 0;
                 if (t3 && s->data[0x3fcd] == 0 && s->data[0x3fce] != 0) {
@@ -13457,6 +13818,16 @@ int c54x_run(C54xState *s, int n_insns)
          * avant le read ROM (pas de patch firmware). Prouve/refute que l offset EST
          * le mur : si le DSP dispatche le corr apres -> confirme. */
         if (exec_pc == 0xa51c || exec_pc == 0xc8ea) {
+            /* @BEQUILLE — FIX_DPAGE_OFF  (CALYPSO_FIX_DPAGE_OFF, EXISTS-INV : la bequille est
+             *              ACTIVE PAR DEFAUT, seule la presence de la variable la coupe)
+             *   masque  : le desaccord d'adresse d_dsp_page — la ROM lit 0x08d4, l'ARM/shunt
+             *             postent la tache a 0x08E2 (+0x0E). La branche reelle = poster la
+             *             tache a l'adresse que la ROM lit reellement.
+             *   retirer : des que le producteur (calypso_dsp_shunt.c / calypso_arm2dsp.c)
+             *             ecrit d_dsp_page a 0x08d4, ou des que l'offset +0x0E est corrige a
+             *             la source.
+             *   NB      : le commentaire amont parle de CALYPSO_FIX_DPAGE — nom inexistant.
+             */
             static int fd = -1;
             if (fd < 0) fd = getenv("CALYPSO_FIX_DPAGE_OFF") ? 0 : 1;
             if (fd && s->data[0x08d4] != s->data[0x08E2]) {
@@ -13474,6 +13845,14 @@ int c54x_run(C54xState *s, int n_insns)
          * au masque IMR reset 0x52fd (comme le boot DSP reel devrait) une fois. Si ca
          * arme IMR=0x52fd -> frame IT prise -> corr tourne -> self-sustain -> PROUVE. */
         if (exec_pc == 0xa4e4) {
+            /* @BEQUILLE — INIT_435B (+ SEED_52FD)  (CALYPSO_INIT_435B_OFF=0 => ACTIVE ;
+             *              CALYPSO_SEED_52FD choisit la valeur ; les 4 profils .env posent 0)
+             *   masque  : l'initialisation du shadow IMR data[0x435b] par le boot DSP. Jamais
+             *             ecrit en QEMU -> la SM 0xa582 propage IMR=0 -> deadlock. On injecte
+             *             0x52ed (ou 0x52fd avec SEED_52FD) a exec_pc==0xa4e4.
+             *   retirer : quand une ecriture firmware sur 0x435b est observee avant 0xa4e4.
+             *   PIEGE   : le nom dit _OFF mais "=0" ACTIVE.
+             */
             static int i435 = -1;
             if (i435 < 0) { const char *_e435 = getenv("CALYPSO_INIT_435B_OFF"); i435 = (_e435 && atoi(_e435)) ? 0 : 1; }  /* [2026-07-23] fix gate: teste VALEUR (OFF=0 => actif) */
             if (i435 && s->data[0x435b] == 0) {
@@ -13626,6 +14005,15 @@ int c54x_run(C54xState *s, int n_insns)
              * (calypso_c54x.c:7702, le <<16 mettait AR7=0x4387 idle au lieu de 0x43c0 go-live).
              * Ce hack (mem[0x5ac8]=data[0x43c0]) ne faisait que masquer ce bug -> plus nécessaire.
              * Opt-in CALYPSO_MASKROM_GOLIVE=1 pour le réactiver (A/B). */
+            /* @BEQUILLE — MASKROM_GOLIVE  (CALYPSO_MASKROM_GOLIVE, EXISTS, defaut OFF)
+             *   masque  : le vecteur de lancement mem[0x5ac8] a la base de pile, pre-charge
+             *             par un mask-ROM absent du dump ; a 0, le RET du BACC idle saute a
+             *             PC=0 (storm).
+             *   retirer : DEJA INUTILE selon le commentaire ci-dessus — le fix ISA LD #k8u
+             *             tue le storm nativement. A supprimer au prochain passage, ce n'est
+             *             plus qu'une garde A/B.
+             *   NB      : le commentaire amont annonce CALYPSO_MASKROM_GOLIVE_OFF — inexistant.
+             */
             static int mrg = -1;
             if (mrg < 0) mrg = getenv("CALYPSO_MASKROM_GOLIVE") ? 1 : 0;
             if (mrg && s->data[0x5ac8] == 0 && s->data[0x43c0] != 0) {
@@ -13911,6 +14299,13 @@ int c54x_run(C54xState *s, int n_insns)
          * storm ET du no-enable reste a trouver (pourquoi 0xa4c7/0xa4d0 jamais
          * atteints ; qui doit peupler mem[0x5ac8]). NE PAS traiter le seed en fix. */
         {
+            /* @BEQUILLE — SEED_5AC8 (+ SEED5AC8_VAL)  (CALYPSO_SEED5AC8, atoi>0, defaut OFF ;
+             *              _VAL defaut 0x71f4, calypso_wire.env:=0xa4c7)
+             *   masque  : le peuplement de mem[0x5ac8] (mot depile par le RET terminal 0xab38,
+             *             qui choisit l'entree go-live). Personne ne l'ecrit dans notre modele.
+             *   retirer : quand on sait QUI ecrit mem[0x5ac8] sur silicium — le commentaire du
+             *             bloc dit deja "NE PAS traiter le seed en fix".
+             */
             static int seed_on = -1;
             /* GATE : seed OFF par defaut (band-aid), ON seulement si CALYPSO_SEED5AC8=1. */
             if (seed_on < 0) { const char *e = getenv("CALYPSO_SEED5AC8"); seed_on = (e && atoi(e) > 0) ? 1 : 0; }
@@ -14069,6 +14464,14 @@ int c54x_run(C54xState *s, int n_insns)
          * sur toute la region go-live+background [0xa4ca..0xdea0]. Valeur de
          * repli / override : CALYPSO_KEEP_IMR_VAL (defaut 0x52fd). */
         {
+            /* @BEQUILLE — KEEP_IMR (+ KEEP_IMR_VAL)  (CALYPSO_KEEP_IMR, EXISTS, defaut 1 en
+             *              hack/native/native_helped/wire ; valeur de repli 0x52fd)
+             *   masque  : le clobber de l'IMR par 0xb37e (STM #0,IMR) et 0xa509 (strip bit12).
+             *             On re-ecrit s->imr = data[0x435b] des que bit5/BRINT0 tombe, sur
+             *             toute la region [0xa4ca..0xdea0].
+             *   retirer : quand le firmware ne perd plus bit5 — c'est-a-dire quand la sequence
+             *             go-live 0xa4c7/0xa51b/0xa582 se deroule dans le bon ordre.
+             */
             static int ki = -1; static uint16_t kiv = 0;
             if (ki < 0) { ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
                 const char *e = getenv("CALYPSO_KEEP_IMR_VAL");
@@ -14090,6 +14493,13 @@ int c54x_run(C54xState *s, int n_insns)
             /* FORCE-GOLIVE (etape1, gated CALYPSO_FORCE_GOLIVE) : release the
              * go-live wait-loop by setting data[0x3f70] bit1 at the 0xa4d4 test
              * (normally gated on control cells 0x098a/0x098c which the ARM leaves 0). */
+            /* @BEQUILLE — FORCE_GOLIVE  (CALYPSO_FORCE_GOLIVE, atoi>0, defaut OFF ; hack.env vide)
+             *   masque  : la wait-loop go-live teste data[0x3f70] bit1, pose seulement par le
+             *             setter 0xde9c, lui-meme conditionne aux cellules 0x098a/0x098c que
+             *             l'ARM laisse a 0.
+             *   retirer : des que le handshake ARM (ARM2DSP_BGEN) fait franchir 0xddf5 et que
+             *             le setter natif 0xde9c s'execute.
+             */
             { static int fg = -1; if (fg < 0) { const char *e = getenv("CALYPSO_FORCE_GOLIVE"); fg = (e && atoi(e) > 0) ? 1 : 0; }
               if (fg && !(fl & 0x0002)) { s->data[0x3f70] = (uint16_t)(fl | 0x0002); fl = s->data[0x3f70];
                 static unsigned fgc = 0; if (fgc++ < 8) fprintf(stderr, "[c54x] FORCE-GOLIVE 0x3f70 |= bit1 -> 0x%04x insn=%u\n", fl, s->insn_count); } }
@@ -14108,6 +14518,15 @@ int c54x_run(C54xState *s, int n_insns)
          * jamais 0x8341. On redirige le prologue vers 0x8341 quand l'IT vient du
          * frame scheduler (g_prev_pc==0x7234). Gate CALYPSO_ISR_TO_8341 (def off). */
         if (exec_pc == 0x013b) {
+            /* @BEQUILLE — ISR_TO_8341  (CALYPSO_ISR_TO_8341, EXISTS, defaut OFF)
+             *   masque  : le prologue ISR overlay 0x013b deraille et n'atteint jamais la LUT
+             *             FB 0x8341 (setup complet BRC/BK/data-ptr du correlateur). On force
+             *             s->pc = 0x8341.
+             *   retirer : des que le prologue 0x013b se termine sur 0x8341 par son propre flot
+             *             (meme condition que FIX_3FCD reussi).
+             *   NB      : calypso_wire.env fait un unset EXPLICITE — un ":=vide" sous set -a
+             *             rallumerait ce gate EXISTS. Ne jamais le convertir en ":=".
+             */
             static int r8 = -1;
             if (r8 < 0) r8 = getenv("CALYPSO_ISR_TO_8341") ? 1 : 0;
             if (r8 && g_prev_pc == 0x7234) {
@@ -14129,6 +14548,16 @@ int c54x_run(C54xState *s, int n_insns)
          * 0x8e8b/0x8e8c sans conclure. On INJECTE ces constantes a l'entree
          * 0x8d00. Gate CALYPSO_CORR_SETUP ; override _AR1/_AR4/_AR5. */
         if (exec_pc == 0x8d00) {
+            /* @BEQUILLE — CORR_SETUP (+ CORR_AR1/_AR4/_AR5)  (CALYPSO_CORR_SETUP, EXISTS,
+             *              defaut OFF)
+             *   masque  : le setup de pointeurs que la LUT native 0x8341 pose avant d'entrer
+             *             en 0x8d00 (STM #0x2f22,AR1 / #0x2be4,AR4 / #0x0060,AR5). On INJECTE
+             *             ces constantes a l'entree du correlateur.
+             *   retirer : quand le chemin natif passe par 0x8341 avant 0x8d00 (au lieu d'y
+             *             entrer par BSP_DISPATCH_FB).
+             *   NB      : idiome EXISTS — un ":=" vide l'ALLUMERAIT, d'ou le unset explicite
+             *             de calypso_wire.env. Mesure : inefficace (AR reecrits avant 0x8e8b).
+             */
             static int cs = -1; static uint16_t a1 = 0, a4 = 0, a5 = 0;
             if (cs < 0) {
                 cs = getenv("CALYPSO_CORR_SETUP") ? 1 : 0;
@@ -14160,6 +14589,14 @@ int c54x_run(C54xState *s, int n_insns)
          * the frame IT then vector to vec28, does d_fb_det become nonzero, and
          * do data[0x3f70]/data[0x435b] populate too (single-root-cause test). */
         if (exec_pc == 0xa4ca) {
+            /* @BEQUILLE — POKE_A4C7_ONCE  (CALYPSO_POKE_A4C7_ONCE, atoi>0, defaut OFF)
+             *   masque  : 0xa4c7 (ORM #0x3000,IMR = armement IMR par la ROM) n'est jamais
+             *             atteint : le flot entre a 0xa4ca en sautant l'instruction d'armement.
+             *             On detourne le PC une fois.
+             *   retirer : des que le chemin amont (0xa4cd BC AEQ, ou le setter de d[434e]/
+             *             d[434f]) laisse tomber dans 0xa4c7.
+             *   NB      : calypso_hack.env le qualifie lui-meme de "falsification, pas un fix".
+             */
             static int poke_en = -1;
             if (poke_en < 0) { const char *e = getenv("CALYPSO_POKE_A4C7_ONCE"); poke_en = (e && atoi(e) > 0) ? 1 : 0; }
             static int poke_done = 0;
@@ -14205,6 +14642,12 @@ int c54x_run(C54xState *s, int n_insns)
          * IRQ-LEVEL le sert). Test falsifiable de la chaine IMR->IT->0x0fff->golive.
          * Defaut OFF. Typique : 0x52fd (bit3 INT3 + bit5 BRINT0 + ...). */
         {
+            /* @BEQUILLE — C54X_FORCE_IMR  (CALYPSO_C54X_FORCE_IMR=<hex>, defaut OFF)
+             *   masque  : le re-armement de l'IMR apres le STM #0,IMR du mask-ROM @0xb37e, et
+             *             le RSBX INTM que le ROM ne joue qu'apres go-live. On OR les bits dans
+             *             l'IMR a chaque pas hors ISR et on clear INTM dans [0xb380..0xb440].
+             *   retirer : quand la SM go-live atteint 0xa582 et pose l'IMR elle-meme.
+             */
             static int fimr = -1; static uint16_t fimrv = 0;
             if (fimr < 0) { const char *e = getenv("CALYPSO_C54X_FORCE_IMR");
                 fimrv = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0; fimr = fimrv ? 1 : 0; }
@@ -14234,6 +14677,12 @@ int c54x_run(C54xState *s, int n_insns)
          * 0xb3e4), pose data[0x098a]/[0x098c] = valeur non nulle cote DSP. Teste si le
          * DSP prend alors la branche GO (0xddf5) puis setter bit1 puis go-live. */
         {
+            /* @BEQUILLE — FORCE_098  (CALYPSO_FORCE_098=<hexval>, defaut vide/OFF ; hack.env)
+             *   masque  : l'ARM ne pose jamais les cellules de handshake d_background
+             *             0x098a/0x098c que la phase-SM 0xddeb/0xde86 relit.
+             *   retirer : des que CALYPSO_ARM2DSP_BGEN pose ces cellules par le pont ARM
+             *             (causalite correcte) — calypso_hack.env declare deja le remplacement.
+             */
             static int f98 = -1; static uint16_t f98v = 0;
             if (f98 < 0) { const char *e = getenv("CALYPSO_FORCE_098");
                 f98v = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0; f98 = f98v ? 1 : 0; }
@@ -14257,6 +14706,14 @@ int c54x_run(C54xState *s, int n_insns)
          * d'overwrite des autres bits scheduler). Gate CALYPSO_GOLIVE_TASKW, defaut OFF.
          * 0x0810 est deja gere par le wire CTRLSYS (arm2dsp) -> plus de FORCE_0810. */
         if (exec_pc >= 0xa4ca && exec_pc <= 0xa575) {
+            /* @BEQUILLE — GOLIVE_TASKW  (CALYPSO_GOLIVE_TASKW, EQ1, defaut OFF)
+             *   masque  : le setter natif ORM #0x0800 @0xa539 est skippe (d[5a00]==0x88), donc
+             *             le bit tache-FB de d[0x3f92] reste 0 et le scheduler ne dispatche
+             *             jamais le correlateur. On rejoue l'instruction.
+             *   retirer : des que 0xa539 est reellement execute (le predicat d[5a00] tient la
+             *             bonne valeur), ce qui rend le rejeu redondant.
+             *   NB      : inerte sans ARM2DSP_CTRLSYS (exige data[0x0810] bit15).
+             */
             static int gt = -1;
             if (gt < 0) { const char *e = getenv("CALYPSO_GOLIVE_TASKW");
                           gt = (e && *e == '1') ? 1 : 0; }
@@ -14476,6 +14933,12 @@ int c54x_run(C54xState *s, int n_insns)
          * son propre contexte). PAS une vectorisation (pas de saut ISR sur contexte
          * non posé) = équivalent « et si le soft-vector pointait 0xa4c7 ». TEST, pas fix. */
         {
+            /* @BEQUILLE — GOLIVE_REDIRECT  (CALYPSO_DSP_GOLIVE_BOOT, EXISTS, defaut OFF)
+             *   masque  : ecrit s->pc = 0xb3ec quand le DSP atteint 0xb3ff, c'est-a-dire le
+             *             choix de soft-vector go-live que le boot ROM ne fait pas dans notre
+             *             modele. Second effet : inhibe VEC28-FORCE (bloc c54x_interrupt_ex).
+             *   retirer : quand data[0x3f6d] est peuple par le chemin ROM et pointe 0xa4c7.
+             */
             static int g_golive = -1;
             if (g_golive < 0) g_golive = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
             if (g_golive) {
@@ -16021,6 +16484,13 @@ int c54x_run(C54xState *s, int n_insns)
             {
                 /* [2026-07-23] fire crude per-2000-insn REMPLACE par sync frame-tick
                  * (dsp_shunt.c:430). Ce bloc desactive (garde pour A/B legacy). */
+                /* @BEQUILLE — TINT0_PERINSN  (CALYPSO_TINT0_PERINSN, EXISTS, defaut OFF)
+                 *   masque  : l'absence de base de temps DSP. Fire TINT0 (vec20/bit4) toutes les
+                 *             2000 insns, sans aucun rapport avec la cadence TDMA.
+                 *   retirer : remplace par le tick TIMER0 fidele juste en dessous.
+                 *   ATTENTION : le commentaire "Ce bloc desactive" est FAUX — le code est execute,
+                 *               seule l'absence de la variable l'eteint.
+                 */
                 if (getenv("CALYPSO_TINT0_PERINSN")) {
                     static unsigned _t0c = 0;
                     if (++_t0c >= 2000) { _t0c = 0; c54x_interrupt_ex(s, 20, 4); }
@@ -16028,6 +16498,16 @@ int c54x_run(C54xState *s, int n_insns)
             }
             static int _tmr = -1;
             if (_tmr < 0) _tmr = getenv("CALYPSO_DSP_TIMER_OFF") ? 0 : 1;
+            /* @BEQUILLE — TINT0_MASTER  (CALYPSO_TINT0_MASTER, EXISTS, defaut OFF hors profil
+             *              WIRE — calypso.env/wire.env ne le posent que sous CALYPSO_WIRE=1)
+             *   masque  : la configuration du TIMER0 par le ROM (TCR/PRD). Le firmware arrete
+             *             le timer (TSS=1) dans une init non-tournee ; on force PRD=0xFFFF et
+             *             on tick MALGRE TSS, plus un fire TINT0 vec20/bit4 au frame-tick du
+             *             shunt (calypso_dsp_shunt.c).
+             *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme,
+             *             TSS=0).
+             *   NB      : le 3e site historique est mort — neutralise par (void)_t0i;.
+             */
             static int _t0master = -1;
             if (_t0master < 0) _t0master = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
             /* [2026-07-23] TIMER0 FIDELE : le firmware arrete le timer (TCR TSS=1) dans
@@ -16650,6 +17130,15 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
      * une ligne cablee vectorise ; aucun poke d'IMR/table/d_fb_det. */
     bool frame_force = false;
     {
+        /* @BEQUILLE — VEC28_REMAP / FRAME_IT_NATIVE  (CALYPSO_DSP_FRAME_VEC28 ou
+         *              CALYPSO_FRAME_IT_NATIVE ; le second est :=1 en native/native_helped/wire)
+         *   masque  : le mapping ligne-frame-TPU -> vecteur DSP. Le modele livre l'IT frame
+         *             sur vec19/bit3 (= stub RETE) ; on la reroute vers vec28/bit12, et le
+         *             mode non-natif va jusqu'a FORCER la vectorisation (frame_force).
+         *   retirer : quand calypso_tpu.c cable la ligne frame sur le bon vecteur a la
+         *             source et que la fenetre INTM du firmware suffit a la prendre.
+         *   NB      : CALYPSO_DSP_GOLIVE_BOOT lu plus bas (g_noforce) inhibe VEC28-FORCE.
+         */
         static int g_v28 = -1, g_native = -1;
         if (g_v28 < 0) g_v28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
         if (g_native < 0) g_native = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
@@ -16717,6 +17206,24 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
 
     bool unmasked = (s->imr & (1 << imr_bit)) != 0;
     if (frame_force) unmasked = true;   /* VEC28-EXP : ligne frame cablee -> vectorise */
+    /* @BEQUILLE — FIX_BRINT0_UNMASK  (CALYPSO_FIXES=FIX_BRINT0_UNMASK, defaut OFF)
+     *   masque  : l absence d armement natif de l IMR bit 5 (BRINT0 / vec 21).
+     *   retirer : des que la vraie branche d armement est implementee, OU
+     *             immediatement si le test montre que la racine est en amont
+     *             (vecteur 21 installe a zero).
+     *   ⚠️ DIAGNOSTIC, a retirer, JAMAIS a confirmer. Ne compte pas comme un correctif.
+     * Repond a UNE question : BRINT0 est-elle le DERNIER verrou ou seulement le
+     * PROCHAIN ? Si le demasquage artificiel fait entrer le DSP dans le demod
+     * (CALYPSO_WATCH_9F00_RD passe de 0 a non-nul), c est le dernier ; sinon la
+     * racine est en amont — candidat : le vecteur 21 installe a zero. */
+    if (imr_bit == 5 && !unmasked && calypso_fix_enabled("FIX_BRINT0_UNMASK")) {
+        static unsigned _bu = 0;
+        if (_bu++ < 5)
+            fprintf(stderr, "[c54x] FIX_BRINT0_UNMASK : bit 5 demasque ARTIFICIELLEMENT "
+                    "(IMR=0x%04x, IFR=0x%04x, PC=0x%04x) — diagnostic, pas un correctif\n",
+                    s->imr, s->ifr, s->pc);
+        unmasked = true;
+    }
 
     /* [2026-07-23] SYNC-DISPATCH-PROBE (unconditional, capped) : c54x_interrupt_ex
      * fait un dispatch SYNCHRONE ici (au moment de la levee) si INTM=0 -- sans

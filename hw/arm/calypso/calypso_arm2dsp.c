@@ -104,6 +104,15 @@ static uint16_t a2d_env_u16(const char *name, uint16_t def)
     return (uint16_t)strtoul(e, NULL, 0);
 }
 
+/* @BEQUILLE — ARM2DSP (+ _TASKWORD / _TASKBIT)  (CALYPSO_ARM2DSP, atoi>0, defaut 0)
+ *   masque  : la propagation ARM->DSP du bit dispatcher data[0x0fff] bit1 que
+ *             l'ecriture ARM de d_dsp_page (B_GSM_TASK) devrait produire via l'API
+ *             RAM partagee.
+ *   retirer : quand l'ecriture ARM de d_dsp_page est reellement routee vers ce
+ *             module (ou quand le dispatcher ROM lit la cellule que l'ARM ecrit).
+ *   NB      : calypso_arm2dsp_on_arm_write() n'a AUCUN appelant -> sans
+ *             CALYPSO_ARM2DSP_CONT, ARM2DSP=1 ne poste rien.
+ */
 static void a2d_resolve(void)
 {
     if (a2d_on >= 0) {
@@ -115,6 +124,16 @@ static void a2d_resolve(void)
     a2d_bit  = a2d_env_u16("CALYPSO_ARM2DSP_TASKBIT", 0x0002);
 
     /* Fix A: faithful background-enable handshake (independent of a2d_on). */
+    /* @BEQUILLE — ARM2DSP_BGEN (+ _A / _C / _VAL / _POLLPC / _ONESHOT)
+     *              (CALYPSO_ARM2DSP_BGEN, atoi>0 ; :=1 en calypso.env, native,
+     *              native_helped, wire ; INDEPENDANT de CALYPSO_ARM2DSP)
+     *   masque  : le handshake go-live ou l'ARM pose d_background_enable (0x098a) et
+     *             d_background_state (0x098c). Sans lui la phase-SM 0xdddb->0xddeb
+     *             prend la branche reset, 0xde9c n'est jamais atteint, d[0x3f70] bit1
+     *             reste 0 et la wait-loop 0xa4ca/0xa4d0 spinne indefiniment.
+     *   retirer : quand le firmware ARM emule ecrit lui-meme 0x098a/0x098c dans
+     *             l'API RAM (portage du handshake cote ARM).
+     */
     const char *eb = getenv("CALYPSO_ARM2DSP_BGEN");
     a2d_bgen        = (eb && atoi(eb) > 0) ? 1 : 0;
     a2d_bgen_a      = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_A",      0x098a);
@@ -128,6 +147,17 @@ static void a2d_resolve(void)
      * bit15 so the DSP go-live gate 0xa53c (BITF data[0x0810],#0x8000) falls
      * through to the bootstrap/FB-dispatch path instead of short-circuiting to
      * 0xa575. Cross-validated: minimal correct value is exactly 0x8000. */
+    /* @BEQUILLE — ARM2DSP_CTRLSYS (+ _CELL / _VAL / _POLLPC)
+     *              (CALYPSO_ARM2DSP_CTRLSYS, atoi>0 ; :=1 sous WIRE, :=0 en NATIVE et
+     *              NATIVE_HELPED)
+     *   masque  : l'ecriture ARM de d_ctrl_system (data[0x0810] bit15) faite par
+     *             l1s_reset() sur le vrai Calypso, que le pont API emule ne propage
+     *             pas. Sans elle le gate 0xa53c (BITF #0x8000) court-circuite en 0xa575.
+     *   retirer : quand le firmware ARM emule ecrit 0x0810 via le chemin API normal.
+     *   ATTENTION : ecriture DIRECTE dans s->data[] -> invisible de data_write, donc
+     *             de CALYPSO_WATCH_0810. Forcee, elle declenche B_TASK_ABORT et casse
+     *             le retour FB (d'ou le =0 des profils natifs).
+     */
     const char *ec  = getenv("CALYPSO_ARM2DSP_CTRLSYS");
     a2d_ctrlsys        = (ec && atoi(ec) > 0) ? 1 : 0;
     a2d_ctrlsys_cell   = a2d_env_u16("CALYPSO_ARM2DSP_CTRLSYS_CELL",   0x0810);
@@ -248,6 +278,16 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
     if (!a2d_on) {
         return;
     }
+    /* @BEQUILLE — ARM2DSP_CONT  (CALYPSO_ARM2DSP_CONT, idiome EXISTS -> "=0" l'ACTIVE,
+     *              seul unset la coupe)
+     *   masque  : l'absence de re-post par trame. Le dispatcher ROM efface le bit tache
+     *             entre deux passages ; faute d'un chemin ARM vivant, CONT relit
+     *             d_dsp_page en API RAM a chaque pas DSP et repose le bit. C'est le
+     *             SEUL chemin par lequel ARM2DSP=1 produit un effet.
+     *   retirer : des que on_arm_write() est appele (a2d_pending redevient le
+     *             declencheur) ; verifier au passage l'offset 0x08E2, conteste
+     *             (d_dsp_page pourrait etre 0x08D4).
+     */
     if (a2d_cont < 0) a2d_cont = getenv("CALYPSO_ARM2DSP_CONT") ? 1 : 0;
     /* CONT mode : re-post every step while the ARM's B_GSM_TASK is asserted in
      * DSP memory (d_dsp_page word 0x08E2 bit1), so the task-ready bit is set when

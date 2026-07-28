@@ -142,3 +142,82 @@ Voir **[`../../../../QUICK_START.md`](../../../../QUICK_START.md)** — choix du
 démarrage, et où lire les logs. Pour un premier run qui marche, prendre le mode fiable
 (`CALYPSO_SHUNT_LEGIT=1`) ; pour travailler le corrélateur natif, prendre le run de référence
 documenté dans [`ETAT_ACTUEL.md`](ETAT_ACTUEL.md) et [`../../../../RAPPORT_DFBDET.md`](../../../../RAPPORT_DFBDET.md).
+
+
+## Rapports ajoutes le 2026-07-28
+
+| Document | Autorite sur |
+|---|---|
+| `../../../../RAPPORT_OPCODES.md` | Audit du decodeur c54x : ~40 findings, ~15 de gravite 1 (longueur d'instruction fausse). Rendu brut de 10 agents, **rien d'applique**. Lire ses trois reserves en tete. |
+| `../../../../PLAN_APPLICATION.md` | Ordre d'application des correctifs et tests de non-regression (produit par le workflow `calypso-reste-a-faire`). |
+| `opcodes/tic54x-opc.c` | **Table binutils — autorite sur l'encodage et la LONGUEUR** des instructions. Format : `{ "mnemo", MOTS, cycles, classe, OPCODE, MASQUE, ... }`. Le champ MOTS fait foi : une longueur fausse desynchronise tout le decodage en aval. |
+
+Ordre d'autorite sur les opcodes : `opcodes/tic54x-opc.c` > `spru172c.pdf` (semantique) > le code
+> les tableaux de synthese. **Ne jamais conclure depuis un commentaire de code** : plusieurs se
+sont averes perimes le 2026-07-28.
+
+
+## Recenser les béquilles : le marqueur `@BEQUILLE`
+
+Le projet a accumulé des dizaines de contournements (`FB_CORR_ENTRY`, `FB_ENERGY`, `FB_STREAM`,
+`DARAM_FORCE`, `NATIVE_HELPED`, forçage de `DP`, `SEED5AC8_VAL`…) sans étiquette commune — au
+point qu'on ne savait plus lequel masquait quoi. Le 2026-07-28, des heures ont été passées à
+analyser un étage de démodulation qui, en mode natif, **n'est jamais exécuté** : il ne l'était
+que par un reroute qu'on croyait retiré.
+
+**Règle : toute béquille porte le marqueur `@BEQUILLE`.** Un seul grep les liste toutes :
+
+Trois greps, selon ce qu'on cherche. Ils s'appliquent depuis `/opt/GSM/qemu-src` et **excluent
+`doc/`** : sinon on attrape aussi la présente page, qui décrit la convention sans être une
+béquille, et le décompte est faux.
+
+```bash
+# A) la liste complète, avec fichier:ligne — le grep de référence
+grep -rn "@BEQUILLE" hw/arm/calypso/*.c hw/arm/calypso/*.h calypso*.env
+
+# B) juste les noms, dédupliqués — pour un coup d'œil
+grep -rhoE "@BEQUILLE — [A-Za-z_0-9]+" hw/arm/calypso/*.c hw/arm/calypso/*.h calypso*.env | sort -u
+
+# C) combien de fichiers en contiennent
+grep -rl "@BEQUILLE" hw/arm/calypso/*.c hw/arm/calypso/*.h calypso*.env | wc -l
+```
+
+État au 2026-07-28 — (B) renvoie :
+
+```
+@BEQUILLE — FB_ENERGY          reroute du corrélateur (avec FB_CORR_ENTRY)
+@BEQUILLE — FB_STREAM          injection d'échantillons à la place du DMA on-chip
+@BEQUILLE — FIX_BRINT0_UNMASK  démasquage artificiel de l'IMR bit 5 (diagnostic)
+@BEQUILLE — NATIVE_HELPED      profil qui repose FB_CORR_ENTRY / FB_ENERGY / FB_IQ_*
+@BEQUILLE — SHUNT_REAL_FB      détection FB côté hôte, court-circuite le corrélateur DSP
+```
+
+Une même béquille peut apparaître à **plusieurs** sites (émetteur et récepteur d'une injection,
+par exemple) : (A) les montre tous, (B) les regroupe.
+
+Format imposé, juste au-dessus du bloc :
+
+```c
+/* @BEQUILLE — NOM_DU_GATE  (VARIABLE_ENV, defaut OFF)
+ *   masque  : ce que ce contournement remplace (la branche réelle non implémentée)
+ *   retirer : la condition qui le rend inutile
+ */
+```
+
+Trois exigences, non négociables :
+1. **gatée par variable d'environnement, défaut OFF** — le comportement sans variable reste celui
+   d'origine ;
+2. **annoncée comme béquille avant le run**, pas après le résultat — sinon on lance une mesure en
+   croyant tester un correctif ;
+3. **toute mesure obtenue sous béquille est étiquetée comme telle** quand on la cite.
+
+Distinguer trois choses qui se ressemblent et ne se traitent pas pareil :
+
+| | vit | finit |
+|---|---|---|
+| **béquille** | tant que la branche réelle manque | remplacée par la branche réelle |
+| **sas** (`CALYPSO_FIXES`) | le temps d'un test sous charge | dégatée (confirmée) ou supprimée (infirmée) |
+| **diagnostic** | le temps d'une question | retiré — ne se confirme **jamais** |
+
+Le sas se vide, la béquille reste : ne jamais laisser vieillir un correctif validé derrière son
+gate, c'est ainsi qu'un sas devient une béquille.

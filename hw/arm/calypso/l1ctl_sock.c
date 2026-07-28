@@ -209,6 +209,15 @@ static void sercomm_frame_complete(L1CTLSock *s)
          *                          Port exact du GDB mutate_agch.
          * Layout payload : l1ctl_hdr(4) + l1ctl_info_dl(12) + corps ;
          * → FBSB result @18 ; DATA_IND chan_nr @4, L3 @16. */
+        /* @BEQUILLE — FORCE_FBSB / FORCE_AGCH  (CALYPSO_FORCE_FBSB, CALYPSO_FORCE_AGCH,
+         *              EQ1, defaut 0 ; VERROUILLES a 0 par run.sh en mode full-grgsm)
+         *   masque  : le resultat du demod DSP vu par le mobile. FBSB : force le resultat
+         *             de FBSB_CONF a SUCCESS. AGCH : rote le type SI du BCCH et ECRASE le
+         *             L3 du PCH par un IMM ASSIGNMENT en dur.
+         *   retirer : quand le demod DSP publie un a_cd valide (SI reels decodes).
+         *   NB      : assignation dure ("=0" puis export) en full-grgsm -> les poser en
+         *             ligne de commande n'a AUCUN effet dans le mode par defaut.
+         */
         static int g_fbsb = -1, g_agch = -1;
         if (g_fbsb < 0) {
             const char *a = getenv("CALYPSO_FORCE_FBSB");

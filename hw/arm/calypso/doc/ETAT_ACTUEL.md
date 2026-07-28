@@ -617,3 +617,78 @@ Dans les deux cas **le code de `calypso_c54x.c` était correct** et c'est la doc
 Corollaire de méthode : **ne jamais conclure depuis un commentaire de code** — plusieurs se
 sont avérés périmés, dont un `[TODO]` sur `STL/STH … ASM` alors que `asm_shift()` est bien
 appliqué.
+
+
+---
+
+## VERROU DU MODE NATIF — mesure du 2026-07-28 (fin de journee)
+
+**En mode natif, sans aucune bequille, le correlateur n'est JAMAIS atteint.** Ce n'est pas un
+probleme de traitement du signal : c'est le dispatch d'interruption qui ne se fait pas.
+
+Run de 102 s, manifeste verifie (`NATIVE_HELPED=0`, `SHUNT_REAL_FB=0`, ni `FB_CORR_ENTRY`
+ni `FB_ENERGY`) :
+
+| Mesure | Valeur | Instrument |
+|---|---|---|
+| le DSP tourne | **100 000 000** instructions | `SP-LEDGER` |
+| le BSP alimente | **266** depots | `DMA fn=` / `a-daram-ok` |
+| l'IT est **pendante** | `IFR = 0x0028` (bit 5) | `SYNC-DISPATCH-PROBE` |
+| l'IT est **masquee** | `vec=21(BRINT0) imr_bit=5 unmasked=0` → `STAYS-PENDING(masked)` | idem |
+| `IMR` | oscille `0x3000` ↔ `0x3200`, ecrit par `PC=0xde84` (op `0x6981`) et `PC=0xddf9` (op `0x6881`). **Le bit 5 (`0x0020`) n'est jamais arme** | `BOOT-MMR-WR` |
+| shadow `d[0x435b]` | `0x0000` en permanence | `HANDLER-PATH`, `CYCLE-TRACE` |
+| le DSP | boucle dans `0xddf5..0xde86` (dispatcher background) | `SP-LEDGER` |
+| l'etage demod | **JAMAIS atteint** — compteur **ZERO** | `CALYPSO_WATCH_9F00_RD` (sonde verifiee presente dans `/proc/<pid>/environ`) |
+
+### Consequence, a lire avant toute autre section
+Tout ce qui a ete observe sur l'etage demod le 2026-07-28 — polyphase stride 5 sur `data[0x4c00]`,
+saturation d'accumulateur, sortie DC, `AR2` charge avec une valeur d'echantillon, recopie de code
+machine (`0xf495` = NOP, `0xf4eb` = RETE) dans le tampon de sortie — **n'existe que sous bequille**,
+c'est-a-dire avec le reroute `CALYPSO_FB_CORR_ENTRY=0x9500` ou `0x94f5`. Ces observations ne
+decrivent PAS l'etat du mode natif et ne doivent pas etre citees comme telles.
+
+### Piste a trancher EN PREMIER : le vecteur 21 est-il installe ?
+```
+[c54x] VEC-INSTALL vec21@0x00d6 w2 <- 0x0000 <BRINT0 PC=0xb4d6
+[c54x] VEC-INSTALL vec21@0x00d7 w3 <- 0x0000 <BRINT0 PC=0xb4d6
+```
+Un vecteur rempli de zeros est-il un handler valide ? **Si le vecteur pointe sur du vide,
+demasquer l'IMR ne servirait a rien** et la racine serait l'INSTALLATION du vecteur, pas le
+masquage. A verifier avant d'ecrire le moindre correctif d'armement.
+
+### Croisement avec l'audit d'opcodes
+Les deux instructions qui ecrivent l'`IMR` en boucle — `0x6881` et `0x6981` — appartiennent a la
+famille `0x68..0x6F`, qui a sa propre note dans le depot (`doc/opcodes/0x68_0x6F.md`), signe
+qu'elle est delicate. **Si elles sont mal decodees, l'`IMR` est mal calcule et le bit 5 ne peut pas
+s'armer** : l'audit d'opcodes expliquerait alors directement ce verrou, et les deux enquetes n'en
+feraient qu'une.
+
+## AUDIT DU DECODEUR c54x — `RAPPORT_OPCODES.md` (2369 lignes)
+
+Le decodeur confond **1 mot** et **2 mots** sur au moins seize familles (`0x62-0x67`, `0x78-0x7D`,
+`0x85`, `0x8D`, `0x94/0x95`, `0x96`, `0xA2/0xA3`, `0xA8/0xA9`, `0xAC-0xAF`, `0xC0-0xC7`, `0xDA`,
+`0xE0-0xE4`). Une longueur fausse ne donne pas un resultat faux : elle **desynchronise tout le
+decodage en aval**. ~40 findings confirmes, dont ~15 de gravite 1. **Rien n'est encore applique.**
+
+Reserves : deux plages (`0x60-0x8F`, `0xC0-0xFF`) n'ont pas eu de passe de refutation ; l'audit a
+demarre avant la correction de deux tables du projet (`0xF4..0xF7` = 1 mot et non 2 ; `0xEA00` =
+`LD #k9,DP` et non `BANZ`), donc tout finding fonde sur l'ancienne table est suspect.
+
+### Correctifs d'opcodes APPLIQUES et VALIDES au 2026-07-28
+
+| opcode | ce qu'on faisait | SPRU172C |
+|---|---|---|
+| `0x1800/1A00/1C00/1E00` | AND/OR/XOR/SUBC executes comme un **LD** | operations logiques ; `Smem` zero-etendu sur 40 bits |
+| `0x47` RPT Smem | ecrivait **BRC** | *Repeat single, **RC** = Smem* — les boucles `RPT` ne s'executaient qu'**une seule fois** et BRC etait corrompu |
+| `0x06/07` ADDC | carry ignore | `src = src + Smem + C` |
+| `0x0E/0F` SUBB | borrow ignore | `src = src - Smem - C` ⚠️ polarite a surveiller (certains DSP soustraient `~C`) |
+| `0x38/39` SQURA | `T` non ecrit | `src = src + Smem*Smem`, **`T = Smem`** |
+
+**Non-regression verifiee** apres l'ensemble : `SHUNT_LEGIT=1 NO_CANNED=1 REAL_FB=1` donne
+`BSIC=7`, 14 `SYSTEM INFORMATION`, `LOCATION UPDATING ACCEPT` et `TMSI REALLOCATION COMPLETE`.
+
+Laisses de cote faute de semantique explicite dans l'extrait du manuel : `LDM 0x48/0x49`
+(zero- vs sign-extension) et `DST 0x4E/0x4F` (post-modification ±2).
+
+⚠️ **Aucun de ces correctifs ne peut debloquer `d_fb_det`** : en natif le correlateur n'est jamais
+atteint (voir ci-dessus). Ils corrigent l'emulation, ce qui est necessaire, mais le verrou est ailleurs.

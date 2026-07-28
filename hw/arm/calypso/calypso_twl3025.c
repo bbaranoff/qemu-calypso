@@ -91,6 +91,14 @@ static void twl3025_lazy_env(void)
 {
     if (twl.env_loaded) return;
     twl.env_loaded = true;
+    /* @BEQUILLE — TWL3025_AFC_HZ  (CALYPSO_TWL3025_AFC_HZ, VALEUR ; 0 = inerte)
+     *   masque  : la boucle AFC fermee (DAC firmware -> pente Hz/LSB -> rotation des
+     *             samples). Une valeur non nulle fige un offset constant en Hz et
+     *             supprime la convergence.
+     *   retirer : jamais necessaire — mettre 0 (ou unset) suffit ; c'est un outil de
+     *             diagnostic. NB : calypso_hack.env la pose a 0 ET l'exporte :
+     *             inoffensive en valeur, mais PRESENTE dans l'environnement.
+     */
     const char *h = getenv("CALYPSO_TWL3025_AFC_HZ");
     twl.force_hz = (h && *h) ? atoi(h) : 0;
     /* Gate maître de la boucle AFC (rotation des samples RX par l'offset VCXO).

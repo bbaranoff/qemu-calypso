@@ -460,6 +460,15 @@ static void bsp_trxd_readable(void *opaque)
          * le correlateur NATIF lit la DARAM 0x2a00 -> on NE return PAS, on remplit
          * AUSSI la DARAM pour lui fournir de IQ (le DSP la consomme -> pas la
          * saturation du shunt-only). Hors revive : comportement inchange. */
+        /* @BEQUILLE — BSP_DARAM_FORCE  (CALYPSO_BSP_DARAM_FORCE, idiome EXISTS, defaut OFF ; calypso_wire.env:=1)
+         *   masque  : calypso_dsp_shunt_route_c54x_active() ne devient jamais vrai sous
+         *             DSP_SHUNT=1, donc ce gate shunt fermerait la DARAM au correlateur
+         *             natif. Le forcage remplace la route DSP reelle, non modelisee.
+         *   retirer : quand route_c54x_active() reflete l'etat reel du c54x, ou quand
+         *             DSP_SHUNT et DSP_RUN_C54X cessent d'etre simultanement a 1.
+         *   NB      : EXISTS -> "=0" NE COUPE PAS, seul unset coupe. Sites solidaires :
+         *             rx_burst (rb_revive) et deliver_buffered (rxw).
+         */
         static int bsp_revive = -1;
         if (bsp_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
@@ -648,6 +657,16 @@ static void bsp_trxd_readable(void *opaque)
      * Gate ON : feed DARAM 0x2a00 DIRECTEMENT via calypso_bsp_rx_burst (write
      * immediat + c54x_bsp_load + INT3, SANS match FN). Gate OFF : inchange. */
     {
+        /* @BEQUILLE — BSP_DIRECT_FEED  (CALYPSO_BSP_DIRECT_FEED, EQ1, calypso.env:=1 -> ACTIF)
+         *   masque  : le match FN de bsp_take_for_fn (+/-BSP_FN_MATCH_WINDOW) echoue
+         *             systematiquement parce que la FN du device (temps reel) et la FN
+         *             virtuelle QEMU divergent -> DARAM jamais ecrite. On livre sans
+         *             aucune correspondance temporelle : le burst arrive "maintenant".
+         *   retirer : quand la FN virtuelle et la FN device sont alignees (FN-PROBE
+         *             delta ~0 stable) ; alors bsp_enqueue -> deliver_buffered suffit.
+         *   NB      : tant que ce gate vaut 1, TOUT calypso_bsp_deliver_buffered() est
+         *             du code mort (file toujours vide).
+         */
         static int direct_feed = -1;
         if (direct_feed < 0) {
             const char *e = getenv("CALYPSO_BSP_DIRECT_FEED");
@@ -985,6 +1004,11 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * vrai DSP LIT la DARAM 0x2a00 -> on DOIT ecrire (aucun mock canned a clobber).
      * Meme condition que bsp_trxd_readable:416. Drop UNIQUEMENT en shunt-mock pur. */
     {
+        /* @BEQUILLE — BSP_DARAM_FORCE (site rx_burst)  (CALYPSO_BSP_DARAM_FORCE, EXISTS, defaut OFF)
+         *   masque  : idem site bsp_revive — la route c54x reelle n'est pas modelisee,
+         *             on force l'ecriture DARAM sous shunt quand RUN_C54X=1.
+         *   retirer : avec le site bsp_revive (meme condition).
+         */
         static int rb_revive = -1;
         if (rb_revive < 0) {
             const char *e = getenv("CALYPSO_DSP_RUN_C54X");
@@ -1080,6 +1104,13 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * dispatche (0 hit confirme). On le leve comme deliver_buffered (meme
      * anti-stack gate IFR bit5). Gate CALYPSO_BSP_DIRECT_BRINT0 (defaut OFF pour
      * tester une variable a la fois). */
+    /* @BEQUILLE — BSP_DIRECT_BRINT0  (CALYPSO_BSP_DIRECT_BRINT0, EXISTS, defaut OFF ; calypso_wire.env:=1)
+     *   masque  : sur silicium, la fin de DMA BSP (fenetre BDLENA) leve BRINT0
+     *             vec21/bit5. Le chemin direct-feed ne leve qu'INT3 ; la chaine
+     *             TPU->TSP->IOTA->BSP qui produirait le pulse n'est pas cablee.
+     *   retirer : des que calypso_iota_take_bdl_pulse() est alimente par la fenetre
+     *             RX du TPU et consomme sur le chemin vivant (cf TPU_RX_WIRE).
+     */
     { static int _db = -1; if (_db < 0) _db = getenv("CALYPSO_BSP_DIRECT_BRINT0") ? 1 : 0;
       /* MISSION-GATE : ne lever BRINT0 que si le DSP est reellement sur la
        * mission FB/SB (d_task_md), pas hors-mission -> le reveil correlateur
@@ -1099,6 +1130,17 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * MASTER = data[0x3fad] bit15 : gate CC 0xa0a0 @0x8754 -> kernel 0xa076
      * (le bloc homonyme de deliver_buffered est MORT sous shunt ET omet 3fad bit15
      *  -> ne peut pas deboucher le noyau). Gate CALYPSO_RX_FBFLAGS, mission FB/SB. */
+    /* @BEQUILLE — RX_FBFLAGS (chemin vivant rx_burst)  (CALYPSO_RX_FBFLAGS, EXISTS, defaut OFF)
+     *   masque  : l'ISR BRINT0 (PROM1[0xFFD4] -> CALL 0xf310) n'est jamais prise,
+     *             donc les bits de handshake FB-det qu'elle devrait poser ne le sont
+     *             pas : data[0x3fad] bit15 (verrou-maitre du kernel @0x8754),
+     *             0x3faa bit2+bit8, 0x3fab bit8, 0x3fae bit8. On les pose depuis la
+     *             livraison du burst.
+     *   retirer : quand BRINT0 est reellement servie et que son ISR ecrit ces bits ;
+     *             le bloc jumeau de deliver_buffered est deja mort sous
+     *             BSP_DIRECT_FEED=1 et omet 0x3fad -> a supprimer en premier.
+     *   NB      : conteneur de POKE_TASK_MD et POKE_DISPATCH ci-dessous.
+     */
     { static int _fbf = -1; if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
       uint16_t _mdf = calypso_dsp_shunt_get_task_md();
       int _fbsbf = (_mdf == 5 || _mdf == 6 || _mdf == 8 || _mdf == 9);
@@ -1113,6 +1155,19 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
            * On pose le descripteur de tache (la mission FB/SB) dans les 2 pages
            * API-RAM que le dispatcher DSP lit. d_dsp_page(0x08e2) a deja bit1
            * (task-ready) set -> seul task_md manquait. */
+          /* @BEQUILLE — POKE_TASK_MD (+ POKE_DISPATCH ci-dessous)  (CALYPSO_POKE_TASK_MD,
+           *              atoi>0 mais DEFAUT 1 SI LA VARIABLE EST ABSENTE)
+           *   masque  : le descripteur de tache (d_task_md, pages API-RAM 0x0804/0x0818)
+           *             n'est jamais publie vers le DSP : la DMA page-ecriture ARM->DARAM
+           *             0x0586 (calypso_trx.c) est fermee sous shunt. Le correlateur entre
+           *             donc sans mission et tourne dans le vide ; on lui pose la mission a
+           *             la main. POKE_DISPATCH va plus loin et replique dsp_end_scenario
+           *             (d_dsp_page = B_GSM_TASK|w_page en alternance).
+           *   retirer : quand la DMA de la write-page atteint le DSP (task_md lu depuis
+           *             0x0586+DB_W_D_TASK_MD) ; alors ces deux pokes deviennent nuls.
+           *   NB      : defaut ON, mais imbrique dans le bloc RX_FBFLAGS -> sans
+           *             CALYPSO_RX_FBFLAGS, jamais atteint.
+           */
           { static int _pt = -1; if (_pt < 0) { const char *_pe = getenv("CALYPSO_POKE_TASK_MD"); _pt = _pe ? (atoi(_pe) > 0) : 1; }  /* defaut ON, =0 pour desactiver */
             if (_pt) { bsp.dsp->data[0x0804] = _mdf;   /* task_md page0 = mission (5=FB 6=SB) */
                        bsp.dsp->data[0x0818] = _mdf; } /* task_md page1 */ }
@@ -1142,6 +1197,15 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * dynamique par burst -- PAS un pin statique) + on leve IMR bit9 (route
      * scheduler 0x7234->0x8341). Au prochain BACC(0xb40f)/CALA(0xb01e) le DSP
      * tombe dans le correlateur. Gate CALYPSO_BSP_DISPATCH_FB (defaut OFF). */
+    /* @BEQUILLE — BSP_DISPATCH_FB (+ _TGT, _NOIMR, _ONESHOT)  (CALYPSO_BSP_DISPATCH_FB,
+     *              EXISTS, defaut OFF ; calypso_wire.env:=1)
+     *   masque  : la LUT native 0x8341 qui installe le handler FB-det 0x8d00 dans
+     *             les slots de dispatch n'est jamais atteinte (0x7234 deraille vers
+     *             l'overlay 0x013b). On ecrit les slots 0x43c0/0x4387/0x43d8 a la
+     *             main et on ouvre IMR bit9 a la place du scheduler.
+     *   retirer : quand 0x7234 atteint 0x8341 et peuple ces slots tout seul ; le
+     *             demasquage IMR est separable (CALYPSO_BSP_DISPATCH_NOIMR=1).
+     */
     { static int _di = -1; static uint16_t _tgt = 0; static int _os = -1; static int _done = 0;
       if (_di < 0) { _di = getenv("CALYPSO_BSP_DISPATCH_FB") ? 1 : 0;
         const char *_t = getenv("CALYPSO_BSP_DISPATCH_FB_TGT");
@@ -1209,6 +1273,14 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      * SAUTE la boucle d'ecriture concurrente (mais on GARDE acquire/release :
      * le lock enveloppe aussi le post-write log jusqu'a 0x2a00 release plus bas).
      * Indep. de DIRECT_FEED/DARAM_FORCE. */
+    /* @BEQUILLE — FB_IQ_OWNS  (CALYPSO_FB_IQ_OWNS, atoi>0, calypso.env:=0)
+     *   masque  : deux producteurs concurrents ecrivent le meme buffer d'entree du
+     *             correlateur (rx_burst cote BSP et feed_iq cote shunt). Le silicium
+     *             n'a qu'un seul chemin : le BSP. Ce flag arbitre a la main qui
+     *             gagne, faute d'un unique writer.
+     *   retirer : quand feed_iq disparait au profit du seul chemin BSP (ou
+     *             inversement) — il ne doit rester qu'un writer de bsp.daram_addr.
+     */
     static int _fbiq_owns = -1;
     if (_fbiq_owns < 0) {
         /* [2026-07-27] DECOUPLE : le SKIP rx_burst ne se declenche QUE sur opt-in
@@ -1342,6 +1414,18 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
      * chaîne RX native remplir DARAM 0x2a00 (+ d[3f92]) même sous shunt, afin
      * d'alimenter le vrai corrélateur DSP. Réversible : sans l'env, inchangé. */
     {
+        /* @BEQUILLE — TPU_RX_WIRE (gate de livraison)  (CALYPSO_TPU_RX_WIRE, EXISTS,
+         *              defaut OFF ; calypso_wire.env:=1)
+         *   masque  : la fenetre RX du TPU (scenario TPU -> MOVE TSP -> IOTA BDLENA)
+         *             n'est raccordee a rien, donc la livraison bufferisee reste fermee
+         *             sous shunt et le correlateur natif reste affame.
+         *   retirer : quand le sequenceur TPU produit le pulse BDLENA et que le BSP le
+         *             consomme sans gate.
+         *   NB      : ce gate se leve AUSSI via (DSP_RUN_C54X=1 && BSP_DARAM_FORCE) —
+         *             mesure du 2026-07-28 : deliver ouvert alors que le site du pulse
+         *             et la DMA de tache (calypso_trx.c) restent fermes = wire a moitie
+         *             leve (d[0x3f92] non pose).
+         */
         static int rxw = -1;
         if (rxw < 0) {
             /* [2026-07-28] coherence avec les gates :474 et :997, qui se levent
@@ -1383,6 +1467,16 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * The loop body still does the DARAM write, INT3 and BRINT0 assert. */
         int rxwin = 0;
         {
+            /* @BEQUILLE — TPU_RX_WIRE (consommation du pulse BDLENA)  (CALYPSO_TPU_RX_WIRE,
+             *              EXISTS, defaut OFF)
+             *   masque  : calypso_iota_take_bdl_pulse() n'a qu'un seul appelant, celui-ci.
+             *             Le wire (a) consomme le pulse, (b) pose la tache FB dans le mot
+             *             scheduler d[0x3f92] bit11 a la place de l'ORM natif 0xa539 jamais
+             *             execute, (c) livre le burst le PLUS PROCHE en contournant la
+             *             fenetre de match FN.
+             *   retirer : quand d[0x3f92] est pose par l'ORM natif et que le match FN
+             *             aboutit sans contournement.
+             */
             static int en = -1;
             if (en < 0) en = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
             if (en && calypso_iota_take_bdl_pulse((uint8_t)tn)) {
@@ -1566,6 +1660,12 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * DARAM 0x2a00 (= "burst pret"), pour que le correlateur deroule. Le
          * traceur CORR-FLOW dira si un gate SUIVANT apparait. */
         {
+            /* @BEQUILLE — RX_FBFLAGS (chemin buffered)  (CALYPSO_RX_FBFLAGS, EXISTS, defaut OFF)
+             *   masque  : les memes bits de handshake FB-det que l'ISR BRINT0 devrait poser,
+             *             mais SANS data[0x3fad] bit15 -> ne peut pas deboucher le kernel.
+             *   retirer : EN PREMIER — ce bloc est deja du code mort tant que
+             *             CALYPSO_BSP_DIRECT_FEED=1 (la file bufferisee reste vide).
+             */
             static int _fbf = -1;
             if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
             if (_fbf && bsp.dsp) {
@@ -1763,6 +1863,13 @@ static uint32_t d_rach_word_offset(void)
  * proven and we know the only remaining bug is the d_rach offset.
  *
  * Returns -1 if unset, otherwise the forced BSIC value (0..63). */
+/* @BEQUILLE — RACH_FORCE_BSIC  (CALYPSO_RACH_FORCE_BSIC, VALEUR, defaut unset = inerte)
+ *   masque  : l'incertitude sur l'offset NDB de d_rach : plutot que de lire le
+ *             BSIC ecrit par le firmware, on impose celui du BSC pour prouver
+ *             la chaine d'encodage RACH independamment de l'offset.
+ *   retirer : quand CALYPSO_NDB_D_RACH_OFFSET est confirme (IMM_ASS_CMD recu
+ *             avec le BSIC lu depuis d_rach, sans forcage).
+ */
 static int rach_force_bsic(void)
 {
     static int cached = -2;

@@ -158,6 +158,14 @@ uint32_t calypso_trx_get_fn(void)
      * (shunt feed, BSP match, FN-ALIGN) pour caler la FN DSP sur la SCH BTS. A
      * -556, la FCCH tombe dans la bonne trame. NB : trop large (touche aussi la
      * FN UL/DATA_IND) -> a n'activer que pour l'alignement correlateur. */
+    /* @BEQUILLE — DL_FN_OFFSET  (CALYPSO_DL_FN_OFFSET, VALEUR, defaut 0 = inerte)
+     *   masque  : l'absence de synchronisation de la FN emulee sur la SCH du BTS.
+     *             L'offset signe est applique a la SOURCE de FN, donc a tous les
+     *             consommateurs (BSP match, feed shunt, FN-ALIGN, et aussi UL /
+     *             DATA_IND — porte trop large, assume dans le commentaire d'origine).
+     *   retirer : quand la FN est calee sur la SCH recue (recalage a la source),
+     *             l'offset mesure tombant a 0 dans FN-PROBE / FN-ALIGN.
+     */
     static int off = 0, off_init = 0;
     if (!off_init) {
         off_init = 1;
@@ -339,6 +347,13 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
         }
     }
     if (!real_fb_hit && size == 2) {
+        /* @BEQUILLE — FORCE_TOA  (CALYPSO_FORCE_TOA, VALEUR, defaut -1/OFF)
+         *   masque  : tout le bloc resultat FB/SB (d_fb_det, a_sync_demod TOA/ANGLE/SNR,
+         *             a_serv_demod[D_TOA]) : oracle canne cote read MMIO ARM.
+         *   retirer : quand d_fb_det natif est ecrit par le DSP.
+         *   PIEGE   : "0" ACTIVE le gate (TOA force a 0) ; seul unset/absent coupe.
+         *   NB      : deja court-circuitee par SHUNT_REAL_FB/DECAN (garde !real_fb_hit).
+         */
         static int force_toa = -2;  /* -2 = uninit, -1 = off */
         if (force_toa == -2) {
             const char *e = getenv("CALYPSO_FORCE_TOA");
@@ -368,6 +383,14 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * check d_burst_d (offset 0x52/0x7A). */
     if (size == 2 && (offset == 0x0050 || offset == 0x0078 ||
                       offset == 0x0052 || offset == 0x007A)) {
+        /* @BEQUILLE — FORCE_NB  (CALYPSO_FORCE_NB, EQ1, defaut OFF)
+         *   masque  : la publication DSP de db_r->d_task_d / d_burst_d. On falsifie le
+         *             read ARM (d_task_d 0->1, d_burst_d recopie de db_w) pour passer
+         *             le bail "EMPTY" de l1s_nb_resp.
+         *   retirer : quand le DSP NB demod ecrit lui-meme la read-page.
+         *   NB      : les memes offsets sont deja traites plus haut par le bloc
+         *             SHUNT_LEGIT/NO_LEGIT + si_valid — conflit potentiel.
+         */
         static int force_nb = -1;
         if (force_nb < 0) {
             const char *e = getenv("CALYPSO_FORCE_NB");
@@ -778,6 +801,16 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
              * ne tire jamais (RACH encode #0). On emet l'access-burst depuis le
              * signal FIABLE = l'ecriture d_rach. 1 write = 1 burst (pas de sticky). */
             {
+                /* @BEQUILLE — UL_RACH_FROM_DRACH  (CALYPSO_UL_RACH_FROM_DRACH ; si absente,
+                 *              retombe sur CALYPSO_SHUNT_LEGIT ; shunt_no_legit.env:=1)
+                 *   masque  : le poll UL natif, qui ne tire jamais l'access-burst parce que
+                 *             SHUNT_LEGIT avale d_task_ra. On emet le burst depuis l'ecriture
+                 *             ARM de d_rach (1 write = 1 burst, sans sticky).
+                 *   retirer : quand d_task_ra atteint le producteur UL sans etre consomme par
+                 *             le shunt.
+                 *   IDIOME  : "if (e) ulr = (*e=='1'); else ulr = SHUNT_LEGIT" -> poser =0 la
+                 *             coupe MEME sous SHUNT_LEGIT=1, contrairement aux INJECT_*.
+                 */
                 static int ulr = -1;
                 if (ulr < 0) {
                     const char *e = getenv("CALYPSO_UL_RACH_FROM_DRACH");
@@ -952,6 +985,15 @@ static void calypso_dsp_done(void *opaque) {
      * commande de tâche ARM (task_md=5 FB) atteindre le DSP DARAM 0x0586 même
      * sous shunt, condition pour que le vrai corrélateur DSP soit dispatché.
      * Réversible : sans l'env, comportement inchangé. */
+    /* @BEQUILLE — TPU_RX_WIRE (DMA de tache ARM->DARAM 0x0586)  (CALYPSO_TPU_RX_WIRE,
+     *              EXISTS, defaut OFF ; calypso_wire.env:=1)
+     *   masque  : sous shunt la DMA page-ecriture ARM->DSP est fermee, donc la
+     *             commande de tache (task_md=5 FB) n'atteint jamais le DSP et le
+     *             correlateur entre sans mission. Le meme gate pose plus bas le bit
+     *             tache FB d[0x3f92]|=0x0800 a la place de l'ORM natif 0xa539.
+     *   retirer : quand le shunt ne substitue plus le DSP (la DMA redevient legitime)
+     *             et que 0xa539 s'execute reellement.
+     */
     static int trx_rxw = -1;
     if (trx_rxw < 0) trx_rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
     if (s->dsp && s->dsp_ram[0x01A8/2] != 0 &&
