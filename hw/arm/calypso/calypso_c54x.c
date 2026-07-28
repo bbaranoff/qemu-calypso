@@ -9449,18 +9449,29 @@ static int c54x_exec_one(C54xState *s)
         bool is_sub = (sub & 0x4) != 0;
         bool is_unsigned = (sub == 1 || sub == 5);  /* ADDS / SUBS */
         bool ts_shift = (sub == 2 || sub == 6);     /* ,TS variants */
+        /* [2026-07-28] sub 3 = ADDC (0x0600) et sub 7 = SUBB (0x0E00) : ils tombaient
+         * dans le traitement ADD/SUB generique, donc SANS la retenue. SPRU172C :
+         *   « ADDC Smem, src : src = src + Smem + C »
+         *   « SUBB Smem, src : src = src - Smem - C »
+         * binutils : addc 0x0600/0xFE00, subb 0x0E00/0xFE00, 1 mot chacun.
+         * NB : on suit la lettre du manuel (- C). Certaines implementations de SUBB
+         * soustraient l emprunt (~C) ; si une mesure le montrait, corriger ICI. */
+        bool with_carry = (sub == 3 || sub == 7);
         v = is_unsigned ? (uint16_t)val
                         : ((s->st1 & ST1_SXM) ? (int16_t)val : (uint16_t)val);
         if (ts_shift) {
             int8_t ts = (int8_t)((s->t & 0x3F) | ((s->t & 0x20) ? 0xC0 : 0));
             v = (ts >= 0) ? (v << ts) : (v >> -ts);
         }
-        if (is_sub) {
-            if (dst) s->b = sext40(s->b - v);
-            else     s->a = sext40(s->a - v);
-        } else {
-            if (dst) s->b = sext40(s->b + v);
-            else     s->a = sext40(s->a + v);
+        {
+            int64_t c = with_carry ? ((s->st0 & ST0_C) ? 1 : 0) : 0;
+            if (is_sub) {
+                if (dst) s->b = sext40(s->b - v - c);
+                else     s->a = sext40(s->a - v - c);
+            } else {
+                if (dst) s->b = sext40(s->b + v + c);
+                else     s->a = sext40(s->a + v + c);
+            }
         }
         /* CALAD-zone ADD/SUB trace: same scope as LD-A-TRACE. */
         if (dst == 0 && (s->pmst & PMST_OVLY) &&
@@ -9496,6 +9507,10 @@ static int c54x_exec_one(C54xState *s)
                 int sdst = (op >> 8) & 1;
                 if (sdst) s->b = sext40(s->b + sq);
                 else      s->a = sext40(s->a + sq);
+                /* [2026-07-28] SPRU172C : « SQURA Smem, src : src = src + Smem * Smem,
+                 * T = Smem ». L ecriture de T manquait : toute instruction suivante qui
+                 * utilise T (MAC, LD Smem,TS, ...) travaillait sur une valeur perimee. */
+                s->t = val;
                 return consumed + s->lk_used;
             }
             int dst = (op >> 8) & 1;
@@ -9593,12 +9608,20 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
             if (op8 == 0x47) {
-                /* RPT Smem — load BRC from mem[Smem] */
+                /* [2026-07-28] RPT Smem — charge le compteur de repetition SIMPLE (RC),
+                 * PAS le compteur de bloc (BRC). SPRU172C : « RPT Smem : Repeat single,
+                 * RC = Smem ». binutils : rpt 0x4700/0xFF00, 1 mot.
+                 * L ancien code ecrivait s->brc : le RPT n avait donc aucun effet sur la
+                 * repetition (rpt_count restait a sa valeur precedente) et BRC etait
+                 * corrompu au passage. On aligne sur le handler RPT #k8u (0xEC00) qui est
+                 * correct : avancer le PC et rendre 0 pour que le dispatcher re-execute
+                 * l instruction SUIVANTE, pas le RPT lui-meme. */
                 addr = resolve_smem(s, op, &ind);
                 uint16_t val = data_read(s, addr);
-                s->brc = val;
-                s->rpt_active = (val != 0); s->rpt_fresh = (val != 0);
-                return consumed + s->lk_used;
+                s->rpt_count = val;
+                s->rpt_active = true; s->rpt_fresh = true;
+                s->pc += 1;
+                return 0;
             }
             if (op8 == 0x48 || op8 == 0x49) {
                 /* LDM MMR, dst — load accumulator from a memory-mapped reg */
