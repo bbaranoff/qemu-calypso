@@ -6,6 +6,15 @@ Synth: RESET_REQ, PM_REQ. Everything else forwarded to firmware.
 
 import errno, fcntl, os, re, select, signal, socket, struct, subprocess, sys, termios, time
 
+# --- racine de l'installation, resolue sans chemin en dur --------------------
+# GSM_ROOT si l'environnement le pose (c'est le cas quand on passe par run.sh),
+# sinon le parent du depot : les deux depots vivent cote a cote.
+import os as _os
+GSM_ROOT = _os.environ.get(
+    "GSM_ROOT",
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+
 # Sercomm
 FLAG = 0x7E; ESCAPE = 0x7D; ESCAPE_XOR = 0x20
 DLCI_L1CTL = 5; CTRL = 0x03
@@ -125,7 +134,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-k", "--kernel", required=True)
     p.add_argument("-s", "--socket", default="/tmp/osmocom_l2_1")
-    p.add_argument("--qemu-bin", default="/opt/GSM/qemu/build/qemu-system-arm")
+    p.add_argument("--qemu-bin", default=f"{GSM_ROOT}/qemu/build/qemu-system-arm")
     p.add_argument("--env", action="append", default=[])
     args = p.parse_args()
 

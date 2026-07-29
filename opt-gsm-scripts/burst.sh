@@ -4,4 +4,4 @@
 # Sources : 4731 (SCH : bsic/fn/toa) + 5700-5702 (TRXD : ts/fn/148 soft-bits).
 # Usage : ./burst.sh                 (def 4731,5700,5701,5702)
 #         SNIFF_PORTS=4731 ./burst.sh
-exec python3 -u /opt/GSM/gsm_sniff.py burst
+exec python3 -u ${GSM_ROOT}/gsm_sniff.py burst

@@ -10258,14 +10258,6 @@ static int c54x_exec_one(C54xState *s)
          * POPM per tic54x-opc.c, not MVDK (which is 0x7100 mask 0xFF00).
          * Kept commented for one revision so any caller depending on the
          * old (incorrect) behaviour is forced to be re-examined. */
-        if (0 && hi8 == 0x8A) {
-            /* MVDK Smem, dmad — INCORRECT for 0x8Axx, see POPM above */
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            data_write(s, op2, data_read(s, addr));
-            return consumed + s->lk_used;
-        }
         /* 0x88xx-0x89xx: STLM src, MMR  (1-word!)
          * Per tic54x-opc.c: { "stlm", 1,2,2, 0x8800, 0xFE00, ... }
          *   bits 9-15 = fixed (0x44)
@@ -10371,86 +10363,6 @@ static int c54x_exec_one(C54xState *s)
          * est ISA-faux (vrai PORTR=0x74) et jamais atteint (audit 0x8F=0 exec ;
          * I/Q via DMA DARAM). Gardé en dead-code (if(0)) pour réf si on relocalise
          * PORTR vers 0x74 un jour. */
-        if (0 && hi8 == 0x8F) {
-            /* PORTR PA, Smem — read I/O port */
-            addr = resolve_smem(s, op, &ind);
-            op2 = prog_fetch(s, s->pc + 1);
-            consumed = 2;
-            /* BSP RX data register — return next burst sample.
-             * The DSP firmware uses PORTR PA=0xF430 (64 sites in PROM0,
-             * verified from ROM dump). We also accept 0x0034 for legacy
-             * compatibility with earlier QEMU experiments. */
-            uint16_t portr_val;
-            bool is_bsp_pa = (op2 == 0xF430 || op2 == 0x0034);
-            if (is_bsp_pa && s->bsp_pos < s->bsp_len) {
-                portr_val = s->bsp_buf[s->bsp_pos++];
-                data_write(s, addr, portr_val);
-            } else {
-                portr_val = 0;
-                data_write(s, addr, 0);
-            }
-            /* === PORTR-DEST-HIST (2026-05-28) ===
-             * Histogramme des Smem destinations quand PA=BSP. Repond directement
-             * a "ou le firmware stocke les samples BSP". Top addresses = la
-             * vraie zone DARAM cible pour CALYPSO_BSP_DARAM_ADDR. */
-            if (is_bsp_pa) {
-                static unsigned phist[0x10000];
-                static unsigned ptotal;
-                phist[addr]++;
-                ptotal++;
-                if ((ptotal % 5000) == 0) {
-                    unsigned best[10] = {0};
-                    uint16_t baddr[10] = {0};
-                    for (unsigned a = 0; a < 0x10000; a++) {
-                        unsigned c = phist[a];
-                        if (c <= best[9]) continue;
-                        int p = 9;
-                        while (p > 0 && best[p-1] < c) {
-                            best[p] = best[p-1]; baddr[p] = baddr[p-1]; p--;
-                        }
-                        best[p] = c; baddr[p] = (uint16_t)a;
-                    }
-                    if (calypso_debug_enabled("PORTR-DEST-HIST")) fprintf(stderr,
-                            "[c54x] PORTR-DEST-HIST (ptotal=%u): ", ptotal);
-                    for (int i = 0; i < 10 && best[i]; i++)
-                        fprintf(stderr, "%04x:%u ", baddr[i], best[i]);
-                    fprintf(stderr, "\n");
-                }
-            }
-            /* Per-PA counters so we can see which I/O ports the DSP polls
-             * and how often. */
-            {
-                static uint64_t portr_total[16];
-                static uint64_t portr_since_summary;
-                int pa_bucket = (op2 >> 4) & 0xF;
-                portr_total[pa_bucket]++;
-                portr_since_summary++;
-
-                static int portr_log = 0;
-                if (portr_log < 50) {
-                    C54_LOG("PORTR PA=0x%04x → [0x%04x] val=0x%04x "
-                            "bsp_pos=%u/%u PC=0x%04x",
-                            op2, addr, portr_val,
-                            (unsigned)s->bsp_pos, (unsigned)s->bsp_len,
-                            s->pc);
-                    portr_log++;
-                }
-                if ((portr_since_summary % 10000) == 0) {
-                    C54_LOG("PORTR summary (last 10000): "
-                            "PA0x=%llu 1x=%llu 2x=%llu 3x=%llu 4x=%llu "
-                            "5x=%llu 6x=%llu 7x=%llu",
-                            (unsigned long long)portr_total[0],
-                            (unsigned long long)portr_total[1],
-                            (unsigned long long)portr_total[2],
-                            (unsigned long long)portr_total[3],
-                            (unsigned long long)portr_total[4],
-                            (unsigned long long)portr_total[5],
-                            (unsigned long long)portr_total[6],
-                            (unsigned long long)portr_total[7]);
-                }
-            }
-            return consumed + s->lk_used;
-        }
         if (hi8 == 0x9F) {
             /* PORTW Smem, PA — write I/O port */
             addr = resolve_smem(s, op, &ind);

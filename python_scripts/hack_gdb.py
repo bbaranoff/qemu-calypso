@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+
+# --- racine de l'installation, resolue sans chemin en dur --------------------
+# GSM_ROOT si l'environnement le pose (c'est le cas quand on passe par run.sh),
+# sinon le parent du depot : les deux depots vivent cote a cote.
+import os as _os
+GSM_ROOT = _os.environ.get(
+    "GSM_ROOT",
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 """
 hack.py — direct QEMU GDB-stub client for the Calypso emulator.
 
@@ -62,7 +71,15 @@ DEFAULT_BP_SNR_CMP    = 0x008265c4  # cmp r3, #0 — patch r3=1 so bne taken (FB
 DEFAULT_BP_SCHED_REDIRECT = 0x00826704
 COMPL_SCHED_PC = 0x0082670c  # bl l1s_compl_sched in l1s_fbdet_resp
 
-DEFAULT_FW = "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
+# Le firmware est livre avec le depot (firmware/compal_e88/). On respecte
+# d abord FIRMWARE_ELF, pose par environnement/paths.env, puis on cherche
+# dans le depot, et seulement ensuite a l exterieur.
+DEFAULT_FW = _os.environ.get(
+    "FIRMWARE_ELF",
+    _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                  "firmware", "compal_e88", "layer1.highram.elf"))
+if not _os.path.exists(DEFAULT_FW):
+    DEFAULT_FW = f"{GSM_ROOT}/firmware/board/compal_e88/layer1.highram.elf"
 
 def discover_bps(fw_path: str):
     """Discover BP addresses from ELF symbol table via objdump.

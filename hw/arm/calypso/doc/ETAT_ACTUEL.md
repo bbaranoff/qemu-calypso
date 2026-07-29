@@ -455,7 +455,7 @@ Pour un natif **nu** (sans intercept de lecture ni PM mocke), ajouter en CLI :
 #    Critere = |DC|/rms et dphi du ddump, PAS d_fb_det.
 rm -f /dev/shm/daram_2a00.cfile          # AVANT le run
 # ... run de reference + CALYPSO_DARAM_DUMP=1 CALYPSO_SHUNT_REAL_FB=0 ...
-cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump | tail -3
+cd ${QEMU_TREE}/tools && python3 corr_iq.py --src ddump | tail -3
 #    reference a battre : |DC|=2.86e4 pour rms=2.94e4, dphi=+0.004  (sortie morte)
 
 # 2) B2 — nommer qui pose / efface l'etat « DMA en cours »
@@ -522,10 +522,10 @@ grep "EVICT-STATS" /root/qemu.log | tail -1     # en SHUNT_LEGIT=DSP,NO_CANNED
 
 ### Runtime
 
-- Tree LIVE = **`/opt/GSM/qemu-src`** (`.latest.bak`/`.bak` = anciens ; overlay
+- Tree LIVE = **`${QEMU_TREE}`** (`.latest.bak`/`.bak` = anciens ; overlay
   `qemu-calypso` = **MORT au runtime**, ne pas le patcher).
-- Firmware = `/opt/GSM/osmocom-bb-transceiver`.
-- Lancement : `osmo_egprs/start-direct.sh` -> `qemu-src/start-clean.sh` (source
+- Firmware = `${GSM_ROOT}/osmocom-bb-transceiver`.
+- Lancement : `osmo-nitb-for-calypso/start-direct.sh` -> `osmo-qemu-calypso/start-clean.sh` (source
   `calypso.env` en `set -a`) -> `run.sh`.
 - `run.sh:1151-1155` (mode `full-grgsm`) utilise `=` et non `:=` : `SHUNT_NO_CANNED=1`,
   `DSP_L1STUB=0`, `DSP_L1_STUB=0`, `FORCE_FBSB=0`, `FORCE_AGCH=0` **ne sont pas

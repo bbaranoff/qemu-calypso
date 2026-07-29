@@ -28,7 +28,7 @@ try:
     import inject as inj
     import mobile_ctl as mc
 except ImportError as e:
-    print(f"[scenario] ERROR : missing module ({e}). Run from qemu-src/", file=sys.stderr)
+    print(f"[scenario] ERROR : missing module ({e}). Run from osmo-qemu-calypso/", file=sys.stderr)
     sys.exit(1)
 
 

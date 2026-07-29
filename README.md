@@ -126,7 +126,7 @@ Toute la doc vit sous `hw/arm/calypso/doc/`.
 ## Configuration
 
 Tout se pilote par variables d'environnement `CALYPSO_*` (voir `calypso.env`, **toutes
-overridables en CLI**). Lancement via `osmo_egprs/start-direct.sh` → `start-clean.sh`
+overridables en CLI**). Lancement via `osmo-nitb-for-calypso/start-direct.sh` → `start-clean.sh`
 (source `calypso.env`) → `run.sh`.
 
 ## Build

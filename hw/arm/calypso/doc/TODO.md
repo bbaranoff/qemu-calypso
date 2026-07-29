@@ -1,350 +1,149 @@
-# TODO - Calypso QEMU (reorganise par priorites reelles, 2026-07-28)
+# TODO — état au 2026-07-28 (fin de journée)
 
-Le STATUT ET LES TODO DEPENDENT DU MODE. Socle = `calypso.env` + un `calypso_X.env`.
-Matrice statut x mode : `ETAT_ACTUEL.md` §1.
-
-Modes :
-- **SHUNT** = `SHUNT_LEGIT=1` / `SHUNT_NO_LEGIT=1` / `SHUNT_LEGIT=DSP,NO_CANNED`.
-  FBSB host-side (`REAL_FB` + gr-gsm -> API RAM). Camp + LU + SMS = DONE.
-- **NATIF** = `CALYPSO_NATIVE=1` / `CALYPSO_NATIVE_HELPED=1`. Le DSP c54x fait le FBSB.
-
-Priorites : **P0** = le verrou unique du moment ; **P1** = ce qui le valide ou le suit
-immediatement ; **P2** = etapes suivantes de la chaine ; **P3** = dette.
-Chaque entree nomme son INSTRUMENT ou sa COMMANDE de verification, et distingue
-MESURE / HYPOTHESE.
-
-Reference d'adresses : `SHUNT_LEGIT_ADDRESS_MAP.md`, `DSP_ADDRESS_MAP.md`,
-`DSP_ARM_LINKAGE.md`. Table d'opcodes de reference : `doc/opcodes/tic54x_hi8_map.md`
-(source : `binutils-2.21.1/opcodes/tic54x-opc.c`).
+> Refonte complète. L'ancien TODO était organisé autour de « RANK1..RANK5 », une numérotation
+> devenue trompeuse : **RANK3 reposait sur une erreur de nomenclature d'interruption**, et
+> plusieurs entrées « en cours » décrivaient des pistes désormais réfutées. Ce document repart de
+> ce qui est **mesuré**.
 
 ---
 
-## DEJA FAIT (ne pas re-lister, ne pas rechasser)
+## P0 — Le verrou natif : une erreur de nomenclature d'interruption
 
-| Sujet | Etat | Instrument de re-verification |
-|---|---|---|
-| Go-live / handshake BGEN (Fix A, ARM -> DSP `0x098a`/`0x098c`) | FAIT | manifeste + sortie de la wait-loop `0xa4ca` |
-| Shadow IMR `data[0x435b]` (= `0x52ed` arme) | FAIT | `CALYPSO_INIT_435B_OFF=0` (defaut) |
-| Boucle Location Update en SHUNT (LU ACCEPT + TMSI REALLOC + On Network) + RACH UL | FAIT | `grep -icE "LOCATION UPDATING ACCEPT" /root/mobile.log` |
-| Sous-voie SDCCH/8 (base DL `SS*4`, fenetre `base..base+3`) | FAIT | SDCCH bidirectionnel, IDENTITY RESPONSE |
-| Re-acquisition apres Ctrl-C mobile (hook `on_arm_write(d_dsp_page,0)` -> re-arme BGEN) | FAIT | signal unique, zero boucle |
-| **Natif observable** : SIGSEGV `g_shunt.as=NULL`, gate early-boot, `get_task_md()` shunt-only, split `active()`/`substitutes()` | FAIT | `dsp_n_exec_2/5 = 32768`, `DSP_ERR_STACK_OV` eteint |
-| **3e gate BSP** (`calypso_bsp.c:1359`, la LIVRAISON vers `data[]`) aligne sur `CALYPSO_BSP_DARAM_FORCE`. Avant : 2 verrous sur 3, rien n'arrivait au DSP. Defaut inchange. | FAIT | `grep "deliver: gate shunt LEVE" /root/qemu.log` ; `grep -c "dropping fn="` = 0 |
-| **Decimation** : `CALYPSO_BSP_IQ_DECIM=4` (`=1` = regression, feed a 4 SPS, `dphi=+0.25x pi/2`). Corollaire `DARAM_LEN=296` (638 ne valait que pour le 4 SPS non decime). | FAIT | `corr_iq.py --src bursts` -> `VERDICT: FCCH @1SPS PROPRE` |
-| **Entree du demod = `data[0x4c00]`**, confirmee par mesure : PC=`0x9fb5` lit `0x4c00/05/0a/0f/15/1a`, valeurs reelles (`ff6e`, `c1fb`, `d147`). Config : `FB_CORR_ENTRY=0x94f5` + `BSP_DARAM_ADDR=0x4c00`. | FAIT | `CALYPSO_WATCH_9F00_RD=1` |
-| **`FB_STREAM` / cellules `0x9213`,`0x9215`,`0x9260-61` : ECARTES** sur cette config — jamais lues avec `CORR_ENTRY=0x94f5`. `CALYPSO_FB_IQ_BASE=0x9210` y est donc inerte. | FAIT (ecarte) | absence de `FB-STREAM addr=` au log ; `CALYPSO_RMAP_PCLO=0x9f00` |
-| **Signal d'entree bon** : `coh=0.998`, `rms=3.25e4`, `|DC|=379`, `zeros=0%`, FFT +67 708 Hz | FAIT | `corr_iq.py --src bursts` sur `/dev/shm/bursts.cfile` |
+**Fait mesuré** : en mode natif sans béquille, le DSP tourne (100 M instructions), le BSP alimente,
+mais le corrélateur n'est **jamais ordonnancé**. `CALYPSO_WATCH_9F00_RD = 0`.
 
-**Faux problemes clos — ne pas les reintroduire :**
-- « `0x4c00` est gele » : artefact de lecture QMP hors fenetre API RAM (signature : peak
-  exactement `0x8000`, 54 % de zeros). Mesurer A L'INTERIEUR (`BSP_LOG` au point
-  d'ecriture, ou `ddump`).
-- « `Q == 0` » : conclu sur les 2 premiers mots d'un burst (amplitude faible par
-  construction) ; sur le burst entier `zeros=0%`.
-- « `0xa042` detruit le signal » : `0x2c00` est du scratch, il n'y avait pas de signal a
-  detruire ; `0x9fd5` y depose une table de coefficients CONSTANTE.
-- « 0 FCCH sur 200 dumps » : artefact de fenetre (`DARAM_DUMP` capé au boot avec
-  `d_fb_mode=0`). Le detecteur EST arme : `d_fb_mode[0x08f9]=0x0001` observe.
-- Pointeur d'entree du demod « jamais initialise » (`AR6=0000`, lectures a `data[0x0000]`) :
-  **perime**, c'etait la consequence de l'entree `0x9500` au lieu de `0x94f5`. Resolu.
-- `api_write_cb` (`calypso_c54x.h`) = callback mort, fausse piste (`ETAT_ACTUEL.md` §6).
-- Correctif TPU de `DOC_PATH_BOOT_TO_CORRELATOR_2026-07-25.md` : **invalide**.
-  `0x8341` a 0 reference sur les 4 banks ; `0x7234 -> 0x013b` est un CALL ROM
-  **inconditionnel** qui retourne en `0x7236`.
+**Racine identifiée** (`PLAN_APPLICATION.md`, 999 l.) — `calypso_c54x.h:117-124` déclare :
 
----
-
-# P0 — DECODEUR c54x : la famille `0x1000-0x1FFF` et son audit systematique
-
-C'est le verrou unique du moment. Symptome amont : **entree du demod VIVANTE, sortie
-MORTE** (`ddump` : `|DC|=2.86e4` pour `rms=2.94e4`, `dphi=+0.004` ; cellule temoin
-invariante sur 157-203 bursts, identique avec `DECIM=1` et `DECIM=4`).
-
-## P0.a — `0x1800` (AND) decode comme LD — **CORRECTIF VALIDE AU RUN (2026-07-28)**
-
-> Rectification : la mention « non valide au run » a ete ecrite avant la mesure. Le correctif
-> **est** valide, par trois signatures independantes plus un test de non-regression :
-> - `T` passe de `0x001f` invariant a {`0x0000`,`0x0010`,`0x0018`,`0x0019`} (`CALYPSO_DEMODIO`) ;
-> - la saturation `A = -2147483648` (0x80000000) disparait : **0 occurrence** (etait systematique) ;
-> - la sortie du demod passe de DC pur (`dphi=+0.004`) a une forme structuree (`dphi=-0.246`,
->   pic FFT de `+1830 Hz` a `-47579 Hz`) — `corr_iq.py --src ddump` avec `CALYPSO_DARAM_DUMP=1` ;
-> - **non-regression** : en `SHUNT_LEGIT=1 NO_CANNED=1 REAL_FB=1`, le mobile est
->   `Channel synched (ARFCN=514, snr=28, BSIC=7)` avec `SYSTEM INFORMATION 2` puis `4`, et
->   LOCATION UPDATING ACCEPT conserve.
-> Le correctif couvre les **quatre** sous-cas (`0x1800` AND, `0x1A00` OR, `0x1C00` XOR,
-> `0x1E00` SUBC), pas seulement `AND`. `d_fb_det` reste 0 : le mur a recule d un etage.
-
-Chaine fautive, verifiee mot a mot contre `calypso_dsp.PROM0.bin` (base `0x7000`) :
-
-```
-9fa1: 7660 000f   ST  #0x000f, *(0x60)   -> data[0x0060] = 15
-9fa3: 7661 0010   ST  #0x0010, *(0x61)   -> data[0x0061] = 16
-9fb1: 1860        AND *(0x60), A         <- devait faire A = A & 15, faisait A = 15
-9fb2: 0061        ADD *(0x61), A         -> A = 31
-9fb3: 880e        STLM A, MMR 0x0E (= T) -> T = 31
-9fb5: 14ce        LD Smem, TS, A         TS = T[5:0] = +31 (SPRU172C : -16 <= TS <= 31)
-                  => decalage gauche de 31 => saturation (A = 0x80000000 observe)
-                  => sortie independante des operandes => DC plat
-9fb8: 8694        STH A, ASM, *AR4+      -> workzone 0x2a00
+```c
+#define C54X_INT_FRAME_VEC   19   /* INT3 */
+#define C54X_INT_FRAME_BIT   3
+/* et en commentaire : "Vec 21: BRINT0 (IMR bit 5)" */
 ```
 
-- **Cause** (MESURE, lecture de code) : `case 0x1:` calculait `sub = (op >> 9) & 7` mais ne
-  nommait que sub 0..3 (`0x1000` LD / `0x1200` LDU / `0x1400` LD,TS / `0x1600` LDR).
-  `0x1860` donne sub=4 et tombait sur le `default` = chargement signe.
-  `LD Smem,TS` (sub 2) est CORRECT ; le bug etait strictement en amont.
-- **Correctif** : `calypso_c54x.c:9365-9389` implemente `AND` (sub 4 / `0x1800`),
-  `OR` (5 / `0x1A00`), `XOR` (6 / `0x1C00`), `SUBC` (7 / `0x1E00`). Smem **zero-etendu**
-  sur 40 bits, conforme a l'exemple TI (SPRU172C p.4-12 : `A=00 00FF 1200 & 0x1500
-  -> A=00 0000 1000`). Compile et embarque.
-- **[ ] RESTE A FAIRE — le valider au run.** Un run post-correctif (44 s) donne toujours
-  `d_fb_det=0` sur 3 600 `DETECTOR-RUN`. Mais **`d_fb_det` n'est pas le critere** :
-  le critere est la SORTIE DU DEMOD.
+Or SPRU131G donne **`vec 20 = BRINT0 = bit 4`** et **`vec 21 = BXINT0`** — l'interruption
+d'**émission**. Toute la traque de « BRINT0 bit 5 » visait donc le mauvais vecteur ; le stub
+`RETE ; NOP` trouvé en `vec21@0x00d4` est parfaitement normal, c'est BXINT0 dont le firmware
+n'a pas l'usage. Le ROM arme bien le bit 4, en quatre sites (`0xbd40`, `0xbd62`, `0xc471`, `0xc498`),
+et ne pose **jamais** `0x0020`.
 
-  ```bash
-  cd /opt/GSM/qemu-src
-  rm -f /dev/shm/daram_2a00.cfile          # AVANT le run (artefact perime sinon)
-  CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 CALYPSO_DSP_RUN_C54X=1 \
-  CALYPSO_BSP_DARAM_FORCE=1 CALYPSO_BSP_DARAM_ADDR=0x4c00 CALYPSO_BSP_DARAM_LEN=296 \
-  CALYPSO_BSP_IQ_DECIM=4 CALYPSO_SHUNT_REAL_FB=0 CALYPSO_DARAM_DUMP=1 ./start-clean.sh
-  cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump | tail -3
-  ```
-  Critere non ambigu : passer de `|DC|=2.86e4 / rms=2.94e4 / dphi=+0.004` (sortie morte)
-  a `coh > 0.90`, `dphi ~ +1.571`. `SHUNT_REAL_FB=0` pour ne pas mesurer l'oracle hote a
-  la place du natif.
+Le vrai blocage : le modèle émet l'IT trame sur `vec 19 / bit 3`, un stub **et** un bit que le ROM
+n'arme jamais ; pire, `calypso_trx.c:1445` se gate sur ce même bit 3 — condition **auto-fausse**,
+l'interruption n'est même pas levée. `IFR=0x0028` ∩ `IMR=0x3200` = **0** : zéro vectorisation sur
+tout le run.
 
-## P0.b — Auditer TOUTE la famille `0x1000-0x1FFF` contre la table
+- [ ] **C1 — `C54X_INT_FRAME_VEC/BIT` = 28 / 12** (deux lignes dans `calypso_c54x.h`).
+      Signature attendue : `IRQ-LEVEL bit=12 vec=28`, puis `IMR-ARM → 0x3010 PC=0xbd40|0xc471`
+      = **le ROM arme BRINT0 tout seul**.
+      ⚠️ Poser `CALYPSO_INIT_435B_OFF=1` **avant** : `INIT-435B` est actif par défaut et polluera
+      la mesure dès que C1 fera atteindre `0xa4e4`.
+- [ ] **C2 — IT réception BSP `(21,5) → (20,4)`** : 4 sites dans `calypso_bsp.c` + `calypso_tpu.c:118`,
+      **et** re-router TINT0 `(20,4) → (19,3)` (`calypso_c54x.c:16139/16163`), qui tape aujourd'hui
+      dans l'ISR série.
+- [ ] **C3 — modéliser BSPC0** (MMR `0x22`, hors du garde `addr < 0x20`). C3a = sonde seule d'abord.
+- [ ] **C4 — `BANZ/BANZD`** : valeur testée = adresse effective, **restreint à MOD ≥ 0xC**
+      (zéro site MOD ≥ 0xC dans le miroir page-0 → risque nul pour `SHUNT_LEGIT` par construction).
+      Seul point de contact opcodes × verrou natif : `BANZ *AR6(+1)` en `PROM0 0xde5a`, **dans** la
+      boucle de fond mesurée.
+- [ ] **C5 — retirer les béquilles** fondées sur la fausse nomenclature.
 
-**Raison** : si `0x1800` etait faux, la meme structure (`sub` calcule, sous-cas non
-nommes avales par un `default`) peut avoir avale d'autres encodages. L'audit est
-mecanique et se fait une fois pour toutes.
-
-- [ ] Confronter les 8 sous-cas de `case 0x1` (`calypso_c54x.c:9320-9393`) ligne a ligne a
-      `doc/opcodes/tic54x_hi8_map.md` (`0x10..0x1F`, tous mask `0xFE00`) : LD / LDU /
-      LD,TS / LDR / AND / OR / XOR / SUBC. **Etat au 28/07 : les 8 sous-cas sont
-      desormais nommes** ; verifier la SEMANTIQUE de chacun (extension de signe,
-      SXM, flags C/TC) et non seulement la presence du `case`.
-- [ ] Verifier que le `default` restant est **inatteignable** (`sub` est sur 3 bits, 8
-      valeurs, 8 `case`) et le transformer en `assert`/`goto unimpl` : un `default`
-      silencieux est exactement ce qui a masque ce bug pendant des semaines.
-- [ ] Instrument d'audit disponible : `CALYPSO_DA_LO` / `_HI` / `_INSN` +
-      `CALYPSO_DEBUG=DECODE-AUDIT`, elargi a `0x7000..0xFFFF`.
-
-## P0.c — Le meme audit applique aux nibbles voisins : deux resultats deja acquis
-
-Ces deux points sortent de l'audit et sont **sur le chemin du demod / du noyau MAC**.
-Statut : MESURE (lecture de code + decodage PROM), correctif NON ecrit.
-
-- [ ] **`case 0x3` = MAC aveugle** (`calypso_c54x.c:9480-9508`). Tout `0x3000-0x3FFF` est
-      execute comme `acc += T * Smem`, **sauf** `0x3800/0x3900` (SQURA, deja corrige le
-      23/06). Or la table donne : `0x30` LD Smem,T · `0x31` MPYA · `0x32` LD Smem,ASM ·
-      `0x33` MASA · `0x34` BITT · `0x35` MACA · `0x36` POLY · `0x37` MACAR ·
-      `0x3A/3B` SQURS · `0x3C-0x3F` ADD.
-      **Impact direct** : le noyau MAC `0xa076..0xa09d` contient le motif `30 6x`
-      (= `LD Smem, T`), execute aujourd'hui comme un MAC. Coherent avec la mesure
-      « 60 000 ecritures pour 4 a 7 valeurs distinctes, toutes dans
-      `{0001, 0002, 001f, 003e}` » = un accumulateur qui double une constante.
-      Le detecteur `0x9ab8..0x9ac2` a le meme motif AND -> T (`1983 AND *AR3,B` puis
-      `890e STLM B,T` puis `348e BITT`).
-      **Les handlers corrects existent deja** (`calypso_c54x.c:6467-6550` :
-      `0x3000` LD Smem,T, `0x3100` MPYA, `0x3200` LD Smem,ASM, `0x3300` MASA,
-      `0x3400` BITT, `0x3500` MACA, `0x3700` MACAR) — mais ils sont **sous `case 0xF`**
-      (switch `hi4`, `calypso_c54x.c:5961`) donc **morts** pour un opcode dont le
-      nibble haut vaut 0x3. Le travail est un DEPLACEMENT, pas une reecriture.
-- [ ] **`case 0x0` : `ADDC` et `SUBB` ignorent la retenue** (`calypso_c54x.c:9434-9476`).
-      Le code derive `is_sub`/`is_unsigned`/`ts_shift` de `sub`, ce qui couvre
-      `0x0000` ADD, `0x0200` ADDS, `0x0400` ADD,TS, `0x0800` SUB, `0x0A00` SUBS,
-      `0x0C00` SUB,TS — mais **sub 3 (`0x0600` ADDC) est traite comme un ADD nu et
-      sub 7 (`0x0E00` SUBB) comme un SUB nu**. Priorite plus basse : impact non mesure
-      sur le chemin FB, a n'attaquer qu'apres P0.a/P0.c.
+**Ne pas appliquer** : `resolve_mmr` (2870 sites MMR, 100 % avec bit 7 = 0 → bénéfice nul),
+`ADDM` avec flags C/OVA.
 
 ---
 
-# P1 — Une fois la SORTIE DU DEMOD vivante : remonter la chaine FBSB
+## P1 — Correctifs d'opcodes : le sas `CALYPSO_FIXES`
 
-Rien ici ne se travaille avant que `corr_iq.py --src ddump` ait donne un verdict
-non-DC. L'ordre est celui de la chaine, chaque etape a son oracle.
+Protocole : poser **tous** les correctifs sûrs d'un coup → tester **sous charge maximale**
+(camp + LU + SMS) → dès confirmation, **effacer LA CONDITION, pas le correctif**.
 
-- [ ] **P1.a — `DSP_ERR_DMA_PEND` (0x20 = 32), permanent.**
-      MESURE : `grep -oE "DSP Error Status: [0-9]+" /root/osmocon.log | sort | uniq -c`
-      -> **723 x « 32 »**, aucune autre valeur.
-      HYPOTHESE : le DSP attend l'achevement d'une DMA ; le BSP ecrit le buffer
-      **directement** dans `data[]` sans passer par la machinerie DMA, donc le drapeau
-      « DMA en cours » n'est jamais efface. Nommer qui pose et qui efface cet etat cote
-      modele (sonde `CALYPSO_DMAWATCH` sur `0x0054..0x0057`).
-      Note de progression : `2048` (`STACK_OV`) -> `32` (`DMA_PEND`) n'est pas une
-      regression — le DSP va assez loin pour se plaindre de la couche suivante.
+### Dégatés (inconditionnels, validés sur deux modes)
+`0x1800/1A00/1C00/1E00` AND/OR/XOR/SUBC · `0x47` RPT Smem (écrivait `BRC` au lieu de `RC` : les
+boucles ne tournaient qu'une fois) · `0x06/07` ADDC (+C) · `0x0E/0F` SUBB (−C) · `0x38/39` SQURA
+(`T = Smem`) · `0x94/95` `ld Xmem,SHFT,dst` · `0x96` `bit` · `0xA2/A3` `sub Xmem,Ymem` ·
+`0x85` `stl B,ASM` · `0x8D` `st TRN` · `0x4E/4F` `dst` ±2 · `0x40-43` bit 9 = SRC.
 
-- [ ] **P1.b — Format d'entree : le demod lit en PAS DE 5, le BSP depose contigu.**
-      MESURE : lectures a `0x4c00`, `+5`, `+0a`, `+0f`, `+15`, `+1a` (PC `0x9fb5`) alors
-      que le BSP depose 296 int16 contigus I/Q entrelaces.
-      HYPOTHESE : structure de 5 mots par echantillon attendue par un filtre polyphase
-      6 taps. **Non tranchee** — il n'est pas exclu que le stride 5 soit correct et que
-      ce soit le REMPLISSAGE qui doive changer de layout. A re-evaluer APRES P0 :
-      un decodeur fautif peut fabriquer un stride qui n'est pas celui du firmware.
+### Dans le sas — formellement corrects, **infirmés par la mesure**
+- [ ] `FIX_LD_PARALLEL` (`0xA8-AF`) — longueur juste, mais n'exécute **que la partie `LD`** et
+      laisse tomber le `MAC/MAS/MASR` parallèle. Dans un **corrélateur**, ça fait disparaître le
+      `SHADOW-DADST`. À reprendre avec la vraie sémantique duale, pas une approximation.
+- [ ] `FIX_STL_STH_SHFT` (`0x98-9B`) — appliquer `SHFT` change l'échelle de la valeur stockée.
+      Écarté par précaution ; aucune charge confirmée contre lui à ce jour.
+- [ ] `FIX_LDM_ZEROEXT` (`0x48/49`) — zéro-extension là où le MMR `T` est signé. À retester isolément.
 
-- [ ] **P1.c — Slot de dispatch FB = stub `RET`.**
-      MESURE : `0xb01c: 10f8 43d8` (adressage **absolu**) ; `data[0x43d8] = 0xab38` ;
-      1er mot de `0xab38` = `fc00` = `RET`. Unique ecrivain sur les 4 banks : `0xbb00` ;
-      aucun writer cache (watchpoint dans `data_write_locked`).
-      Question ouverte, unique : pourquoi l'ordonnanceur de trame `0x7234` ne tombe-t-il
-      jamais sur `0x8341` (la LUT FB, seule a installer un vrai handler dans `0x43d8`) ?
-      Bequille de VALIDATION (pas correctif) : `CALYPSO_BSP_DISPATCH_FB=1`
-      (+ `_TGT`, `_NOIMR`).
+### Reste à traiter (`RAPPORT_OPCODES.md`, 2369 l. — ~40 findings, ~15 de gravité 1)
+- [ ] `0x62-0x67` (`mpy`/`mac`) et `0x78-0x7D` (`macp`/`macd`/`mvpd`/`mvdp`) : décodés en **1 mot**
+      là où binutils en donne **2** — l'inverse des précédents.
+- [ ] `0xC0-0xC7`, `0xDA`, `0xE0-0xE4`.
+- [ ] ⚠️ Deux plages (`0x60-0x8F`, `0xC0-0xFF`) n'ont **pas** eu de passe de réfutation :
+      vérification manuelle obligatoire contre `doc/opcodes/tic54x-opc.c`.
 
-- [ ] **P1.d — `d_fb_det` : personne ne l'ecrit en natif.**
-      MESURE : verifie des deux cotes du miroir `api_ram` (`CALYPSO_FBDET_API`) — seul
-      l'ARM touche la cellule, toujours 0. Publisher natif unique =
-      `ORM #1,*(0x08f8)` @`0x79e4`, en banque commune `0x7700-0x79F0`, jamais executee.
-      Le `FB0_SEARCH -> SB_SEARCH` observe est le **renoncement** d'osmocom
-      (`BSIC=0`, `snr=0`, `attempt=12`), pas une detection. Depend de P0, P1.a, P1.c.
-
-- [ ] **P1.e — En natif : ni SCH ni SI, donc pas de camp meme avec le FB servi.**
-      MESURE : `dispatch_allc` = 0 occurrence, `feed_agch` = 0, `DISPATCH SDCCH` = 0,
-      `sb_valid` = 0 ; mobile en boucle
-      `No sysinfo yet` -> `Cell selection failed, read timeout`.
-      Consequence de methode : meme si P0 tombait demain, le natif ne camperait pas.
-      Il manque SCH (`sb_bsic`/`sb_fn`/`sb_toa`) et SI (`si_buf`).
-
-- [ ] **P1.f — Remplacer gr-gsm par le DSP DANS `SHUNT_LEGIT`** (plan du 28/07).
-      Le FB ne depend **deja plus** de gr-gsm (correlateur hote `REAL_FB`). Restent SCH
-      et SI. Couper gr-gsm : `CALYPSO_SHUNT_NO_GRGSM=1`. Piloter le correlateur DSP
-      depuis le shunt : `CALYPSO_SHUNT_DSP_FB=1` — excursion **bornee** (`_MAX`) et
-      **pile dediee** (`_SP`), sans quoi on corrompt la pile du DSP et `STACK_OV` revient.
-      Ordre : FB (fait) -> SCH -> SI ; oracle a chaque etape = le producteur actuel.
+**Leçon** : un encodage confirmé par binutils **ne suffit pas**. Valider demande trois niveaux —
+formel (binutils + SPRU172C), **grandeur physique** (une valeur mesurable reste-t-elle plausible ?),
+et **chemin fonctionnel** (un traitement qui marchait marche-t-il encore ?). Trois correctifs sur
+dix ont passé le premier niveau et échoué aux suivants.
 
 ---
 
-# P2 — Chantiers paralleles (mode SHUNT, independants du P0)
+## P2 — Chaîne de signal (acquis, ne pas défaire)
 
-- [ ] **Voix TCH/F — lever l'ASSIGNMENT FAILURE.**
-      Etat : ASSIGNMENT COMMAND atteint, puis FAILURE ; le shunt ne presente pas le
-      TCH DL. Reseau OK (`call fake_trx` = ACTIVE + audio ; GAPK/FR compile).
-      Double cause localisee :
-      (a) `calypso_dsp_shunt.c:177` lit **inconditionnellement** `a_cu@0x264`
-          (SDCCH/SACCH, 23 o) quel que soit le type de tache ; a l'assignation le
-          firmware ecrit `a_fu@0x282` (FACCH UL) et la voix `a_du_1@0x134` -> le shunt
-          lit une cellule vide et rate la FACCH ;
-      (b) `tools/calypso-ipc-device/qemu_wrap.c:1194` : voie RF montante cablee en dur
-          TS0/RACH (`ul_slotoff=1875`), alors que le TCH/F est assigne **TS2**.
-      Deja cable, NE PAS reecrire : TCH DL sub0 (`calypso_tch_dl_poll` `:333-350`,
-      `shunt_dispatch_tch_dl` `:356-369`, routage `:836-837`). Manque le **producteur**
-      du sideband `/dev/shm/calypso_tch_dl`.
-      Detail : [`VOIX_PLAN.md`](VOIX_PLAN.md).
-
-- [ ] **Fiabiliser SMS en `SHUNT_LEGIT=DSP,NO_CANNED` (flaky).**
-      MO/MT = DONE en `SHUNT_LEGIT` et `SHUNT_NO_LEGIT` ; intermittent quand le c54x
-      tourne en // sans cannes (anti-stall deja ajoute).
-      **Mesure prealable obligatoire** : `grep "EVICT-STATS" /root/qemu.log | tail -1`
-      **dans ce mode**. En `SHUNT_LEGIT` les 3 politiques d'eviction sont a zero et la
-      profondeur du ring vaut 1 ; la saturation `depth=32` n'existait qu'en
-      `DSP,NO_CANNED`. NE RIEN supprimer de `sdcch_ring` avant cette mesure.
-
-- [ ] **Robustesse LU en SHUNT — deux mesures contradictoires a departager.**
-      `run_results.md` Run A5 : 2,70 s RACH -> ACCEPT, **0 retry T3211** (n=2).
-      `SHUNT_LEGIT_ADDRESS_MAP.md` §9 : « intermittent, ~1 succes / 19 retries T3211 »
-      (26/07, **anterieur** au fix sous-voie SDCCH/8).
-      Trancher : `grep -c T3211 /root/mobile.log` sur 5 runs `SHUNT_LEGIT` consecutifs.
+- [x] **3 gates BSP**, pas un : `calypso_bsp.c:474`, `:997`, et la **livraison** (`:1347`) qui ne se
+      levait qu'avec `TPU_RX_WIRE`. Avant ce fix, `DARAM_FORCE=1` ouvrait deux verrous sur trois et
+      **rien n'arrivait au DSP**.
+- [x] **`CALYPSO_BSP_IQ_DECIM=4`** (`1` = régression mesurée : feed à 4 SPS) avec `DARAM_LEN=296`.
+- [x] **Entrée démod = `data[0x4c00]`** confirmée par mesure : `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a`,
+      stride 5 = polyphase 6 taps.
+- [ ] **Sortie démod = `0x52ed` constant** — inchangé depuis le début. Le corrélateur lit du continu.
+      À reprendre **après C1** : inutile d'analyser un étage qui n'est atteint que sous reroute.
 
 ---
 
-# P3 — Dette transverse (tous modes)
+## P3 — Chantiers parallèles
 
-- [ ] **Decodeur c54x, suite de l'audit P0** : cluster MAC/LD/BITT `0x30-0x37` present
-      mais **mort sous `case 0xF`** (cf P0.c) ; `BC`/`FB` `0xF8` par nibble ;
-      catch-all FIRS/LMS `0xE000-0xE3FF` ; `0xF6`/`0xF7` fabriques.
-      NE PAS re-fixer `0x72`/`0x73` MVDM/MVMD sans le side-effect (`REVERT_MVMD`).
-- [ ] Refacto `sdcch_ring` : `fn` stocke-non-utilise, eviction silencieuse, ajouter TTL +
-      drop explicite. Dette de structure, pas un blocage. **A mener en session
-      foreground dediee** — ne pas coder depuis une reorg doc, et pas avant la mesure
-      `EVICT-STATS` du P2.
-- [ ] Retirer les env `BURST_*` mortes (`BURST_FN` / `BURST_OFS` / `BURST_ECHO`) une fois
-      `d_burst_d` WP-mirror valide au run.
-- [ ] `a_pm` mot 8 vs mot 12 : la section A de `on_frame_tick` ecrit sous le label
-      « a_pm » les idx `0x30`/`0x44` (= `a_serv_demod`) ; la vraie cellule `a_pm` est
-      `0x834`/`0x848`.
-- [ ] Code mort a supprimer : `bsp.fb_valid` jamais mis a 1 ;
-      `calypso_dsp_shunt_route_c54x_active()` sans appelant ; API
-      `calypso_orch_init/publish` inexistante ; `calypso_tint0_start()` jamais reference ;
-      `fw_console.c` sans appelant.
-- [ ] Variables d'env INERTES a nettoyer : `CALYPSO_CORRELATOR_TRACE` (le vrai gate est
-      `CALYPSO_DEBUG=CORRELATOR`), `CALYPSO_FORCE_3F92`, `CALYPSO_FORCE_0810`,
-      `CALYPSO_FIX_MVDM` (le code ne lit que `..._OFF`), et la ligne morte `: "0xC000"`
-      dans `calypso.env`.
-- [ ] Ecart profils livres / config mesuree correcte : `calypso_native.env` et
-      `calypso_native_helped.env` posent encore `FB_CORR_ENTRY=0x9500` (introuvable dans
-      les 28 672 mots de PROM) alors que l'entree ROM est `0x94f5`. Le run de reference
-      le corrige en CLI. **Documenter, ne pas changer le defaut sans decision.**
-- [ ] Mode `CALYPSO_L1=c` **mort par auto-annulation** : `l1_c_active()` arme le shunt
-      (`calypso_dsp_shunt.c:1847`) alors que `calypso_trx.c:1475` exige
-      `l1_c_active() && !shunt_active()`. `calypso_layer1_tick()` n'est donc jamais
-      appele. Soit reparer, soit retirer le mode. (DEDUCTION DE CODE, non testee au run.)
-- [ ] Threading (roadmap) : un thread par bloc (ARM/DSP/TPU/BSP) pour eliminer les
-      ~300 artefacts de serialisation TCG (`THREADING_TODO`).
-- [ ] Doc : `DSP_ROM_MAP.md` canonique dit « PROM1 mirroree `0x8000-0xFFFF` » ; corriger en
-      « chargee `0x18000+` sans mirror » (fix 2026-05-29). Marquer « historique » les
-      `REPORT_CLAUDE_WEB_*`, `BOOT_TO_FBSB_SEQUENCE`, `FBSB_SEQUENCE_TRACE`.
+- [ ] Voix TCH/F — cf `VOIX_PLAN.md` (ASSIGNMENT COMMAND → FAILURE, le shunt ne présente pas le TCH DL).
+- [ ] SMS — DONE en `SHUNT_LEGIT`, instable en `DSP,NO_CANNED`.
+- [ ] `run.sh` unifié + `run_modules/` — **abandonné en cours de route** : le point d'entrée a été
+      remplacé avant que les modules existent, ce qui a cassé le lancement. `run.sh` est restauré
+      (2426 l.) ; le travail est conservé dans `run.sh.unifie_incomplet_2026-07-28`. À reprendre en
+      écrivant **les modules d'abord**.
 
 ---
 
-# Hygiene de mesure (a lire avant d'ouvrir un ticket ci-dessus)
+## Réfuté — ne pas re-soulever
 
-1. **`BUILD-STAMP` ne dit PAS quel binaire tourne.** La macro vit dans
-   `calypso_dsp_shunt.c:107` (`__DATE__`/`__TIME__`) et date **son propre TU**. Un run a
-   affiche `09:42:13` alors que le binaire datait de `11:29:07`.
-   Instrument correct : mtime du `.o` de l'unite modifiee + `lstart` du process.
-   **[ ] A corriger** : faire dependre le stamp du TU du decodeur, ou d'un hash des objets.
-2. **Les compteurs `REAL-FB` sont plafonnes par le logger** (`calypso_dsp_shunt.c:1670` :
-   `rfl < 20 || (det && rfl < 300)`). « 280/300 » = contenu des lignes loguees, pas un
-   taux de detection.
-3. **Comparer les mtimes des artefacts au `lstart` du process** avant d'interpreter
-   (`/dev/shm/daram_2a00.cfile` a 11:06 vs `bursts.cfile` a 11:31 = deux runs differents).
-4. **Toute mesure prise via le monitor QMP est hors fenetre API RAM et racy.** Les mesures
-   valides se prennent a l'interieur : `BSP_LOG` au point d'ecriture, ou `ddump`.
-5. **Hygiene de mode** : `CALYPSO_SHUNT_REAL_FB=1` fait servir `d_fb_det` a l'ARM par le
-   correlateur HOTE (`calypso_dsp_shunt.c:1463-1490` via `calypso_trx.c:297`). En natif,
-   mettre `SHUNT_REAL_FB=0` — sinon on mesure l'oracle, pas le DSP. Seule la cellule
-   `data[0x08f8]` imprimee par `DETECTOR-RUN` mesure le natif.
-6. **Regles de sonde** (payees 4 fois) : concevoir par la CONDITION DE DECLENCHEMENT et
-   non par l'adresse ; preferer un AGREGAT a un flux plafonne, avec temoin de saturation ;
-   distinguer « varie dans l'espace » de « varie dans le temps » ; **« pas de log » n'est
-   jamais « pas d'evenement »** tant que la sonde n'est pas verifiee VIVANTE et sa fenetre
-   COUVRANTE (plafond sature, seuil de dump trop haut, plage ecrite cote HOTE donc
-   invisible depuis `data_write_locked`, variable d'env absente du run).
+| Affirmation | Pourquoi elle tombe |
+|---|---|
+| « verrou = BRINT0 / IMR bit 5 » (RANK3) | `vec 21 = BXINT0` (émission). BRINT0 = `vec 20 / bit 4`, armé par le ROM. |
+| `golive-imr-shadow-435b` | `0xa582` = `IMR \|= shadow`, jamais destructeur (utilise `0x1A00 OR`, corrigé le 28/07). |
+| `golive-gate-a53c-0810-bit15` | bit 15 = `B_TASK_ABORT`. |
+| « IMR 0x52fd = masque de reset réel » | absent des 6 ROM, codé en dur `calypso_c54x.c:16631`. |
+| `calypso_bsp.c:1077-1080` | `PROM1[0xFFD4]` n'est pas une table de vecteurs. |
+| « `0x4c00` est gelé » | lecture hors fenêtre API RAM via QMP (signature : `peak = 0x8000`, 54 % de zéros). |
+| « `Q == 0` » | conclu sur 2 mots de début de burst ; `zeros=0%` sur le burst entier. |
+| « `0xa042` détruit le signal » | `0x2c00` est du scratch ; `0x9fd5` y dépose une table de coefficients constante. |
+| « `WATCH_9F00_RD=0` = corrélateur affamé » | **conséquence**, pas cause : il n'est jamais ordonnancé. |
 
+Confirmé au passage : `dsp-dpage-offset-bug` — `0x08E2 = d_dsp_state = 3`, donc le test
+`data[0x08E2] & 2` (`:16862`) est **toujours vrai**.
 
 ---
 
-## PRIORITES au 2026-07-28 (fin de journee) — recadrees par la mesure du mode natif
+## Règles de travail
 
-### P0 — Verrou natif : BRINT0 (vec 21 / IMR bit 5) jamais demasquee
-Mesure sans bequille : le DSP tourne (100 M insn), le BSP alimente (266 depots), l'IT est
-PENDANTE (`IFR=0x0028`) mais MASQUEE (`imr_bit=5 unmasked=0`), `IMR` oscille `0x3000`↔`0x3200`
-sans le bit 5, `d[0x435b]=0`, le DSP boucle dans `0xddf5..0xde86` et l'etage demod n'est
-**jamais atteint** (`CALYPSO_WATCH_9F00_RD` = 0).
-- [ ] **P0.a — Le vecteur 21 est-il installe ?** `VEC-INSTALL vec21@0x00d6/0x00d7 <- 0x0000`.
-      Un vecteur a zero rendrait le demasquage inutile : la racine serait l'installation.
-      **A trancher avant tout correctif d'armement.**
-- [ ] **P0.b — 0x6881 / 0x6981 sont-ils bien decodes ?** Ce sont les deux ecritures d'`IMR`
-      (famille `0x68..0x6F`). Si elles sont fausses, l'audit d'opcodes explique le verrou.
-- [ ] **P0.c — Test de diagnostic** (bequille assumee, gate env, defaut OFF) : demasquer
-      artificiellement le bit 5 pour savoir si BRINT0 est le DERNIER verrou ou seulement le
-      PROCHAIN. A faire AVANT d'implementer, le resultat change les priorites.
-- [ ] **P0.d — Implementer la branche manquante** : qui, sur le silicium, arme ce bit, et quel
-      maillon de notre modele ne le fait pas. **Pas une bequille de plus.**
-
-### P1 — Correctifs d'opcodes issus de l'audit (`RAPPORT_OPCODES.md`)
-~40 findings confirmes, ~15 de gravite 1 (longueur fausse -> desynchronisation du decode).
-**Rien d'applique.** Un correctif a la fois, non-regression `SHUNT_LEGIT` obligatoire entre chaque.
-Deux plages (`0x60-0x8F`, `0xC0-0xFF`) sans passe de refutation : verification manuelle exigee.
-
-### FAIT le 2026-07-28
-- [x] `0x1800/1A00/1C00/1E00` AND/OR/XOR/SUBC executes comme un LD — corrige, valide, non-regression OK
-- [x] `0x47` RPT Smem ecrivait BRC au lieu de RC (les boucles ne tournaient qu'une fois)
-- [x] `0x06/07` ADDC (+C), `0x0E/0F` SUBB (-C), `0x38/39` SQURA (T = Smem)
-- [x] 3e gate BSP (la livraison) aligne sur `CALYPSO_BSP_DARAM_FORCE`
-- [x] `CALYPSO_BSP_IQ_DECIM=4` + `DARAM_LEN=296` (DECIM=1 = regression mesuree)
-- [x] Entree demod = `data[0x4c00]` confirmee par mesure (stride 5, polyphase 6 taps)
-- [x] `FB_STREAM` / cellules `0x9260-61` : ecarte (jamais lues dans cette configuration)
-- [x] Deux tables d'opcodes du projet rectifiees (`0xF4..0xF7` = 1 mot ; `0xEA00` = `LD #k9,DP`)
-- [x] `doc/opcodes/tic54x-opc.c` (binutils) verse au depot comme source d'autorite
-- [x] `make-overlay.sh` : `ROOT_GLOBS` elargi a `RAPPORT_*.md PLAN_*.md`
+1. **Lire le MANIFESTE, jamais la ligne de commande.** `CALYPSO_NATIVE_HELPED=1` repose
+   `FB_CORR_ENTRY=0x9500`, `FB_ENERGY=1`, `FB_IQ_DARAM=1` : retirer une variable de la CLI ne la
+   supprime pas.
+2. **Un correctif à la fois pour la mesure**, mais **tous d'un coup dans le sas** — sinon on y passe
+   des mois.
+3. **Non-régression obligatoire** après chaque correctif :
+   `CALYPSO_SHUNT_LEGIT=1 CALYPSO_SHUNT_NO_CANNED=1 CALYPSO_SHUNT_REAL_FB=1 ./start-clean.sh`
+   → `BSIC=7` + `SYSTEM INFORMATION` + `LOCATION UPDATING ACCEPT`, **sans exception**.
+4. **Ne jamais mesurer pendant qu'un agent écrit dans le code.** Une base `AR6` perdue a été
+   attribuée à tort à trois correctifs successifs avant qu'on réalise que deux workflows
+   modifiaient les `.c` sous les pieds de la mesure.
+5. **Toute béquille porte `@BEQUILLE`** — `grep -rn "@BEQUILLE" hw/arm/calypso/*.c *.env`.
+6. **Autorité opcodes** : `doc/opcodes/tic54x-opc.c` (binutils, le champ MOTS fait foi) >
+   `spru172c.pdf` (sémantique) > le code > les tableaux de synthèse. **Ne jamais conclure depuis un
+   commentaire** : plusieurs se sont avérés périmés.
+7. **Une sonde se conçoit par sa condition de déclenchement**, pas par son adresse ; préférer un
+   agrégat à un flux plafonné ; distinguer « varie dans l'espace » de « varie dans le temps » ;
+   « pas de log » n'est jamais « pas d'événement » tant que la sonde n'est pas vérifiée vivante.

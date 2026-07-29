@@ -38,7 +38,7 @@ Le correctif applique le matin meme (`0x1800/1A00/1C00/1E00` = AND/OR/XOR/SUBC e
 
 # Carte de structure du décodeur `calypso_c54x.c` (16865 l.)
 
-Fichier audité : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`), copie locale de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`). Table de référence : `/root/.claude/jobs/26578783/tmp/tic54x_hi8_map.md`.
+Fichier audité : `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`), copie locale de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`). Table de référence : `/root/.claude/jobs/26578783/tmp/tic54x_hi8_map.md`.
 
 ## 1. Points d'entrée du décodage
 
@@ -457,7 +457,7 @@ Légende encodage : `S`=src acc (b9 ou b8 selon famille), `D`=dst acc, `I`+`AAAA
 
 # AUDIT 0x00-0x2F
 
-# AUDIT hi8 0x00–0x2F — `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
+# AUDIT hi8 0x00–0x2F — `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
 
 Copie locale identique : `/root/.claude/jobs/26578783/tmp/calypso_c54x.c`. Aucun fichier modifié. Toutes les preuves d'encodage viennent de `spru.txt` décodé avec la permutation calibrée du contexte, recoupé avec `tic54x_hi8_map.md`.
 
@@ -752,7 +752,7 @@ Re-décodés indépendamment et confirmés justes : ADD `@415929` `0000000S`, AD
 
 # AUDIT 0x30-0x5F
 
-## AUDIT hi8 0x30–0x5F — `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
+## AUDIT hi8 0x30–0x5F — `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
 
 Localisation des handlers : `case 0x3:` L9480‑9507 · `case 0x4:` L9556‑9652 · `case 0x5:` L9654‑9761. Aucune interception pré‑switch (vérifié : entre L5034 et L5960 le seul `return` est le vectoring IRQ L5037 ; labels `case` de premier niveau : 5961/8475/8724/9320/9434/9480/9509/9556/9654/9763).
 
@@ -1093,7 +1093,7 @@ L4753-4757 calcule toujours `(dp(s) << 7) | (opcode & 0x7F)`. Le C54x, lorsque `
 
 `F5` (compteur RC **+ corruption d'AR par ré-exécution** — le plus destructeur, et isolé) → `F1+F2` (patch unique, en veillant à ne pas déborder sur MAX/MIN L6386-6406 ni ROLTC L6554-6569, et en portant A**32**−16) → `F6` (LDM, une ligne, risque nul) → `F4` (+`M1` dans le même patch, même plage) → `F8` **seul** (autonome, contrairement à ce qu'affirme le rapport) → `F3` (à mesurer isolément : chemin porteur documenté) → `F10` → `F9` (atomique multi-sites) → `F7` (avec neutralisation de `lk_used`) → `M2`/`M3` en lot séparé.
 
-Fichiers : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`), copie de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c`, manuel `/root/.claude/jobs/26578783/tmp/spru.txt`. **Aucun fichier modifié.**
+Fichiers : `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`), copie de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c`, manuel `/root/.claude/jobs/26578783/tmp/spru.txt`. **Aucun fichier modifié.**
 
 ---
 
@@ -1101,7 +1101,7 @@ Fichiers : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-op
 
 # AUDIT hi8 0x60–0x8F — `calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
 
-Sources citées : `L####` = ligne de `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` · `map:L##` = `doc/opcodes/tic54x_hi8_map.md` · `p.4-x` = SPRU172C (vérifié sur `spru172c.pdf` avec `pdftotext -layout`, pages PDF = page manuel + 114).
+Sources citées : `L####` = ligne de `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` · `map:L##` = `doc/opcodes/tic54x_hi8_map.md` · `p.4-x` = SPRU172C (vérifié sur `spru172c.pdf` avec `pdftotext -layout`, pages PDF = page manuel + 114).
 
 ---
 
@@ -1835,7 +1835,7 @@ Ordre des `if` re-vérifié ligne à ligne (`case 0x8/0x9` L9763→10278 : 0x90-
 - **Aucun finding REFUTÉ sur le fond.** L'audit est solide ; ses deux erreurs matérielles sont concentrées sur le champ COND des stores conditionnels (F10/F12 → corrigées par F28/F29), et il a manqué le mauvais rang du bit R (F27), la fausseté intrinsèque de SQDST (F30) et le bit dst de 0xA4-0xA7 (dans F15).
 - **Avertissement de séquencement à conserver** : toute correction du masque 0x9C00→0x9E00 (F10/F11) doit supprimer **dans le même patch** le handler PORTW `hi8 == 0x9F` L10125, sinon 0x9F bascule de SACCD vers un PORTW **2 mots** → désynchronisation de décode introduite par le correctif lui-même.
 
-Fichiers : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`) ; copie de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c` ; manuel `/root/.claude/jobs/26578783/tmp/spru.txt` ; dump ROM `/tmp/prom0.txt` (conteneur). Aucun fichier modifié.
+Fichiers : `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-operator-1`) ; copie de travail `/root/.claude/jobs/26578783/tmp/calypso_c54x.c` ; manuel `/root/.claude/jobs/26578783/tmp/spru.txt` ; dump ROM `/tmp/prom0.txt` (conteneur). Aucun fichier modifié.
 
 ---
 
@@ -1843,7 +1843,7 @@ Fichiers : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (conteneur `osmo-op
 
 # AUDIT hi8 0xC0–0xFF — `calypso_c54x.c` (md5 `9d8108f4f626cfbc906ce11c258ce7e2`, 16865 l.)
 
-Fichiers : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (copie locale identique `/root/.claude/jobs/26578783/tmp/calypso_c54x.c`), `/root/.claude/jobs/26578783/tmp/spru.txt`, table projet fournie.
+Fichiers : `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (copie locale identique `/root/.claude/jobs/26578783/tmp/calypso_c54x.c`), `/root/.claude/jobs/26578783/tmp/spru.txt`, table projet fournie.
 
 **Outil de lecture spru.txt** : `/tmp/dec.py` + `/tmp/enc.py` (permutation e[k]→bit du contexte, revalidée sur SFTA `01111DS10T11FIHS` où les lettres `SHIFT` retombent exactement sur b4..b0, et sur 12 encodages connus). Toutes les citations `spru.txt@N` = offset octet.
 

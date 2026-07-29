@@ -31,7 +31,7 @@ import pytest
 
 CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
-QEMU_SRC = "/opt/GSM/qemu-src"
+QEMU_SRC = "/opt/GSM/osmo-qemu-calypso"
 FW_ELF = os.environ.get(
     "FW_ELF",
     "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf")

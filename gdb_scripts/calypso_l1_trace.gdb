@@ -7,8 +7,8 @@
 # est purement DSP (c54x). Si l'ARM se fige/diverge aussi → autre front.
 #
 # Usage (dans le conteneur osmo-operator-1, QEMU déjà lancé avec -gdb tcp::1234) :
-#   gdb-multiarch /opt/GSM/firmware/board/compal_e88/layer1.highram.elf \
-#       -x /opt/GSM/qemu-src/calypso_l1_trace.gdb
+#   gdb-multiarch ${GSM_ROOT}/firmware/board/compal_e88/layer1.highram.elf \
+#       -x ${QEMU_TREE}/calypso_l1_trace.gdb
 # ============================================================================
 
 set pagination off

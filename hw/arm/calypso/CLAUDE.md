@@ -46,9 +46,9 @@ mais pas le c54x.
 ## ROM Reader
 
 ```bash
-bash /opt/GSM/dsp_read.sh <section> <addr_hex>
+bash ${GSM_ROOT}/dsp_read.sh <section> <addr_hex>
 # Sections: regs, drom, pdrom, prom0, prom1, prom2, prom3
-# Example: bash /opt/GSM/dsp_read.sh prom0 0x770C
+# Example: bash ${GSM_ROOT}/dsp_read.sh prom0 0x770C
 ```
 
 ## DSP Boot Trace Format

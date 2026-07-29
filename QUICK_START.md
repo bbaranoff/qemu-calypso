@@ -15,15 +15,15 @@ retirée, ne pas réintroduire).
 1. Tout tourne **dans le conteneur `osmo-operator-1`** ; on y entre par
    `docker exec -it osmo-operator-1 bash`. Depuis l'hôte, tout accès prend la
    forme `docker exec osmo-operator-1 bash -lc '...'`.
-2. Le **runtime est `/opt/GSM/qemu-src`** (build + `calypso.env` + `run.sh` +
-   `start-clean.sh`). `/opt/GSM/qemu-calypso` est un **overlay mort au
+2. Le **runtime est `${QEMU_TREE}`** (build + `calypso.env` + `run.sh` +
+   `start-clean.sh`). `${GSM_ROOT}/qemu-calypso` est un **overlay mort au
    runtime** : n'y écrire jamais (§5).
 3. Build : `ninja -C build qemu-system-arm` puis `./make-overlay.sh` (back-port
    du working tree vers l'overlay git ; ne change rien au runtime).
 
 ```bash
 docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src &&
+  cd ${QEMU_TREE} &&
   ninja -C build qemu-system-arm &&
   ./make-overlay.sh
 '
@@ -36,7 +36,7 @@ du `.o` de l'unité modifiée + `lstart` du process :
 
 ```bash
 docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src &&
+  cd ${QEMU_TREE} &&
   stat -c "%y %n" build/qemu-system-arm &&
   find build -name "*calypso_c54x*.o" -printf "%T+ %p\n" &&
   ps -eo pid,lstart,cmd | grep [q]emu-system-arm
@@ -56,7 +56,7 @@ l'ARM par intercept de lecture (`calypso_dsp_shunt.c:1463-1490`, appelé depuis
 
 ```bash
 docker exec -it osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src && CALYPSO_SHUNT_LEGIT=1 ./start-clean.sh
+  cd ${QEMU_TREE} && CALYPSO_SHUNT_LEGIT=1 ./start-clean.sh
 '
 ```
 
@@ -135,7 +135,7 @@ détecteur hôte. **Ce mode ne campe pas** aujourd'hui.
 
 ```bash
 docker exec -it osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src && rm -f /dev/shm/daram_2a00.cfile /dev/shm/bursts.cfile &&
+  cd ${QEMU_TREE} && rm -f /dev/shm/daram_2a00.cfile /dev/shm/bursts.cfile &&
   CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 CALYPSO_DSP_RUN_C54X=1 \
   CALYPSO_BSP_DARAM_FORCE=1 CALYPSO_BSP_DARAM_ADDR=0x4c00 CALYPSO_BSP_DARAM_LEN=296 \
   CALYPSO_BSP_IQ_DECIM=4 CALYPSO_SHUNT_REAL_FB=1 CALYPSO_DEBUG=BSP ./start-clean.sh
@@ -163,12 +163,12 @@ docker exec osmo-operator-1 bash -lc '
 
 # N2 — ce qui est déposé en DARAM est bien de la FCCH à 1 SPS
 docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src bursts | tail -8'
+  cd ${QEMU_TREE}/tools && python3 corr_iq.py --src bursts | tail -8'
 
 # N3 — ce que le détecteur LIT réellement (dump interne, non-racy)
 #      exige CALYPSO_DARAM_DUMP=1 dans le run
 docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump | tail -6 ;
+  cd ${QEMU_TREE}/tools && python3 corr_iq.py --src ddump | tail -6 ;
   grep -a "DARAM-SANITY" /root/qemu.log | tail -3'
 
 # N4 — le résultat natif
@@ -243,10 +243,10 @@ Métrique : `coh = |Σ iq[k+1]·conj(iq[k])| / Σ|iq[k+1]||iq[k]|` (1.0 = ton pu
 FCCH, ~0 = bruit ou GMSK) et `dphi` exprimé **en unités de π/2**.
 
 ```bash
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src bursts'
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump'
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src shunt'
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src all'
+docker exec osmo-operator-1 bash -lc 'cd ${QEMU_TREE}/tools && python3 corr_iq.py --src bursts'
+docker exec osmo-operator-1 bash -lc 'cd ${QEMU_TREE}/tools && python3 corr_iq.py --src ddump'
+docker exec osmo-operator-1 bash -lc 'cd ${QEMU_TREE}/tools && python3 corr_iq.py --src shunt'
+docker exec osmo-operator-1 bash -lc 'cd ${QEMU_TREE}/tools && python3 corr_iq.py --src all'
 ```
 
 | `--src` | Fichier | Ce que ça mesure | Confiance |
@@ -307,7 +307,7 @@ docker exec osmo-operator-1 bash -lc '
    Les deux `.env` natifs livrés posent encore `0x9500` : le run de référence le
    corrige en CLI (§3).
 4. **L'overlay ne sert à rien au runtime.** Le runtime est
-   `/opt/GSM/qemu-src` **uniquement** ; `/opt/GSM/qemu-calypso` est un overlay
+   `${QEMU_TREE}` **uniquement** ; `${GSM_ROOT}/qemu-calypso` est un overlay
    git alimenté par `./make-overlay.sh` **après** coup. Patcher l'overlay n'a
    aucun effet sur ce qui tourne. Les répertoires `bak`/`bak2` sont de vieilles
    sources.
@@ -353,7 +353,7 @@ docker exec osmo-operator-1 bash -lc '
 
 ## 6. Ne pas faire
 
-- Ne pas écrire dans `/opt/GSM/qemu-calypso` (overlay mort au runtime).
+- Ne pas écrire dans `${GSM_ROOT}/qemu-calypso` (overlay mort au runtime).
 - Ne pas modifier un **défaut** de configuration pour faire passer un test : les
   overrides se posent **en CLI** (l'idiome `: "${X:=…}"` du projet garantit que
   la CLI gagne sur le profil, qui gagne sur `calypso.env`).

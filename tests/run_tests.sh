@@ -9,7 +9,7 @@
 # Usage : run_tests.sh [loop]
 set -u
 PY="${CALYPSO_PY:-/root/.env/bin/python3}"
-TESTS=/opt/GSM/qemu-src/tests
+TESTS=${QEMU_TREE}/tests
 OUT="${CALYPSO_TEST_OUT:-/root/test_reports}"
 PERIOD="${CALYPSO_TEST_PERIOD:-90}"
 mkdir -p "$OUT"

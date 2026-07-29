@@ -48,7 +48,7 @@ QEMU_LOG_CONTAINER = "/root/qemu.log"   # canonical, lecture via docker exec
 QEMU_LOG       = HOST_ROOT / "qemu.log" # backup mount, peut être stale
 MOBILE_PCAP    = HOST_ROOT / "mobile-gsmtap.pcap"
 
-REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/opt/GSM/qemu-src"))
+REPO_ROOT      = Path(os.environ.get("CALYPSO_REPO", "/opt/GSM/osmo-qemu-calypso"))
 DSP_ROM_TXT    = Path(os.environ.get("CALYPSO_DSP_ROM_TXT", str(REPO_ROOT / "calypso_dsp.txt")))
 
 # Sondes connues (rapport 05-14)

@@ -48,7 +48,17 @@ done < <(cd "$OVERLAY" && git ls-files)
 # sources calypso_*, docs unifies, MASTER/STATUS/TODO) et on le `git add` dans
 # l'overlay pour qu'il soit suivi ensuite. Exclut artefacts de build et backups.
 # Racines surchargées via CALYPSO_OVERLAY_ROOTS.
-ADD_ROOTS="${CALYPSO_OVERLAY_ROOTS:-hw/arm/calypso tools/calypso-ipc-device}"
+# [2026-07-29] Ajout des quatre racines nées du refactor. Elles sont 100 %
+# Calypso (absentes de QEMU vanilla), donc éligibles à l'auto-ajout :
+#   run_modules/    le lanceur modulaire (contrat check/status/start/wait/stop)
+#   tmux_modules/   une disposition tmux par profil
+#   environnement/  la configuration découpée par domaine
+#   firmware/       l'image layer1 versionnée avec le dépôt
+# Sans elles, 102 fichiers — tout le lanceur — restaient hors de l'overlay, donc
+# hors image et hors ISO, sans aucun message. On n'ajoute QUE du Calypso : les
+# répertoires vanilla (accel/, block/, target/…) doivent rester dehors, c'est le
+# principe du montage overlay + genuine.
+ADD_ROOTS="${CALYPSO_OVERLAY_ROOTS:-hw/arm/calypso tools/calypso-ipc-device run_modules tmux_modules environnement firmware}"
 added=0
 for root in $ADD_ROOTS; do
     [ -d "$SRC/$root" ] || continue
@@ -80,7 +90,9 @@ done
 # il doit suivre l overlay comme run_results.md (sinon lien mort cote overlay).
 # [2026-07-28] glob RAPPORT_*.md + PLAN_*.md : couvre RAPPORT_DFBDET/OPCODES/BRINT0/
 # SYNTHESE et PLAN_APPLICATION sans re-editer ce script a chaque nouveau rapport.
-ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md RAPPORT_*.md PLAN_*.md}"
+# [2026-07-29] start-oqc.sh : point d'entrée du dépôt frère (osmo-nitb), appelé
+# par la documentation ; il vivait à la racine sans être suivi par l'overlay.
+ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md RAPPORT_*.md PLAN_*.md start-oqc.sh TODO.md}"
 for pat in $ROOT_GLOBS; do
     for f in $SRC/$pat; do
         [ -f "$f" ] || continue

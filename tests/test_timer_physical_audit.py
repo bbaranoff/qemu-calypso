@@ -26,7 +26,7 @@ import pytest
 
 CONTAINER = os.environ.get("CALYPSO_CONTAINER", "trying")
 INSIDE = os.path.exists("/.dockerenv")
-QEMU_SRC = "/opt/GSM/qemu-src"
+QEMU_SRC = "/opt/GSM/osmo-qemu-calypso"
 QEMU_LOG = "/root/qemu.log"
 (removed) = "/tmp/bridge.log"
 BTS_LOG = "/tmp/bts.log"

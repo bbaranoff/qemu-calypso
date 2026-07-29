@@ -1469,7 +1469,7 @@ def _run_log_timeline(folder: Path, bucket_s: float = 10.0) -> tuple[str, bool]:
     """
     container = os.environ.get("CALYPSO_CONTAINER", "trying")
     script_host = Path(__file__).resolve().parent.parent / "log_timeline.py"
-    script_ct = "/opt/GSM/qemu-src/log_timeline.py"
+    script_ct = "/opt/GSM/osmo-qemu-calypso/log_timeline.py"
     csv_inside = "/tmp/log_timeline.csv"
     inside = os.path.exists("/.dockerenv")
 

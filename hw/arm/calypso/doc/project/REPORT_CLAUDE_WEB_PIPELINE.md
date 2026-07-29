@@ -104,7 +104,7 @@ passée **inline** au launch device car tmux bake l'env, pas d'héritage shell.
 
 | FIFO | Consommateur | Rôle |
 |------|-------------|------|
-| `/tmp/iq_fft.fifo` | `osmo_egprs/fft.sh` (host, X `:0`) | FFT live matplotlib (PSD+waterfall) |
+| `/tmp/iq_fft.fifo` | `osmo-nitb-for-calypso/fft.sh` (host, X `:0`) | FFT live matplotlib (PSD+waterfall) |
 | `/tmp/iq_grgsm.fifo` | `si_bridge.py` → `grgsm_decode` (CLAIR) | **décode SI → feed_si → a_cd → mobile (l'e2e)** |
 | `/tmp/iq_grgsm_ciph.fifo` | `si_bridge.py` → `grgsm_decode` (CIPHER) | decipher DL chiffré (2ᵉ instance grgsm, respawn au cipher) |
 | `/tmp/iq_record.fifo` | `record_drain.py` | ring 128MB externe → `/tmp/record.cfile` (le "record", HORS hot-path) |
@@ -130,7 +130,7 @@ passée **inline** au launch device car tmux bake l'env, pas d'héritage shell.
 SI depuis `iq_grgsm.fifo`, le mobile reçoit les DATA_IND. **« Les SI sont
 revenus »** après le passage FIFO, **et plus d'underrun**.
 
-✅ **FFT live** (`osmo_egprs/fft.sh`) : lit `iq_fft.fifo`, affiche PSD+waterfall
+✅ **FFT live** (`osmo-nitb-for-calypso/fft.sh`) : lit `iq_fft.fifo`, affiche PSD+waterfall
 sur le X de l'hôte. Réglages : `NSAMP` (petit=gigote, défaut 32768), `REFRESH`
 (défaut 0.25s), `FFT_SRC=fifo|sweep|tail`.
 
@@ -159,10 +159,10 @@ sur le X de l'hôte. Réglages : `NSAMP` (petit=gigote, défaut 32768), `REFRESH
 
 ```bash
 # Lancer tout (défauts : full-grgsm + icount=off + si_bridge)
-cd /opt/GSM/qemu-src && ./run.sh
+cd ${QEMU_TREE} && ./run.sh
 
 # FFT live (host)
-cd /home/nirvana/osmo_egprs && ./fft.sh
+cd /home/nirvana/osmo-nitb-for-calypso && ./fft.sh
 
 # Tester le décode SI sur le record (sans voler le flux à si_bridge)
 grgsm_decode -m BCCH -t 0 -a 514 -c /tmp/record.cfile -s 1083333 -v
@@ -177,9 +177,9 @@ docker exec osmo-operator-1 grep -iE "SYSTEM INFORMATION|No sysinfo|camp" /tmp/l
 
 ## 7. Contraintes / gotchas (IMPORTANT)
 
-- **Sync 3-way** : toute modif sous `qemu-src` → container `osmo-operator-1:/opt/GSM/qemu-src`
-  (source de vérité pour le BUILD) **ET** host `/home/nirvana/qemu-src` **ET**
-  `/home/nirvana/qemu-calypso` ; vérifier md5. Scripts `/opt/GSM/*.py|*.sh`
+- **Sync 3-way** : toute modif sous `osmo-qemu-calypso` → container `osmo-operator-1:${QEMU_TREE}`
+  (source de vérité pour le BUILD) **ET** host `/home/nirvana/osmo-qemu-calypso` **ET**
+  `/home/nirvana/qemu-calypso` ; vérifier md5. Scripts `${GSM_ROOT}/*.py|*.sh`
   (container-only) → backup `opt-gsm-scripts/` sur les 2 hosts.
 - **Builds** : QEMU = `cd build && ninja qemu-system-arm`. Device =
   `cd tools/calypso-ipc-device && make`. **Relancer `./run.sh`** pour charger les
@@ -204,10 +204,10 @@ docker exec osmo-operator-1 grep -iE "SYSTEM INFORMATION|No sysinfo|camp" /tmp/l
 - `hw/arm/calypso/l1ctl_sock.c` — `l1ctl_inject_dl_si()`, oracles FORCE_*.
 - `run.sh` — orchestration, kill exhaustif, lancement device/bts/mobile, drainer
   record, fenêtres tmux (FFT, grgsm-decode).
-- `/opt/GSM/si_bridge.py` + `si_bridge_loop.sh` — décode SI depuis `iq_grgsm.fifo`.
-- `/opt/GSM/record_drain.py` — drainer `iq_record.fifo` → `record.cfile`.
-- `/opt/GSM/grgsm_fft_live.py` — FFT ASCII (lit `iq_asciifft.fifo`).
-- `/home/nirvana/osmo_egprs/fft.sh` — FFT live host (lit `iq_fft.fifo`).
+- `${GSM_ROOT}/si_bridge.py` + `si_bridge_loop.sh` — décode SI depuis `iq_grgsm.fifo`.
+- `${GSM_ROOT}/record_drain.py` — drainer `iq_record.fifo` → `record.cfile`.
+- `${GSM_ROOT}/grgsm_fft_live.py` — FFT ASCII (lit `iq_asciifft.fifo`).
+- `/home/nirvana/osmo-nitb-for-calypso/fft.sh` — FFT live host (lit `iq_fft.fifo`).
 
 ---
 

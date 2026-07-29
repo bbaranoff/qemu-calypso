@@ -231,7 +231,7 @@ def _generate_csv() -> str:
     if _has_docker() and not INSIDE:
         r = subprocess.run(
             ["docker", "exec", CONTAINER, "python3",
-             "/opt/GSM/qemu-src/log_timeline.py",
+             "/opt/GSM/osmo-qemu-calypso/log_timeline.py",
              "--bucket-s", "10", "--csv", CSV_PATH],
             capture_output=True, text=True, timeout=20)
         return r.stderr or r.stdout[:200]

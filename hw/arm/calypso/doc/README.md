@@ -75,7 +75,7 @@ Il n'y a **pas** de document faisant autorité sur les variables `CALYPSO_*`. La
 regénère (≈ 300 variables, 375 sites) :
 
 ```bash
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/qemu-src/hw/arm/calypso && \
+docker exec osmo-operator-1 bash -lc 'cd ${QEMU_TREE}/hw/arm/calypso && \
   grep -rhoE "getenv\(\"CALYPSO_[A-Z0-9_]+\"\)" *.c | grep -oE "CALYPSO_[A-Z0-9_]+" | sort -u'
 ```
 
@@ -87,13 +87,13 @@ Un `grep CALYPSO_` nu renvoie un sur-ensemble bruité (macros d'IRQ, registres S
 
 ## 4. Règles de travail non négociables
 
-**4.1 — Le runtime est DANS le conteneur.** L'arbre vivant est `/opt/GSM/qemu-src` **à l'intérieur**
+**4.1 — Le runtime est DANS le conteneur.** L'arbre vivant est `${QEMU_TREE}` **à l'intérieur**
 de `osmo-operator-1`. Tout accès passe par `docker exec osmo-operator-1 bash -lc '...'`. Un éditeur
 qui voit un fichier depuis l'hôte ne voit **pas** le runtime.
 
-**4.2 — `/opt/GSM/qemu-calypso` est un overlay MORT au runtime.** Ne rien y écrire : la modification
+**4.2 — `${GSM_ROOT}/qemu-calypso` est un overlay MORT au runtime.** Ne rien y écrire : la modification
 n'aura aucun effet sur le run. Après toute écriture dans `doc/`, propager :
-`cd /opt/GSM/qemu-src && ./make-overlay.sh`.
+`cd ${QEMU_TREE} && ./make-overlay.sh`.
 
 **4.3 — On ne change pas un défaut de configuration.** Documenter, pas modifier. Toute variation se
 fait **en CLI** (l'idiome `: "${VAR:=…}"` du projet garantit que la CLI gagne sur les `.env`).
@@ -167,7 +167,7 @@ que par un reroute qu'on croyait retiré.
 
 **Règle : toute béquille porte le marqueur `@BEQUILLE`.** Un seul grep les liste toutes :
 
-Trois greps, selon ce qu'on cherche. Ils s'appliquent depuis `/opt/GSM/qemu-src` et **excluent
+Trois greps, selon ce qu'on cherche. Ils s'appliquent depuis `${QEMU_TREE}` et **excluent
 `doc/`** : sinon on attrape aussi la présente page, qui décrit la convention sans être une
 béquille, et le décompte est faux.
 

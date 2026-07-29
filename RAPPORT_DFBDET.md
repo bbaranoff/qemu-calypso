@@ -190,7 +190,7 @@ seul** producteur absent, pas deux symptômes.
 ## 7bis. REPRODUCTION
 
 ```bash
-cd /opt/GSM/qemu-src
+cd ${QEMU_TREE}
 
 # mode natif VRAI (shunt désarmé) — impossible avant les correctifs du §1
 CALYPSO_NATIVE_HELPED=1 CALYPSO_DSP=none CALYPSO_FB_ENERGY=0 \
@@ -216,7 +216,7 @@ Sondes livrées, **toutes gatées par env et inactives par défaut** : `CALYPSO_
 
 ## 7. RECOUPEMENT AVEC OSMOCOM-BB — comment le vrai firmware obtient `d_fb_det`
 
-Source : `/opt/GSM/osmocom-bb/src/target/firmware`. Ce recoupement n'était pas dans le
+Source : `${GSM_ROOT}/osmocom-bb/src/target/firmware`. Ce recoupement n'était pas dans le
 périmètre du workflow ; il **corrobore** la §1 et **ouvre une piste** que le rapport n'a
 pas explorée.
 
@@ -263,7 +263,7 @@ défaut 0) : osmocom présuppose un niveau bande de base **calibré par l'AGC**,
 
 ### Reproduire ce recoupement
 ```bash
-docker exec osmo-operator-1 bash -lc 'cd /opt/GSM/osmocom-bb/src/target/firmware && \
+docker exec osmo-operator-1 bash -lc 'cd ${GSM_ROOT}/osmocom-bb/src/target/firmware && \
   grep -n "d_fb_det" include/calypso/dsp_api.h layer1/prim_fbsb.c calypso/dsp.c && \
   sed -n 364,386p layer1/prim_fbsb.c && grep -n "FB_DSP_TASK" include/calypso/l1_environment.h'
 ```
@@ -485,7 +485,7 @@ Deux issues, toutes deux exploitables :
 ## 5. Reproduire
 
 ```bash
-cd /opt/GSM/qemu-src
+cd ${QEMU_TREE}
 
 # run de reference (chaine d'entree correcte, mesuree)
 CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 \
@@ -495,8 +495,8 @@ CALYPSO_SHUNT_REAL_FB=1 CALYPSO_DEBUG=BSP ./start-clean.sh
 
 grep -E "deliver: gate shunt LEVE|dropping fn=" /root/qemu.log   # gate levee, 0 drop
 grep -E "DMA fn=" /root/qemu.log | tail -2                        # le BSP depose
-cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src bursts | grep VERDICT         # FCCH @1SPS PROPRE
-cd /opt/GSM/qemu-src/tools && python3 corr_iq.py --src ddump  | tail -3              # CONFORMITE KERNEL
+cd ${QEMU_TREE}/tools && python3 corr_iq.py --src bursts | grep VERDICT         # FCCH @1SPS PROPRE
+cd ${QEMU_TREE}/tools && python3 corr_iq.py --src ddump  | tail -3              # CONFORMITE KERNEL
 ```
 
 Sondes disponibles (toutes gatees, **defaut OFF**) : `CALYPSO_WMAP` (+`_LO/_HI/_LO2/_HI2`),

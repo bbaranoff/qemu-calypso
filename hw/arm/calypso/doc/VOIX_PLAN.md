@@ -4,7 +4,7 @@ But : faire passer la voix full-rate (TCH/F, GSM 06.10) contre notre stack, mêm
 méthode que FB/SI/SDCCH (sonde → mapping exact API-RAM → présentation host-side),
 sans que le DSP émulé fasse le codec/corrélation.
 
-Base confirmée (lecture code runtime `/opt/GSM/qemu-src` + firmware `/opt/GSM/osmocom-bb`).
+Base confirmée (lecture code runtime `${QEMU_TREE}` + firmware `${GSM_ROOT}/osmocom-bb`).
 
 ---
 
@@ -186,9 +186,9 @@ Rien de bloquant en config : le timeslot TCH/F, le codec FR et le RTP sont déj�
 ---
 
 ### Fichiers clés (absolus)
-- Shunt : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_dsp_shunt.c` (`:177` capture UL, `:333/356` DL TCH, `:836` routage, `:96` publish)
-- Helper : `/opt/GSM/qemu-src/hw/arm/calypso/calypso_dsp_helper.c` (`shunt_dispatch_allc`)
-- Offsets : `/opt/GSM/qemu-src/include/hw/arm/calypso/calypso_dsp_internal.h`
-- RF UL : `/opt/GSM/qemu-src/tools/calypso-ipc-device/qemu_wrap.c` (`:1194,1205,1258,1285`, reader `:880`), `tch_dl_inject.py`
-- Firmware TCH : `/opt/GSM/osmocom-bb/src/target/firmware/layer1/prim_tch.c` (RX `:234-345`, UL `:422/485`, SACCH `:667/729`), `mframe_sched.c:228-269`, `l23_api.c:254-303`
-- Host : `/opt/GSM/osmocom-bb/src/host/layer23/src/mobile/tch.c`, `tch_voice.c`, `gapk_io.c`, `gsm48_rr.c:4768/4041/4713`, `common/l1ctl.c:445/817/842/875`
+- Shunt : `${QEMU_TREE}/hw/arm/calypso/calypso_dsp_shunt.c` (`:177` capture UL, `:333/356` DL TCH, `:836` routage, `:96` publish)
+- Helper : `${QEMU_TREE}/hw/arm/calypso/calypso_dsp_helper.c` (`shunt_dispatch_allc`)
+- Offsets : `${QEMU_TREE}/include/hw/arm/calypso/calypso_dsp_internal.h`
+- RF UL : `${QEMU_TREE}/tools/calypso-ipc-device/qemu_wrap.c` (`:1194,1205,1258,1285`, reader `:880`), `tch_dl_inject.py`
+- Firmware TCH : `${GSM_ROOT}/osmocom-bb/src/target/firmware/layer1/prim_tch.c` (RX `:234-345`, UL `:422/485`, SACCH `:667/729`), `mframe_sched.c:228-269`, `l23_api.c:254-303`
+- Host : `${GSM_ROOT}/osmocom-bb/src/host/layer23/src/mobile/tch.c`, `tch_voice.c`, `gapk_io.c`, `gsm48_rr.c:4768/4041/4713`, `common/l1ctl.c:445/817/842/875`

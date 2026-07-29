@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+
+# --- racine de l'installation, resolue sans chemin en dur --------------------
+# GSM_ROOT si l'environnement le pose (c'est le cas quand on passe par run.sh),
+# sinon le parent du depot : les deux depots vivent cote a cote.
+import os as _os
+GSM_ROOT = _os.environ.get(
+    "GSM_ROOT",
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 """
 make_dsp_bin_L1.py — Generate calypso_dsp.PROM0.bin with synthetic L1+L2 publisher.
 
@@ -30,7 +39,7 @@ Usage :
 import sys
 import struct
 
-INPUT  = sys.argv[1] if len(sys.argv) > 1 else '/opt/GSM/calypso_dsp.PROM0.bin'
+INPUT  = sys.argv[1] if len(sys.argv) > 1 else f'{GSM_ROOT}/calypso_dsp.PROM0.bin'
 # *** OUTPUT path EXPLICITLY separate — JAMAIS écrase l'original ***
 OUTPUT = sys.argv[2] if len(sys.argv) > 2 else '/tmp/calypso_dsp_L1stub.PROM0.bin'
 

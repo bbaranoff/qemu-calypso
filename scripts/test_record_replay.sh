@@ -19,7 +19,7 @@ DUR="${1:-30}"
 DUMP=/tmp/bsp_rx.dump
 LOGDIR=/tmp/record_replay_logs
 mkdir -p "$LOGDIR"
-RUN_SH="${RUN_SH:-/opt/GSM/qemu-src/run.sh}"
+RUN_SH="${RUN_SH:-${QEMU_TREE}/run.sh}"
 QEMU_LOG="${QEMU_LOG:-/root/qemu.log}"
 
 # ---- helper : kill toute la stack et nettoyer ----

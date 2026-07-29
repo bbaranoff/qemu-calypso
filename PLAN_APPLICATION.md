@@ -8,8 +8,8 @@ Statut de chaque affirmation : **MESURE** (log / dump binaire), **LECTURE DE COD
 (fichier:ligne), **HYPOTHÈSE** (falsifiable, test indiqué).
 
 Autorités, dans l'ordre :
-1. `/opt/GSM/qemu-src/hw/arm/calypso/doc/opcodes/tic54x-opc.c` (champ MOTS fait foi)
-2. `/opt/GSM/qemu-src/hw/arm/calypso/doc/spru172c.pdf` (extrait `spru.txt`) — sémantique C54x
+1. `${QEMU_TREE}/hw/arm/calypso/doc/opcodes/tic54x-opc.c` (champ MOTS fait foi)
+2. `${QEMU_TREE}/hw/arm/calypso/doc/spru172c.pdf` (extrait `spru.txt`) — sémantique C54x
 3. TI SPRU131G (extrait `/root/.claude/jobs/26578783/tmp/spru131g.txt`) — périphériques,
    IMR/IFR, table des vecteurs, init BSP
 4. les images ROM DSP (`calypso_dsp.PROM0..3.bin`, `PDROM.bin`, `DROM.bin`)
@@ -309,7 +309,7 @@ peut réordonner la suite.
 
 Test de non-régression **obligatoire après chaque correctif**, sans exception :
 ```
-cd /opt/GSM/qemu-src && CALYPSO_SHUNT_LEGIT=1 CALYPSO_SHUNT_NO_CANNED=1 \
+cd ${QEMU_TREE} && CALYPSO_SHUNT_LEGIT=1 CALYPSO_SHUNT_NO_CANNED=1 \
     CALYPSO_SHUNT_REAL_FB=1 ./start-clean.sh
 ```
 Attendu : **BSIC=7**, **SYSTEM INFORMATION 2 et 4**, **LOCATION UPDATING ACCEPT**.
@@ -358,7 +358,7 @@ le shunt).
 
 **Commande de test** (mode natif pur, aucune béquille) :
 ```
-cd /opt/GSM/qemu-src && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
+cd ${QEMU_TREE} && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
   CALYPSO_INIT_435B_OFF=1 CALYPSO_WATCH_9F00_RD=1 \
   CALYPSO_DEBUG=IRQ,VEC ./start-clean.sh
 ```
@@ -816,7 +816,7 @@ Ces trois tests ne corrigent rien. Leur résultat **réordonne** la §3.
 
 ### D0 — Purger les semences (coût nul, aucune modification de code)
 ```
-cd /opt/GSM/qemu-src && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
+cd ${QEMU_TREE} && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
   CALYPSO_INIT_435B_OFF=1 CALYPSO_WATCH_9F00_RD=1 ./start-clean.sh
 ```
 (sans `CALYPSO_KEEP_IMR`, sans `CALYPSO_FIXES`, sans `CALYPSO_ARM2DSP_*`.)
@@ -831,7 +831,7 @@ dans `/proc/<pid>/environ` (le gate teste la **valeur**, pas la présence :
 **Le gate existe déjà, défaut OFF** : `calypso_c54x.c:16929-16937`,
 `CALYPSO_FIXES=FIX_BRINT0_UNMASK`. Il force `unmasked = true` pour `imr_bit == 5`.
 ```
-cd /opt/GSM/qemu-src && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
+cd ${QEMU_TREE} && CALYPSO_DSP=c54x CALYPSO_SHUNT_LEGIT=0 \
   CALYPSO_INIT_435B_OFF=1 CALYPSO_WATCH_9F00_RD=1 \
   CALYPSO_FIXES=FIX_BRINT0_UNMASK ./start-clean.sh
 ```
@@ -968,21 +968,21 @@ et que la valeur écrite en `d[0x3fd2]` est cohérente.
 ## 8. Fichiers et artefacts
 
 **Sources citées (aucune modifiée)** :
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.h` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_bsp.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_tpu.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_trx.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/calypso_arm2dsp.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/doc/opcodes/tic54x-opc.c` ·
-`/opt/GSM/qemu-src/hw/arm/calypso/doc/spru172c.pdf` ·
-`/opt/GSM/osmocom-bb/src/target/firmware/include/calypso/dsp_api.h` ·
-`/opt/GSM/osmocom-bb/src/target/firmware/include/calypso/l1_environment.h` ·
-`/opt/GSM/osmocom-bb/src/target/firmware/calypso/dsp.c` ·
-`/opt/GSM/osmocom-bb/src/target/firmware/layer1/sync.c` ·
-`/opt/GSM/osmocom-bb/src/target/firmware/layer1/prim_fbsb.c`
+`${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` ·
+`${QEMU_TREE}/hw/arm/calypso/calypso_c54x.h` ·
+`${QEMU_TREE}/hw/arm/calypso/calypso_bsp.c` ·
+`${QEMU_TREE}/hw/arm/calypso/calypso_tpu.c` ·
+`${QEMU_TREE}/hw/arm/calypso/calypso_trx.c` ·
+`${QEMU_TREE}/hw/arm/calypso/calypso_arm2dsp.c` ·
+`${QEMU_TREE}/hw/arm/calypso/doc/opcodes/tic54x-opc.c` ·
+`${QEMU_TREE}/hw/arm/calypso/doc/spru172c.pdf` ·
+`${GSM_ROOT}/osmocom-bb/src/target/firmware/include/calypso/dsp_api.h` ·
+`${GSM_ROOT}/osmocom-bb/src/target/firmware/include/calypso/l1_environment.h` ·
+`${GSM_ROOT}/osmocom-bb/src/target/firmware/calypso/dsp.c` ·
+`${GSM_ROOT}/osmocom-bb/src/target/firmware/layer1/sync.c` ·
+`${GSM_ROOT}/osmocom-bb/src/target/firmware/layer1/prim_fbsb.c`
 
-**Images ROM** : `/opt/GSM/calypso_dsp.{PROM0,PROM1,PROM2,PROM3,PDROM,DROM}.bin`
+**Images ROM** : `${GSM_ROOT}/calypso_dsp.{PROM0,PROM1,PROM2,PROM3,PDROM,DROM}.bin`
 (PROM0 base **0x7000**, mots **little-endian** — revérifié : `W(0xddf9)=0x6881`,
 `W(0xde84)=0x6981`, exactement les opcodes du log natif).
 
@@ -995,5 +995,5 @@ et que la valeur écrite en `d[0x3fd2]` est cohérente.
 `xref.py` + `xref_PROM0.json` (graphe d'appels PROM0, 13 733 instructions) ·
 `wf_results/dis.py` (table binutils + désassembleur ancré + descente récursive).
 
-**Rapports amont** : `/opt/GSM/qemu-src/RAPPORT_OPCODES.md` ·
-`/opt/GSM/qemu-src/RAPPORT_DFBDET.md`
+**Rapports amont** : `${QEMU_TREE}/RAPPORT_OPCODES.md` ·
+`${QEMU_TREE}/RAPPORT_DFBDET.md`

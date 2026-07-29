@@ -174,10 +174,10 @@ Or **l'émulateur définit `NDB_D_DSP_PAGE = 0x08E2`** (`calypso_fbsb.h:51`) et 
 ---
 
 ### Sources
-- API RAM : `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/include/calypso/dsp_api.h` (struct db_r/db_w/ndb + BASE_API_* :18-23)
-- Offsets émulateur : `/opt/GSM/qemu-src/include/hw/arm/calypso/calypso_dsp_internal.h`, `.../hw/arm/calypso/calypso_fbsb.h`, `.../calypso_c54x.h`
+- API RAM : `${GSM_ROOT}/osmocom-bb-transceiver/src/target/firmware/include/calypso/dsp_api.h` (struct db_r/db_w/ndb + BASE_API_* :18-23)
+- Offsets émulateur : `${QEMU_TREE}/include/hw/arm/calypso/calypso_dsp_internal.h`, `.../hw/arm/calypso/calypso_fbsb.h`, `.../calypso_c54x.h`
 - Handshake/wiring : `calypso_bsp.c`, `calypso_c54x.c`, `calypso_arm2dsp.c`, `calypso_dsp_shunt.c`, `calypso_dsp_helper.c`
-- ROM disasm : `/opt/GSM/calypso_dsp.txt` (base PROM0=0x7000) ; carte existante `doc/DSP_ROM_MAP.md`
+- ROM disasm : `${GSM_ROOT}/calypso_dsp.txt` (base PROM0=0x7000) ; carte existante `doc/DSP_ROM_MAP.md`
 
 ---
 

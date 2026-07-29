@@ -21,6 +21,15 @@ import subprocess
 import sys
 import time
 
+# --- racine de l'installation, resolue sans chemin en dur --------------------
+# GSM_ROOT si l'environnement le pose (c'est le cas quand on passe par run.sh),
+# sinon le parent du depot : les deux depots vivent cote a cote.
+import os as _os
+GSM_ROOT = _os.environ.get(
+    "GSM_ROOT",
+    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 1234
 
@@ -34,7 +43,15 @@ ARM_PC  = 15
 ARM_CPSR = 25
 
 # Default observation breakpoints (no patching)
-DEFAULT_FW = "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf"
+# Le firmware est livre avec le depot (firmware/compal_e88/). On respecte
+# d abord FIRMWARE_ELF, pose par environnement/paths.env, puis on cherche
+# dans le depot, et seulement ensuite a l exterieur.
+DEFAULT_FW = _os.environ.get(
+    "FIRMWARE_ELF",
+    _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                  "firmware", "compal_e88", "layer1.highram.elf"))
+if not _os.path.exists(DEFAULT_FW):
+    DEFAULT_FW = f"{GSM_ROOT}/firmware/board/compal_e88/layer1.highram.elf"
 BP_FBDET_RESP_ENTRY = 0x00826434  # l1s_fbdet_resp+0x10 (after ldrh r8)
 BP_FBSB_COMPL_ENTRY = 0x00826754  # l1a_fb_compl+0x08
 BP_FB1_FREQ         = 0x008266c8  # FB1 freq cmp

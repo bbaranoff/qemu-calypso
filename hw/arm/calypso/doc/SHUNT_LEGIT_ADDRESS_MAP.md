@@ -219,16 +219,16 @@ Suivi de gain vivant : chaque write TSP REG_RX (dev 1, `calypso_trf6151_tsp_writ
 | `HACK` | 0 (natif) | 0=natif ; calypso_hack.env = bequilles. |
 
 Fichiers de reference (absolus, conteneur `osmo-operator-1`) :
-- `/opt/GSM/qemu-src/hw/arm/calypso/calypso_dsp_shunt.c`
-- `/opt/GSM/qemu-src/hw/arm/calypso/calypso_dsp_helper.c`
-- `/opt/GSM/qemu-src/hw/arm/calypso/calypso_c54x.c` (+ `.h` : C54X_API_BASE 0x0800, C54X_API_SIZE 0x2000)
-- `/opt/GSM/qemu-src/hw/arm/calypso/calypso_trx.c` (MMIO read/write, miroir off/2+0x800, DMA proof l.905-921)
-- `/opt/GSM/qemu-src/hw/arm/calypso/calypso_trf6151.c` / `.h`
-- `/opt/GSM/qemu-src/include/hw/arm/calypso/calypso_dsp_internal.h` (bases pages, offsets WP_/RP_/NDB_, task IDs)
-- `/opt/GSM/qemu-src/include/hw/arm/calypso/calypso_trx.h`
-- `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/include/calypso/dsp_api.h`
-- `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/include/calypso/l1_environment.h`
-- `/opt/GSM/osmocom-bb-transceiver/src/target/firmware/layer1/prim_fbsb.c`, `prim_pm.c`, `prim_rx_nb.c`
+- `${QEMU_TREE}/hw/arm/calypso/calypso_dsp_shunt.c`
+- `${QEMU_TREE}/hw/arm/calypso/calypso_dsp_helper.c`
+- `${QEMU_TREE}/hw/arm/calypso/calypso_c54x.c` (+ `.h` : C54X_API_BASE 0x0800, C54X_API_SIZE 0x2000)
+- `${QEMU_TREE}/hw/arm/calypso/calypso_trx.c` (MMIO read/write, miroir off/2+0x800, DMA proof l.905-921)
+- `${QEMU_TREE}/hw/arm/calypso/calypso_trf6151.c` / `.h`
+- `${QEMU_TREE}/include/hw/arm/calypso/calypso_dsp_internal.h` (bases pages, offsets WP_/RP_/NDB_, task IDs)
+- `${QEMU_TREE}/include/hw/arm/calypso/calypso_trx.h`
+- `${GSM_ROOT}/osmocom-bb-transceiver/src/target/firmware/include/calypso/dsp_api.h`
+- `${GSM_ROOT}/osmocom-bb-transceiver/src/target/firmware/include/calypso/l1_environment.h`
+- `${GSM_ROOT}/osmocom-bb-transceiver/src/target/firmware/layer1/prim_fbsb.c`, `prim_pm.c`, `prim_rx_nb.c`
 ---
 
 ## 9. Chaine UPLINK / Location Update (2026-07-26)

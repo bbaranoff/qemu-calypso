@@ -1,7 +1,7 @@
 # Calypso DSP ROM Map
 
 ## ROM Dump Sections
-Source: `/opt/GSM/calypso_dsp.txt` — dumped from Motorola C1xx via osmocon + ESP32
+Source: `${GSM_ROOT}/calypso_dsp.txt` — dumped from Motorola C1xx via osmocon + ESP32
 
 | Section | Address Range | Size (words) | Loaded Into |
 |---------|--------------|--------------|-------------|
