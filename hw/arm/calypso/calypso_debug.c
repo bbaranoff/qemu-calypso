@@ -119,3 +119,29 @@ bool calypso_debug_enabled_(const char *probe_name)
     }
     return false;
 }
+
+/* calypso_gate — voir calypso_debug.h pour la sémantique et le pourquoi.
+ *
+ * Pas de cache : un appelant qui veut mémoriser le fait déjà dans son `static
+ * int`. Mettre un cache ICI empêcherait de changer d'avis à chaud et masquerait
+ * les cas où deux modules lisent la même variable à des moments différents. */
+int calypso_gate(const char *nom, int defaut)
+{
+    const char *e = nom ? getenv(nom) : NULL;
+    if (!e) {
+        return defaut;          /* absente : c'est l'appelant qui décide */
+    }
+    if (!*e) {
+        return 0;               /* posée VIDE = explicitement coupée */
+    }
+    /* Comparaison insensible à la casse, sur les formes que les gens écrivent
+     * réellement dans un .env. Tout ce qui n'est pas une négation vaut « oui » :
+     * mieux vaut activer sur « yes » que d'ignorer silencieusement une valeur
+     * que l'opérateur croyait comprise. */
+    if (!strcasecmp(e, "0")     || !strcasecmp(e, "no") ||
+        !strcasecmp(e, "off")   || !strcasecmp(e, "false") ||
+        !strcasecmp(e, "n")) {
+        return 0;
+    }
+    return 1;
+}

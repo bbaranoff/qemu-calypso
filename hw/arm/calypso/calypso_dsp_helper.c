@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_debug.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_dsp_internal.h"
 
@@ -723,7 +724,7 @@ void shunt_dispatch_allc(uint8_t page_idx)
      *             r_page est deduit du protocole et non devine.
      */
     static int canned_on = -1, dual = -1;
-    if (canned_on < 0) canned_on = getenv("CALYPSO_SHUNT_CANNED") ? 1 : 0;
+    if (canned_on < 0) canned_on = calypso_gate("CALYPSO_SHUNT_CANNED", 0);
     if (dual < 0) { const char *ed = getenv("CALYPSO_SHUNT_DUAL_PAGE"); dual = (ed && *ed == '0') ? 0 : 1; }
     for (int pg = 0; pg < 2; pg++) {
         if (!dual && pg != page_idx) continue;

@@ -304,7 +304,7 @@ static BspBurstSlot *bsp_take_for_fn(uint8_t tn, uint32_t current_fn)
      * (fix = une ligne) ; delta qui DÉRIVE = problème d'horloge. Cap 300 + 1/500. */
     {
         static int fp = -1;
-        if (fp < 0) fp = getenv("CALYPSO_BSP_FN_PROBE") ? 1 : 0;
+        if (fp < 0) fp = calypso_gate("CALYPSO_BSP_FN_PROBE", 0);
         if (fp && n_valid > 0) {
             static unsigned fpn = 0;
             if (fpn < 300 || (fpn % 500) == 0)
@@ -1111,7 +1111,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      *   retirer : des que calypso_iota_take_bdl_pulse() est alimente par la fenetre
      *             RX du TPU et consomme sur le chemin vivant (cf TPU_RX_WIRE).
      */
-    { static int _db = -1; if (_db < 0) _db = getenv("CALYPSO_BSP_DIRECT_BRINT0") ? 1 : 0;
+    { static int _db = -1; if (_db < 0) _db = calypso_gate("CALYPSO_BSP_DIRECT_BRINT0", 0);
       /* MISSION-GATE : ne lever BRINT0 que si le DSP est reellement sur la
        * mission FB/SB (d_task_md), pas hors-mission -> le reveil correlateur
        * arrive au bon moment, comme le vrai "buffer recu" du silicium.
@@ -1141,7 +1141,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      *             BSP_DIRECT_FEED=1 et omet 0x3fad -> a supprimer en premier.
      *   NB      : conteneur de POKE_TASK_MD et POKE_DISPATCH ci-dessous.
      */
-    { static int _fbf = -1; if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
+    { static int _fbf = -1; if (_fbf < 0) _fbf = calypso_gate("CALYPSO_RX_FBFLAGS", 0);
       uint16_t _mdf = calypso_dsp_shunt_get_task_md();
       int _fbsbf = (_mdf == 5 || _mdf == 6 || _mdf == 8 || _mdf == 9);
       if (_fbf && _fbsbf && bsp.dsp) {
@@ -1207,10 +1207,10 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
      *             demasquage IMR est separable (CALYPSO_BSP_DISPATCH_NOIMR=1).
      */
     { static int _di = -1; static uint16_t _tgt = 0; static int _os = -1; static int _done = 0;
-      if (_di < 0) { _di = getenv("CALYPSO_BSP_DISPATCH_FB") ? 1 : 0;
+      if (_di < 0) { _di = calypso_gate("CALYPSO_BSP_DISPATCH_FB", 0);
         const char *_t = getenv("CALYPSO_BSP_DISPATCH_FB_TGT");
         _tgt = (_t && *_t) ? (uint16_t)strtoul(_t, NULL, 0) : 0x8d00;
-        _os = getenv("CALYPSO_BSP_DISPATCH_ONESHOT") ? 1 : 0; } /* cible 0x8d00.
+        _os = calypso_gate("CALYPSO_BSP_DISPATCH_ONESHOT", 0); } /* cible 0x8d00.
         * ONESHOT (diag user "pulse") : n'installe+leve BRINT0 qu'UNE fois, au lieu
         * de re-dispatcher chaque trame (= la congestion : correlateur re-entre en
         * boucle sans finir). Le pulse laisse le correlateur derouler une passe. */
@@ -1226,7 +1226,7 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
            * entree (IT vers vec21/0x00d4). CALYPSO_BSP_DISPATCH_NOIMR=1 pour
            * installer le handler SANS toucher l IMR. */
           static int _noimr = -1;
-          if (_noimr < 0) _noimr = getenv("CALYPSO_BSP_DISPATCH_NOIMR") ? 1 : 0;
+          if (_noimr < 0) _noimr = calypso_gate("CALYPSO_BSP_DISPATCH_NOIMR", 0);
           if (!_noimr) bsp.dsp->imr |= 0x0200;   /* bit9 : route frame scheduler */
         }
         static unsigned _dl = 0;
@@ -1478,7 +1478,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
              *             aboutit sans contournement.
              */
             static int en = -1;
-            if (en < 0) en = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+            if (en < 0) en = calypso_gate("CALYPSO_TPU_RX_WIRE", 0);
             if (en && calypso_iota_take_bdl_pulse((uint8_t)tn)) {
                 rxwin = 1;
                 if (bsp.dsp) bsp.dsp->data[0x3f92] |= 0x0800;
@@ -1667,7 +1667,7 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
              *             CALYPSO_BSP_DIRECT_FEED=1 (la file bufferisee reste vide).
              */
             static int _fbf = -1;
-            if (_fbf < 0) _fbf = getenv("CALYPSO_RX_FBFLAGS") ? 1 : 0;
+            if (_fbf < 0) _fbf = calypso_gate("CALYPSO_RX_FBFLAGS", 0);
             if (_fbf && bsp.dsp) {
                 bsp.dsp->data[0x3faa] |= 0x0104;   /* bit2 + bit8 */
                 bsp.dsp->data[0x3fab] |= 0x0100;   /* bit8 (cible FBEN) */

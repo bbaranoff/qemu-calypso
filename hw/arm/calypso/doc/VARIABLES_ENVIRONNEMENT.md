@@ -9,6 +9,12 @@
 > Chaque entrée est vérifiée contre le **code exécuté**, pas contre les commentaires : plusieurs
 > se sont avérés périmés. Les numéros de ligne valent pour le snapshot dont les md5 sont donnés
 > en tête de chaque lot ; re-grepper avant d'annoter.
+>
+> **Mise à jour du 2026-07-29** — l'idiome `EXISTS` n'existe plus : ses 103 sites ont été migrés
+> vers un helper unique, `calypso_gate()`. Voir « Le helper unifié » ci-dessous. Les sections
+> « idiomes », « MORTES » et « pièges » ont été corrigées en conséquence ; le recensement détaillé
+> par lot, lui, reste le snapshot du 28 et n'a PAS été réécrit — ses colonnes « IDIOME » disant
+> `EXISTS` sont donc historiques.
 
 ---
 
@@ -37,7 +43,7 @@ Ils ne se coupent pas de la même façon. C'est la première source d'erreur de 
 
 | Idiome | Actif quand | Comment le couper |
 |---|---|---|
-| `getenv("X") ? 1 : 0` (**EXISTS**) | la variable **existe**, même à `0` | **`unset X`** — mettre `0` ne suffit pas |
+| ~~`getenv("X") ? 1 : 0` (**EXISTS**)~~ | ~~la variable **existe**, même à `0`~~ | **MIGRÉ le 2026-07-29** → `calypso_gate()` |
 | `atoi(getenv("X")) > 0` | valeur > 0 | `X=0` |
 | `*e == '1'` (**EQ1**) | valeur exactement `"1"` | toute autre valeur |
 | défaut ON + `X_OFF` | par défaut | poser `X_OFF` |
@@ -47,6 +53,39 @@ Dans les fichiers `.env`, l'idiome compte aussi : `:=` laisse la ligne de comman
 
 À part : `CALYPSO_DEBUG` n'est pas une variable mais un **namespace** de ~105 jetons, lus par
 `calypso_debug_enabled()` / `cdbg_env()`.
+
+### Le helper unifié — `calypso_gate()` (2026-07-29)
+
+Les trois idiomes donnaient **trois réponses différentes** à `X=0` et à `X=` : c'était, de loin,
+la première cause d'erreur de manipulation. Un helper unique les remplace :
+
+```c
+int calypso_gate(const char *nom, int defaut);   /* calypso_debug.h */
+```
+
+| Valeur | Résultat |
+|---|---|
+| variable **absente** | `defaut` |
+| `""` · `0` · `no` · `off` · `false` (casse indifférente) | **0** |
+| tout le reste (`1`, `yes`, `2`, …) | **1** |
+
+Deux gains : `X=0` coupe **toujours**, et le paramètre `defaut` dit **à l'appel** ce que vaut
+l'absence — l'information qui manquait le plus dans le code.
+
+L'implémentation est dans `calypso_debug.c`. ⚠️ **Pas** dans `calypso_dbg.c`, qui n'est pas
+référencé par `meson.build` et n'est donc jamais compilé — piège déjà signalé plus bas.
+
+**État de la migration** : `EXISTS` **fait, 103 sites, 0 reste**
+(`arm2dsp` 1 · `bsp` 8 · `c54x` 85 · `dsp_helper` 1 · `dsp_shunt` 3 · `trx` 5).
+Restent `EQ1` (79 sites) et `ATOI` (22) — leur idiome ne piège pas dans le même sens, la migration
+est moins urgente.
+
+La migration était sûre parce que **mesurée avant** : sur les 82 variables en idiome `EXISTS`,
+aucune n'était posée à `0` dans `environnement/` ni `run_modules/`. Non-régression vérifiée
+(camp + `LU ACCEPT` + `TMSI` sur les deux abonnés).
+
+**Ce que le helper ne couvre pas** : les variables qui portent une **valeur** (adresse, longueur,
+cadence, chemin, liste) gardent `getenv` + `strtoul`/`atoi`. Les convertir n'aurait aucun sens.
 
 ## Les cinq catégories
 
@@ -60,6 +99,13 @@ Dans les fichiers `.env`, l'idiome compte aussi : `:=` laisse la ligne de comman
 
 Critère qui tranche entre CONFIG et BÉQUILLE : *« le matériel réel a-t-il un équivalent de ce
 réglage ? »* Si non, c'est une béquille.
+
+> **État du sas `CALYPSO_FIXES` au 2026-07-29 — il est VIDE de candidats.**
+> Les sept correctifs confirmés ont déjà été dégatés (leur condition effacée, le code conservé).
+> Il ne reste que quatre noms, dont **aucun n'est à durcir** :
+> `FIX_LD_PARALLEL`, `FIX_STL_STH_SHFT`, `FIX_LDM_ZEROEXT` sont les trois **infirmés** malgré un
+> encodage formellement juste, et `FIX_BRINT0_UNMASK` est un **diagnostic** — il répond à une
+> question puis se retire, il ne se confirme jamais.
 
 **105 béquilles sont annotées dans le code** et se recensent d'un grep :
 
@@ -77,6 +123,14 @@ Repérées par le recensement, avec la preuve qu'elles ne sont plus lues :
 `ORCH` · `TINT0_PERIOD` · `C54X_CRASHPC` (ses deux occurrences sont des arguments de `fprintf`) ·
 `TRAP_CHECKPOINT` · `FIX_MVDM` · `CORRELATOR_TRACE`.
 
+> **Re-vérification du 2026-07-29 — la liste n'est PAS à appliquer telle quelle.**
+> Un contrôle par `grep 'CALYPSO_<VAR>"'` sur `hw/` et `tools/` ne confirme la mort que de
+> **quatre** d'entre elles : `START_FN`, `NB_MAXDLY`, `FIX_MVDM`, `CORRELATOR_TRACE`.
+> Les six autres ont encore une occurrence du littéral. Ce n'est pas contradictoire — pour
+> `C54X_CRASHPC` la doc dit elle-même que ses occurrences sont des `fprintf`, pas des `getenv` —
+> mais **chacune doit être ré-examinée individuellement avant retrait**, en distinguant un
+> `getenv()` d'une simple mention. Ne pas supprimer sur la foi de cette liste seule.
+
 ## Pièges relevés par le recensement
 
 - **`BSP_DIRECT_FEED`** court-circuite tout le match FN : la file reste vide, donc **tout
@@ -85,6 +139,13 @@ Repérées par le recensement, avec la preuve qu'elles ne sont plus lues :
 - **`BSP_DARAM_FORCE`** utilise l'idiome `EXISTS` : `=0` **ne la coupe pas**, il faut `unset`.
   Et elle n'a d'effet que si `DSP_RUN_C54X=="1"`.
 - **`DSP_BLOB`**, s'il est posé, fait **ignorer toutes** les sections PROM/DROM.
+- **`LDK8_SHIFT16`** *(trouvé le 2026-07-29, en migrant vers `calypso_gate`)* : elle était
+  déclarée **vide** dans `opcodes.env` (`: "${CALYPSO_LDK8_SHIFT16:=}"`), ce qui, sous l'idiome
+  `EXISTS`, la rendait **ACTIVE** — l'ancien comportement A/B de LDK8 tournait donc en permanence,
+  à l'inverse de ce que la ligne laissait lire. Elle est désormais fixée explicitement à `1`, pour
+  ne rien changer au run validé : c'est un **constat**, pas un choix de conception, et il est
+  maintenant révocable en connaissance de cause. Leçon générale : **une variable déclarée vide
+  n'était pas neutre** ; chercher les autres `:=` vides avant de conclure sur un défaut.
 
 ---
 

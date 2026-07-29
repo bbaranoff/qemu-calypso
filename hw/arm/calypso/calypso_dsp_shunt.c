@@ -37,6 +37,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_debug.h"
 #include <math.h>
 #include "qemu/log.h"
 #include "qemu/error-report.h"
@@ -565,7 +566,7 @@ static void shunt_route_to_c54x_run(void)
          *             (idem VEC28_REMAP cote calypso_c54x.c).
          */
         static int fin = -1;
-        if (fin < 0) fin = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
+        if (fin < 0) fin = calypso_gate("CALYPSO_FRAME_IT_NATIVE", 0);
         if (fin)
             c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
         else
@@ -581,7 +582,7 @@ static void shunt_route_to_c54x_run(void)
              *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
              */
             static int _t0m = -1;
-            if (_t0m < 0) _t0m = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
+            if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
             if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
         }
     }
@@ -2303,7 +2304,7 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
     {
         static int _b2i = -1; static unsigned _n = 0, _imax = 0, _qmax = 0; static int _iidx = -1;
         static uint64_t _e = 0; static unsigned _wn = 0;
-        if (_b2i < 0) _b2i = getenv("CALYPSO_B2IN") ? 1 : 0;
+        if (_b2i < 0) _b2i = calypso_gate("CALYPSO_B2IN", 0);
         if (_b2i) {
             int16_t _I = (int16_t)*outI, _Q = (int16_t)*outQ;
             unsigned _ai = _I < 0 ? (unsigned)(-_I) : (unsigned)_I;

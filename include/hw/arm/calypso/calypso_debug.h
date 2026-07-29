@@ -82,3 +82,34 @@ static inline const char *cdbg_env(const char *token)
 }
 
 #endif /* HW_ARM_CALYPSO_DEBUG_H */
+
+/* =============================================================================
+ *  calypso_gate() — UNE sémantique pour toutes les gardes par environnement
+ * =============================================================================
+ *
+ *  POURQUOI. Le modèle utilisait TROIS idiomes concurrents pour la même
+ *  question « cette option est-elle active ? » :
+ *
+ *      getenv("X") ? 1 : 0     103 sites   X=0 n'y coupe RIEN — seul `unset`
+ *      e && *e == '1'           79 sites   X posée vide vaut 0
+ *      atoi(getenv("X")) > 0    22 sites
+ *
+ *  Trois réponses différentes à « X=0 » et à « X= ». La documentation appelle
+ *  cela « la première source d'erreur de manipulation », et le terrain lui donne
+ *  raison : `CALYPSO_LDK8_SHIFT16` est déclarée VIDE dans opcodes.env, ce qui
+ *  sous l'idiome EXISTS la rend ACTIVE — l'inverse de l'intention lisible.
+ *
+ *  SÉMANTIQUE UNIQUE, celle que tout le monde suppose déjà :
+ *
+ *      variable absente                      -> `defaut`
+ *      "0" · "" · "no" · "off" · "false"     -> 0     (insensible à la casse)
+ *      tout le reste                         -> 1
+ *
+ *  Donc `X=0` coupe TOUJOURS, et `X=1` active toujours. `defaut` rend explicite,
+ *  à l'appel, ce que vaut l'absence — l'information qui manquait le plus.
+ *
+ *  CE QUE CE HELPER N'EST PAS. Il répond par oui ou non. Les variables qui
+ *  portent une VALEUR (adresse, longueur, cadence, chemin, liste) gardent leur
+ *  `getenv` + `strtoul`/`atoi` : les convertir n'aurait aucun sens.
+ * ---------------------------------------------------------------------------- */
+int calypso_gate(const char *nom, int defaut);

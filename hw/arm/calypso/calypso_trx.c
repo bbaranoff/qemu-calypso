@@ -200,7 +200,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     if (offset >= CALYPSO_DSP_SIZE) return 0;
     {   /* [2026-07-28] FIND32 : voir en-tete du patch. */
         static int _f3 = -1; static unsigned _f3n = 0; static uint16_t _f3v = 0x0020;
-        if (_f3 < 0) { _f3 = getenv("CALYPSO_FIND32") ? 1 : 0;
+        if (_f3 < 0) { _f3 = calypso_gate("CALYPSO_FIND32", 0);
                        const char *v = getenv("CALYPSO_FIND32_VAL");
                        if (v && *v) _f3v = (uint16_t)strtol(v, NULL, 0); }
         if (_f3 && _f3n < 40 && s->dsp_ram && (offset & 1) == 0) {
@@ -216,7 +216,7 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     }
     {   /* [2026-07-28] ERRREAD : voir en-tete du patch. */
         static int _er = -1; static unsigned _ern = 0;
-        if (_er < 0) _er = getenv("CALYPSO_ERRREAD") ? 1 : 0;
+        if (_er < 0) _er = calypso_gate("CALYPSO_ERRREAD", 0);
         if (_er && offset >= 0x01A8 && offset <= 0x01AE && _ern < 40) {
             _ern++;
             unsigned _w = (unsigned)(offset / 2);
@@ -505,7 +505,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     if (offset >= CALYPSO_DSP_SIZE) return;
     {   /* [2026-07-28] BOOTCMD cote ARM : commande bootloader DSP (voir en-tete). */
         static int _bc = -1; static unsigned _bcn = 0;
-        if (_bc < 0) _bc = getenv("CALYPSO_BOOTCMD") ? 1 : 0;
+        if (_bc < 0) _bc = calypso_gate("CALYPSO_BOOTCMD", 0);
         if (_bc && offset >= 0x0FF8 && offset <= 0x0FFF && _bcn < 40) {
             _bcn++;
             const char *_nm = (offset == 0x0FFE) ? "BL_CMD_STATUS (2/4=download)" :
@@ -519,7 +519,7 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
     {   /* [2026-07-28] FBDET-API (b) cote ARM : ecriture MMIO de d_fb_det
          * (mot DSP 0x08F8 -> offset 0x01F0) et du bloc a_sync_demod. */
         static int _fb = -1; static unsigned _fbn = 0;
-        if (_fb < 0) _fb = getenv("CALYPSO_FBDET_API") ? 1 : 0;
+        if (_fb < 0) _fb = calypso_gate("CALYPSO_FBDET_API", 0);
         if (_fb && offset >= 0x01F0 && offset <= 0x01FB && _fbn < 40) {
             _fbn++;
             fprintf(stderr, "[calypso-trx] FBDET-API ARM off=0x%04x (mot 0x%04x, %s)"
@@ -995,7 +995,7 @@ static void calypso_dsp_done(void *opaque) {
      *             et que 0xa539 s'execute reellement.
      */
     static int trx_rxw = -1;
-    if (trx_rxw < 0) trx_rxw = getenv("CALYPSO_TPU_RX_WIRE") ? 1 : 0;
+    if (trx_rxw < 0) trx_rxw = calypso_gate("CALYPSO_TPU_RX_WIRE", 0);
     if (s->dsp && s->dsp_ram[0x01A8/2] != 0 &&
         (!calypso_dsp_shunt_active() || trx_rxw)) {
         uint16_t page = s->dsp_ram[0x01A8/2] & 1;

@@ -31,6 +31,7 @@
  *   CALYPSO_ARM2DSP_BGEN_ONESHOT=1  post exactly once (single go-live transition)
  */
 #include "qemu/osdep.h"
+#include "hw/arm/calypso/calypso_debug.h"
 #include "hw/arm/calypso/calypso_dsp_shunt.h"
 #include "calypso_arm2dsp.h"
 
@@ -288,7 +289,7 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
      *             declencheur) ; verifier au passage l'offset 0x08E2, conteste
      *             (d_dsp_page pourrait etre 0x08D4).
      */
-    if (a2d_cont < 0) a2d_cont = getenv("CALYPSO_ARM2DSP_CONT") ? 1 : 0;
+    if (a2d_cont < 0) a2d_cont = calypso_gate("CALYPSO_ARM2DSP_CONT", 0);
     /* CONT mode : re-post every step while the ARM's B_GSM_TASK is asserted in
      * DSP memory (d_dsp_page word 0x08E2 bit1), so the task-ready bit is set when
      * the dispatcher checks it (b424) despite b419 clearing it. Non-CONT : one

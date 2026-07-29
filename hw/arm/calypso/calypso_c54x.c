@@ -1674,7 +1674,7 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
          *   retirer : quand le tampon est alimente par le vrai chemin (BSP -> DARAM).
          *   Note : inerte avec CORR_ENTRY=0x94f5 — les cellules 0x9260/61 n y sont
          *   jamais lues (mesure 2026-07-28, WATCH-9F00-RD). */
-        if (_fs < 0) _fs = getenv("CALYPSO_FB_STREAM") ? 1 : 0;
+        if (_fs < 0) _fs = calypso_gate("CALYPSO_FB_STREAM", 0);
         if (_fs) {
             static uint16_t _si, _sq; static int _hv = 0; uint16_t _rv;
             if (addr == _fscI) { _hv = calypso_dsp_shunt_fb_stream_next(&_si, &_sq) ? 1 : 0; _rv = _hv ? _si : s->data[addr]; }
@@ -1688,7 +1688,7 @@ static uint16_t data_read(C54xState *s, uint16_t addr)
     }
     if (s->pc >= 0x9f00 && s->pc <= 0x9fb8) {
         static int _r9 = -1;
-        if (_r9 < 0) _r9 = getenv("CALYPSO_WATCH_9F00_RD") ? 1 : 0;
+        if (_r9 < 0) _r9 = calypso_gate("CALYPSO_WATCH_9F00_RD", 0);
         if (_r9) {
             /* Lectures du chemin actif (0x9f00..0x9fb8) SANS exclusion : localise les
              * cellules SOURCE lues avant le fill workzone 0x2a00 (0x9213/0x9215 IQ ?). */
@@ -1816,7 +1816,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
     rmap_note(addr, s->pc);
     {   /* [2026-07-28] WZREAD : voir en-tete du patch (gate CALYPSO_WZWRITE). */
         static int _wr = -1; static unsigned _wrn = 0;
-        if (_wr < 0) _wr = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wr < 0) _wr = calypso_gate("CALYPSO_WZWRITE", 0);
         if (_wr && addr == 0x2c00 && s->pc == 0xa07c && _wrn < 40) {
             /* v3 : seule la lecture du noyau MAC nous interesse (0x9aba = boucle
              * de normalisation, bruyante et deja caracterisee en B4B). */
@@ -1829,7 +1829,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
     }
     {   /* [2026-07-28] DMAWATCH (lecture) : voir en-tete du patch. */
         static int _dw2 = -1; static unsigned _dwr = 0;
-        if (_dw2 < 0) _dw2 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw2 < 0) _dw2 = calypso_gate("CALYPSO_DMAWATCH", 0);
         if (_dw2 && addr >= 0x0054 && addr <= 0x0057 && _dwr < 40) {
             _dwr++;
             const char *_nm = (addr==0x0054) ? "DMPREC?(modele:DMSA)" :
@@ -1841,7 +1841,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
     }
     {   /* [2026-07-28] DEMODRD : voir en-tete du patch. */
         static int _dr = -1; static unsigned _drn = 0;
-        if (_dr < 0) _dr = getenv("CALYPSO_DEMODRD") ? 1 : 0;
+        if (_dr < 0) _dr = calypso_gate("CALYPSO_DEMODRD", 0);
         if (_dr && _drn < 60 && s->pc == 0x9fb5) {   /* seule la lecture des echantillons */
             _drn++;
             fprintf(stderr, "[c54x] DEMODRD PC=0x%04x XPC=%u op=0x%04x lit data[0x%04x]=0x%04x "
@@ -1857,7 +1857,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
     }
     {   /* [2026-07-27] SLOTSRC-RD : quelle adresse contient le stub 0xab38 ? */
         static int _sr = -1; static unsigned _srn = 0;
-        if (_sr < 0) _sr = getenv("CALYPSO_SLOTSRC") ? 1 : 0;
+        if (_sr < 0) _sr = calypso_gate("CALYPSO_SLOTSRC", 0);
         if (_sr && _srn < 40 && s->data[addr] == 0xab38) {
             _srn++;
             fprintf(stderr, "[c54x] SLOTSRC-RD data[0x%04x] = 0xab38 (STUB) lu PC=0x%04x insn=%u\n",
@@ -1873,7 +1873,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
      * boucle. Log tout READ dans cette fenetre (valeur, PC), cap 200. */
     if (addr >= 0x2b80 && addr < 0x2c00) {
         static int mw2b80_en = -1;
-        if (mw2b80_en < 0) mw2b80_en = getenv("CALYPSO_MEM_WATCH_2B80") ? 1 : 0;
+        if (mw2b80_en < 0) mw2b80_en = calypso_gate("CALYPSO_MEM_WATCH_2B80", 0);
         if (mw2b80_en) {
             static unsigned mw2b80_n = 0;
             if (mw2b80_n < 200) {
@@ -2389,7 +2389,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
             dsp_page_log++;
         }
         /* FBWATCH PRODUCTEUR : le DSP re-lit-il d_dsp_page PAR-FRAME ? (env one-shot) */
-        if (g_fbwatch_on < 0) g_fbwatch_on = getenv("CALYPSO_FBWATCH") ? 1 : 0;
+        if (g_fbwatch_on < 0) g_fbwatch_on = calypso_gate("CALYPSO_FBWATCH", 0);
         if (g_fbwatch_on) {
             static unsigned wpg = 0;
             if (wpg++ < 60)
@@ -2481,7 +2481,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
      * CALYPSO_PROBE_3FAD_GATE. Zero cout/effet quand OFF. */
     if (addr == 0x3fad && s->pc == 0x8753 && calypso_rxfb_fired) {  /* [fix v3] gate = RX-FBFLAGS a REELLEMENT pose 3fad bit15 (definitif) */
         static int p3_en = -1; static unsigned p3_n = 0;
-        if (p3_en < 0) p3_en = getenv("CALYPSO_PROBE_3FAD_GATE") ? 1 : 0;
+        if (p3_en < 0) p3_en = calypso_gate("CALYPSO_PROBE_3FAD_GATE", 0);
         if (p3_en && p3_n < 200) {
             p3_n++;
             fprintf(stderr, "[c54x] PROBE-3FAD-GATE @0x8753 val=0x%04x bit15=%d "
@@ -2501,7 +2501,7 @@ static uint16_t data_read_locked(C54xState *s, uint16_t addr)
          *             @0x8753 — c.-a-d. quand PROBE_3FAD_GATE voit bit15=1 sans ce gate.
          *   NB      : conditionne par calypso_rxfb_fired, pose par CALYPSO_RX_FBFLAGS.
          */
-        { static int _fk = -1; if (_fk < 0) _fk = getenv("CALYPSO_FORCE_3FAD_KERNEL") ? 1 : 0;
+        { static int _fk = -1; if (_fk < 0) _fk = calypso_gate("CALYPSO_FORCE_3FAD_KERNEL", 0);
           if (_fk && calypso_rxfb_fired) s->data[0x3fad] |= 0x8000; }
     }
 
@@ -2521,7 +2521,7 @@ static unsigned g_stkw_idx  = 0;
 static int      g_orphan_on = -1;
 static void stkw_rec(C54xState *s, uint16_t addr, uint16_t val)
 {
-    if (g_orphan_on < 0) g_orphan_on = getenv("CALYPSO_ORPHAN") ? 1 : 0;  /* env dédiée (hors CALYPSO_DEBUG → master reste 0, anti-Heisenbug) */
+    if (g_orphan_on < 0) g_orphan_on = calypso_gate("CALYPSO_ORPHAN", 0);  /* env dédiée (hors CALYPSO_DEBUG → master reste 0, anti-Heisenbug) */
     if (!g_orphan_on) return;
     if (addr < 0x1000 || addr > 0x6000) return;   /* zone pile (SP dérive 0x1100→0x56xx) */
     StkwEv *e = &g_stkw_ring[g_stkw_idx % STKW_RING_N];
@@ -2548,7 +2548,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * clobbe-t-il l ecriture DIRECTE du shunt (SI1-4) apres un reset ? Gate CALYPSO_WATCH_ACD. */
     if (addr >= 0x09D2 && addr <= 0x09E0) {
         static int _wac = -1;
-        if (_wac < 0) _wac = getenv("CALYPSO_WATCH_ACD") ? 1 : 0;
+        if (_wac < 0) _wac = calypso_gate("CALYPSO_WATCH_ACD", 0);
         if (_wac) { static unsigned _nac = 0;
             if (_nac++ < 60)
                 fprintf(stderr, "[c54x] WATCH-ACD DSP-opcode-write data[0x%04x]=0x%04x (was 0x%04x) PC=0x%04x insn=%u\n",
@@ -2561,7 +2561,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * avec le pointeur feed_iq. Gate CALYPSO_WATCH_2A00. */
     if (addr >= 0x2a00 && addr <= 0x2a07) {
         static int _w2a = -1;
-        if (_w2a < 0) _w2a = getenv("CALYPSO_WATCH_2A00") ? 1 : 0;
+        if (_w2a < 0) _w2a = calypso_gate("CALYPSO_WATCH_2A00", 0);
         if (_w2a) {
             static unsigned _n2a = 0;
             if (_n2a++ < 80)
@@ -2576,7 +2576,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * region pour voir si qqun l'alimente per-frame (et d'ou). Gate CALYPSO_WATCH_9200. */
     if ((addr >= 0x9210 && addr <= 0x9220) || (addr >= 0x9260 && addr <= 0x9262)) {
         static int _w92 = -1;
-        if (_w92 < 0) _w92 = getenv("CALYPSO_WATCH_9200") ? 1 : 0;
+        if (_w92 < 0) _w92 = calypso_gate("CALYPSO_WATCH_9200", 0);
         if (_w92) {
             static unsigned _n92 = 0;
             if (_n92++ < 80)
@@ -2591,7 +2591,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * Gate CALYPSO_WATCH_RESULT. */
     if (addr >= 0x08F8 && addr <= 0x08FD) {
         static int _wr = -1;
-        if (_wr < 0) _wr = getenv("CALYPSO_WATCH_RESULT") ? 1 : 0;
+        if (_wr < 0) _wr = calypso_gate("CALYPSO_WATCH_RESULT", 0);
         if (_wr) {
             static unsigned _nr = 0;
             const char *_nm = (addr==0x08F8)?"d_fb_det":(addr==0x08F9)?"d_fb_mode":
@@ -2610,7 +2610,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
      * le re-setter s'il n'apparait pas). Cap 200. */
     if (addr == 0x0810) {
         static int w810 = -1;
-        if (w810 < 0) w810 = getenv("CALYPSO_WATCH_0810") ? 1 : 0;
+        if (w810 < 0) w810 = calypso_gate("CALYPSO_WATCH_0810", 0);
         if (w810) {
             static unsigned n810 = 0;
             if (n810++ < 200)
@@ -2638,7 +2638,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
          *             (data[0x3fcd] vaut 0xa4e4 sans le gate).
          */
         static int f3f = -1;
-        if (f3f < 0) f3f = getenv("CALYPSO_FIX_3FCD") ? 1 : 0;
+        if (f3f < 0) f3f = calypso_gate("CALYPSO_FIX_3FCD", 0);
         if (f3f && val != 0xa4e4) {
             static unsigned f3n = 0;
             if (f3n++ < 8)
@@ -2802,7 +2802,7 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
         }
     }
     /* === FBWATCH (env CALYPSO_FBWATCH, one-shot, hors master-gate) === */
-    if (g_fbwatch_on < 0) g_fbwatch_on = getenv("CALYPSO_FBWATCH") ? 1 : 0;
+    if (g_fbwatch_on < 0) g_fbwatch_on = calypso_gate("CALYPSO_FBWATCH", 0);
     if (g_fbwatch_on) {
         /* (1) qui ÉCRIT le flag dispatch FB (slot data[0x60-0x70] / 0x3dc0-2) ? */
         if ((addr >= 0x0060 && addr <= 0x0070) || (addr >= 0x3dc0 && addr <= 0x3dc2)) {
@@ -3007,7 +3007,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     flow_log("W", addr, val, s->pc, s->insn_count);
     {   /* [2026-07-28] WZWRITE : qui remplit l entree du noyau ? (voir en-tete) */
         static int _wz = -1; static unsigned _wzn = 0;
-        if (_wz < 0) _wz = getenv("CALYPSO_WZWRITE") ? 1 : 0;
+        if (_wz < 0) _wz = calypso_gate("CALYPSO_WZWRITE", 0);
         if (_wz && addr == 0x2c00 && (s->pc == 0x9fd5 || s->pc == 0x9ab1) && _wzn < 40) {
             /* v3 : filtre par PC PRODUCTEUR — 0xa03d/a042/a079 (init MAC) exclus,
              * ils saturaient le plafond et masquaient les bursts suivants. */
@@ -3021,7 +3021,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     }
     {   /* [2026-07-28] ERRWATCH : qui pose d_error_status ? (voir en-tete) */
         static int _ew = -1; static unsigned _ewn = 0;
-        if (_ew < 0) _ew = getenv("CALYPSO_ERRWATCH") ? 1 : 0;
+        if (_ew < 0) _ew = calypso_gate("CALYPSO_ERRWATCH", 0);
         /* v3 : sur d_error_status (0x08D5) on ignore les ecritures de 0 —
          * elles sont le nettoyage de boot et consommaient tout le plafond. */
         if (_ew && addr == 0x08D5 && val != 0 && _ewn < 60) {
@@ -3040,7 +3040,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     }
     {   /* [2026-07-28] DMAWATCH (ecriture). */
         static int _dw3 = -1; static unsigned _dww = 0;
-        if (_dw3 < 0) _dw3 = getenv("CALYPSO_DMAWATCH") ? 1 : 0;
+        if (_dw3 < 0) _dw3 = calypso_gate("CALYPSO_DMAWATCH", 0);
         if (_dw3 && addr >= 0x0054 && addr <= 0x0057 && _dww < 40) {
             _dww++;
             fprintf(stderr, "[c54x] DMAWATCH WR 0x%04x <- 0x%04x (etait 0x%04x) PC=0x%04x insn=%u\n",
@@ -3049,7 +3049,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     }
     {   /* [2026-07-28] BOOTCMD cote DSP : qui ecrase la commande ? */
         static int _bc2 = -1; static unsigned _bc2n = 0;
-        if (_bc2 < 0) _bc2 = getenv("CALYPSO_BOOTCMD") ? 1 : 0;
+        if (_bc2 < 0) _bc2 = calypso_gate("CALYPSO_BOOTCMD", 0);
         if (_bc2 && addr >= 0x0FFC && addr <= 0x0FFF && _bc2n < 40) {
             _bc2n++;
             fprintf(stderr, "[c54x] BOOTCMD DSP data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x insn=%u%s\n",
@@ -3059,7 +3059,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     }
     {   /* [2026-07-27] DISPTAB-WR : qui remplit la table de dispatch ? */
         static int _dt = -1; static unsigned _dtn = 0;
-        if (_dt < 0) _dt = getenv("CALYPSO_DISPTAB") ? 1 : 0;
+        if (_dt < 0) _dt = calypso_gate("CALYPSO_DISPTAB", 0);
         if (_dt && addr >= 0x4380 && addr <= 0x43cf && _dtn < 60) {
             _dtn++;
             fprintf(stderr, "[c54x] DISPTAB-WR data[0x%04x] <- 0x%04x PC=0x%04x insn=%u\n",
@@ -3101,7 +3101,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * atteint). Deux bugs differents. */
     if (addr == 0x08f8) {
         static int _b4 = -1; static unsigned _b4n = 0;
-        if (_b4 < 0) _b4 = getenv("CALYPSO_B4") ? 1 : 0;
+        if (_b4 < 0) _b4 = calypso_gate("CALYPSO_B4", 0);
         if (_b4 && _b4n < 64) {
             _b4n++;
             fprintf(stderr, "[c54x] B4-DFBDET-WR data[0x08f8] 0x%04x -> 0x%04x PC=0x%04x xpc=%u insn=%u\n",
@@ -3113,7 +3113,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * boot-copy 0x76f8->0x2c00 et QUI l ecrit. */
     if (addr >= 0x2c00 && addr < 0x2c10) {
         static int _b1w = -1; static unsigned _b1wn = 0;
-        if (_b1w < 0) _b1w = getenv("CALYPSO_B1") ? 1 : 0;
+        if (_b1w < 0) _b1w = calypso_gate("CALYPSO_B1", 0);
         if (_b1w && _b1wn < 64 && val != 0) {
             _b1wn++;
             fprintf(stderr, "[c54x] B1-BOOTCOPY-WR data[0x%04x] 0x%04x -> 0x%04x PC=0x%04x xpc=%u insn=%u\n",
@@ -3122,7 +3122,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
     }
     if (addr >= 0x2b80 && addr < 0x2c00) {
         static int mw2b80_wen = -1;
-        if (mw2b80_wen < 0) mw2b80_wen = getenv("CALYPSO_MEM_WATCH_2B80") ? 1 : 0;
+        if (mw2b80_wen < 0) mw2b80_wen = calypso_gate("CALYPSO_MEM_WATCH_2B80", 0);
         if (mw2b80_wen) {
             static unsigned mw2b80_wn = 0;
             if (mw2b80_wn < 200) {
@@ -3325,7 +3325,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
      * (prouve firing). Cap 40. */
     if (val == 0x71f4) {
         static int vw_en = -1;
-        if (vw_en < 0) vw_en = getenv("CALYPSO_AR0_DEBUG") ? 1 : 0;
+        if (vw_en < 0) vw_en = calypso_gate("CALYPSO_AR0_DEBUG", 0);
         if (vw_en) {
             static unsigned vw = 0;
             if (vw++ < 40)
@@ -4200,7 +4200,7 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
             s->api_ram[woff] = val;
         {   /* [2026-07-28] FBDET-API (a) cote DSP : voir en-tete du patch. */
             static int _fa = -1; static unsigned _fan = 0;
-            if (_fa < 0) _fa = getenv("CALYPSO_FBDET_API") ? 1 : 0;
+            if (_fa < 0) _fa = calypso_gate("CALYPSO_FBDET_API", 0);
             if (_fa && woff >= 0xF8 && woff <= 0xFD && _fan < 40) {
                 _fan++;
                 fprintf(stderr, "[c54x] FBDET-API DSP api_ram[0x%02x] (mot 0x%04x, %s)"
@@ -5014,7 +5014,7 @@ static bool c54x_irq_level_check(C54xState *s)
      * pend=0. C'est le verrou du mur terminal Frontiere A. */
     {
         static int lcdbg = -1;
-        if (lcdbg < 0) lcdbg = getenv("CALYPSO_AR0_DEBUG") ? 1 : 0;
+        if (lcdbg < 0) lcdbg = calypso_gate("CALYPSO_AR0_DEBUG", 0);
         if (lcdbg && s->imr && s->insn_count > 4000) {   /* skip boot-reset noise, vise go-live */
             static unsigned lc = 0;
             uint16_t iptr = (s->pmst >> PMST_IPTR_SHIFT) & 0x1FF;
@@ -5168,7 +5168,7 @@ static int c54x_exec_one(C54xState *s)
      * contre du zero). Le moins cher / binaire. */
     {
         static int _b1 = -1; static unsigned _b1n = 0;
-        if (_b1 < 0) _b1 = getenv("CALYPSO_B1") ? 1 : 0;
+        if (_b1 < 0) _b1 = calypso_gate("CALYPSO_B1", 0);
         if (_b1 && s->xpc == 0 && s->pc == 0xa076 && _b1n < 20) {
             _b1n++;
             uint32_t _ck = 0;
@@ -5210,7 +5210,7 @@ static int c54x_exec_one(C54xState *s)
          *   retirer : quand la chaine RX/BRINT0 ecrit ces flags (RANK2 resolu).
          */
         static int f3ae = -1;
-        if (f3ae < 0) f3ae = getenv("CALYPSO_FORCE_3FAE") ? 1 : 0;
+        if (f3ae < 0) f3ae = calypso_gate("CALYPSO_FORCE_3FAE", 0);
         if (f3ae && s->xpc == 0 && s->pc >= 0x8d00 && s->pc <= 0xa200) {
             /* TOUTE la handshake FB-det que le handler poll (0x8866 + 0x90xx) :
              * 0x3faa bit2/bit8, 0x3fab bit8, 0x3fae bit8. Decouple RANK3 du feed
@@ -5226,7 +5226,7 @@ static int c54x_exec_one(C54xState *s)
      * flux quitte le kernel MAC 0xa076 (lit 0x2a00). Marque 0xa076/0x9a80. Cap 8000. */
     {
         static int cf = -1; static unsigned cfn = 0;
-        if (cf < 0) cf = getenv("CALYPSO_CORR_FLOW") ? 1 : 0;
+        if (cf < 0) cf = calypso_gate("CALYPSO_CORR_FLOW", 0);
         /* Range ELARGIE : inclut 0x8866 (sous-routine handshake, <0x8d00) + 0xa076.
          * Trace AUSSI AR3 (ptr CMPS/coeff) et AR1/AR2 pour voir le setup pointeurs. */
         /* Skip la boucle de copie 0x8866-0x886c (op 8091, ~134x/appel) qui bouffait
@@ -6343,7 +6343,7 @@ static int c54x_exec_one(C54xState *s)
                 /* [2026-07-27] CALA-FB : cible NATIVE du dispatcher + d_task_md,
                  * loggee AVANT tout reroute (voir en-tete du patch). */
                 { static int _cf = -1; static unsigned _cfn = 0;
-                  if (_cf < 0) _cf = getenv("CALYPSO_CALA_FB") ? 1 : 0;
+                  if (_cf < 0) _cf = calypso_gate("CALYPSO_CALA_FB", 0);
                   if (_cf && _cfn < 40) { _cfn++;
                       fprintf(stderr, "[c54x] CALA-FB tgt=0x%04x md0804=%u md0818=%u md058a=%u "
                               "(0x7700=routine resultat FB, 0xab38=?, 0x8d00=corr symbole) "
@@ -7040,7 +7040,7 @@ static int c54x_exec_one(C54xState *s)
             {
                 static int fix_sftl_rsbx = -1;
                 if (fix_sftl_rsbx < 0)
-                    fix_sftl_rsbx = getenv("CALYPSO_FIX_SFTL_RSBX") ? 1 : 0;
+                    fix_sftl_rsbx = calypso_gate("CALYPSO_FIX_SFTL_RSBX", 0);
                 /* NATIF 2026-07-20 : RSBX/SSBX (low-byte nibble 0xB = 0x?Bx) ne sont
                  * JAMAIS un shift accumulator legal (cf binutils tic54x-opc.c). Exclusion
                  * INCONDITIONNELLE du pattern shift -> ils tombent dans leur vrai handler
@@ -7327,7 +7327,7 @@ static int c54x_exec_one(C54xState *s)
                 {
                     static int fix_sftl_rsbx2 = -1;
                     if (fix_sftl_rsbx2 < 0)
-                        fix_sftl_rsbx2 = getenv("CALYPSO_FIX_SFTL_RSBX") ? 1 : 0;
+                        fix_sftl_rsbx2 = calypso_gate("CALYPSO_FIX_SFTL_RSBX", 0);
                     if ((op & 0xFCE0) == 0xF4A0 &&
                         (fix_sftl_rsbx2 == 0 || (op & 0xF0) != 0xB0)) {
                         /* SFTL src,shift,dst — logical shift accumulator */
@@ -7805,7 +7805,7 @@ static int c54x_exec_one(C54xState *s)
                  * fix strict a casse 2x avant (TC/BITF) -> valider via chaine de tests. */
                 {
                     static int fixbc = -1;
-                    if (fixbc < 0) fixbc = getenv("CALYPSO_C54X_FIX_BC") ? 1 : 0;
+                    if (fixbc < 0) fixbc = calypso_gate("CALYPSO_C54X_FIX_BC", 0);
                     if (fixbc) {
                         if (c54x_cond_true(s, op & 0xFF)) { s->pc = op2; return 0; }
                         return consumed + s->lk_used;
@@ -7829,7 +7829,7 @@ static int c54x_exec_one(C54xState *s)
                  * boucle infinie. Gate PC-range + env : semantique BC TC reelle
                  * uniquement sur 0xde0d-0xde26. Defaut OFF -> aucun risque ailleurs. */
                 static int bctc_sm = -1;
-                if (bctc_sm < 0) bctc_sm = getenv("CALYPSO_C54X_BCTC_SM") ? 1 : 0;
+                if (bctc_sm < 0) bctc_sm = calypso_gate("CALYPSO_C54X_BCTC_SM", 0);
                 bool tc_strict = ((g_prev_op & 0xFE00) == 0x6000) ||
                                  (bctc_sm && s->pc >= 0xde0d && s->pc <= 0xde26);
                 if (tc_strict) {
@@ -8909,7 +8909,7 @@ static int c54x_exec_one(C54xState *s)
              * Verifie runtime (TERM-TRACE). Correct c54x SPRU172C : LD #k8 -> low bits.
              * Env CALYPSO_LDK8_SHIFT16=1 restaure l'ancien comportement (A/B). */
             static int _ldk8sh = -1;
-            if (_ldk8sh < 0) _ldk8sh = getenv("CALYPSO_LDK8_SHIFT16") ? 1 : 0;
+            if (_ldk8sh < 0) _ldk8sh = calypso_gate("CALYPSO_LDK8_SHIFT16", 0);
             int64_t _ldv = _ldk8sh ? (v << 16) : v;
             if (dst) s->b = sext40(_ldv);
             else     s->a = sext40(_ldv);
@@ -9198,7 +9198,7 @@ static int c54x_exec_one(C54xState *s)
              * l'AFC/correlateur ne recevait AUCUN echantillon -> jamais de
              * convergence. GATED CALYPSO_FIX_PORTR. */
             static int fix_portr = -1;
-            if (fix_portr < 0) fix_portr = getenv("CALYPSO_FIX_PORTR") ? 1 : 0;
+            if (fix_portr < 0) fix_portr = calypso_gate("CALYPSO_FIX_PORTR", 0);
             if (fix_portr && (pa == 0xF430 || pa == 0x0034)) {
                 uint16_t iq = (s->bsp_pos < s->bsp_len) ? s->bsp_buf[s->bsp_pos++] : 0;
                 data_write(s, addr, iq);
@@ -12276,7 +12276,7 @@ int c54x_run(C54xState *s, int n_insns)
          *   NB      : maitre de INITTAB et REDIR7000 ; exclut MASKROM_INIT.
          */
         static int redir_legacy = -1;
-        if (redir_legacy < 0) redir_legacy = getenv("CALYPSO_REDIR_LEGACY") ? 1 : 0;
+        if (redir_legacy < 0) redir_legacy = calypso_gate("CALYPSO_REDIR_LEGACY", 0);
         if (redir_legacy && s->pc == 0xFF80 && s->sp == 0x1100) {
             static int redirect_log;
             /* EXPÉRIENCE CALYPSO_REDIR7000 (2026-05-30) : le redirect→0x7120 saute
@@ -12291,7 +12291,7 @@ int c54x_run(C54xState *s, int n_insns)
              *   NB      : imbriquee dans REDIR_LEGACY, et ecrasee par INITTAB (else if).
              */
             static int redir7000 = -1;
-            if (redir7000 < 0) redir7000 = getenv("CALYPSO_REDIR7000") ? 1 : 0;
+            if (redir7000 < 0) redir7000 = calypso_gate("CALYPSO_REDIR7000", 0);
             if (redirect_log < 3) {
                 C54_LOG("SILICON-BOOT-REDIRECT PC=0xFF80 SP=0x1100 → 0x%04x%s",
                         redir7000 ? 0x7000 : 0x7120,
@@ -12311,7 +12311,7 @@ int c54x_run(C54xState *s, int n_insns)
              *   NB      : sans CALYPSO_REDIR_LEGACY, ce gate n'est jamais evalue.
              */
             static int inittab = -1;
-            if (inittab < 0) inittab = getenv("CALYPSO_INITTAB") ? 1 : 0;
+            if (inittab < 0) inittab = calypso_gate("CALYPSO_INITTAB", 0);
             if (inittab) {
                 s->sp = 0x5AC8;
                 s->sp--; s->data[s->sp] = 0x7120;   /* retour = boot normal */
@@ -12337,7 +12337,7 @@ int c54x_run(C54xState *s, int n_insns)
              *             qui N'EXISTE PAS — le gate reel est opt-in CALYPSO_MASKROM_INIT.
              */
             static int mrti = -1;
-            if (mrti < 0) mrti = getenv("CALYPSO_MASKROM_INIT") ? 1 : 0;   /* [2026-07-23] OPT-IN (default OFF) : le forcing boot-op derail (etat froid) ; garde pour A/B */
+            if (mrti < 0) mrti = calypso_gate("CALYPSO_MASKROM_INIT", 0);   /* [2026-07-23] OPT-IN (default OFF) : le forcing boot-op derail (etat froid) ; garde pour A/B */
             if (mrti) {
                 static int mrti_log = 0;
                 if (mrti_log < 2) { mrti_log++;
@@ -12374,7 +12374,7 @@ int c54x_run(C54xState *s, int n_insns)
              *             n'existe pas, le gate reel est opt-in CALYPSO_D247.
              */
             static int _d247 = -1;
-            if (_d247 < 0) _d247 = getenv("CALYPSO_D247") ? 1 : 0;   /* [2026-07-23] OPT-IN OFF : bootstrap pousse dans 0xc6a5 (init coeffs) mais boucle sur source vide. Garde A/B */
+            if (_d247 < 0) _d247 = calypso_gate("CALYPSO_D247", 0);   /* [2026-07-23] OPT-IN OFF : bootstrap pousse dans 0xc6a5 (init coeffs) mais boucle sur source vide. Garde A/B */
             static int _d247_done = 0;
             if (_d247 && !_d247_done) {
                 _d247_done = 1;
@@ -12392,7 +12392,7 @@ int c54x_run(C54xState *s, int n_insns)
              *             (D247-TRACE : d[4c41]/d[4c46] non nuls en fin de boot).
              */
             static int mrti2 = -1;
-            if (mrti2 < 0) mrti2 = getenv("CALYPSO_REPOPULATE") ? 1 : 0;   /* [2026-07-23] OPT-IN OFF : peupler 0x4c5c ne debloque PAS l acquisition FB (teste : fb0_att reste 0). Garde pour A/B */
+            if (mrti2 < 0) mrti2 = calypso_gate("CALYPSO_REPOPULATE", 0);   /* [2026-07-23] OPT-IN OFF : peupler 0x4c5c ne debloque PAS l acquisition FB (teste : fb0_att reste 0). Garde pour A/B */
             if (mrti2) {
                 static int rlg = 0;
                 if (rlg < 3) { rlg++;
@@ -12914,7 +12914,7 @@ int c54x_run(C54xState *s, int n_insns)
              * Gate CALYPSO_TINT0_MASTER. C'est la vraie cadence (par slot, pas par frame). */
             {
                 static int _t0i = -1;
-                if (_t0i < 0) _t0i = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
+                if (_t0i < 0) _t0i = calypso_gate("CALYPSO_TINT0_MASTER", 0);
                 static unsigned _t0period = 0;
                 if (_t0period == 0) { const char *_p = getenv("CALYPSO_TINT0_PERIOD"); _t0period = _p ? (unsigned)atoi(_p) : 1500; if (_t0period < 1) _t0period = 1500; }
                 static unsigned _t0last = 0;
@@ -13708,7 +13708,7 @@ int c54x_run(C54xState *s, int n_insns)
                  *             (meme cellule, PC 0x013b) est retenu comme mecanisme unique.
                  */
                 static int t3 = -1;
-                if (t3 < 0) t3 = getenv("CALYPSO_TEST_3FCD") ? 1 : 0;
+                if (t3 < 0) t3 = calypso_gate("CALYPSO_TEST_3FCD", 0);
                 if (t3 && s->data[0x3fcd] == 0 && s->data[0x3fce] != 0) {
                     static unsigned tn3 = 0;
                     if (tn3++ < 4)
@@ -13927,7 +13927,7 @@ int c54x_run(C54xState *s, int n_insns)
              *   NB      : le commentaire amont annonce CALYPSO_MASKROM_GOLIVE_OFF — inexistant.
              */
             static int mrg = -1;
-            if (mrg < 0) mrg = getenv("CALYPSO_MASKROM_GOLIVE") ? 1 : 0;
+            if (mrg < 0) mrg = calypso_gate("CALYPSO_MASKROM_GOLIVE", 0);
             if (mrg && s->data[0x5ac8] == 0 && s->data[0x43c0] != 0) {
                 static unsigned mgn = 0;
                 if (mgn++ < 4)
@@ -14130,7 +14130,7 @@ int c54x_run(C54xState *s, int n_insns)
          * Env CALYPSO_DETTRACE=1, cap 800. */
         {
             static int dettr_on = -1;
-            if (dettr_on < 0) dettr_on = getenv("CALYPSO_DETTRACE") ? 1 : 0;
+            if (dettr_on < 0) dettr_on = calypso_gate("CALYPSO_DETTRACE", 0);
             if (dettr_on && exec_pc >= 0xf074 && exec_pc <= 0xf0c0) {
                 static unsigned dettr_n = 0;
                 if (dettr_n < 800) {
@@ -14259,7 +14259,7 @@ int c54x_run(C54xState *s, int n_insns)
         {
             static int ad_en = -1;
             static uint16_t ar0_prev = 0xFFFF;
-            if (ad_en < 0) ad_en = getenv("CALYPSO_AR0_DEBUG") ? 1 : 0;
+            if (ad_en < 0) ad_en = calypso_gate("CALYPSO_AR0_DEBUG", 0);
             if (ad_en && s->insn_count < 12000 && s->ar[0] != ar0_prev
                 && exec_pc != 0xb387) {   /* skip le fill-loop qui noie le cap */
                 static unsigned adn = 0;
@@ -14385,7 +14385,7 @@ int c54x_run(C54xState *s, int n_insns)
              *             go-live 0xa4c7/0xa51b/0xa582 se deroule dans le bon ordre.
              */
             static int ki = -1; static uint16_t kiv = 0;
-            if (ki < 0) { ki = getenv("CALYPSO_KEEP_IMR") ? 1 : 0;
+            if (ki < 0) { ki = calypso_gate("CALYPSO_KEEP_IMR", 0);
                 const char *e = getenv("CALYPSO_KEEP_IMR_VAL");
                 kiv = (e && *e) ? (uint16_t)strtoul(e, NULL, 0) : 0x52fd; }
             if (ki && exec_pc >= 0xa4ca && exec_pc <= 0xdea0 && !(s->imr & 0x0020)) {
@@ -14440,7 +14440,7 @@ int c54x_run(C54xState *s, int n_insns)
              *             rallumerait ce gate EXISTS. Ne jamais le convertir en ":=".
              */
             static int r8 = -1;
-            if (r8 < 0) r8 = getenv("CALYPSO_ISR_TO_8341") ? 1 : 0;
+            if (r8 < 0) r8 = calypso_gate("CALYPSO_ISR_TO_8341", 0);
             if (r8 && g_prev_pc == 0x7234) {
                 static unsigned r8n = 0;
                 if (r8n++ < 8)
@@ -14472,7 +14472,7 @@ int c54x_run(C54xState *s, int n_insns)
              */
             static int cs = -1; static uint16_t a1 = 0, a4 = 0, a5 = 0;
             if (cs < 0) {
-                cs = getenv("CALYPSO_CORR_SETUP") ? 1 : 0;
+                cs = calypso_gate("CALYPSO_CORR_SETUP", 0);
                 const char *e;
                 a1 = (e = getenv("CALYPSO_CORR_AR1")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2f22;
                 a4 = (e = getenv("CALYPSO_CORR_AR4")) && *e ? (uint16_t)strtoul(e,0,0) : 0x2be4;
@@ -14530,7 +14530,7 @@ int c54x_run(C54xState *s, int n_insns)
          * fermee auto-referentielle que data[0x4387]->0xab38, addendum 15). */
         if (exec_pc == 0x71da) {
             static int cala_en = -1;
-            if (cala_en < 0) cala_en = getenv("CALYPSO_CALA_71DA") ? 1 : 0;
+            if (cala_en < 0) cala_en = calypso_gate("CALYPSO_CALA_71DA", 0);
             if (cala_en) {
                 static unsigned cala_n = 0;
                 static uint16_t last_target = 0xFFFF;
@@ -14645,7 +14645,7 @@ int c54x_run(C54xState *s, int n_insns)
          * routeraient. Cap 400. */
         if (exec_pc >= 0xdde0 && exec_pc <= 0xde9f) {
             static int smt = -1; static unsigned smn = 0;
-            if (smt < 0) smt = getenv("CALYPSO_SM_TRACE") ? 1 : 0;
+            if (smt < 0) smt = calypso_gate("CALYPSO_SM_TRACE", 0);
             if (smt && smn < 400) {
                 smn++;
                 fprintf(stderr, "[c54x] SM-TRACE PC=0x%04x op=0x%04x A=0x%04x TC=%d 098[a=%04x b=%04x c=%04x d=%04x e=%04x] insn=%u\n",
@@ -14662,7 +14662,7 @@ int c54x_run(C54xState *s, int n_insns)
          * ARM (d_dsp_page bit1) n aboutit pas au bloc b3db. Cap 500. */
         if (exec_pc >= 0xb380 && exec_pc <= 0xb440) {
             static int b3t = -1; static unsigned b3n = 0;
-            if (b3t < 0) b3t = getenv("CALYPSO_B3_TRACE") ? 1 : 0;
+            if (b3t < 0) b3t = calypso_gate("CALYPSO_B3_TRACE", 0);
             if (b3t && b3n < 500) {
                 b3n++;
                 fprintf(stderr, "[c54x] B3-TRACE PC=0x%04x op=0x%04x fff=0x%04x "
@@ -14852,7 +14852,7 @@ int c54x_run(C54xState *s, int n_insns)
              *   retirer : quand data[0x3f6d] est peuple par le chemin ROM et pointe 0xa4c7.
              */
             static int g_golive = -1;
-            if (g_golive < 0) g_golive = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
+            if (g_golive < 0) g_golive = calypso_gate("CALYPSO_DSP_GOLIVE_BOOT", 0);
             if (g_golive) {
                 static int gdone = 0;
                 if (!gdone && s->pc == 0xb3ff) {
@@ -15325,7 +15325,7 @@ int c54x_run(C54xState *s, int n_insns)
              * les instructions dont un mot == 0x08f8 (adr d_fb_det) dans tout le
              * bank courant -> writer de d_fb_det existe-t-il, et a quel PC ? */
             static int _sc = -1; static int _scdone = 0;
-            if (_sc < 0) _sc = getenv("CALYPSO_SCAN_08F8") ? 1 : 0;
+            if (_sc < 0) _sc = calypso_gate("CALYPSO_SCAN_08F8", 0);
             if (_sc && !_scdone && exec_pc == 0x9ac0) {
                 _scdone = 1;
                 unsigned _hits = 0;
@@ -15339,7 +15339,7 @@ int c54x_run(C54xState *s, int n_insns)
                 fprintf(stderr, "[c54x] SCAN-08F8 total hits(bank%u)=%u\n", s->xpc, _hits);
             }
             static int _b4b = -1; static int _armed = 0; static unsigned _b4bn = 0; static int _opd = 0;
-            if (_b4b < 0) _b4b = getenv("CALYPSO_B4B") ? 1 : 0;
+            if (_b4b < 0) _b4b = calypso_gate("CALYPSO_B4B", 0);
             if (_b4b && exec_pc == 0x9ac0) {
                 _armed = 1;
                 if (!_opd) { _opd = 1;
@@ -15358,7 +15358,7 @@ int c54x_run(C54xState *s, int n_insns)
         if (exec_pc == 0xa076) {   /* kernel MAC = LECTURE des operandes (I/Q + coeffs) */
             g_flow_armed = 1;   /* FLOWTRACE : arme la fenetre autour du detecteur */
             static int _b2k = -1; static unsigned _b2kn = 0;
-            if (_b2k < 0) _b2k = getenv("CALYPSO_B2AR") ? 1 : 0;
+            if (_b2k < 0) _b2k = calypso_gate("CALYPSO_B2AR", 0);
             /* [fix] compteur HORS gate : le min/max doit couvrir TOUT le run
              * (la version precedente se bloquait a la 1ere iteration). */
             static uint16_t _ar5min = 0xffff, _ar5max = 0;
@@ -15383,7 +15383,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] ARWATCH : voir en-tete du patch. */
             static int _aw = -1; static unsigned _awn = 0;
-            if (_aw < 0) _aw = getenv("CALYPSO_ARWATCH") ? 1 : 0;
+            if (_aw < 0) _aw = calypso_gate("CALYPSO_ARWATCH", 0);
             if (_aw && _awn < 60 &&
                 (exec_pc == 0x8d00 || exec_pc == 0x8d1a || exec_pc == 0x8e5f ||
                  exec_pc == 0x8e8c || exec_pc == 0x8e97)) {
@@ -15442,7 +15442,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-28] CORROUT : voir en-tete du patch. */
             static int _co = -1; static int _in_k = 0; static unsigned _con = 0;
-            if (_co < 0) _co = getenv("CALYPSO_CORROUT") ? 1 : 0;
+            if (_co < 0) _co = calypso_gate("CALYPSO_CORROUT", 0);
             if (_co) {
                 if (exec_pc >= 0xa070 && exec_pc <= 0xa0a0) { _in_k = 1; }
                 else if (_in_k) {   /* on vient de QUITTER le noyau MAC */
@@ -15467,7 +15467,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-28] VECTAB : voir en-tete du patch. */
             static int _vt = -1; static int _vtdone = 0; static int _vtseen = 0;
-            if (_vt < 0) _vt = getenv("CALYPSO_VECTAB") ? 1 : 0;
+            if (_vt < 0) _vt = calypso_gate("CALYPSO_VECTAB", 0);
             if (_vt && !_vtdone && exec_pc == 0xb01c && ++_vtseen >= 2) {
                 _vtdone = 1;
                 fprintf(stderr, "[c54x] VECTAB table de vecteurs 0x0080..0x00FF "
@@ -15496,7 +15496,7 @@ int c54x_run(C54xState *s, int n_insns)
             static int _sd2 = -1; static int _sddone = 0; static unsigned _sdhit = 0;
             static uint16_t _lo = 0x76f8, _hi = 0x79f0;
             if (_sd2 < 0) {
-                _sd2 = getenv("CALYPSO_SCANDATA") ? 1 : 0;
+                _sd2 = calypso_gate("CALYPSO_SCANDATA", 0);
                 const char *a = getenv("CALYPSO_SCANDATA_LO");
                 const char *b = getenv("CALYPSO_SCANDATA_HI");
                 if (a && *a) _lo = (uint16_t)strtol(a, NULL, 0);
@@ -15524,7 +15524,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-28] DISPWATCH : voir en-tete du patch. */
             static int _dw = -1; static unsigned _dwn = 0, _dwfb = 0;
-            if (_dw < 0) _dw = getenv("CALYPSO_DISPWATCH") ? 1 : 0;
+            if (_dw < 0) _dw = calypso_gate("CALYPSO_DISPWATCH", 0);
             if (_dw && (exec_pc == 0xb40f || exec_pc == 0xb01c || exec_pc == 0xb01e ||
                         exec_pc == 0xb0f0 || exec_pc == 0xb0f6)) {
                 unsigned _md = s->data[0x0804] ? s->data[0x0804] : s->data[0x0818];
@@ -15576,7 +15576,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] SCANFB : voir en-tete du patch. */
             static int _sf = -1; static int _sfd = 0;
-            if (_sf < 0) _sf = getenv("CALYPSO_SCANFB") ? 1 : 0;
+            if (_sf < 0) _sf = calypso_gate("CALYPSO_SCANFB", 0);
             if (_sf && !_sfd && exec_pc == 0xb01c) {
                 _sfd = 1;
                 const uint16_t _tg[4] = { 0x7708, 0x76fb, 0x770d, 0x795f };
@@ -15604,7 +15604,7 @@ int c54x_run(C54xState *s, int n_insns)
         {   /* [2026-07-27] FBENTRY : voir en-tete du patch. */
             static int _fe = -1; static int _dmp = 0; static int _in = 0; static int _after = 0;
             static unsigned _n = 0;
-            if (_fe < 0) _fe = getenv("CALYPSO_FBENTRY") ? 1 : 0;
+            if (_fe < 0) _fe = calypso_gate("CALYPSO_FBENTRY", 0);
             if (_fe) {
                 if (exec_pc >= 0x75e0 && exec_pc <= 0x79f0) {   /* inclut le sous-prog 0x75e8 */
                     if (!_dmp) { _dmp = 1;
@@ -15638,7 +15638,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] SCAN43D8 : voir en-tete du patch. */
             static int _s4 = -1; static int _s4done = 0;
-            if (_s4 < 0) _s4 = getenv("CALYPSO_SCAN43D8") ? 1 : 0;
+            if (_s4 < 0) _s4 = calypso_gate("CALYPSO_SCAN43D8", 0);
             if (_s4 && !_s4done && exec_pc == 0xb01c) {
                 _s4done = 1;
                 unsigned _h = 0;
@@ -15669,7 +15669,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] SLOTSRC : voir en-tete du patch. */
             static int _ss = -1; static unsigned _ssn = 0;
-            if (_ss < 0) _ss = getenv("CALYPSO_SLOTSRC") ? 1 : 0;
+            if (_ss < 0) _ss = calypso_gate("CALYPSO_SLOTSRC", 0);
             if (_ss && _ssn < 120 && exec_pc >= 0xaff0 && exec_pc <= 0xb01d) {
                 _ssn++;
                 fprintf(stderr, "[c54x] SLOTSRC pc=0x%04x op=0x%04x op2=0x%04x "
@@ -15681,7 +15681,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] FBCALL : voir en-tete du patch. */
             static int _fc = -1;
-            if (_fc < 0) _fc = getenv("CALYPSO_FBCALL") ? 1 : 0;
+            if (_fc < 0) _fc = calypso_gate("CALYPSO_FBCALL", 0);
             if (_fc) {
                 static uint16_t _pmd = 0xffff, _ppc = 0; static int _arm = 0;
                 static unsigned _steps = 0, _logged = 0, _rounds = 0;
@@ -15714,7 +15714,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] DISPIDX : voir en-tete du patch. */
             static int _di = -1; static unsigned _din = 0; static unsigned _idx = 0;
-            if (_di < 0) _di = getenv("CALYPSO_DISPIDX") ? 1 : 0;
+            if (_di < 0) _di = calypso_gate("CALYPSO_DISPIDX", 0);
             if (_di) {
                 if (exec_pc == 0xb0f0) _idx = (unsigned)(s->a & 0xFFFF);
                 if (exec_pc == 0xb0f6 && _din < 80) {
@@ -15730,7 +15730,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] DISPTAB-DUMP : contenu de la table au dispatcher. */
             static int _dd2 = -1; static unsigned _ddn2 = 0;
-            if (_dd2 < 0) _dd2 = getenv("CALYPSO_DISPTAB") ? 1 : 0;
+            if (_dd2 < 0) _dd2 = calypso_gate("CALYPSO_DISPTAB", 0);
             if (_dd2 && exec_pc == 0xb0f1 && _ddn2 < 4) {
                 _ddn2++;
                 fprintf(stderr, "[c54x] DISPTAB-DUMP #%u data[0x4380..0x43cf] :", _ddn2);
@@ -15743,7 +15743,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] TASKGO : voir en-tete du patch. */
             static int _tg = -1;
-            if (_tg < 0) _tg = getenv("CALYPSO_TASKGO") ? 1 : 0;
+            if (_tg < 0) _tg = calypso_gate("CALYPSO_TASKGO", 0);
             if (_tg) {
                 static uint16_t _prev = 0xffff; static int _armed = 0;
                 static unsigned _n = 0, _rounds = 0, _hi = 0;
@@ -15772,7 +15772,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] AB38 : voir en-tete du patch. */
             static int _ab = -1;
-            if (_ab < 0) _ab = getenv("CALYPSO_AB38") ? 1 : 0;
+            if (_ab < 0) _ab = calypso_gate("CALYPSO_AB38", 0);
             if (_ab) {
                 static int _dumped = 0, _armed = 0; static unsigned _n = 0, _rounds = 0;
                 if (exec_pc == 0xab38) {
@@ -15796,7 +15796,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         {   /* [2026-07-27] FBROUTE : voir en-tete du patch. */
             static int _fr = -1;
-            if (_fr < 0) _fr = getenv("CALYPSO_FBROUTE") ? 1 : 0;
+            if (_fr < 0) _fr = calypso_gate("CALYPSO_FBROUTE", 0);
             if (_fr) {
                 static unsigned _in = 0, _hi = 0, _n76fb = 0;
                 if (exec_pc >= 0x7700 && exec_pc <= 0x79f0) {
@@ -15829,7 +15829,7 @@ int c54x_run(C54xState *s, int n_insns)
         }
         if (exec_pc == 0x93a5) {   /* consommateur DARAM 0x2a00 (AR3 post-inc) = VRAIE entree corr */
             static int _b2c = -1; static unsigned _b2cn = 0;
-            if (_b2c < 0) _b2c = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+            if (_b2c < 0) _b2c = calypso_gate("CALYPSO_B2SEQ", 0);
             if (_b2c && _b2cn < 8) { _b2cn++;
                 fprintf(stderr, "[c54x] B2SEQ-IN 0x2a00@0x93a5 (I,Q)x16:");
                 for (int _i = 0; _i < 16; _i++)
@@ -15933,7 +15933,7 @@ int c54x_run(C54xState *s, int n_insns)
              * 0x2a00 (VRAIE entree corr, depot BSP/ADC). Pattern Fs/4 = FCCH :
              * (a,0)(0,a)(-a,0)(0,-a).. ; quasi-constant = DC sans ton (entree vide). */
             { static int _b2s = -1; static unsigned _b2sn = 0;
-              if (_b2s < 0) _b2s = getenv("CALYPSO_B2SEQ") ? 1 : 0;
+              if (_b2s < 0) _b2s = calypso_gate("CALYPSO_B2SEQ", 0);
               if (_b2s && _b2sn < 8) { _b2sn++;
                   fprintf(stderr, "[c54x] B2SEQ 0x2a00 (I,Q)x16:");
                   for (int _i = 0; _i < 16; _i++)
@@ -15949,7 +15949,7 @@ int c54x_run(C54xState *s, int n_insns)
              * + valeur lue. AR5/AR3 dans [0x2a00..0x2b27] => lit la FCCH ; hors =>
              * lit a cote (RANK3, pointeur mal initialise). */
             { static int _b2a = -1; static unsigned _b2an = 0;
-              if (_b2a < 0) _b2a = getenv("CALYPSO_B2AR") ? 1 : 0;
+              if (_b2a < 0) _b2a = calypso_gate("CALYPSO_B2AR", 0);
               if (_b2a && _b2an < 12) { _b2an++;
                   int _a3in = (s->ar[3] >= 0x2a00 && s->ar[3] < 0x2b28);
                   int _a5in = (s->ar[5] >= 0x2a00 && s->ar[5] < 0x2b28);
@@ -15961,7 +15961,7 @@ int c54x_run(C54xState *s, int n_insns)
              * plat-sans-pic. */
             {
                 static int _b2 = -1; static unsigned _b2n = 0;
-                if (_b2 < 0) _b2 = getenv("CALYPSO_B2") ? 1 : 0;
+                if (_b2 < 0) _b2 = calypso_gate("CALYPSO_B2", 0);
                 if (_b2 && _b2n < 24) {
                     _b2n++;
                     int64_t A = ((int64_t)(s->a & 0xFFFFFFFFFFULL) << 24) >> 24;
@@ -16421,7 +16421,7 @@ int c54x_run(C54xState *s, int n_insns)
              *   NB      : le 3e site historique est mort — neutralise par (void)_t0i;.
              */
             static int _t0master = -1;
-            if (_t0master < 0) _t0master = getenv("CALYPSO_TINT0_MASTER") ? 1 : 0;
+            if (_t0master < 0) _t0master = calypso_gate("CALYPSO_TINT0_MASTER", 0);
             /* [2026-07-23] TIMER0 FIDELE : le firmware arrete le timer (TCR TSS=1) dans
              * l'init op non-tournee. En mode TINT0_MASTER on modelise le ROM ayant
              * configure+demarre le timer : on tick malgre TSS. PRD non configure (0/0xFFFF
@@ -17052,8 +17052,8 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
          *   NB      : CALYPSO_DSP_GOLIVE_BOOT lu plus bas (g_noforce) inhibe VEC28-FORCE.
          */
         static int g_v28 = -1, g_native = -1;
-        if (g_v28 < 0) g_v28 = getenv("CALYPSO_DSP_FRAME_VEC28") ? 1 : 0;
-        if (g_native < 0) g_native = getenv("CALYPSO_FRAME_IT_NATIVE") ? 1 : 0;
+        if (g_v28 < 0) g_v28 = calypso_gate("CALYPSO_DSP_FRAME_VEC28", 0);
+        if (g_native < 0) g_native = calypso_gate("CALYPSO_FRAME_IT_NATIVE", 0);
         /* [2026-07-22] CALYPSO_FRAME_IT_NATIVE : livraison PROPRE du scheduler frame.
          * Remap l IT frame (vec19/bit3 = stub RETE) vers vec28/bit12 (le vrai scheduler
          * HW frame-sync) et pose SEULEMENT IFR bit12 -> prise naturelle par
@@ -17061,7 +17061,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         if ((g_v28 || g_native) && vec == C54X_INT_FRAME_VEC && imr_bit == C54X_INT_FRAME_BIT) {
             vec = 28; imr_bit = 12;
             static int g_noforce = -1;
-            if (g_noforce < 0) g_noforce = getenv("CALYPSO_DSP_GOLIVE_BOOT") ? 1 : 0;
+            if (g_noforce < 0) g_noforce = calypso_gate("CALYPSO_DSP_GOLIVE_BOOT", 0);
             /* [2026-07-22] FRAME-IT-PROBE (gated CALYPSO_FRAME_IT_PROBE) : d_dsp_page
              * au moment de CHAQUE frame IT -> bit1 (B_GSM_TASK) set ici ou pas ? */
             {
@@ -17183,7 +17183,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
             s->pc = (iptr * 0x80) + vec * 4;
             if (vec == 28) {
                 if (g_vec28_trace_en < 0)
-                    g_vec28_trace_en = getenv("CALYPSO_TRACE_VEC28_STACK") ? 1 : 0;
+                    g_vec28_trace_en = calypso_gate("CALYPSO_TRACE_VEC28_STACK", 0);
                 if (g_vec28_trace_en && !g_vec28_tracing) {
                     g_vec28_tracing = true;
                     g_vec28_sp_entry = s->sp;
@@ -17244,7 +17244,7 @@ void c54x_interrupt_ex(C54xState *s, int vec, int imr_bit)
         s->pc = (iptr * 0x80) + vec * 4;
         if (vec == 28) {
             if (g_vec28_trace_en < 0)
-                g_vec28_trace_en = getenv("CALYPSO_TRACE_VEC28_STACK") ? 1 : 0;
+                g_vec28_trace_en = calypso_gate("CALYPSO_TRACE_VEC28_STACK", 0);
             if (g_vec28_trace_en && !g_vec28_tracing) {
                 g_vec28_tracing = true;
                 g_vec28_sp_entry = s->sp;
