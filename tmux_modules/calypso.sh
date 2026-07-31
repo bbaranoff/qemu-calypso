@@ -11,7 +11,7 @@
 #      5 shell
 # -----------------------------------------------------------------------------
 TMUX_FENETRE_PREMIERE=radio
-TMUX_RESUME="5 fenêtres : radio · coeur · ms1 · voix · shell"
+TMUX_RESUME="7 fenêtres : radio · coeur · dsp · asm · ms1 · voix · shell"
 
 tmux_layout_premiere() {   # commande de la fenêtre créée avec la session
     printf "tail -n 200 -F '%s/qemu.log' 2>/dev/null | stdbuf -oL tr -d '\\\\007' || sleep infinity" \
@@ -33,6 +33,8 @@ tmux_layout() {
         "$(_tail "'$L/osmo-trx-ipc.log'")" "$C_RADIO"
 
     _fenetre_coeur
+    _fenetre_dsp
+    _fenetre_asm
 
     # ── 3 · ms1 — ce que le téléphone comprend du signal ─────────────────────
     _w     ms1 "MS | pile L2/L3 du telephone emule - camp, LU, appels" \

@@ -79,6 +79,47 @@ _fenetre_coeur() {
         "$(_tail "'$O/osmo-mgw.log' '$O/osmo-stp.log'")" "$C_COEUR"
 }
 
+_fenetre_dsp() {
+    # [2026-07-29] La frontière ARM <-> DSP, la seule qui compte pour le natif.
+    #
+    #   mail_dissam.log = le croisement mailbox × désassemblage : quelle cellule,
+    #     dans quel sens, combien de fois, et QUELLE instruction la touche. C'est
+    #     un TABLEAU réécrit toutes les 2 s, pas un flux — donc `watch`, pas `tail`.
+    #   mailbox.log = le flux brut, replié au changement de valeur.
+    #
+    # Fenêtre séparée à dessein : ces deux vues méritent de la place, et les
+    # écraser dans `radio` rendrait les quatre panes existants illisibles.
+    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    _w     dsp "mailbox x desassemblage | quelle instruction touche quelle cellule" \
+        "while :; do clear; cat '$L/mail_dissam.log' 2>/dev/null || echo 'en attente du premier cycle...'; sleep 2; done" \
+        "${C_RADIO:-}"
+    _split dsp "mailbox | flux ARM<->DSP brut, replie au changement" \
+        "$(_tail "'$L/mailbox.log'")" "${C_RADIO:-}"
+}
+
+_fenetre_asm() {
+    # [2026-07-29] La frontière ARM<->DSP au niveau INSTRUCTION.
+    #
+    #   haut  — le TABLEAU agrégé (mail_dissam.log) : quelle cellule, combien de
+    #           fois, par quelle instruction. Réécrit toutes les 2 s, donc
+    #           `clear; cat` et non `tail` (le mv change l'inode : `tail -f` ne
+    #           verrait jamais rien bouger).
+    #   bas   — le FLUX annoté, au fil de l'eau : chaque accès mailbox suivi de
+    #           l'instruction c54x qui le produit. C'est la vue « asm bas niveau »
+    #           du dialogue ARM<->DSP.
+    #
+    # Le désassemblage est mis en cache par PC côté outil : une boucle serrée ne
+    # coûte qu'une recherche, pas une par ligne.
+    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    local T="${QEMU_TREE:-/opt/GSM/osmo-qemu-calypso}"
+    _w     asm "croisement | cellule x instruction, agrege, rafraichi 2s" \
+        "while :; do clear; cat '$L/mail_dissam.log' 2>/dev/null || echo 'en attente du premier cycle...'; sleep 2; done" \
+        "${C_RADIO:-}"
+    _split asm "mailbox ASM | chaque acces suivi de son instruction c54x" \
+        "tail -n 40 -F '$L/mailbox.log' 2>/dev/null | stdbuf -oL python3 '$T/tools/mailbox-annote.py' --flux 2>/dev/null || sleep infinity" \
+        "${C_RADIO:-}"
+}
+
 _fenetre_voix() {
     local L="${LOG_DIR:-/tmp/calypso/logs}" O="${OSMO_LOG_DIR:-/var/log/osmocom}"
     _w     voix "gapk | transcodage GSM-FR <-> PCM (actif pendant un appel)" \
@@ -99,6 +140,48 @@ _fenetre_shell() {   # _fenetre_shell [ligne d'aide supplémentaire…]
 # Habillage. La barre de statut nomme PROFIL · MODE · PIPELINE : la question
 # « on est en quel mode ? » se pose à chaque session, et la ligne de commande
 # ment (les fichiers d'environnement peuvent la surcharger).
+
+# -----------------------------------------------------------------------------
+#  _tmux_env_repropre — rendre le run REPRODUCTIBLE depuis sa ligne de commande
+# -----------------------------------------------------------------------------
+#  [2026-07-29] Le serveur tmux HÉRITE de l environnement du premier « ./run.sh »
+#  qui l a créé, et le conserve comme environnement GLOBAL. Toute relance faite
+#  depuis un pane hérite donc des variables de la ligne d avant. Symptôme vécu :
+#  « CALYPSO_MODE=native ./run.sh » produisait un manifeste portant INJECT_SB=1,
+#  SHUNT_REAL_FB=1, FRAME_IT_NATIVE=1, AB38=1 — jamais tapées — et « la même
+#  commande » donnait deux résultats différents à cinq minutes d intervalle.
+#
+#  On purge donc TOUTES les CALYPSO_* de l environnement global tmux, puis on
+#  repose exactement celles du processus courant. Après ça, le manifeste reflète
+#  la ligne de commande, et deux runs identiques le sont vraiment.
+#
+#  NB : on ne touche qu au préfixe CALYPSO_ — PATH, LANG, TERM et le reste
+#  doivent continuer d être hérités normalement.
+_tmux_env_repropre() {
+    command -v tmux >/dev/null 2>&1 || return 0
+
+    # 1. purge — « show-environment -g » préfixe d un « - » les variables déjà
+    #    supprimées ; le sed ne retient que les lignes « NOM=valeur ».
+    tmux show-environment -g 2>/dev/null \
+        | sed -n 's/^\(CALYPSO_[A-Za-z0-9_]*\)=.*/\1/p' \
+        | while IFS= read -r _v; do
+              [ -n "$_v" ] && tmux set-environment -g -u "$_v" 2>/dev/null
+          done
+
+    # 2. et on NE REPOSE RIEN. Première version de ce correctif : je reposais
+    #    l environnement du run courant — erreur. Après `load.env`, cet
+    #    environnement contient les ~170 CALYPSO_* avec leurs défauts RÉSOLUS ;
+    #    les reposer les rend collantes exactement comme le fossile qu on vient
+    #    de purger, et « := » ne peut plus rien poser au run suivant. On aurait
+    #    remplacé un fossile par un autre.
+    #
+    #    Aucun pane n en a besoin : les dispositions de tmux_modules/ n utilisent
+    #    aucune CALYPSO_* en expansion différée (vérifié) — la ligne de statut est
+    #    expansée à la construction, côté run.sh. Le serveur tmux garde donc une
+    #    ardoise vierge, et la ligne de commande redevient la seule source.
+    unset _v
+}
+
 _tmux_style() {
     local s="$TMUX_SESSION"
     # Locale de la session : sans elle, tmux translittere les caracteres non-ASCII

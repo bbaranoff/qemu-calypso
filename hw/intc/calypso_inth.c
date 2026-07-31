@@ -22,6 +22,18 @@
 #include "qemu/log.h"
 #include "hw/arm/calypso/calypso_inth.h"
 
+/* [2026-07-30] Instance unique + acquittement externe.
+ *
+ * ANTISECHE — osmocom-bb src/target/firmware/calypso/irq.c, epilogue de irq() :
+ *     tmp = readb(IRQ_REG(IRQ_CTRL)); tmp |= 0x01; writeb(tmp, IRQ_REG(IRQ_CTRL));
+ *     /\* Start new IRQ agreement *\/
+ * Tant que ce mot n'est pas ecrit, le vrai INTH ne presente pas l'IT suivante :
+ * c'est LA fin de service cote ARM. Notre modele ne l'exposait qu'au write MMIO
+ * 0x14 ; il n'existait aucun moyen de la declencher depuis le DSP, alors que
+ * c'est le DSP qui, en prenant l'IT (INTM 0->1), signale que la requete ARM a
+ * ete servie. calypso_inth_arm_ack() ouvre cette porte. */
+static CalypsoINTHState *g_inth;
+
 /* ---- Priority arbitration ---- */
 
 static void calypso_inth_update(CalypsoINTHState *s)
@@ -107,6 +119,34 @@ static void calypso_inth_set_irq(void *opaque, int irq, int level)
     calypso_inth_update(s);
 }
 
+/* [2026-07-30] ACK ARM appelable depuis le c54x (cf. calypso_c54x.c, hook
+ * INTM 0->1). Fait ce que fait l'ecriture IRQ_CTRL bit0 du firmware, PLUS la
+ * retombee du niveau de la source servie — que le write MMIO 0x14 ne faisait
+ * pas : il n'avancait que le round-robin, si bien qu'une source de niveau
+ * restee haute etait representee immediatement (= re-entree en boucle). */
+void calypso_inth_arm_ack(void);
+void calypso_inth_arm_ack(void)
+{
+    CalypsoINTHState *s = g_inth;
+    if (!s) return;
+
+    uint16_t svc = s->ith_v;
+    if (svc > 0 || (s->levels & 1)) {
+        s->levels &= ~(1u << svc);      /* fin de service : la source retombe */
+        s->rr_start = (svc + 1) % CALYPSO_INTH_NUM_IRQS;
+    }
+    s->irq_in_service = -1;
+
+    {
+        static unsigned _n = 0;
+        if (_n++ < 40)
+            fprintf(stderr, "[INTH] ARM-ACK #%u svc=%u levels=0x%08x mask=0x%08x "
+                    "(new IRQ agreement, depuis le DSP)\n",
+                    _n, svc, s->levels, s->mask);
+    }
+    calypso_inth_update(s);
+}
+
 /* ---- MMIO read/write ---- */
 
 static uint64_t calypso_inth_read(void *opaque, hwaddr offset, unsigned size)
@@ -187,6 +227,38 @@ static void calypso_inth_write(void *opaque, hwaddr offset, uint64_t value,
     CalypsoINTHState *s = CALYPSO_INTH(opaque);
 
     switch (offset) {
+    /* [2026-07-30] IT_REG1/IT_REG2 en ECRITURE — etaient silencieusement jetes
+     * dans le default:. ANTISECHE osmocom-bb calypso/irq.c (mode detection
+     * logicielle) :
+     *     writew(~(1 << num), IRQ_REG(IT_REG1));   /\* clear this interrupt *\/
+     * Le mot ecrit porte des 1 PARTOUT sauf sur le bit a effacer : la semantique
+     * est donc « write 0 to clear », d'ou le ET avec la valeur ecrite. */
+    case 0x00: /* IT_REG1 — acquittement des sources [15:0] */
+    {
+        uint32_t old = s->levels;
+        s->levels &= (0xFFFF0000u | (uint32_t)(value & 0xFFFF));
+        if (old != s->levels) {
+            static unsigned _n = 0;
+            if (_n++ < 20)
+                fprintf(stderr, "[INTH] IT_REG1-ACK val=0x%04x levels 0x%08x -> 0x%08x\n",
+                        (unsigned)value, old, s->levels);
+        }
+        calypso_inth_update(s);
+        break;
+    }
+    case 0x02: /* IT_REG2 — acquittement des sources [31:16] */
+    {
+        uint32_t old = s->levels;
+        s->levels &= (0x0000FFFFu | ((uint32_t)(value & 0xFFFF) << 16));
+        if (old != s->levels) {
+            static unsigned _n = 0;
+            if (_n++ < 20)
+                fprintf(stderr, "[INTH] IT_REG2-ACK val=0x%04x levels 0x%08x -> 0x%08x\n",
+                        (unsigned)value, old, s->levels);
+        }
+        calypso_inth_update(s);
+        break;
+    }
     case 0x08: /* MASK_IT_REG1 */
     {
         uint32_t old = s->mask;
@@ -264,6 +336,8 @@ static const MemoryRegionOps calypso_inth_ops = {
 static void calypso_inth_realize(DeviceState *dev, Error **errp)
 {
     CalypsoINTHState *s = CALYPSO_INTH(dev);
+
+    g_inth = s;   /* [2026-07-30] instance unique, pour calypso_inth_arm_ack() */
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &calypso_inth_ops, s,
                           "calypso-inth", 0x100);

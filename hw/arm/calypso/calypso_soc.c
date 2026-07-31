@@ -363,8 +363,19 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     add_stub(sysmem, "calypso.tmr6800",    0xFFFE6800, &calypso_mmio8_ops);
     add_stub(sysmem, "calypso.mmio_80xx",  0xFFFE8000, &calypso_mmio8_ops);
     add_stub(sysmem, "calypso.conf",       0xFFFEF000, &calypso_mmio16_ops);
-    add_stub(sysmem, "calypso.mmio_98xx",  0xFFFF9800, &calypso_mmio16_ops);
-    add_stub(sysmem, "calypso.dpll",       0xFFFFF000, &calypso_mmio16_ops);
+    /* [2026-07-30] Etiquetage corrige. Le firmware est autoritaire :
+     * osmocom-bb calypso/clock.c:28 « #define REG_DPLL 0xffff9800 », avec les
+     * champs DPLL_LOCK(0), DPLL_BREAKLN(1), BYPASS_DIV(2,2b), PLL_ENABLE(4),
+     * PLL_DIV(5,2b), PLL_MULT(7,5b), TEST(12). La DPLL est donc en 0xFFFF9800,
+     * que nous appelions « mmio_98xx » — et la region qu'on nommait
+     * « calypso.dpll » (0xFFFFF000) est autre chose, non identifiee.
+     * Sortie de la DPLL : f = 26 MHz * mult / (div + 1), mult 1..30, div 0..2
+     * (cf. l'outil de developpement `calypso_pll` du wiki Osmocom, qui ne fait
+     * qu'enumerer ces combinaisons — ce n'est PAS une puce a modeliser).
+     * ⚠️ Nous ne modelisons PAS la frequence : ces registres sont des stubs. Le
+     * DSP est cadence par cette DPLL sur silicium ; chez nous il est interprete. */
+    add_stub(sysmem, "calypso.dpll",       0xFFFF9800, &calypso_mmio16_ops);
+    add_stub(sysmem, "calypso.mmio_f0xx",  0xFFFFF000, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.rhea",       0xFFFFF900, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.clkm",       0xFFFFFB00, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.mmio_fcxx",  0xFFFFFC00, &calypso_mmio16_ops);

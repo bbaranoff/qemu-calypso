@@ -34,7 +34,8 @@
 #     l'écrit dans son journal. Trancher relève de environnement/calypso.env,
 #     pas d'un module.
 #
-#  3. CES DRAPEAUX N'ONT PAS ENCORE DE CONSOMMATEUR.
+#  3. [CORRIGE 2026-07-30] CES DRAPEAUX ONT MAINTENANT UN CONSOMMATEUR.
+#     Ce qui suit decrivait l'etat d'avant et est conserve pour l'historique :
 #     40-qemu.sh (L54-57) construit sa ligne de commande lui-même et code en
 #     dur `-gdb tcp::1234`, sans lire QEMU_*_FLAG. Tant que ce point n'est pas
 #     arbitré, CALYPSO_ICOUNT / CALYPSO_MTTCG / CALYPSO_QEMU_HALT restent
@@ -110,7 +111,11 @@ mod_accel_start() {
     mod_say "QEMU_ACCEL_FLAG  = '${QEMU_ACCEL_FLAG}'"
     mod_say "QEMU_GDB_FLAG    = '${QEMU_GDB_FLAG}'"
     mod_say "QEMU_HALT_FLAG   = '${QEMU_HALT_FLAG}'"
-    mod_say "ATTENTION : 40-qemu.sh ne lit pas encore ces drapeaux (cf. POURQUOI 3)"
+    # [2026-07-30] L'avertissement est LEVE : 40-qemu.sh consomme desormais ces
+    # drapeaux (il les ajoute a sa ligne de commande et les journalise). En meme
+    # temps, le defaut de calypso.env est passe de `auto` a `off`, pour que le
+    # branchement soit neutre au lieu d'imposer `-icount auto` a tous les profils.
+    mod_say "ces drapeaux sont APPLIQUES par 40-qemu.sh depuis le 2026-07-30"
     mod_ok
 }
 

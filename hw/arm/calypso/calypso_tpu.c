@@ -235,8 +235,83 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
     seq_run(fn);
 }
 
+/* [2026-07-30] IT TRAME TPU -> DSP — le fil manquant, pas une bequille.
+ *
+ * CONSTAT. Sur silicium, rien dans le code ARM ne « leve » l'IT trame du DSP :
+ * c'est le TPU qui la genere SEUL quand son sequenceur atteint le point
+ * programme. Les deux fonctions d'osmocom-bb qui pourraient le faire a la main —
+ * `tpu_enq_dsp_irq()` (tpu.h:114 -> MOVE TPUI_DSP_INT_PG) et
+ * `tpu_force_dsp_frame_irq()` (tpu.c:313 -> ICTRL_DSP_FRAME_FORCE) — n'ont
+ * AUCUN appelant, et c'est normal : ce sont des trappes de debug. Leur absence
+ * d'appelant n'est donc PAS le bug.
+ *
+ * Le trou etait ICI : ce fichier n'avait qu'UN point d'emission d'IT DSP
+ * (`seq_exec_move` -> vec21/bit5, sur un MOVE TPUI_DSP_INT_PG, c'est-a-dire
+ * jamais). Aucune IT de fin de trame n'existait dans le modele. Meme defaut que
+ * le verdict du 28/07 (la ROM arme IMR bits 12/13 = vec 28/29, le modele emettait
+ * sur vec19/bit3 -> condition auto-fausse), vu du bon cote.
+ *
+ * CE QUE CA CABLE. La condition est prise sur les DEUX registres que le firmware
+ * manipule reellement dans `dsp_end_scenario()`, donc c'est du wiring fidele et
+ * non un poke :
+ *   TPU_CTRL.DSP_EN      pose par tpu_dsp_frameirq_enable()      (actif-haut)
+ *   INT_CTRL.DSP_FRAME   EFFACE par tpu_frame_irq_en(mcu,dsp=1)  (actif-BAS)
+ * Sans ces deux conditions on n'emet rien — un firmware qui n'arme pas l'IT ne la
+ * recoit pas, comme sur silicium.
+ *
+ * ⚠️ CE QUI RESTE UNE HYPOTHESE : le NUMERO de vecteur. La table des interruptions
+ * du DSP Calypso n'est nulle part dans le depot. On prend 30 par defaut parce que
+ * c'est le slot MESURE : la tache FB arme `data[0x0158..0159] = call 0x728a`, et ce
+ * tremplin n'est atteignable que par le slot 30 (`data[0x00F8-0x00FB]` = `fb 0x0158`,
+ * recopie de PDROM 0xe399 par le reada de 0xb4c9). IMR bit = vec - 16 (regle de
+ * calypso_dma.c:185, validee par la mesure : IT trame vue a PC=0x00f0 = slot 28 =
+ * bit 12). Reglable par CALYPSO_TPU_DSP_FRAME_VEC pour balayer si 30 est faux.
+ *
+ * GATE : CALYPSO_TPU_DSP_FRAME_IT, defaut 0 le temps de valider. Quand ce sera
+ * valide, le defaut doit passer a 1 et les bequilles CALYPSO_FORCE_VEC **et
+ * probablement CALYPSO_DISPATCH_INSTALL** doivent tomber (un dispatch jamais
+ * rearme faute d'IT expliquerait aussi le bouchon `0x43d8`).
+ * FAIT QUAND : `0x728a` s'execute sans CALYPSO_FORCE_VEC. */
+static void tpu_frame_irq_to_dsp(uint32_t fn)
+{
+    static int gate = -1, vec = 30;
+
+    if (gate < 0) {
+        gate = calypso_gate("CALYPSO_TPU_DSP_FRAME_IT", 0);
+        const char *v = getenv("CALYPSO_TPU_DSP_FRAME_VEC");
+        if (v && *v) vec = (int)strtol(v, NULL, 0);
+        if (gate)
+            fprintf(stderr, "[calypso-tpu] IT trame -> DSP ARMEE : vec%d (IMR bit %d), "
+                    "conditionnee par TPU_CTRL.DSP_EN + INT_CTRL.DSP_FRAME efface\n",
+                    vec, vec - 16);
+    }
+    if (!gate || !seq.dsp || !seq.tpu_regs || vec < 16 || vec >= 32)
+        return;
+
+    uint16_t ctrl  = seq.tpu_regs[TPU_CTRL / 2];
+    uint16_t ictrl = seq.tpu_regs[TPU_INT_CTRL / 2];
+
+    if (!(ctrl & TPU_CTRL_DSP_EN))   /* le firmware n'a pas arme l'IT DSP */
+        return;
+    if (ictrl & ICTRL_DSP_FRAME)     /* actif-BAS : bit pose = masquee */
+        return;
+
+    static unsigned n = 0;
+    if (++n <= 20)
+        fprintf(stderr, "[calypso-tpu] IT trame -> DSP #%u vec%d/bit%d "
+                "(TPU_CTRL=0x%04x INT_CTRL=0x%02x) fn=%u\n",
+                n, vec, vec - 16, ctrl, ictrl, fn);
+
+    c54x_interrupt_ex(seq.dsp, vec, vec - 16);
+}
+
 void calypso_tpu_sequencer_tick(uint32_t fn)
 {
+    /* L'IT trame est generee par le MATERIEL a chaque trame des qu'elle est armee,
+     * independamment de l'etat du sequenceur — donc AVANT les retours anticipes
+     * ci-dessous, qui ne concernent que l'avancement d'un scenario en attente. */
+    tpu_frame_irq_to_dsp(fn);
+
     if (!seq.active || seq.wait_frames <= 0)
         return;
     seq.wait_frames--;

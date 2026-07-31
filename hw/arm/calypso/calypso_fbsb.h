@@ -32,7 +32,14 @@
  *   d_fb_det           0x08F9    (DSP → ARM: non-zero = FB found)
  *   d_fb_mode          0x08FA    (ARM → DSP: 0 = wideband search, 1 = narrow)
  *   a_sync_demod[0]    0x08FB    D_TOA  — time-of-arrival
- *   a_sync_demod[1]    0x08FC    D_PM   — power measurement
+ *   a_sync_demod[1]    0x08FB    D_PM   — power measurement
+ *     [2026-07-30] Corrige : ce commentaire disait 0x08FC, en desaccord d'UN MOT
+ *     avec le #define NDB_A_SYNC_DEMOD_PM (0x08FB) plus bas. Le firmware tranche
+ *     (include/calypso/dsp_api.h:202-204) : d_fb_det, d_fb_mode, puis
+ *     a_sync_demod[4] = {D_TOA, D_PM, D_ANGLE, D_SNR} -> 0x08F8, 0x08F9, puis
+ *     0x08FA..0x08FD. Le define etait bon, le commentaire faux. Meme famille
+ *     d'erreur que l'offset d_dsp_page corrige le 29/07 : un decalage d'un mot
+ *     dans un commentaire finit par etre lu comme une adresse.
  *   a_sync_demod[2]    0x08FD    D_ANGLE — frequency phase angle
  *   a_sync_demod[3]    0x08FE    D_SNR  — signal-to-noise ratio
  *
@@ -48,7 +55,22 @@
 /* Offsets verified against calypso_trx.c lines 575-581: ARM sees NDB
  * starting at byte 0x01A8 (= dsp_ram word 0xD4), and d_fb_det is at
  * dsp_ram[0xF8]. With api_base=0x0800 → DSP word = 0x0800 + 0xF8. */
-#define NDB_D_DSP_PAGE       0x08E2
+/* [2026-07-29] CORRECTION D'ADRESSE — d_dsp_page etait defini a 0x08E2, soit
+ * NDB+14 mots : c'est d_dsp_state. Trois sources concordantes :
+ *   1. osmocom-bb dsp_api.h:18  BASE_API_NDB = 0xFFD001A8 -> mot DSP 0x0800 +
+ *      0x1A8/2 = 0x08D4, et d_dsp_page est le champ 0 de T_NDB_MCU_DSP ;
+ *      d_dsp_state est le champ 14 -> 0x08E2.
+ *   2. Runtime : la seule ecriture ARM sur 0x08E2 vient de dsp.c:215
+ *      (ndb->d_dsp_state = 3 = C_DSP_IDLE3), a l'offset ARM 0x01C4.
+ *   3. La ROM DSP lit 0x08d4 (0xa51c = selecteur de page bit0 -> pages
+ *      0x0800/0x0828 vs 0x0814/0x083c ; 0xc8ea) et ne reference JAMAIS 0x08e2
+ *      dans les 5 ROM programme.
+ * Le commentaire ci-dessus disait deja « NDB = mot 0xD4 » — seule la constante
+ * etait fausse. Le chemin ARM principal, lui, etait correct (api_ram==dsp_ram,
+ * cf calypso_trx.c:2033), donc seuls les ecrivains/sondes SECONDAIRES tapaient
+ * a cote. */
+#define NDB_D_DSP_PAGE       0x08D4
+#define NDB_D_DSP_STATE      0x08E2
 #define NDB_D_FB_DET         0x08F8
 #define NDB_D_FB_MODE        0x08F9
 #define NDB_A_SYNC_DEMOD_TOA 0x08FA
@@ -91,11 +113,13 @@ typedef struct CalypsoFbsb {
     uint8_t          fb0_retries;
     uint8_t          afc_retries;
 
-    /* Last DSP result snapshot (what we'd write to a_sync_demod). */
-    int16_t          last_toa;
-    int16_t          last_angle;
-    uint16_t         last_pm;
-    uint16_t         last_snr;
+    /* [2026-07-29] Vue ARM. `ndb` pointe sur data[] cote DSP ; `api` pointe sur
+     * api_ram, c est-a-dire ce que le firmware lit REELLEMENT (prim_fbsb.c
+     * read_fb_result). Les deux vues peuvent diverger — c est le diagnostic.
+     * Remplace les 4 champs last_* qui etaient MORTS (mis a 0 au reset, jamais
+     * ecrits) et faisaient lire « last(snr=0 toa=0 ang=0 pm=0) » comme « le DSP
+     * ne rend rien » alors que la ligne ne disait rien du tout. */
+    uint16_t        *api;
 
     /* Bookkeeping. */
     uint64_t         fn_started;
@@ -103,7 +127,7 @@ typedef struct CalypsoFbsb {
 
 /* Lifecycle. */
 void calypso_fbsb_init(CalypsoFbsb *s, uint16_t *ndb_word_base,
-                       uint16_t api_base);
+                       uint16_t api_base, uint16_t *api_ram);
 void calypso_fbsb_reset(CalypsoFbsb *s);
 
 /* Hooks. */

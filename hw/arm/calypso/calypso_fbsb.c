@@ -10,6 +10,22 @@
  * directly. The only env-gated hack on this path is
  * CALYPSO_FORCE_ANGLE_ZERO (calypso_trx.c).
  *
+ * [2026-07-29] LOGGER REBRANCHE SUR DU VIVANT. Le quadruplet « last(...) »
+ * etait MORT : les champs last_toa/last_angle/last_pm/last_snr etaient mis a 0
+ * par calypso_fbsb_reset() et plus jamais ecrits par personne. La ligne
+ * « last(snr=0 toa=0 ang=0 pm=0) » a donc ete lue pendant des semaines comme
+ * « le DSP ne rend aucun resultat », alors qu elle ne disait rien du tout —
+ * red herring documente. Le dump lit desormais les cellules NDB VIVANTES, et
+ * aux DEUX endroits, parce que ces deux vues peuvent diverger :
+ *
+ *   data[] : vue DSP   — ce que le correlateur natif / le shunt ecrivent
+ *   api[]  : vue ARM   — ce que le firmware lit REELLEMENT (prim_fbsb.c:306
+ *                        read_fb_result() tape dans api_ram, PAS dans data[])
+ *
+ * Une divergence entre les deux colonnes n est pas un artefact de sonde :
+ * c est le diagnostic. « data[] plein / api[] vide » = le resultat est calcule
+ * et n arrive jamais au firmware.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "calypso_fbsb.h"
@@ -19,10 +35,11 @@
 #include <string.h>
 
 void calypso_fbsb_init(CalypsoFbsb *s, uint16_t *ndb_word_base,
-                       uint16_t api_base)
+                       uint16_t api_base, uint16_t *api_ram)
 {
     if (!s) return;
     s->ndb       = ndb_word_base;
+    s->api       = api_ram;
     s->api_base  = api_base;
     calypso_fbsb_reset(s);
 }
@@ -30,16 +47,14 @@ void calypso_fbsb_init(CalypsoFbsb *s, uint16_t *ndb_word_base,
 void calypso_fbsb_reset(CalypsoFbsb *s)
 {
     if (!s) return;
+    /* NB : ne remet PAS a zero ndb / api / api_base — ce sont des liaisons,
+     * pas de l etat de session. */
     s->state       = FBSB_IDLE;
     s->fb0_attempt = 0;
     s->fb1_attempt = 0;
     s->sb_attempt  = 0;
     s->fb0_retries = 0;
     s->afc_retries = 0;
-    s->last_toa    = 0;
-    s->last_angle  = 0;
-    s->last_pm     = 0;
-    s->last_snr    = 0;
     s->fn_started  = 0;
 }
 
@@ -79,6 +94,16 @@ void calypso_fbsb_on_dsp_task_change(CalypsoFbsb *s, uint16_t d_task_md,
     }
 }
 
+/* Lecture d une cellule NDB dans une des deux vues. `base` vaut s->api_base
+ * (0x0800) pour les deux : data[] est indexe depuis &data[0x0800] et api_ram
+ * depuis C54X_API_BASE, qui vaut la meme chose. Rend -1 si la vue est absente
+ * (pointeur nul) pour distinguer « non liee » de « lue a zero » — cette
+ * distinction est exactement celle qui manquait a l ancienne ligne morte. */
+static int fbsb_cell(const uint16_t *view, uint16_t base, uint16_t cell)
+{
+    return view ? (int)view[cell - base] : -1;
+}
+
 void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag)
 {
     if (!s) return;
@@ -88,12 +113,31 @@ void calypso_fbsb_dump(const CalypsoFbsb *s, const char *tag)
         "SB_SEARCH",  "SB_FOUND",
         "DONE", "FAIL",
     };
+    const uint16_t b = s->api_base;
+
+    int d_det = fbsb_cell(s->ndb, b, NDB_D_FB_DET);
+    int d_toa = fbsb_cell(s->ndb, b, NDB_A_SYNC_DEMOD_TOA);
+    int d_pm  = fbsb_cell(s->ndb, b, NDB_A_SYNC_DEMOD_PM);
+    int d_ang = fbsb_cell(s->ndb, b, NDB_A_SYNC_DEMOD_ANG);
+    int d_snr = fbsb_cell(s->ndb, b, NDB_A_SYNC_DEMOD_SNR);
+
+    int a_det = fbsb_cell(s->api, b, NDB_D_FB_DET);
+    int a_toa = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_TOA);
+    int a_pm  = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_PM);
+    int a_ang = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_ANG);
+    int a_snr = fbsb_cell(s->api, b, NDB_A_SYNC_DEMOD_SNR);
+
+    /* TOA et ANGLE sont signes cote firmware. */
     fprintf(stderr,
             "[fbsb] %s state=%s fb0_att=%u fb1_att=%u sb_att=%u "
-            "fb0_ret=%u afc_ret=%u last(snr=%u toa=%d ang=%d pm=%u)\n",
+            "fb0_ret=%u afc_ret=%u "
+            "data[](det=%d toa=%d pm=%d ang=%d snr=0x%04x) "
+            "api[](det=%d toa=%d pm=%d ang=%d snr=0x%04x)%s\n",
             tag ? tag : "", names[s->state],
             s->fb0_attempt, s->fb1_attempt, s->sb_attempt,
             s->fb0_retries, s->afc_retries,
-            s->last_snr, s->last_toa, s->last_angle, s->last_pm);
+            d_det, (int)(int16_t)d_toa, d_pm, (int)(int16_t)d_ang, d_snr & 0xFFFF,
+            a_det, (int)(int16_t)a_toa, a_pm, (int)(int16_t)a_ang, a_snr & 0xFFFF,
+            (d_det > 0 && a_det <= 0) ? "  <<<< DIVERGENCE data/api" : "");
     fflush(stderr);
 }

@@ -18,7 +18,7 @@
 #      6 shell
 # -----------------------------------------------------------------------------
 TMUX_FENETRE_PREMIERE=radio
-TMUX_RESUME="6 fenêtres : radio · coeur · ms1 · ms2 (side-car) · voix · shell"
+TMUX_RESUME="8 fenêtres : radio · coeur · dsp · asm · ms1 · ms2 (side-car) · voix · shell"
 
 tmux_layout_premiere() {
     printf "tail -n 200 -F '%s/qemu.log' 2>/dev/null | stdbuf -oL tr -d '\\\\007' || sleep infinity" \
@@ -40,6 +40,8 @@ tmux_layout() {
         "$(_tail "'$L/osmo-trx-ipc.log'")" "$C_RADIO"
 
     _fenetre_coeur
+    _fenetre_dsp
+    _fenetre_asm
 
     # ── 3 · ms1 — le premier abonné, celui qui passe par le firmware ─────────
     _w     ms1 "MS#1 | pile L2/L3 du telephone emule - camp, LU, appels" \

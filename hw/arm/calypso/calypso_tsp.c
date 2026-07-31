@@ -15,6 +15,8 @@
  */
 #include "qemu/osdep.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
+#include "hw/arm/calypso/calypso_asm4532.h"
+#include "hw/arm/calypso/calypso_rf3166.h"
 #include "hw/arm/calypso/calypso_tsp.h"
 #include "hw/arm/calypso/calypso_debug.h"
 
@@ -35,6 +37,23 @@ static struct {
     uint8_t  ctrl1;
     uint16_t act;         /* TSPACT enable-line state (tsp_act_update()) */
 } tsp;
+
+/* [2026-07-30] Les lignes TSPACT ont enfin des CONSOMMATEURS.
+ *
+ * Avant : `tsp.act` etait latche puis seulement journalise — le commutateur
+ * d'antenne et l'ampli de puissance n'existaient pas dans le modele, donc une
+ * emission demandee sans commutation, ou un PA laisse actif hors fenetre,
+ * passaient inapercus. Cf. doc/CHAINE_RF_MATERIELLE.md §5, ecart n°2.
+ *
+ * L'ORDRE compte et il est celui du firmware (rffe_dualband.c, rffe_mode()) :
+ * le commutateur est pose AVANT que le PA s'allume
+ * (`tspact &= ~TRENA` puis `tspact |= PA_ENABLE`). On notifie donc l'ASM4532
+ * d'abord : le RF3166 interroge son etat pour detecter l'incoherence. */
+static void tspact_notify(uint32_t fn)
+{
+    calypso_asm4532_tspact_update(tsp.act, fn);
+    calypso_rf3166_tspact_update(tsp.act, fn);
+}
 
 bool calypso_tsp_owns_addr(uint8_t addr)
 {
@@ -93,12 +112,14 @@ void calypso_tsp_move(uint8_t addr, uint8_t data, uint32_t fn)
         if (data != (tsp.act & 0xff)) {
             tsp.act = (tsp.act & 0xff00) | data;
             TSP_LOG("ACT_L -> 0x%02x (tspact=0x%04x) fn=%u", data, tsp.act, fn);
+            tspact_notify(fn);
         }
         break;
     case TPUI_TSP_ACT_U:
         if (data != (tsp.act >> 8)) {
             tsp.act = (tsp.act & 0x00ff) | ((uint16_t)data << 8);
             TSP_LOG("ACT_U -> 0x%02x (tspact=0x%04x) fn=%u", data, tsp.act, fn);
+            tspact_notify(fn);
         }
         break;
     case TPUI_TSP_SET1: case TPUI_TSP_SET2: case TPUI_TSP_SET3:

@@ -1,12 +1,27 @@
 # QUICK START — QEMU-Calypso
 
 Lancer et **vérifier**. Ce fichier ne décrit que ce qui est mesuré aujourd'hui
-(2026-07-28). Chaque affirmation nomme son instrument. Vérité de fond :
+(2026-07-30). Chaque affirmation nomme son instrument. Vérité de fond :
 [`hw/arm/calypso/doc/ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md).
 
 Distinction employée partout : **MESURE** (relevé, avec sa commande) /
 **HYPOTHÈSE** (déduite du code, pas encore relevée) / **INVALIDE** (affirmation
 retirée, ne pas réintroduire).
+
+## Les profils, en une ligne chacun
+
+`CALYPSO_MODE=…` — un profil = **qui fait quoi**, et rien d'autre :
+
+| profil | FB / SB | SI | à quoi il sert |
+|---|---|---|---|
+| `shunt_legit` | hôte | gr-gsm | la pile de bout en bout : camp, LU, SMS (§2) |
+| `native_twl` | hôte / TWL | **DSP** | **le DSP traite-t-il le SI ?** (§3bis) |
+| `native` | DSP | DSP | la vérité sur l'acquisition (§3) |
+| `native_helped` | DSP, entrée reroutée | DSP | observer le corrélateur — **sous béquille** |
+| `empty` | rien de posé | rien de posé | construire un banc gate par gate |
+
+Un profil ne pose que des `:=` : **la CLI garde toujours le dernier mot**, et
+c'est le **manifeste** qui dit ce que vous avez réellement obtenu (§5).
 
 ---
 
@@ -198,6 +213,85 @@ critère de tranche — `d_fb_det` est trop en aval pour arbitrer un correctif.
 
 ---
 
+## 3bis. `native_twl` — la question du SI, sans attendre le FB/SB
+
+Le FB/SB natif n'arrive pas (§3, critère N4 = 0 sur tous les runs depuis le
+28/07). Ce profil retourne le problème au lieu de l'attendre : **on donne la
+synchro au DSP, et on regarde s'il traite le SI.** C'est la dernière ligne du
+tableau des pistes de §3 (« ni SCH ni SI »), prise par l'autre bout.
+
+| profil | FB / SB (acquisition) | SI (décodage) | campe ? |
+|---|---|---|---|
+| `shunt_legit` | hôte | **gr-gsm** — le DSP est shunté | oui |
+| `native_twl` | hôte / TWL | **DSP** | oui (synchro fournie) |
+| `native` | DSP | DSP | non, aujourd'hui |
+
+**Règle de frontière** : *si les SI viennent de gr-gsm, ce n'est pas ce mode,
+c'est `shunt_legit`.* Les deux seules portes par lesquelles un bloc gr-gsm entre
+dans `a_cd` sont `CALYPSO_SHUNT_FEED_SI` et `CALYPSO_INJECT_ACD` — le profil les
+pose à 0, et `run_modules/01-profil.sh` proteste si on les rallume.
+
+⚠️ **BÉQUILLE assumée** : FB et SB sont **substitués** par l'hôte
+(`SHUNT_REAL_FB` + `INJECT_SB` + le transport `SHUNT_PUBLISH_FB`). Ce qu'elle
+masque : l'incapacité actuelle du corrélateur natif à publier `d_fb_det` — donc
+`data[0x08f8]` **n'est pas un verdict dans ce mode**, et ne doit jamais être cité
+comme tel ; le seul mode qui juge l'acquisition est `native` (§3). À retirer
+quand `native` sort un `d_fb_det` positif : ce profil se dissout alors dans
+`native`.
+
+### Lancer
+
+```bash
+docker exec -it osmo-operator-1 bash -lc '
+  cd /opt/GSM/osmo-qemu-calypso &&
+  CALYPSO_MODE=native_twl CALYPSO_DEBUG=BSP,A_CD-BY-BURST ./run.sh --restart'
+```
+
+Le profil pose lui-même, côté DSP : `DSP_RUN_C54X=1 DSP_SHUNT=0
+FRAME_IT_NATIVE=1 TPU_DSP_FRAME_IT=1 BSP_DARAM_FORCE=1 BSP_DARAM_ADDR=0x4c00
+BSP_DARAM_LEN=296 BSP_IQ_DECIM=4` ; côté synchro : `SHUNT_REAL_FB=1 INJECT_SB=1
+SHUNT_PUBLISH_FB=1 SHUNT_NO_GRGSM=0 SHUNT_NO_CANNED=1` ; côté SI : les cinq
+gates d'injection à `0` ; et l'instrument `WATCH_ACD=1`. Vérifiez-le **au
+manifeste**, jamais à la ligne de commande (§5).
+
+`CALYPSO_DEBUG` est obligatoire pour que les sondes BSP et les totaux `a_cd`
+parlent : leur silence ne veut alors rien dire (§5).
+
+### Les 3 vérifications, dans l'ordre
+
+```bash
+# T1 — la synchro est bien fournie : le mobile se cale sur un BSIC réel
+docker exec osmo-operator-1 bash -lc '
+  grep -a "BSIC" /root/qemu.log | tail -3 ;
+  grep -a "ALLC task=24" /root/qemu.log'
+
+# T2 — le DSP est alimenté en bursts, aucun jeté
+docker exec osmo-operator-1 bash -lc '
+  grep -ac "deliver: gate shunt LEVE" /root/qemu.log ;
+  grep -ac "dropping fn=" /root/qemu.log'
+
+# T3 — LE critère du mode : le DSP écrit-il a_cd de son propre opcode ?
+docker exec osmo-operator-1 bash -lc '
+  grep -a "WATCH-ACD" /root/qemu.log | head -10 ;
+  grep -a "A_CD-BY-BURST" /root/qemu.log | tail -2'
+
+# T3bis — contrôle d'honnêteté : AUCUNE injection au manifeste
+docker exec osmo-operator-1 bash -lc '
+  grep -aoE "CALYPSO_(SHUNT_FEED_SI|INJECT_ACD)=[0-9]" /root/qemu.log | sort -u'
+```
+
+| # | Question | Critère de décision, posé d'avance |
+|---|---|---|
+| T1 | la synchro est-elle fournie ? | un `BSIC` ≠ 0. Sinon le mode n'a pas démarré et **rien d'autre ne se lit** — on ne conclut pas sur le SI d'un DSP non synchronisé. `ALLC task=24` dit en plus que l'ARM a confié le CCCH au DSP (`calypso_fbsb.c:85`) |
+| T2 | le DSP est-il alimenté ? | `deliver: gate shunt LEVE` > 0 **et** `dropping fn=` = 0 |
+| T3 | **le DSP traite-t-il le SI ?** | ≥ 1 ligne `WATCH-ACD DSP-opcode-write data[0x09d2..0x09e0]` (`calypso_c54x.c:2563`, écriture **opcode**, plafonnée à 60). **Zéro est une réponse — négative — pas un échec de run.** |
+| T3bis | la réponse est-elle honnête ? | `FEED_SI=0` **et** `INJECT_ACD=0` au manifeste. Si l'un vaut 1, T3 est un artefact : c'est gr-gsm qui a rempli `a_cd` (`calypso_dsp_shunt.c:2249`) |
+
+`a_cd` = `data[0x09D0..0x09DE]`. Une écriture **opcode** dans cette plage est du
+DSP ; une écriture directe du shunt n'en est pas — c'est précisément ce que
+`WATCH-ACD` distingue, et pourquoi la sonde a été écrite le 27/07.
+
+---
 ## 4. Boîte à outils de diagnostic
 
 ### 4.1 Sondes (toutes gatées par variable d'environnement, **défaut OFF**)
@@ -281,6 +375,109 @@ docker exec osmo-operator-1 bash -lc '
   ps -eo lstart,cmd | grep [q]emu-system-arm'
 ```
 
+---
+
+### 4.3 Les captures I/Q sont ON par défaut dans tous les modes (2026-07-30)
+
+Motif : `corr_iq.py` ne sert à rien si le run n'a rien écrit, et on ne s'en
+aperçoit qu'après. Sauf en `CALYPSO_MODE=empty`, tout run produit donc :
+
+| fichier | posé par | plafond | `corr_iq --src` |
+|---|---|---|---|
+| `/dev/shm/dsp_iq.cfile` | défaut C (`calypso_dsp_shunt.c:1637`) | non | `shunt` |
+| `/dev/shm/bursts.cfile` | `BSP_DUMP_RX_FILE` (`calypso.env:36`) | **non** — ~600 o/burst FCCH | `bursts` |
+| `/tmp/iq_rx_*.bin` | `CALYPSO_IQDUMP` | 24 fichiers | `rxdump` |
+| `/dev/shm/daram_2a00.cfile` | `CALYPSO_DARAM_DUMP` | 200 captures | `ddump` — ⚠️ **conditionnel, voir ci-dessous** |
+| `/dev/shm/dsp_iq_fn.cfile` | `CALYPSO_SHUNT_IQ_CFILE2` | **512 Mo** | — (voir 4.4) |
+
+Le shunt s'arme même en natif (sur `CALYPSO_DSP=c54x`), donc `dsp_iq.cfile`
+existe dans tous les modes sans qu'on pose quoi que ce soit.
+
+⚠️ `BSP_DUMP_RX_FILE` ne porte pas le préfixe `CALYPSO_` : il **n'apparaît pas au
+manifeste**. C'est la seule de ces variables dont le manifeste ne dit rien.
+
+⚠️ **`daram_2a00.cfile` fait souvent 0 ko, et ce n'est pas un bug d'activation.**
+Mesuré le 30/07 en `native_twl` : la sonde est bien armée (`[c54x] DARAM-DUMP
+armed pc=0x9ac0 max=200 -> … (ok)` — c'est ce fopen qui crée le fichier vide),
+mais elle n'écrit que si **deux** conditions tombent, et aucune des deux n'est
+garantie :
+1. `exec_pc == CALYPSO_DARAM_DUMP_PC` (défaut **0x9ac0**). Dans ce run, la seule
+   occurrence de `0x9ac0` dans tout le journal est la ligne d'armement, et
+   **aucun `PC=0x9xxx`** n'apparaît : la banque 0x9xxx appartient au banc
+   `native_helped`, dont l'entrée corrélateur est reroutée (`FB_CORR_ENTRY`).
+2. `d_fb_mode[0x08f9] != 0`, sauf `CALYPSO_DARAM_DUMP_ANYMODE=1`.
+
+De plus la base filmée est **codée en dur à `0x2a00`** (aucune variable pour la
+changer), alors que ces profils livrent en **`0x4c00`** (`BSP_DARAM_ADDR`) : même
+déclenchée, la sonde filmerait l'autre tampon. `--src ddump` est donc un
+instrument pointé sur le banc du 27/07, pas une capture universelle. Pour l'I/Q
+réellement livrée à ce DSP : `--src bursts`. Pour la faire tirer ici :
+`CALYPSO_DARAM_DUMP_PC=<un PC réellement exécuté> CALYPSO_DARAM_DUMP_ANYMODE=1`.
+
+⚠️ `CALYPSO_DARAM_DUMP_ANYMODE` reste à 0 par défaut, exprès : sans ce garde-fou (27/07) le
+plafond de 200 est consommé dès le boot pendant que `d_fb_mode[0x08f9]==0`, et on
+en conclut à tort « le buffer ne contient jamais de FCCH ».
+
+### 4.4 Décoder l'I/Q d'un run avec `grgsm_decode`
+
+**La pile décode DÉJÀ cet I/Q avec gr-gsm, en direct.** Le module
+`66-grgsm-decode.sh` lance :
+
+```
+grgsm_decode -m BCCH_SDCCH4 -t 0 -a 514 -c /tmp/iq_grgsm.fifo -s 1083333 -v
+```
+
+et ça marche : 2 000+ `PAGING REQUEST 1` dans `$LOG_DIR/grgsm_decode.log` (mesuré
+le 30/07). Donc l'I/Q du shunt **est** décodable ; c'est le chemin FIFO live, à
+4 SPS, mode C0 combiné.
+
+⚠️ **Une seule instance à la fois** : `grgsm_decode` bind `UDP 127.0.0.1:4729`, et
+le décodeur live le tient déjà. Toute invocation offline échoue sur
+`RuntimeError: bind: Address already in use` — et si vous filtrez la sortie, ça
+ressemble à « rien décodé ». J'ai fait exactement cette erreur le 30/07 et j'en
+ai tiré une fausse conclusion. Isolez le réseau :
+
+```bash
+docker exec osmo-operator-1 bash -lc '
+  unshare -rn bash -c "ip link set lo up
+    /root/.env/bin/grgsm_decode -c /tmp/snap.cfile -s 1083333 -a 514 -m BCCH_SDCCH4 -t 0 -v"'
+```
+
+⚠️ `/tmp` est un **tmpfs de 512 Mo** : un snapshot de cfile le remplit vite, et un
+`/tmp` plein peut casser la pile en cours. Snapshottez dans `/dev/shm` (8 Go) ou
+par tranches, et supprimez après.
+
+⚠️ **Le cfile #2 (`dsp_iq_fn.cfile`) est incohérent avec lui-même** : `spf=2500`
+floats = 1250 complexes = une trame à **1 SPS**, alors que le contenu des bursts y
+est écrit à **4 SPS**. Rien ne peut s'y verrouiller — vérifié, 0 message à 270833
+comme à 1083333. C'est probablement pourquoi `CALYPSO_IQ_CFILE_SPF` avait été
+rendu « sweepable » ; la valeur cohérente avec du 4 SPS serait **10000**. À
+trancher par un run, pas par déduction.
+
+Le cfile #2 rejoue chaque burst à sa position de FN et comble les trous
+(`calypso_dsp_shunt.c:2076`) — c'est l'idée juste, mal cadencée :
+
+```bash
+# 1. snapshot — le run écrit dans le fichier pendant que vous le lisez
+docker exec osmo-operator-1 bash -lc '
+  cp /dev/shm/dsp_iq_fn.cfile /tmp/snap_fn.cfile && ls -l /tmp/snap_fn.cfile'
+
+# 2. décodage (fs = 270833 : spf=2500 floats/trame = 1250 complexes / 4,615 ms = 1 SPS)
+docker exec osmo-operator-1 bash -lc '
+  /root/.env/bin/grgsm_decode -c /tmp/snap_fn.cfile -s 270833 -a 514 -m BCCH -t 0 -v'
+```
+
+- `-a` doit être l'ARFCN **du run** : `CALYPSO_CCCH_ARFCN` (défaut 514).
+- `-s 270833` vient de `spf` (`CALYPSO_IQ_CFILE_SPF`, défaut 2500). Si vous
+  changez `spf`, la cadence change : `fs = spf / 2 / 4.615e-3`.
+- Rien ne sort ? `-p` (print-bursts) sépare les deux cas : des bursts mais pas de
+  messages = démod OK / décodage KO ; **rien du tout** = pas de verrouillage, donc
+  un problème de cadence, d'ARFCN, ou un fichier trop court.
+- Le plafond de 512 Mo (`CALYPSO_IQ_CFILE2_MAX_MB`) ferme le fichier proprement :
+  il reste décodable. `=0` pour illimité — 7,8 Go/h en temps réel, dans la RAM.
+
+Pour `bursts.cfile` / `daram_2a00.cfile`, l'instrument n'est pas `grgsm_decode`
+mais `corr_iq.py` (§4.2) : ce sont des captures IQ16 par burst, pas un flux.
 ---
 
 ## 5. Les pièges connus

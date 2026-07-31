@@ -22,6 +22,8 @@
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_sim.h"
 #include "hw/arm/calypso/calypso_fbsb.h"
+#include "calypso_mailbox.h"
+#include "calypso_dma.h"
 #include "chardev/char-fe.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -112,6 +114,70 @@ static CalypsoTRX *g_trx;
  * FB_DSP_TASK, allowing the L1→L2→L3 stack to progress toward Location
  * Update without requiring physical RF AFC simulation. */
 static CalypsoFbsb g_fbsb;
+
+/* [2026-07-30] CLOBBER-WHO — qui ecrase la page de lecture DSP->ARM ?
+ *
+ * Gate CALYPSO_CLOBBER_WHO (defaut 1, diagnostic plafonne). Repond a UNE
+ * question binaire : les ecritures qui pietinent la sortie du DSP viennent-elles
+ * du FIRMWARE (CPU ARM) ou de NOTRE PLOMBERIE (shunt_write_w -> dma_memory_write,
+ * qui passe par le meme bus et se deguise donc en « ARM>WR » dans mailbox.log) ?
+ *
+ * `current_cpu` est non-NULL uniquement quand un CPU execute le store. Un
+ * dma_memory_write depuis un thread/timer hote laisse current_cpu a NULL.
+ */
+static void calypso_clobber_who(uint16_t mot, uint16_t val, uint16_t ancien,
+                                uint32_t off, uint32_t fn)
+{
+    if (mot != 0x0829 && mot != 0x082C && mot != 0x083D && mot != 0x0840) {
+        return;
+    }
+    static int en = -1;
+    if (en < 0) {
+        en = calypso_gate("CALYPSO_CLOBBER_WHO", 1);
+        if (en)
+            fprintf(stderr, "[trx] CLOBBER-WHO arme : source des ecritures sur "
+                    "0x0829/0x082c/0x083d/0x0840 (CPU ARM = firmware, "
+                    "DMA hote = notre plomberie)\n");
+    }
+    if (!en) {
+        return;
+    }
+    static unsigned long long n_cpu = 0, n_dma = 0;
+    static unsigned long long n_boot = 0, n_run = 0;
+    static unsigned nlog = 0, nlog_run = 0;
+    bool from_cpu = (current_cpu != NULL);
+    /* [2026-07-30, v2] BOOT vs REGIME ETABLI. dsp_db_init() (osmocom-bb
+     * calypso/dsp.c:437-440) fait QUATRE dsp_api_memset au demarrage, sur les
+     * deux pages W et les deux pages R. Ca balaye ces cellules avec des valeurs
+     * anciennes non initialisees (0x771a, 0x783f, 0xf47c...) et ecrit des zeros.
+     * C'est legitime et ca ne dit RIEN du regime etabli — or les 30 premieres
+     * lignes de la v1 etaient exactement ca. On separe. */
+    bool boot = (fn < 100);
+    if (from_cpu) { n_cpu++; } else { n_dma++; }
+    if (boot) { n_boot++; } else { n_run++; }
+
+    /* Les 10 premieres, quel que soit le regime, pour garder la trace du boot. */
+    if (nlog < 10) {
+        nlog++;
+        fprintf(stderr, "[trx] CLOBBER-WHO(boot?) #%u mot=0x%04x 0x%04x -> 0x%04x "
+                "off=0x%x fn=%u source=%s\n", nlog, mot, ancien, val, off, fn,
+                from_cpu ? "CPU-ARM" : "DMA-HOTE");
+    }
+    /* Et surtout : les 40 premieres du REGIME ETABLI, celles qui comptent. */
+    if (!boot && nlog_run < 40) {
+        nlog_run++;
+        fprintf(stderr, "[trx] CLOBBER-WHO-RUN #%u mot=0x%04x 0x%04x -> 0x%04x "
+                "off=0x%x fn=%u source=%s\n", nlog_run, mot, ancien, val, off, fn,
+                from_cpu ? "CPU-ARM" : "DMA-HOTE");
+    }
+    if (((n_cpu + n_dma) % 200) == 0) {
+        fprintf(stderr, "[trx] CLOBBER-WHO resume : cpu_arm=%llu dma_hote=%llu "
+                "| boot=%llu regime_etabli=%llu\n",
+                (unsigned long long)n_cpu, (unsigned long long)n_dma,
+                (unsigned long long)n_boot, (unsigned long long)n_run);
+    }
+}
+
 static bool        g_fbsb_inited;
 /* Définis dans calypso_c54x.c — posés ici quand l'ARM écrit d_task_md=5,
  * lus par la sonde D_TASK_MD-RD (test H1 timing/EA write-vs-read). */
@@ -147,6 +213,55 @@ extern uint16_t g_arm_taskmd5_ea;
  * (LCD MMIO, talloc memory pool, IRQ controller, SIM stub) rather than
  * re-introducing a firmware patch.
  */
+
+/* [2026-07-30] Commit direct d'un mot de la fenetre API dans les DEUX banques,
+ * sans round-trip MMIO.
+ *
+ * Existe pour reparer un trou precis : calypso_dsp_shunt.c superpose une region
+ * IO de 2 octets sur 0xFFD001A8 (d_dsp_page) en priorite 10, et son handler
+ * d'ecriture ne stockait rien -- il croyait a des « pass-through semantics »
+ * qui n'existent pas dans QEMU (la plus haute priorite traite l'acces
+ * EXCLUSIVEMENT). L'ecriture de dsp_end_scenario() n'atteignait donc jamais
+ * calypso_dsp_write() et la cellule gardait son dechet de boot 0xf600.
+ *
+ * Les DEUX banques sont necessaires :
+ *   dsp_ram[]  = ce que l'ARM relit, et la SOURCE du miroir par tick plus bas
+ *                dans ce fichier (api_ram[d_dsp_page] = dsp_ram[0x01A8/2]) ;
+ *                sans elle, la valeur serait ecrasee au tick suivant ;
+ *   dsp->data[]= ce que le DSP lit.
+ *
+ * Pas de calypso_pcb_daram_lock ici, volontairement : le mutex DARAM n'est pas
+ * recursif et cette fonction est appelee depuis un handler MMIO qui peut deja
+ * etre dans le contexte frame-tick -> re-lock = abort. Meme raisonnement, et
+ * meme precedent, que shunt_c54x_api_rd() dans calypso_dsp_shunt.c. Un store
+ * 16 bits aligne ne se dechire pas, et le c54x tourne sur ce meme thread. */
+void calypso_trx_api_commit_w(uint32_t arm_offset, uint16_t value)
+{
+    CalypsoTRX *s = g_trx;
+    uint16_t mot, ancien;
+
+    if (!s || (arm_offset + 1u) >= CALYPSO_DSP_SIZE) {
+        return;
+    }
+    mot = (uint16_t)(arm_offset / 2 + 0x0800);
+    ancien = s->dsp ? s->dsp->data[mot] : s->dsp_ram[arm_offset / 2];
+
+    /* [2026-07-30] Journaliser le sens ARM>WR, comme le fait calypso_dsp_write().
+     * Sans ca le journal MENT par asymetrie : on voit le DSP relire la cellule
+     * changer de valeur sans qu'aucune ecriture n'apparaisse jamais — la valeur
+     * a l'air de bouger par magie, et les sondes posees sur le chemin MMIO
+     * (DDP-ANY, WR-OP, DPAGE_HUNT) restent muettes alors que le commit a bien
+     * lieu. Meme contexte que le hook de calypso_dsp_write (ecriture MMIO depuis
+     * le CPU), donc meme innocuite. */
+    calypso_mbx(MBX_ARM_WR, mot, value, ancien, arm_offset, s->fn,
+                s->dsp ? s->dsp->insn_count : 0);
+    calypso_clobber_who(mot, (uint16_t)value, ancien, arm_offset, s->fn);
+
+    s->dsp_ram[arm_offset / 2] = value;
+    if (s->dsp) {
+        s->dsp->data[mot] = value;
+    }
+}
 
 uint32_t calypso_trx_get_fn(void)
 {
@@ -198,6 +313,14 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return 0;
+    /* [2026-07-29] Moniteur mailbox : ce que l'ARM LIT de la mailbox — le sens
+     * qu'aucune sonde ne couvrait, alors que « quel résultat l'ARM voit-il ? »
+     * est la moitié de toutes les questions de la journée. */
+    if (s->dsp_ram && (offset & 1) == 0) {
+        calypso_mbx(MBX_ARM_RD, (uint16_t)(0x0800 + offset / 2),
+                    s->dsp_ram[offset / 2], 0, (uint32_t)offset, s->fn,
+                    s->dsp ? s->dsp->insn_count : 0);
+    }
     {   /* [2026-07-28] FIND32 : voir en-tete du patch. */
         static int _f3 = -1; static unsigned _f3n = 0; static uint16_t _f3v = 0x0020;
         if (_f3 < 0) { _f3 = calypso_gate("CALYPSO_FIND32", 0);
@@ -315,11 +438,30 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     if (size == 2 && (offset == 0x0050 || offset == 0x0078)) {
         static int _cl = -1;
         if (_cl < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _cl = ((l && *l=='1') || (nl && *nl=='1')) ? 1 : 0; }
+        /* [2026-07-30] DEUX CHOSES DE NATURES DIFFERENTES, separees.
+         *
+         * (a) le POP de l'anneau : c'est de la MODELISATION. `d_task_d` est lu une
+         *     fois par nb_resp (prim_rx_nb.c:77), donc c'est le bon moment pour
+         *     avancer d'un burst. Sans ce pop, `s_burst_cur` reste a 0 et la
+         *     lecture sert `(0+3)&3 = 3` — un burst-id CONSTANT, que le firmware
+         *     rejette 3 fois sur 4. Mesure du 30/07 : la valeur servie est passee
+         *     de 2 (desaliasage eteint) a 3 (desaliasage allume, anneau jamais
+         *     depile) — meme symptome, cause deplacee d'un cran. Meme gate que le
+         *     push et la lecture : CALYPSO_BURST_ID_DEALIAS, defaut ON.
+         *
+         * (b) `val = 24` : c'est une BEQUILLE — on fabrique ALLC_DSP_TASK quand le
+         *     firmware lit d_task_d=0, pour lui eviter le « EMPTY » et le faire
+         *     continuer vers a_cd. Ca reste sous le parapluie, c'est du shunt.
+         */
+        {
+            static int _cbp = -1;
+            if (_cbp < 0) _cbp = calypso_gate("CALYPSO_BURST_ID_DEALIAS", 1);
+            if (_cbp) {
+                s_burst_cur = s_bd_ring[s_bd_r++ & 7u];   /* (a) modelisation */
+            }
+        }
         if (_cl && calypso_dsp_shunt_si_valid()) {
-            /* d_task_d lu 1x/nb_resp (prim_rx_nb.c:77) -> POP le prochain burst_id
-             * du FIFO. Stable pour les 1-2 lectures d_burst_d du meme nb_resp. */
-            s_burst_cur = s_bd_ring[s_bd_r++ & 7u];
-            if (val == 0) val = 24;   /* ALLC_DSP_TASK : evite EMPTY */
+            if (val == 0) val = 24;   /* (b) BEQUILLE : ALLC_DSP_TASK, evite EMPTY */
         }
     }
     /* [2026-07-26 camp] db_r->d_burst_d (read page @off 0x52 / 0x7A) : le pipeline
@@ -328,9 +470,22 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
      * nb_resp(3) matche (3==3) et lit a_cd/SI ; nb_resp(0/1/2) bail (mesures
      * non-critiques). Gate SHUNT_LEGIT + si_valid. */
     if (size == 2 && (offset == 0x0052 || offset == 0x007A)) {
+        /* [2026-07-30] DECOUPLE. Avant : `_cb && si_valid()`, soit DEUX conditions
+         * dont AUCUNE n'a de rapport avec la coherence d'un compteur de burst :
+         *   · `_cb` = SHUNT_LEGIT || SHUNT_NO_LEGIT — un parapluie de shunt ;
+         *   · `si_valid()` — « gr-gsm a-t-il decode un SI ? ».
+         * Or le firmware exige la sequence 0,1,2,3 (prim_rx_nb.c:80 fait un early
+         * return sinon, et jette TOUT l'aval : TOA, PM, SNR, AFC, TA, gain,
+         * assemblage du bloc de 4). C'est une NECESSITE DE MODELISATION, pas une
+         * bequille : elle doit valoir quel que soit qui produit les bursts.
+         * Mesure du 30/07 : en `native_twl` avec des SI honnetes (FEED_SI=0),
+         * si_valid() est faux -> desaliasage eteint -> d_burst_d fige a 2 (516 cas
+         * sur 539) -> « BURST ID 2!=0 / 2!=1 / 2!=3 » -> 3 rapports sur 4 jetes ->
+         * le bloc de 4 n'est JAMAIS assemble -> aucun CCCH ne remonte.
+         * Gate dediee, defaut ON ; `=0` restaure l'ancien comportement. */
         static int _cb = -1;
-        if (_cb < 0) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); _cb = ((l && *l=='1') || (nl && *nl=='1')) ? 1 : 0; }
-        if (_cb && calypso_dsp_shunt_si_valid()) {
+        if (_cb < 0) _cb = calypso_gate("CALYPSO_BURST_ID_DEALIAS", 1);
+        if (_cb) {
             /* SOURCE UNIQUE : miroir per-page du burst_id commande par l'ARM.
              * db_w->d_burst_d est latche par parite dans calypso_dsp_write :
              *   write 0x0002 -> s_wp_burst_d[0] (read-page 0, off 0x0052)
@@ -536,7 +691,10 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * sont a frames L1 CONSECUTIVES (shunt_l1s_fn +1) ; gros trou avant cmd0 du
      * bloc suivant -> fn != last+1 => reset FIFO -> alignement 0,1,2,3 sans OFS. */
     if (size == 2 && ((uint32_t)offset == 0x0002 || (uint32_t)offset == 0x002A)) {
-        if (calypso_dsp_shunt_si_valid()) {
+        /* [2026-07-30] Meme decouplage cote push : l'anneau doit se remplir des
+         * que l'ARM commande un burst, independamment des SI. Sinon le
+         * desaliasage lit un anneau vide. */
+        {
             uint32_t wfn = shunt_l1s_fn();
             if (wfn != s_bd_last_wfn + 1) { s_bd_w = 0; s_bd_r = 0; }  /* nouveau bloc */
             s_bd_last_wfn = wfn;
@@ -566,6 +724,79 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                             " <== task_md";
             fprintf(stderr, "[calypso-trx] WR-OP off=0x%04x val=0x%04x size=%u fn=%u%s\n",
                     (unsigned)offset, (unsigned)value, size, s->fn, z);
+        }
+    }
+
+    /* [2026-07-30] DPAGE-HUNT (CALYPSO_DPAGE_HUNT, defaut 0) — ou atterrit
+     * l ecriture ARM de d_dsp_page ?
+     *
+     * CONSTAT qui motive la sonde : le firmware EXECUTE forcement
+     * `dsp_api.ndb->d_dsp_page = B_GSM_TASK | dsp_api.w_page` (dsp.c:471), car
+     * la ligne suivante `w_page ^= 1` (dsp.c:472) est le SEUL site de flip du
+     * firmware et l ARM ecrit bien task_md alternativement en page 0 (off
+     * 0x0008) et page 1 (off 0x0030) — vu par WR-OP et par DSP_WRITE_COUNT.
+     * Et pourtant aucune ecriture n arrive jamais a l offset 0x01A8 (= NDB+0 =
+     * cellule DSP 0x08D4), ni au moniteur mailbox, ni a WR-OP qui surveille
+     * pourtant 0x01A8-0x0210 avec val!=0. Le DSP lit donc UNE fois 0x08D4 et y
+     * trouve le dechet de boot 0xf600 (B_GSM_TASK absent) pour tout le run.
+     *
+     * Deux sondes, deux questions distinctes :
+     *   (a) NDB+0 : est-ce que le store passe par CE hook, oui ou non ?
+     *       Declencheur = offset == 0x01A8 exactement, TOUTES valeurs (0 compris,
+     *       contrairement a WR-OP qui filtre val!=0 et rate donc les remises a 0
+     *       de l_1s_reset_hw). Une ligne = un evenement, plafond 40.
+     *   (b) BALAYAGE : ou tombe la valeur B_GSM_TASK|w_page (0x0002/0x0003) ?
+     *       Declencheur = valeur 2 ou 3, n importe ou dans la fenetre API. La
+     *       plage 0x01A8-0x0210 de WR-OP etait un choix arbitraire : si le store
+     *       atterrit ailleurs, seul un balayage sans borne le nomme.
+     *       Replie PAR OFFSET (un offset nouveau = une ligne, 32 max) pour ne
+     *       pas tronquer le journal, plus un bilan tous les 2000 coups (10 max)
+     *       afin que l ABSENCE soit mesurable et pas confondue avec un plafond.
+     *
+     * A LIRE : une ligne (a) => le store arrive ici, le bug est en AVAL (miroir
+     * vers data[], ou calypso_trx.c qui repose 0xf600 a chaque tick). Zero ligne
+     * (a) mais un offset en (b) => le store part ailleurs, l offset affiche dit
+     * ou. Zero ligne des deux => le store ne traverse pas ce hook du tout, il
+     * faut regarder les memory_region de la fenetre API. */
+    if (calypso_gate("CALYPSO_DPAGE_HUNT", 0)) {
+        static unsigned n_a8 = 0;
+        if ((uint32_t)offset == 0x01A8 && n_a8 < 40) {
+            n_a8++;
+            fprintf(stderr, "[calypso-trx] DPAGE-HUNT NDB+0 off=0x01a8 "
+                    "val=0x%04x size=%u fn=%u insn=%llu\n",
+                    (unsigned)(value & 0xFFFFu), size, s->fn,
+                    (unsigned long long)(s->dsp ? s->dsp->insn_count : 0));
+        }
+
+        if (size >= 2) {
+            static uint32_t vus[32];
+            static unsigned n_vus = 0, n_hit = 0, n_bilan = 0;
+            int nmots = (size == 4) ? 2 : 1;
+            for (int k = 0; k < nmots; k++) {
+                uint16_t vv = (uint16_t)(value >> (16 * k));
+                uint32_t oo = (uint32_t)offset + 2u * (uint32_t)k;
+                unsigned i;
+                if (vv != 0x0002 && vv != 0x0003) continue;
+                n_hit++;
+                for (i = 0; i < n_vus; i++) if (vus[i] == oo) break;
+                if (i == n_vus && n_vus < 32) {
+                    vus[n_vus++] = oo;
+                    fprintf(stderr, "[calypso-trx] DPAGE-HUNT val=0x%04x a un "
+                            "offset NOUVEAU 0x%04x (= cellule DSP 0x%04x%s) "
+                            "size=%u fn=%u insn=%llu\n",
+                            (unsigned)vv, (unsigned)oo,
+                            (unsigned)(0x0800u + oo / 2u),
+                            (oo == 0x01A8) ? ", NDB+0 = d_dsp_page" : "",
+                            size, s->fn,
+                            (unsigned long long)(s->dsp ? s->dsp->insn_count : 0));
+                }
+                if ((n_hit % 2000u) == 0 && n_bilan < 10) {
+                    n_bilan++;
+                    fprintf(stderr, "[calypso-trx] DPAGE-HUNT bilan : %u coups "
+                            "val=2/3, %u offsets distincts, fn=%u\n",
+                            n_hit, n_vus, s->fn);
+                }
+            }
         }
     }
 
@@ -602,29 +833,18 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
      * MVPD-copied) value via prog_fetch. */
     if (s->dsp) {
         uint16_t dsp_word = offset/2 + 0x0800;
-        /* [2026-07-23] ARM-WRITE-0810 (READ-ONLY) : trace le mirror ARM->DSP
-         * specifiquement pour d_ctrl_system (dsp_word 0x0810, ARM offset 0x20).
-         * La sonde precedente (WATCH-0810-WR, cote C54x data_write) etait AVEUGLE
-         * aux writes ARM (ce mirror ecrit s->dsp->data[] DIRECTEMENT, sans passer
-         * par data_write()). Cette sonde-ci confirme si le mirror ARM marche
-         * reellement pour ce mot precis. */
-        if (dsp_word == 0x0810) {
-            static unsigned aw810_zero = 0, aw810_nz = 0;
-            /* val!=0 (surtout bit15=0x8000, B_TASK_ABORT) = JAMAIS cappe : c'est
-             * l'ecriture qu'on cherche (l1s_abort_cmd, deferee via tdma_schedule,
-             * peut arriver bien apres le burst de zeros du boot memset). */
-            if (value != 0)
-                fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 *** NONZERO *** #%u offset=0x%04x "
-                        "val=0x%04x size=%u dsp_word=0x0810 (avant: data[0x0810]=0x%04x) fn=%u "
-                        "dsp_insn=%u\n",
-                        ++aw810_nz, (unsigned)offset, (unsigned)value, size,
-                        s->dsp->data[dsp_word], s->fn,
-                        s->dsp ? s->dsp->insn_count : 0);
-            else if (aw810_zero++ < 100000)
-                fprintf(stderr, "[calypso-trx] ARM-WRITE-0810 zero #%u offset=0x%04x val=0x%04x "
-                        "size=%u fn=%u dsp_insn=%u\n", aw810_zero, (unsigned)offset, (unsigned)value,
-                        size, s->fn, s->dsp ? s->dsp->insn_count : 0);
-        }
+        /* [2026-07-29] ARM-WRITE-0810 retirée : une seule cellule, un seul
+         * sens. Le moniteur mailbox ci-dessous la couvre et bien davantage —
+         *   grep 'd_ctrl_system' mailbox.log
+         */
+        /* [2026-07-29] Moniteur mailbox — remplace la sonde ARM-API-WR posée
+         * plus tôt le même jour, qu'il subsume (voir calypso_mailbox.h). */
+        calypso_mbx(MBX_ARM_WR, dsp_word, (uint16_t)value,
+                    s->dsp->data[dsp_word], (uint32_t)offset, s->fn,
+                    s->dsp ? s->dsp->insn_count : 0);
+        calypso_clobber_who(dsp_word, (uint16_t)value,
+                            s->dsp->data[dsp_word], (uint32_t)offset, s->fn);
+
         calypso_pcb_daram_lock_acquire();
         if (size == 2) {
             s->dsp->data[dsp_word] = (uint16_t)value;
@@ -907,7 +1127,8 @@ static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsig
                 uint16_t *ndb_target = (s->dsp && s->dsp->data)
                                        ? &s->dsp->data[0x0800]
                                        : s->dsp_ram;
-                calypso_fbsb_init(&g_fbsb, ndb_target, 0x0800);
+                calypso_fbsb_init(&g_fbsb, ndb_target, 0x0800,
+                                  s->dsp ? s->dsp->api_ram : NULL);
                 g_fbsb_inited = true;
                 TRX_LOG("fbsb init ok ndb_base=0x0800 target=%s",
                         (s->dsp && s->dsp->data) ? "dsp->data" : "dsp_ram (fallback)");
@@ -1349,6 +1570,16 @@ static QEMUClockType calypso_tdma_clock(void) {
 }
 
 static void calypso_tdma_tick(void *opaque) {
+    /* [2026-07-29] Un tick DMA par trame TDMA. C'est le signal de complétion
+     * qui manquait : sans lui le firmware DSP empile ses requêtes dans sa file
+     * de 14 entrées, personne ne dépile, l'anneau sature et il lève
+     * DSP_ERR_DMA_PROG. Inerte tant que CALYPSO_DMA n'est pas posé. */
+    {
+        CalypsoTRX *_s_dma = opaque;
+        if (_s_dma && _s_dma->dsp) {
+            calypso_dma_tick(_s_dma->dsp);
+        }
+    }
     CalypsoTRX *s = opaque;
 
     /* Halt-sync : if the ARM CPU is paused (GDB stop, monitor stop),

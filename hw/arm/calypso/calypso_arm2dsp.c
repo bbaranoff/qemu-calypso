@@ -38,7 +38,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* ARM byte offset of d_dsp_page (DSP word 0x08E2). B_GSM_TASK = bit1. */
+/* ARM byte offset of d_dsp_page (DSP word 0x08D4). B_GSM_TASK = bit1.
+ * [2026-07-29] Le commentaire disait 0x08E2 : faux de +14 mots (= d_dsp_state).
+ * L'offset ARM 0x01A8 ci-dessous, lui, a toujours ete le bon. */
 #define A2D_DSP_PAGE_OFF   0x01A8
 #define A2D_B_GSM_TASK     0x0002
 
@@ -76,6 +78,15 @@ static int          a2d_bgen = -1;       /* -1 unresolved, 0/1 disabled/enabled 
 static uint16_t     a2d_bgen_a;          /* d_background_enable word (0x098a)     */
 static uint16_t     a2d_bgen_c;          /* d_background_state  word (0x098c)     */
 static uint16_t     a2d_bgen_val;        /* enable value to post     (0x0001)     */
+/* [2026-07-29] Valeur SÉPARÉE pour la cellule C (0x098c). Décodage ROM PROM0 :
+ *   0xddeb  LD *(0x098a),A ; BC 0xde8a, AEQ   -> 098a == 0 déclenche le reset
+ *   0xde86  LD *(0x098c),A ; BC 0xddf5, ANEQ  -> 098c != 0 fait REBOUCLER
+ * Les deux cellules ont donc des polarités OPPOSÉES : il faut 098a != 0 ET
+ * 098c == 0. Écrire 1 dans les deux (l'ancien comportement) débloque la
+ * première condition et verrouille la seconde — 466 497 tours mesurés sur
+ * 0xde86. Défaut = a2d_bgen_val pour ne rien changer sans mesure ; poser
+ * CALYPSO_ARM2DSP_BGEN_VAL_C=0 pour tester la polarité correcte. */
+static uint16_t     a2d_bgen_val_c;      /* valeur pour 0x098c (défaut = val)     */
 static uint16_t     a2d_bgen_pollpc;     /* phase-SM poll PC         (0xdddb)     */
 static int          a2d_bgen_oneshot = -1; /* 1 = one transition only (default)   */
 static int          a2d_bgen_done;       /* one-shot latch                        */
@@ -140,6 +151,7 @@ static void a2d_resolve(void)
     a2d_bgen_a      = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_A",      0x098a);
     a2d_bgen_c      = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_C",      0x098c);
     a2d_bgen_val    = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_VAL",    0x0001);
+    a2d_bgen_val_c  = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_VAL_C",  a2d_bgen_val);
     a2d_bgen_pollpc = a2d_env_u16("CALYPSO_ARM2DSP_BGEN_POLLPC", 0xdddb);
     const char *eo  = getenv("CALYPSO_ARM2DSP_BGEN_ONESHOT");
     a2d_bgen_oneshot = (eo && *eo) ? (atoi(eo) > 0 ? 1 : 0) : 1;
@@ -174,9 +186,9 @@ static void a2d_resolve(void)
     if (a2d_bgen) {
         fprintf(stderr,
                 "[arm2dsp] BGEN enabled (Fix A): on ARM task-cmd post "
-                "data[0x%04x]=data[0x%04x]=0x%04x @DSP-PC=0x%04x (oneshot=%d) "
+                "data[0x%04x]=0x%04x data[0x%04x]=0x%04x @DSP-PC=0x%04x (oneshot=%d) "
                 "-> DSP phase-SM reaches 0xde9c, raises d[0x3f70] bit1\n",
-                a2d_bgen_a, a2d_bgen_c, a2d_bgen_val, a2d_bgen_pollpc,
+                a2d_bgen_a, a2d_bgen_val, a2d_bgen_c, a2d_bgen_val_c, a2d_bgen_pollpc,
                 a2d_bgen_oneshot);
     }
     if (a2d_ctrlsys) {
@@ -257,7 +269,7 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
         int armed = (s->data[a2d_word] & a2d_bit) || (taskw & a2d_bit);
         if (armed) {
             s->data[a2d_bgen_a] = a2d_bgen_val;
-            s->data[a2d_bgen_c] = a2d_bgen_val;
+            s->data[a2d_bgen_c] = a2d_bgen_val_c;   /* polarité opposée — cf. en-tête */
             if (a2d_bgen_a >= A2D_API_BASE && s->api_ram) {
                 s->api_ram[a2d_bgen_a - A2D_API_BASE] = a2d_bgen_val;
             }
@@ -268,9 +280,9 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
             a2d_bgen_posts++;
             if (a2d_bgen_posts <= 8) {
                 fprintf(stderr,
-                        "[arm2dsp] BGEN post #%u: data[0x%04x]=data[0x%04x]="
-                        "0x%04x @DSP-PC=0x%04x d[0x3f70]=0x%04x insn=%u\n",
-                        a2d_bgen_posts, a2d_bgen_a, a2d_bgen_c, a2d_bgen_val,
+                        "[arm2dsp] BGEN post #%u: data[0x%04x]=0x%04x "
+                        "data[0x%04x]=0x%04x @DSP-PC=0x%04x d[0x3f70]=0x%04x insn=%u\n",
+                        a2d_bgen_posts, a2d_bgen_a, a2d_bgen_val, a2d_bgen_c, a2d_bgen_val_c,
                         exec_pc, s->data[0x3f70], s->insn_count);
             }
         }
@@ -295,8 +307,11 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
      * the dispatcher checks it (b424) despite b419 clearing it. Non-CONT : one
      * post per ARM write (a2d_pending). */
     if (a2d_cont) {
-        uint16_t page = s->api_ram ? s->api_ram[0x08E2 - A2D_API_BASE]
-                                   : s->data[0x08E2];
+        /* [2026-07-29] 0x08E2 = d_dsp_state ; d_dsp_page = 0x08D4 (offset ARM
+         * 0x01A8, cf calypso_fbsb.h). L'offset « conteste » du commentaire
+         * ci-dessus est tranche : c'est bien 0x08D4. */
+        uint16_t page = s->api_ram ? s->api_ram[0x08D4 - A2D_API_BASE]
+                                   : s->data[0x08D4];
         if (!(page & A2D_B_GSM_TASK)) {
             return;
         }

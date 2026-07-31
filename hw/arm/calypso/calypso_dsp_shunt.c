@@ -192,6 +192,36 @@ static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm
 static bool shunt_grgsm_off(void);                  /* fwd : CALYPSO_SHUNT_NO_GRGSM */
 
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
+/* [2026-07-30] ONE_PAGE — la page de lecture courante, et elle seule.
+ *
+ * Rend l'index de page que d_dsp_page (mot DSP 0x08D4, bit0) designe. Antiseche
+ * osmocom-bb calypso/dsp.c:471 : `d_dsp_page = B_GSM_TASK | w_page`. Mesure du
+ * 30/07 : le DSP suit ce bit0 a 99,6 % pour choisir sa page de sortie ; l'hote,
+ * lui, ecrivait LES DEUX — ce qui annule le double buffer (l'ARM lit la meme chose
+ * quelle que soit sa r_page, une page fraiche devient indiscernable d'une perimee).
+ *
+ * Gate CALYPSO_ONE_PAGE, defaut 0 : ce chemin porte le camp du profil shunt.
+ */
+static int shunt_one_page_on(void)
+{
+    static int c = -1;
+    if (c < 0) {
+        c = calypso_gate("CALYPSO_ONE_PAGE", 0);
+        if (c)
+            fprintf(stderr, "[shunt] ONE_PAGE=1 : l'hote n'ecrit plus que la page de "
+                    "lecture designee par d_dsp_page bit0 (double buffer restaure)\n");
+    }
+    return c;
+}
+
+static uint8_t shunt_cur_rpage(void)
+{
+    if (!g_shunt.c54x || !g_shunt.c54x->data) {
+        return 0;
+    }
+    return (uint8_t)(g_shunt.c54x->data[0x08D4] & 1u);
+}
+
 static void shunt_latch_task(uint16_t new_d_dsp_page)
 {
     if (!(new_d_dsp_page & B_GSM_TASK)) {
@@ -523,18 +553,32 @@ static void shunt_route_to_c54x_header(uint8_t page_idx)
          * cellule sujette a race, evitant de repropager du perime dans
          * data[0x0584]/api_ram[0x08E2] ci-dessous. */
         uint16_t dsp_page = B_GSM_TASK | page_idx;
-        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, was: data[0x08E2]=0x%04x) "
-                "api_ram=%p\n",
-                dsp_page, (unsigned)page_idx, dsp->data[NDB_D_DSP_PAGE], (void*)dsp->api_ram);
+        /* [2026-07-29] La « race » decrite juste au-dessus n'en etait pas une :
+         * a2 affichait data[0x08E2] (jamais ecrit) et le FRAME-IT affichait
+         * api_ram[0x08E2] (ecrit par le miroir ci-dessous) — deux tableaux
+         * distincts, deux valeurs, aucune course. Et 0x08E2 n'etait de toute
+         * facon pas la bonne cellule : d_dsp_page = 0x08D4 (cf calypso_fbsb.h).
+         * On affiche desormais la cellule que la ROM lit reellement, dans le
+         * tableau qu'elle lit reellement (api_ram). */
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, "
+                "api_ram[0x%04x]=0x%04x) api_ram=%p\n",
+                dsp_page, (unsigned)page_idx, NDB_D_DSP_PAGE,
+                dsp->api_ram ? dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE]
+                             : dsp->data[NDB_D_DSP_PAGE],
+                (void*)dsp->api_ram);
         dsp->data[0x0584] = dsp_page;
         dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
         fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
         for (int i = 0; i < 20; i++)
             dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
         fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
-        /* mirror d_dsp_page cote DSP (le firmware le lit a api_ram 0x08E2). */
+        /* [2026-07-29] Miroir d_dsp_page cote DSP. Ecrivait 0x08E2 = d_dsp_state :
+         * la page ecrasait le C_DSP_IDLE3 pose par l'ARM (dsp.c:215), et la ROM,
+         * qui lit 0x08D4 (0xa51c/0xc8ea), ne voyait rien. Corrige a la source —
+         * ce qui remplit la condition de retrait de la bequille FIX_DPAGE_OFF
+         * (calypso_c54x.c), retiree du meme coup. */
         if (dsp->api_ram)
-            dsp->api_ram[0x08E2 - C54X_API_BASE] = dsp_page;
+            dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE] = dsp_page;
     }
     fprintf(stderr, "[c54x-route] a-daram-ok\n");
 }
@@ -701,13 +745,65 @@ void calypso_dsp_shunt_on_frame_tick(void)
          *             et a_pm des que gr-gsm a decode la SCH (sb_valid).
          *   retirer : quand data[0x08f8] est ecrit par le DSP (RANK3 leve).
          */
-        static int legit = -1;
+        /* [2026-07-30] DECOUPLAGE — ce bloc etait soude aux parapluies
+         * SHUNT_LEGIT / SHUNT_NO_LEGIT, alors qu'il fait deux choses de natures
+         * DIFFERENTES qui n'ont rien a faire couplees :
+         *
+         *   (a) SUPPLEER UN BLOC ABSENT : le transport du resultat de la chaine
+         *       analogique (TWL/gr-gsm) vers l'API, la boucle AFC fermee
+         *       (rx_afc recalcule chaque tick), a_pm/rxlev. Le DSP ne sait pas
+         *       encore faire ca -> legitime, et necessaire pour mesurer le reste.
+         *   (b) ECRASER UN RESULTAT : poser rx_fb_det = 1, que l'ARM relit ensuite
+         *       par calypso_dsp_shunt_real_fb_read() (offsets 0x01F0/0x01F4/0x01FA).
+         *       CELA SEUL interdit de juger le correlateur natif.
+         *
+         * Consequence vecue le 30/07 : `CALYPSO_SHUNT_REAL_FB=0` desarme bien le
+         * helper (calypso_dsp_helper.c:259) mais PAS ce bloc-ci, donc les lectures
+         * de d_fb_det rendaient 1 alors que les seules ecritures DSP mesurees
+         * valaient 0 (0xb2cc `st #0x0000`, 0x778a `andm #0xfffe`). On croyait tenir
+         * une detection ; c'etait l'interception. Il n'existait AUCUNE combinaison
+         * de gates donnant le transport ET un d_fb_det honnete.
+         *
+         * Desormais : (a) reste sous les parapluies, (b) a son propre gate.
+         *   CALYPSO_SHUNT_PUBLISH_FB=1  -> publie rx_fb_det (ancien comportement)
+         *   CALYPSO_SHUNT_PUBLISH_FB=0  -> transport ouvert, resultat NON substitue
+         *                                  => data[0x08f8] devient le verdict
+         * Defaut = valeur du parapluie, pour ne RIEN changer aux runs existants.
+         * Le mode `native_twl` (cf. doc/ETAT_ACTUEL.md §12.9) le pose a 0. */
+        static int legit = -1, publish = -1;
         if (legit < 0) { const char *e = getenv("CALYPSO_SHUNT_LEGIT"); const char *nl = getenv("CALYPSO_SHUNT_NO_LEGIT"); legit = ((e && *e == '1') || (nl && *nl=='1')) ? 1 : 0; }
-        if (legit && g_shunt.c54x && g_shunt.sb_valid) {
+        if (publish < 0) {
+            publish = calypso_gate("CALYPSO_SHUNT_PUBLISH_FB", legit);
+            fprintf(stderr, "[shunt] PUBLISH_FB = %d (transport=%d) : d_fb_det %s\n",
+                    publish, legit,
+                    publish ? "SUBSTITUE par l'hote (bequille)"
+                            : "laisse au DSP -> data[0x08f8] est le verdict");
+            fprintf(stderr, "[shunt] transport analogique (AFC/a_pm/TOA) : %s\n",
+                    (legit || publish) ? "OUVERT" : "ferme");
+        }
+        /* [2026-07-30, correctif du decouplage] La condition etait
+         * `legit && publish`. Bug : `native_twl` ne pose PAS le parapluie mais
+         * demande explicitement PUBLISH_FB=1 — donc `legit=0` tuait tout le
+         * bloc, transport COMPRIS (AFC ferme, a_pm, rx_toa). Mesure du 30/07 :
+         *   [shunt] PUBLISH_FB = 1 (transport=0)
+         *   [fbsb]  fb0_att=13 sb_att=8 fb0_ret=0  api[](det=0 ...)
+         * L'hote ne publiait donc RIEN, alors que le profil promet « FB/SB =
+         * TWL ». Le mobile recevait un SB (INJECT_SB -> BSIC=7) mais jamais de
+         * detection FB, d'ou une reselection de cellule en boucle toutes les 10 s.
+         *
+         * Correct : le bloc tourne si l'un OU l'autre le demande, et seule la
+         * SUBSTITUTION du resultat (b) reste sous `publish`. Table de verite :
+         *   legit=1 publish=1 (defaut)  -> transport + substitution   (inchange)
+         *   legit=1 publish=0           -> transport seul, verdict au DSP
+         *   legit=0 publish=1 (native_twl) -> transport + substitution  [CORRIGE]
+         *   legit=0 publish=0 (native)  -> rien                        (inchange) */
+        if ((legit || publish) && g_shunt.c54x && g_shunt.sb_valid) {
             /* L'ARM lit d_fb_det/snr/toa via calypso_dsp_shunt_real_fb_read
              * (0x01F0/0x01FA/0x01F4) qui retourne g_shunt.rx_*. On pose ces
              * champs depuis la detection gr-gsm reelle -> l'ARM voit FB found. */
-            g_shunt.rx_fb_det = 1;
+            if (publish) {
+                g_shunt.rx_fb_det = 1;   /* (b) SUBSTITUTION — sous `publish` seul */
+            }
             /* [AFC loop-close v2 2026-07-26] recalcule rx_afc CHAQUE tick :
              * brut(FCCH memorise) - freq DEJA compensee par le DAC courant
              * (get_afc_hz). Sans ca, feed_iq/det gele rx_afc une fois le DAC
@@ -747,6 +843,112 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 ar[0x08FB - C54X_API_BASE] = g_shunt.last_pm;          /* a_sync_PM  */
                 ar[0x08FC - C54X_API_BASE] = (uint16_t)g_shunt.rx_afc; /* a_sync_ANG */
                 ar[0x08FD - C54X_API_BASE] = dsnr ? g_shunt.rx_snr : 0x7000; /* a_sync_SNR (DECAN) */
+
+                /* [2026-07-30] ACQUITTEMENT VERS LE DSP — CALYPSO_TWL_ACK_DSP.
+                 *
+                 * Le bloc ci-dessus ecrit `api_ram[]`, la vue ARM. Le DSP, lui,
+                 * lit `data[]` : deux tableaux distincts du modele. Consequence
+                 * mesuree le 30/07 en `native_twl` :
+                 *     api[] (det=1 toa=23 pm=20929 ang=-186 snr=0x735b)
+                 *     data[](det=0 toa=0  pm=0     ang=0    snr=0x0000)
+                 *     fb0_att=17  sb_att=9  fb0_ret=0
+                 * L'hote a dit a l'ARM que la FB etait trouvee, et ne l'a JAMAIS
+                 * dit au DSP : sa machine d'etat reste bloquee a l'etape FB,
+                 * cherche 17 fois, et n'atteint jamais le CCCH — c'est-a-dire la
+                 * question meme que ce banc pose.
+                 *
+                 * Formule par l'utilisateur : « il faut qu'en mode native_twl
+                 * l'ARM ack (det=1 toa=23 pm=…) au DSP ».
+                 *
+                 * @BEQUILLE — TWL_ACK_DSP
+                 *   c'en est une : `data[0x08F8..0x08FD]` est desormais ECRIT PAR
+                 *     L'HOTE. Ces cinq cellules cessent d'etre un verdict — on ne
+                 *     peut plus citer `data[0x08f8]` comme « ce que le DSP a
+                 *     produit ». C'est le prix pour que la machine d'etat avance.
+                 *   masque : l'incapacite du correlateur natif a poser d_fb_det.
+                 *   ce qui reste HONNETE : `a_cd` (0x09D0..) et donc `WATCH-ACD`.
+                 *     La question « le DSP traite-t-il le SI ? » garde son juge,
+                 *     puisque rien ici n'ecrit a_cd.
+                 *   retirer : quand le correlateur natif pose d_fb_det seul.
+                 * Defaut 0 — le profil `native_twl` le pose a 1.
+                 */
+                {
+                    static int ack = -1;
+                    if (ack < 0) {
+                        ack = calypso_gate("CALYPSO_TWL_ACK_DSP", 0);
+                        if (ack)
+                            fprintf(stderr, "[shunt] TWL_ACK_DSP=1 : le resultat FB "
+                                    "hote est aussi ecrit dans data[0x08F8..0x08FD] "
+                                    "-> le DSP voit la FB trouvee et peut avancer. "
+                                    "BEQUILLE : ces 5 cellules ne sont plus un "
+                                    "verdict ; le juge du SI, lui, reste intact.\n");
+                    }
+                    if (ack && g_shunt.c54x->data) {
+                        uint16_t *dd = g_shunt.c54x->data;
+                        dd[0x08F8] = 1;
+                        dd[0x08FA] = (uint16_t)g_shunt.sb_toa;
+                        dd[0x08FB] = g_shunt.last_pm;
+                        dd[0x08FC] = (uint16_t)g_shunt.rx_afc;
+                        dd[0x08FD] = dsnr ? g_shunt.rx_snr : 0x7000;
+                    }
+                }
+
+                /* [2026-07-30] L'ACQUITTEMENT VERS L'ARM — CALYPSO_TWL_ACK_ARM.
+                 *
+                 * Symetrique de TWL_ACK_DSP. Quand l'hote realise une tache a la
+                 * place du DSP, il faut aussi POSER LA COMPLETION dans la page de
+                 * lecture, sinon l'ARM ne sait pas que c'est fini. Le firmware est
+                 * explicite (prim_rx_nb.c:72) :
+                 *     if (dsp_api.db_r->d_task_d == 0) { puts("EMPTY"); return 0; }
+                 * `d_task_d` a zero => rapport jete avant meme le test du burst-id.
+                 *
+                 * On ECHO la tache commandee (d_task_md, page d'ecriture 0 ou 1)
+                 * dans `d_task_d` des DEUX pages de lecture (0x0828, 0x083c), dans
+                 * les deux tableaux du modele. On ne touche PAS `d_burst_d` : son
+                 * desaliasage fonctionne depuis ce soir (calypso_trx.c), et deux
+                 * mecanismes sur la meme cellule, c'est exactement le conflit qu'on
+                 * vient de defaire.
+                 *
+                 * @BEQUILLE — TWL_ACK_ARM
+                 *   c'en est une : la COMPLETION est fabriquee par l'hote.
+                 *   masque : le DSP qui n'acquitte pas les taches qu'il n'execute pas.
+                 *   ce qu'elle NE fabrique PAS : `a_cd`. Le juge du SI reste intact.
+                 *   retirer : quand le DSP execute et acquitte lui-meme.
+                 * Defaut 0 ; le profil `native_twl` le pose a 1.
+                 */
+                {
+                    static int acka = -1;
+                    if (acka < 0) {
+                        acka = calypso_gate("CALYPSO_TWL_ACK_ARM", 0);
+                        if (acka)
+                            fprintf(stderr, "[shunt] TWL_ACK_ARM=1 : la completion "
+                                    "de tache est posee dans d_task_d (0x0828/0x083c) "
+                                    "-> l'ARM ne voit plus « EMPTY ». BEQUILLE : la "
+                                    "completion est fabriquee, le contenu non.\n");
+                    }
+                    if (acka && g_shunt.c54x->data) {
+                        uint16_t *dd = g_shunt.c54x->data;
+                        uint16_t md = dd[0x0804] ? dd[0x0804] : dd[0x0818];
+                        if (md) {
+                            if (shunt_one_page_on()) {
+                                dd[shunt_cur_rpage() ? 0x083C : 0x0828] = md;
+                            } else {
+                                dd[0x0828] = md;
+                                dd[0x083C] = md;
+                            }
+                            if (g_shunt.c54x->api_ram) {
+                                uint16_t *a2 = g_shunt.c54x->api_ram;
+                                if (shunt_one_page_on()) {
+                                    a2[(shunt_cur_rpage() ? 0x083C : 0x0828)
+                                       - C54X_API_BASE] = md;
+                                } else {
+                                    a2[0x0828 - C54X_API_BASE] = md;
+                                    a2[0x083C - C54X_API_BASE] = md;
+                                }
+                            }
+                        }
+                    }
+                }
                 /* [2026-07-26 RANK5] a_pm (rxlev) au format natif : le vrai DSP
                  * ecrit a_pm=0 sur les read pages -> ecrase dispatch_pm. On pose
                  * directement, chaque tick (apres le run DSP), la valeur calibree
@@ -771,8 +973,87 @@ void calypso_dsp_shunt_on_frame_tick(void)
             shunt_dispatch_fb(0);
             /* SB : encode le burst SB depuis gr-gsm (BSIC=%d/sb_fn) sur les 2 pages
              * -> l'ARM decode BSIC reel + FN au lieu de BSIC=0/vide. */
-            shunt_dispatch_sb(0);
-            shunt_dispatch_sb(1);
+            if (shunt_one_page_on()) {
+                shunt_dispatch_sb(shunt_cur_rpage());   /* page courante seulement */
+            } else {
+                shunt_dispatch_sb(0);
+                shunt_dispatch_sb(1);
+            }
+
+            /* [2026-07-30] TWL_ACK_SB — publier a_sch dans data[], la vue que le
+             * firmware lit REELLEMENT.
+             *
+             * @BEQUILLE — TWL_ACK_SB  (CALYPSO_TWL_ACK_SB, defaut 0)
+             *   (1) C'EST UNE BEQUILLE : le resultat SB est fabrique par l'hote a
+             *       partir de gr-gsm, pas demodule par le DSP.
+             *   (2) CE QU'ELLE MASQUE : le DSP n'ecrit jamais a_sch. Or le firmware
+             *       REPOSE lui-meme le bit d'echec a chaque bascule de page —
+             *       osmocom-bb layer1/sync.c, dans l1_sync() :
+             *           dsp_api.db_r->a_sch[0] = (1<<B_SCH_CRC);
+             *           /\* TSM30 does it: Set crc result as "SB not found". *\/
+             *       et l1s_sbdet_resp() (prim_fbsb.c:181) rejette sur ce bit. Le
+             *       defaut est donc « SB non trouve » : sans ecriture DSP, le test
+             *       echoue A TOUS LES COUPS, quoi que trouve le correlateur.
+             *   (3) QUAND LA RETIRER : quand A_SCH-WR (calypso_c54x.c:3492, zone
+             *       0x0837..0x083B / 0x084B..0x084F) montre le DSP ecrivant a_sch
+             *       lui-meme avec le bit CRC a 0.
+             *   CE QU'ELLE NE FABRIQUE PAS : a_cd. Le juge du SI (A_CD-WR, sans
+             *   gate) reste intact — c'est la question que ce banc pose.
+             *
+             * POURQUOI ICI ET PAS DANS shunt_dispatch_sb : celui-ci publie via
+             * shunt_write_w() = dma_memory_write() sur BASE_API_R_PAGE_0/1. Le
+             * commentaire du bloc a_cd, quelques lignes plus bas, dit que ce chemin
+             * n'atteint PAS ce que lit le firmware (dsp->data via calypso_trx.c:213)
+             * — c'est pour cela qu'a_cd a ete bascule en ecriture directe. a_sch
+             * etait reste sur l'ancien chemin. On aligne les deux.
+             */
+            {
+                static int _asch = -1;
+                if (_asch < 0) {
+                    _asch = calypso_gate("CALYPSO_TWL_ACK_SB", 0);
+                    if (_asch)
+                        fprintf(stderr, "[shunt] TWL_ACK_SB=1 : a_sch[0..4] ecrit en "
+                                "direct dans data[0x0837..] / [0x084B..] (les deux "
+                                "pages de lecture) avec B_SCH_CRC EFFACE. BEQUILLE : "
+                                "le SB est fabrique depuis gr-gsm ; a_cd, lui, n'est "
+                                "pas touche — le juge du SI reste intact.\n");
+                }
+                if (_asch && g_shunt.sb_valid && g_shunt.c54x && g_shunt.c54x->data) {
+                    uint32_t _fn = g_shunt.sb_fn;
+                    uint32_t _sb = shunt_encode_sb(g_shunt.sb_bsic,
+                                                   (uint16_t)(_fn / (26u * 51u)),
+                                                   (uint8_t)(_fn % 26u),
+                                                   (uint8_t)(_fn % 51u));
+                    uint16_t *dd = g_shunt.c54x->data;
+                    /* db_r p0 a_sch[0..4] = 0x0837..0x083B ; p1 = 0x084B..0x084F */
+                    static const uint16_t _p[2] = { 0x0837, 0x084B };
+                    int _k0 = 0, _k1 = 2;
+                    if (shunt_one_page_on()) {          /* page courante seulement */
+                        _k0 = shunt_cur_rpage(); _k1 = _k0 + 1;
+                    }
+                    for (int _k = _k0; _k < _k1; _k++) {
+                        uint16_t b = _p[_k];
+                        dd[b + 0] = 0x0000;                      /* CRC clear = pass */
+                        dd[b + 1] = 0x0000;                      /* inutilise        */
+                        dd[b + 2] = 0x0000;                      /* inutilise        */
+                        dd[b + 3] = (uint16_t)(_sb & 0xFFFF);
+                        dd[b + 4] = (uint16_t)(_sb >> 16);
+                        if (g_shunt.c54x->api_ram) {
+                            uint16_t *aa = g_shunt.c54x->api_ram;
+                            aa[b + 0 - C54X_API_BASE] = 0x0000;
+                            aa[b + 1 - C54X_API_BASE] = 0x0000;
+                            aa[b + 2 - C54X_API_BASE] = 0x0000;
+                            aa[b + 3 - C54X_API_BASE] = (uint16_t)(_sb & 0xFFFF);
+                            aa[b + 4 - C54X_API_BASE] = (uint16_t)(_sb >> 16);
+                        }
+                    }
+                    static unsigned _n = 0;
+                    if (_n++ < 20 || (_n % 500) == 0)
+                        fprintf(stderr, "[shunt] TWL_ACK_SB #%u a_sch <- sb=0x%08x "
+                                "BSIC=%u FN=%u (CRC efface, 2 pages, data[]+api_ram[])\n",
+                                _n, _sb, g_shunt.sb_bsic, _fn);
+                }
+            }
             /* [2026-07-26 camp] SI -> a_cd sur le VRAI array data[] (le firmware lit
              * dsp->data via calypso_trx.c:213, PAS dsp_ram ou vont les shunt_write_w).
              * a_cd @ NDB_A_CD=0x1FC -> data word 0x9D2 (a_cd[0]), SI3 en a_cd[3]=0x9D5.
@@ -1003,11 +1284,36 @@ void calypso_dsp_shunt_on_frame_tick(void)
 static void shunt_d_dsp_page_write(void *opaque, hwaddr offset,
                                    uint64_t value, unsigned size)
 {
-    /* Write also commits the value in the underlying RAM region; we
-     * intercept here for the latch side-effect only. Caller's write
-     * happens via the normal RAM path (this overlay is registered with
-     * higher priority but pass-through semantics). */
+    /* [2026-07-30] CORRECTIF — l'ancien commentaire ici disait : « Write also
+     * commits the value in the underlying RAM region [...] this overlay is
+     * registered with higher priority but pass-through semantics ». C'ETAIT
+     * FAUX, et ca a coute une semaine.
+     *
+     * Dans QEMU, memory_region_add_subregion_overlap ne superpose pas : la
+     * region de plus haute priorite qui couvre l'adresse traite l'acces
+     * EXCLUSIVEMENT. La region du dessous (calypso.dsp_api, priorite 0) ne le
+     * voit jamais. Cet overlay fait 2 octets et couvre exactement 0xFFD001A8 =
+     * d_dsp_page. Consequence mesuree le 30/07 :
+     *   - calypso_dsp_write() n'etait JAMAIS appele pour ce mot -> aucune sonde
+     *     ne pouvait le voir (DDP-ANY, ungated depuis le 22/07 : 0 tir sur 17
+     *     journaux ; WR-OP ; moniteur mailbox ; DPAGE_HUNT) ;
+     *   - la valeur n'etait stockee NULLE PART -> la cellule gardait son dechet
+     *     de boot 0xf600, dont le bit1 (B_GSM_TASK) est 0 : le DSP s'entendait
+     *     dire « aucune tache GSM » a chaque trame, et bit0=0 lui faisait
+     *     latcher la page 0 a vie (il ne relit d_dsp_page qu'UNE fois par run) ;
+     *   - shunt_d_dsp_page_read ci-dessous « passait a la RAM » et retournait
+     *     donc consciencieusement ce 0xf600.
+     * Le bouchon data[0x43d8]=0xab38 (=RET) etait une CONSEQUENCE de ca.
+     *
+     * On commite donc reellement la valeur, dans les DEUX banques (dsp_ram que
+     * l'ARM relit et qui est la source du miroir par tick de calypso_trx.c, et
+     * data[] que le DSP lit) : n'ecrire que data[] serait ecrase au tick
+     * suivant par ce miroir. Le commit passe par un helper direct, PAS par
+     * l'espace d'adressage : un shunt_write_w ici retomberait sur cet overlay
+     * -> recursion. */
     shunt_latch_task((uint16_t)value);
+    calypso_trx_api_commit_w(BASE_API_NDB + NDB_D_DSP_PAGE - 0xFFD00000UL,
+                             (uint16_t)value);
 }
 
 static uint64_t shunt_d_dsp_page_read(void *opaque, hwaddr offset,
@@ -1498,6 +1804,37 @@ static int16_t  g_fbs[FBS_RING];
 static uint32_t g_fbs_wr, g_fbs_rd;
 static uint32_t              g_shm_last_si_seq;
 static FILE                 *g_iq_cfile2;  /* cfile #2 FN-espace (zero-fill) -> test grgsm SACCH */
+
+/* [2026-07-30] PLAFOND du cfile #2. Le zero-fill produit un flux CONTINU : spf
+ * (def 2500) floats par trame TDMA = 10 ko/trame, soit ~2,2 Mo/s en temps réel
+ * = 7,8 Go/h — pour un /dev/shm de 8 Go, qui est de la RAM. C'était donc le seul
+ * dump non plafonné du projet, et il ne pouvait pas être activé par défaut.
+ * Plafonné, il peut l'être : à l'atteinte du plafond on ferme proprement (le
+ * fichier reste décodable) et on le dit UNE fois.
+ *   CALYPSO_IQ_CFILE2_MAX_MB=0 -> illimité (à vos risques).
+ * Cf. la règle « toute sonde PLAFONNÉE » (TODO.md §4). */
+static int64_t g_c2_written;    /* octets écrits */
+static int64_t g_c2_max = -1;   /* -1 = non résolu, 0 = illimité */
+
+static void cfile2_wr(const void *buf, size_t nfloats)
+{
+    if (!g_iq_cfile2) return;
+    if (g_c2_max < 0) {
+        const char *e = getenv("CALYPSO_IQ_CFILE2_MAX_MB");
+        int mb = (e && *e) ? atoi(e) : 512;
+        g_c2_max = (mb <= 0) ? 0 : (int64_t)mb * 1024 * 1024;
+    }
+    if (g_c2_max && g_c2_written >= g_c2_max) {
+        SHUNT_ERR("cfile #2 : plafond %lld Mo atteint -> fermeture, le fichier "
+                  "reste decodable (CALYPSO_IQ_CFILE2_MAX_MB=0 pour illimite)",
+                  (long long)(g_c2_max / (1024 * 1024)));
+        fclose(g_iq_cfile2);
+        g_iq_cfile2 = NULL;
+        return;
+    }
+    fwrite(buf, sizeof(float), nfloats, g_iq_cfile2);
+    g_c2_written += (int64_t)nfloats * (int64_t)sizeof(float);
+}
 static int                   g_iq_fd      = -1;   /* fd brut I/Q : fichier ou FIFO live */
 static int                   g_iq_is_fifo = 0;    /* 1 = FIFO -> non bloquant + drop */
 static char                  g_iq_path[256];      /* chemin memorise pour retry FIFO */
@@ -1611,11 +1948,36 @@ bool calypso_dsp_shunt_real_fb_read(uint32_t off, uint16_t *out)
          *   l etat du mode natif. Seule data[0x08f8] via DETECTOR-RUN le mesure. */
         const char *e = getenv("CALYPSO_SHUNT_REAL_FB");
         const char *dm = getenv("CALYPSO_DECAN");  /* master DECAN implique REAL_FB */
-        real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0;
+        /* [2026-07-30] L'implication DECAN -> intercept est le TROISIEME couplage de
+         * la meme famille, et il rouvrait la substitution en douce : le parapluie
+         * SHUNT_LEGIT charge calypso_shunt_legit.env qui pose DECAN:=1, donc meme
+         * avec SHUNT_REAL_FB=0 ET PUBLISH_FB=0 l'ARM relisait g_shunt.rx_fb_det.
+         * Comme pour l'implication SHUNT_LEGIT ci-dessous, on la conditionne a
+         * PUBLISH_FB (defaut 1 = comportement historique inchange).
+         * `SHUNT_REAL_FB=1` reste un opt-in EXPLICITE et n'est pas touche. */
+        real_fb = (e && *e == '1') ? 1 : 0;
+        if (!real_fb && dm && dm[0] == '1')
+            real_fb = calypso_gate("CALYPSO_SHUNT_PUBLISH_FB", 1) ? 1 : 0;
         /* [2026-07-26] SHUNT_LEGIT implique l'intercept de lecture : c'est LUI
          * qui livre rx_fb_det/rx_snr (detection gr-gsm) a l'ARM. Sans ca, le
-         * feed legit n'atteint jamais la lecture ARM. */
-        if (!real_fb) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); real_fb = (l && *l == '1') ? 1 : 0; }
+         * feed legit n'atteint jamais la lecture ARM.
+         *
+         * [2026-07-30] DECOUPLE. Cette implication est LE piege qui a produit un
+         * faux positif : avec `SHUNT_REAL_FB=0` et `SHUNT_LEGIT=1`, l'intercept
+         * restait ARME, donc l'ARM lisait `d_fb_det = 1` alors que les SEULES
+         * ecritures DSP mesurees valaient 0 (`0xb2cc` = `st #0x0000`, `0x778a` =
+         * `andm #0xfffe`). La lecture ne touchait jamais la cellule : elle rendait
+         * `g_shunt.rx_fb_det`, pose par le demod HOTE (l.~1832, det = coh>0.95 &&
+         * |resid|<0.13) — qui n'est gate par aucun parapluie.
+         * L'implication est donc desormais conditionnee par PUBLISH_FB, meme gate
+         * que le bloc de transport. PUBLISH_FB=0 => l'ARM lit la VRAIE cellule.
+         * NB : `SHUNT_REAL_FB=1` et `DECAN=1` restent des opt-in explicites et
+         * gardent l'ancien comportement — on ne desarme que l'implication. */
+        if (!real_fb) {
+            const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+            int legit_on = (l && *l == '1') ? 1 : 0;
+            real_fb = (legit_on && calypso_gate("CALYPSO_SHUNT_PUBLISH_FB", 1)) ? 1 : 0;
+        }
     }
     if (!real_fb) return false;
     switch (off) {
@@ -1971,10 +2333,10 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         int64_t gap = target - pos;
         if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
         static const float zeros[512] = {0};
-        while (gap > 0) { int c = gap > 512 ? 512 : (int)gap; fwrite(zeros, sizeof(float), (size_t)c, g_iq_cfile2); pos += c; gap -= c; }
+        while (gap > 0 && g_iq_cfile2) { int c = gap > 512 ? 512 : (int)gap; cfile2_wr(zeros, (size_t)c); pos += c; gap -= c; }
         float fbuf2[SHM_IQ_LEN];
         for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
-        fwrite(fbuf2, sizeof(float), (size_t)n, g_iq_cfile2);
+        cfile2_wr(fbuf2, (size_t)n);
         pos += n;
     }
     /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
@@ -1991,10 +2353,10 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         int64_t gap = target - pos;
         if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
         static const float zeros[512] = {0};
-        while (gap > 0) { int c = gap > 512 ? 512 : (int)gap; fwrite(zeros, sizeof(float), (size_t)c, g_iq_cfile2); pos += c; gap -= c; }
+        while (gap > 0 && g_iq_cfile2) { int c = gap > 512 ? 512 : (int)gap; cfile2_wr(zeros, (size_t)c); pos += c; gap -= c; }
         float fbuf2[SHM_IQ_LEN];
         for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
-        fwrite(fbuf2, sizeof(float), (size_t)n, g_iq_cfile2);
+        cfile2_wr(fbuf2, (size_t)n);
         pos += n;
     }
 }
@@ -2099,6 +2461,8 @@ void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
  * l'I/Q réel du BTS. Le shunt l'écrit ensuite dans a_cd (shunt_dispatch_allc)
  * à la place du SI3 canned → "sans hack", vrai signal. len doit être 23 (XCCH
  * L2). Réécrit à chaque nouveau SI (rotation SI1/2/3/4 du BCCH). */
+
+
 /* [2026-07-22] DE-ALIAS du d_burst_d. RACINE du jitter burst-ID : g_shunt.d_burst_d
  * etait capture dans shunt_latch_task (horloge d_dsp_page/scenario) qui SOUS-
  * ECHANTILLONNE le flux commande NB propre 0,1,2,3 -> sequence aliasee periode-12,
@@ -2116,16 +2480,50 @@ void calypso_dsp_shunt_wp_burst_write(uint32_t off, uint16_t value)
      * C est une feature du shunt : hors shunt, elle ne doit rien faire. */
     if (!g_shunt.active) return;
     /* @BEQUILLE — SHUNT_BURST_PERCMD (miroir per-commande)  (CALYPSO_SHUNT_BURST_PERCMD,
-     *              ON-sauf-0, defaut ON)
+     *              calypso_gate, defaut = ON sous shunt_legit, OFF ailleurs)
      *   masque  : la derivation materielle de d_burst_d. On capture chaque ecriture ARM
      *             de la write-page et on MIROITE l'echo sur LES DEUX read-pages, parce
      *             que le r_page du mobile n'est pas modelise.
      *   retirer : quand la fenetre RX TPU cadence le burst-id et que r_page est
      *             modelise fidelement.
+     *
+     * [2026-07-30] DEFAUT RESTREINT A shunt_legit — un mecanisme de trop.
+     *
+     * Deux mecanismes ecrivaient db_r->d_burst_d : celui-ci (chemin ECRITURE) et le
+     * desaliasage par FIFO de calypso_trx.c (chemin LECTURE, CALYPSO_BURST_ID_DEALIAS,
+     * defaut 1). Le commentaire voisin annoncait deja « deux mecanismes sur la meme
+     * cellule, c'est exactement le conflit qu'on vient de defaire » — ils coexistaient
+     * toujours.
+     *
+     * Celui-ci est le mauvais, et c'est mesure : shunt_burst_echo() vaut
+     * (g_shunt.d_burst_d + ofs + 4) & 3 avec ofs = -2, or l'ARM ecrit
+     * db_w->d_burst_d = 0 dans 355 cas sur 364 (page 0) et 64 sur 79 (page 1).
+     * Ces zeros ne sont pas des commandes : c'est le `dsp_api_memset(db_w, ...)` que
+     * l1_sync() execute en debut de CHAQUE trame (osmocom-bb layer1/sync.c:244).
+     * Commande 0 -> echo 2. Resultat mesure (CLOBBER-WHO-RUN) : d_burst_d FIGE a
+     * 0x0002 dans 0x0829 ET 0x083D, rafraichi toutes les 12 trames
+     * (fn=110,123,135,...,339). Le firmware exige la sequence 0,1,2,3 pour assembler
+     * un bloc CCCH de 4 bursts : il lit toujours 2, rejette 3 rapports sur 4,
+     * n'assemble jamais le bloc, ne consomme jamais a_cd -> pas de SI -> read timeout
+     * -> L1CTL_RESET_REQ FULL. Le desaliasage par FIFO, lui, derive de la sequence
+     * REELLEMENT commandee.
+     *
+     * On ne le supprime pas franchement parce qu'il PORTE le camp du profil
+     * shunt_legit. Il y reste donc actif par defaut ; ailleurs (natif, native_twl)
+     * il disparait et le FIFO reste seule source. Le latch g_shunt.d_burst_d, lui,
+     * est preserve : 12 consommateurs en dependent.
      */
     static int en = -1;
-    if (en < 0) { const char *e = getenv("CALYPSO_SHUNT_BURST_PERCMD");
-                  en = (e && *e == '0') ? 0 : 1; }
+    if (en < 0) {
+        const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+        int def = (l && *l == '1') ? 1 : 0;
+        en = calypso_gate("CALYPSO_SHUNT_BURST_PERCMD", def);
+        fprintf(stderr, "[feed-daram-dsp] SHUNT_BURST_PERCMD=%d (defaut %d : ON sous "
+                "shunt_legit, OFF ailleurs) — miroir per-commande de d_burst_d sur les "
+                "deux read-pages%s\n", en, def,
+                en ? "" : " DESACTIVE : le desaliasage FIFO (CALYPSO_BURST_ID_DEALIAS) "
+                          "est seule source");
+    }
     if (!en) return;
     if (off != 0x0002 && off != 0x002A) return;   /* WP_D_BURST_D page0/1 */
     g_shunt.d_burst_d = (uint16_t)(value & 3);
@@ -2156,11 +2554,21 @@ void calypso_dsp_shunt_feed_si(const uint8_t *l2, int len)
          *             si_set[0..5], avec fabrication d'un SI6 seed depuis le SI3.
          *   retirer : quand a_cd se remplit par la demodulation native.
          */
+        /* [2026-07-30] CONVERTI a calypso_gate : un `=0` EXPLICITE doit couper.
+         * Avant, le repli sur SHUNT_LEGIT ECRASAIT le 0 explicite :
+         *   fs = (e=='1'); if (!fs) fs = (SHUNT_LEGIT=='1');
+         * Consequence mesuree le 30/07 : profil `native_twl` avec FEED_SI=0 au
+         * manifeste, et 184 injections `feed_si` quand meme, parce que
+         * SHUNT_LEGIT=1 avait fuite dans l'environnement (tmux fossilise l'env du
+         * 1er run de la session). Le banc repondait donc « les SI arrivent »
+         * alors qu'ils venaient de gr-gsm — exactement la question qu'il posait.
+         * calypso_gate(nom, defaut) : la variable, si posee, GAGNE toujours ;
+         * le parapluie ne sert plus que de DEFAUT. */
         static int fs = -1;
-        if (fs < 0) { const char *e = getenv("CALYPSO_SHUNT_FEED_SI");
-                      fs = (e && *e == '1') ? 1 : 0;
-                      if (!fs) { const char *l = getenv("CALYPSO_SHUNT_LEGIT");  /* option3: SI3 gr-gsm -> a_cd */
-                                 fs = (l && *l == '1') ? 1 : 0; } }  /* [2026-07-26] fire aussi sous SHUNT_LEGIT */
+        if (fs < 0) {
+            const char *l = getenv("CALYPSO_SHUNT_LEGIT");
+            fs = calypso_gate("CALYPSO_SHUNT_FEED_SI", (l && *l == '1') ? 1 : 0);
+        }
         if (!fs) { g_shunt.si_valid = false; return; }
     }
     int n = len < 23 ? len : 23;

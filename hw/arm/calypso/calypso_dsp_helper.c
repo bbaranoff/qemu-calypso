@@ -372,7 +372,17 @@ void shunt_dispatch_allc(uint8_t page_idx)
      *   NB      : garde d'entree de shunt_dispatch_allc -> conditionne AUSSI toutes les
      *             bequilles AGCH / SDCCH / SACCH / BCCH ci-dessous.
      */
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_ACD"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-26] CALYPSO_INJECT_ACD=1 OU SHUNT_LEGIT=1 (option3: SI3->a_cd) */
+    /* [2026-07-30] CONVERTI a calypso_gate — un `=0` EXPLICITE doit couper.
+     * Avant : `_ginj = (INJECT_ACD=='1'); if (!_ginj) _ginj = (SHUNT_LEGIT=='1');`
+     * donc le parapluie ECRASAIT le 0 pose a la main. Mesure du 30/07 : profil
+     * `native_twl` avec INJECT_ACD=0 ET FEED_SI=0 au manifeste, et les SI
+     * arrivaient quand meme dans a_cd parce que SHUNT_LEGIT=1 avait fuite
+     * (tmux fossilise l'env du 1er run). Le banc repondait a sa propre question
+     * par les SI de gr-gsm. Desormais le parapluie n'est qu'un DEFAUT. */
+    { static int _ginj = -1;
+      if (_ginj < 0) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT");
+                       _ginj = calypso_gate("CALYPSO_INJECT_ACD", (_l && *_l == '1') ? 1 : 0); }
+      if (!_ginj) return; }
     /* a_cd layout (cf osmocom-bb prim_rx_nb.c) :
      *   a_cd[0]   = FIRE status bits (B_FIRE0/B_FIRE1) -> 0x0000 = CRC pass
      *   a_cd[1]   = (reserved / BLUD bit)              -> 0x0000

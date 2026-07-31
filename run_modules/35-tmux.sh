@@ -84,6 +84,12 @@ mod_tmux_start() {
         mod_hint "un serveur tmux périmé peut refuser la session : tmux kill-server puis relancez"
         mod_fail "création de la session « $TMUX_SESSION » refusée"; return $MOD_RC_FAIL; }
 
+    # [2026-07-29] AVANT toute disposition : purger l environnement global du
+    # serveur tmux et le reposer depuis le run courant. Sans ça le serveur garde
+    # les CALYPSO_* du PREMIER run et les relances suivantes en héritent
+    # silencieusement — le manifeste ne correspond plus à la ligne de commande.
+    _tmux_env_repropre
+
     tmux_layout
     _tmux_style
     tmux select-window -t "$TMUX_SESSION:${TMUX_FENETRE_PREMIERE:-radio}" 2>/dev/null

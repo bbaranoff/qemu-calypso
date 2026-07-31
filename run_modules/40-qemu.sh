@@ -13,6 +13,8 @@ MOD_TIMEOUT[qemu]=30
 # Un garde-fou tronque le fichier au-delà de cette taille, plutôt que de remplir
 # le disque de lignes sans valeur de diagnostic.
 : "${QEMU_LOG_MAX:=$((64 * 1024 * 1024))}"
+# Tête figée du journal : ce que la troncature emporterait sinon.
+: "${QEMU_LOG_HEAD:=$((8 * 1024 * 1024))}"
 
 mod_qemu_check() {
     [ -x "${QEMU_BIN:-}" ] || { mod_fail "binaire QEMU absent : ${QEMU_BIN:-<non défini>}"
@@ -50,6 +52,24 @@ _qemu_save_manifest() {
 # vide plutôt que de remplir le disque. Le modèle émet des sondes très bavardes —
 # quand rien ne répond en face, `POST-BOOTSTUB-RET` seul produit ~2,8 Mo/s,
 # mesuré à 337 Mo en deux minutes. Le manifeste, lui, est déjà sauvegardé.
+# _qemu_save_head <source> <dest> <octets> — fige les premiers octets du journal.
+# Le garde-fou tronque par le DÉBUT ; sur un emballement (storm), le début est
+# atteint en quelques secondes et c'est justement lui qu'on veut lire. On le
+# recopie une fois, dès qu'il est disponible, et on ne le touche plus.
+_qemu_save_head() {
+    local src="$1" dst="$2" taille="$3" i=0
+    while [ "$i" -lt 120 ]; do
+        if [ -s "$src" ] && [ "$(stat -c %s "$src" 2>/dev/null || echo 0)" -ge "$taille" ]; then
+            head -c "$taille" "$src" > "$dst" 2>/dev/null
+            return 0
+        fi
+        sleep 1; i=$(( i + 1 ))
+    done
+    # Le journal n'a jamais atteint la taille voulue : on fige ce qu'il y a.
+    [ -s "$src" ] && head -c "$taille" "$src" > "$dst" 2>/dev/null
+    return 0
+}
+
 _qemu_log_guard() {
     local f="$1" max="$2" qpid="$3" n=0
     while kill -0 "$qpid" 2>/dev/null; do
@@ -71,13 +91,44 @@ mod_qemu_start() {
     mod_say "machine  : $mach"
     mod_say "journal  : $qlog (plafond ${QEMU_LOG_MAX} o)"
 
+    # [2026-07-30] Les drapeaux calcules par 08-accel.sh ont enfin un CONSOMMATEUR.
+    # Avant : ce module codait tout en dur et 08-accel.sh journalisait
+    # « ATTENTION : 40-qemu.sh ne lit pas encore ces drapeaux » — donc
+    # CALYPSO_ICOUNT / CALYPSO_MTTCG / CALYPSO_QEMU_HALT apparaissaient au
+    # manifeste sans AUCUN effet sur la ligne de commande. Verifie le 30/07 :
+    # `CALYPSO_ICOUNT=auto` au manifeste, zero `-icount` dans les args du process.
+    #
+    # ⚠️ Le defaut du depot a ete remis a `off` dans calypso.env EN MEME TEMPS que
+    # ce branchement : sinon tous les runs auraient recu `-icount auto` du jour au
+    # lendemain. Dans ce projet un changement de cadence change le COMPORTEMENT de
+    # la L1, pas seulement la vitesse (cf. le piege CALYPSO_DSP_YIELD=0, TODO §0quinquies).
+    local -a xflags=()
+    [ -n "${QEMU_ICOUNT_FLAG:-}" ] && xflags+=($QEMU_ICOUNT_FLAG)
+    [ -n "${QEMU_ACCEL_FLAG:-}"  ] && xflags+=($QEMU_ACCEL_FLAG)
+    [ -n "${QEMU_HALT_FLAG:-}"   ] && xflags+=($QEMU_HALT_FLAG)
+    local gdbflag="${QEMU_GDB_FLAG:--gdb tcp::1234}"
+
+    # Garde-fou : -icount et MTTCG sont incompatibles ; QEMU meurt au demarrage
+    # avec un message que personne ne relie a sa cause. On le dit ici.
+    if [ -n "${QEMU_ICOUNT_FLAG:-}" ] && [ -n "${QEMU_ACCEL_FLAG:-}" ]; then
+        mod_hint "posez CALYPSO_ICOUNT=off, ou desactivez MTTCG — les deux ensemble tuent QEMU au demarrage"
+        mod_fail "icount ($QEMU_ICOUNT_FLAG) et accel ($QEMU_ACCEL_FLAG) demandes ensemble"
+        return $MOD_RC_FAIL
+    fi
+    if [ ${#xflags[@]} -gt 0 ]; then
+        mod_say "drapeaux : ${xflags[*]}  (issus de 08-accel.sh, desormais APPLIQUES)"
+    else
+        mod_say "drapeaux : aucun (CALYPSO_ICOUNT=${CALYPSO_ICOUNT:-<vide>})"
+    fi
+
     "$QEMU_BIN" -M "$mach" -cpu arm946 \
-        -gdb tcp::1234 -serial pty -serial pty \
+        "${xflags[@]}" $gdbflag -serial pty -serial pty \
         -monitor "unix:${RUN_DIR}/qemu-monitor.sock,server,nowait" \
         -kernel "$FIRMWARE_ELF" >>"$qlog" 2>&1 &
     local qpid=$!
     printf '%s\n' "$qpid" > "${RUN_DIR}/qemu.pid"
     _qemu_save_manifest "$qlog" "${LOG_DIR}/qemu-manifest.log" &
+    _qemu_save_head     "$qlog" "${LOG_DIR}/qemu-tete.log" "${QEMU_LOG_HEAD:-8388608}" &
     _qemu_log_guard     "$qlog" "$QEMU_LOG_MAX" "$qpid" &
     mod_say "manifeste : ${LOG_DIR}/qemu-manifest.log"
     mod_ok

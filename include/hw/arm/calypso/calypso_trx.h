@@ -133,6 +133,14 @@ void calypso_trx_tx_burst_poll(void);
  * FN-alignment of arriving DL bursts. Returns 0 before TDMA starts. */
 uint32_t calypso_trx_get_fn(void);
 
+/* [2026-07-30] Commit d'un mot de la fenetre API (offset ARM en OCTETS depuis
+ * 0xFFD00000) dans dsp_ram[] ET dsp->data[], sans round-trip MMIO ni verrou.
+ * Pour un handler qui superpose une region IO sur un mot de l'API et doit
+ * quand meme committer la valeur : QEMU donne l'acces EXCLUSIF a la region de
+ * plus haute priorite, il n'y a pas de pass-through. Cf. le correctif
+ * d_dsp_page dans calypso_dsp_shunt.c. */
+void calypso_trx_api_commit_w(uint32_t arm_offset, uint16_t value);
+
 /* calypso_tpu.c: interpret a committed TPU RAM scenario (MOVE
  * instructions only; AT/SYNC/WAIT/OFFSET timing unmodeled). Called
  * from calypso_dsp_done() when TPU_CTRL_EN is written. */

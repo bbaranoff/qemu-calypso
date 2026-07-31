@@ -1,26 +1,18 @@
-# --- artefacts de compilation ---
-/build/
-*.o
-*.a
-*.so
-*.d
+build/
 
-# --- sorties d'execution (logs, captures, IPC) ---
-*.log
-*.cfile
-*.pcap
-/logs/
-/captures/
+tests/keys/id_rsa
 
-# --- sauvegardes et temporaires ---
-*.bak
-*.bak_*
-*.orig
-*~
-.#*
-
-# --- environnements Python locaux ---
-/venv/
-/.venv/
+# Python bytecode — never commit (was polluting 63b4fe5 with 23 .pyc files)
 __pycache__/
 *.pyc
+*.pyo
+
+# Manual snapshot backups
+*.bak
+*.bak.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*
+hw/arm/calypso/calypso_tdma_hw.*
+
+# artefacts generes par full_text.sh — non versionnes
+calypso-full.txt

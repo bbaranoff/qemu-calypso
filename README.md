@@ -37,7 +37,14 @@ seule — rien n'a été corrigé sur la foi de ce rapport.
 ## État — TODO / DONE
 
 > ⚠️ **Le statut DÉPEND DU MODE.** Les ✅ ci-dessous valent pour la **famille shunt**
-> (`SHUNT_LEGIT=1`, `SHUNT_NO_LEGIT=1`, `SHUNT_LEGIT=DSP,NO_CANNED`) ; en mode
+> (`SHUNT_LEGIT=1`, `SHUNT_NO_LEGIT=1`, ou la combinaison « SHUNT_LEGIT + DSP
+> natif + NO_CANNED » — ⚠️ **notation en prose, PAS une valeur** : posé
+> littéralement, `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` ne fait **rien du tout**.
+> Les 16 tests du modèle comparent `*e == '1'` et `calypso.env:19` teste
+> `= "1"` : toute autre valeur est fausse partout, et on croit tourner en
+> famille shunt alors qu'on est en natif nu. La combinaison se pose
+> aujourd'hui par `CALYPSO_MODE=shunt_legit_no_inject` ou `native_twl`,
+> qui la traduisent en gates individuelles — vérifié le 30/07) ; en mode
 > **natif** (`CALYPSO_NATIVE=1` / `NATIVE_HELPED`) plusieurs lignes sont WIP/TODO
 > (FB/SB, Camp, LU, SMS, Ctrl-C). **La vérité-terrain par mode est la
 > [matrice statut × mode d'`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md)** —
@@ -125,8 +132,30 @@ Toute la doc vit sous `hw/arm/calypso/doc/`.
 
 ## Configuration
 
+### Profils (`CALYPSO_MODE=…`) — un profil dit QUI FAIT QUOI
+
+| profil | FB / SB (acquisition) | SI (décodage) | ce qu'il prouve |
+|---|---|---|---|
+| `shunt_legit` | hôte | gr-gsm | la pile de bout en bout : camp, LU, SMS. Rien sur le DSP |
+| `native_twl` | hôte / TWL | **DSP** | **le DSP traite-t-il le SI ?** — on lui donne la synchro pour poser la question sans attendre le FB/SB natif |
+| `native` | DSP | DSP | la vérité sur l'acquisition. Ne campe pas aujourd'hui |
+| `native_helped` | DSP, entrée reroutée | DSP | ⚠️ **sous béquille** — toute mesure prise ici doit être citée comme telle |
+| `empty` | rien de posé | rien de posé | construire un banc gate par gate ; neutralise `modes.env`, **et lui seul** |
+
+Frontière à ne pas franchir sans changer de nom : **dès que les SI viennent de
+gr-gsm, on shunte le DSP — c'est `shunt_legit`**, pas un mode natif. Les deux
+seules portes sont `CALYPSO_SHUNT_FEED_SI` et `CALYPSO_INJECT_ACD` ;
+`run_modules/01-profil.sh` proteste si elles sont rallumées sous un profil natif.
+
+Détail, critères de décision et commandes de vérification : **[QUICK_START.md
+§3bis](QUICK_START.md)**. Définitions exécutables : `environnement/modes.env`.
+
+### Variables
+
 Tout se pilote par variables d'environnement `CALYPSO_*` (voir `calypso.env`, **toutes
-overridables en CLI**). Lancement via `osmo-nitb-for-calypso/start-direct.sh` → `start-clean.sh`
+overridables en CLI**). Un profil ne pose que des `:=` : la CLI garde le dernier
+mot, et **la seule source de vérité sur ce qu'un run a réellement obtenu est le
+manifeste imprimé par le modèle**, jamais la ligne de commande. Lancement via `osmo-nitb-for-calypso/start-direct.sh` → `start-clean.sh`
 (source `calypso.env`) → `run.sh`.
 
 ## Build

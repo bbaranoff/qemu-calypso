@@ -50,6 +50,10 @@ Usage : ./run.sh [options]
   --no-attach         ne pas s'attacher à tmux à la fin
   --verbose           montre la sortie des modules
   --check-paths       vérifie que les dépendances déclarées existent
+  --restart           = --reset puis démarrage — la relance sûre au quotidien
+  --reset             repart d'un état propre : arrête la pile, TUE le serveur
+                      tmux (son environnement global fossilise les CALYPSO_*
+                      du premier run), archive les journaux, purge sockets/FIFO
   -h, --help          cette aide
 
 Toute variable CALYPSO_* passée en préfixe est transmise à QEMU :
@@ -98,7 +102,7 @@ _configure() {
                               hybrid calypso faketrx core)"
     mode="$(_cfg_demander     'Mode d émulation du DSP' \
                               "${CALYPSO_MODE:-shunt_legit}" \
-                              shunt_legit native native_helped)"
+                              empty none bare shunt_legit shunt_legit_no_inject native native_twl native_helped)"
     pipeline="$(_cfg_demander 'Chaîne radio' \
                               "${CALYPSO_PIPELINE:-full-grgsm}" \
                               full-grgsm full shunt shunt-ipc bridge bare free)"
@@ -128,6 +132,120 @@ _configure() {
     printf '\nLancez maintenant : ./run.sh\n\n' >&2
 }
 
+# -----------------------------------------------------------------------------
+#  --reset — repartir d'un état propre, et surtout REPRODUCTIBLE
+# -----------------------------------------------------------------------------
+#  [2026-07-29] Motif : le serveur tmux hérite de l'environnement du PREMIER
+#  « ./run.sh » qui l'a créé et le garde comme environnement global. Toute
+#  relance faite depuis un pane hérite donc des CALYPSO_* de la ligne d'avant.
+#  Vécu : « CALYPSO_MODE=native ./run.sh » rendait un manifeste portant
+#  INJECT_SB=1, SHUNT_REAL_FB=1, FRAME_IT_NATIVE=1 — jamais tapées — et deux
+#  runs de la MÊME commande divergeaient. Tuer le serveur est le seul moyen sûr
+#  de repartir sans ce fossile.
+#
+#  Archive aussi les journaux au lieu de les laisser écraser : sans historique
+#  on ne peut pas répondre à « ça marchait il y a cinq minutes ».
+_reset() {
+    local horodat rep n=0
+    printf '\nRemise à zéro — rien ne sera relancé.\n\n' >&2
+
+    # 1. arrêt propre via le plan existant (best-effort).
+    printf '  arrêt de la pile…\n' >&2
+    "$0" --stop >/dev/null 2>&1 || true
+
+    # 2. archivage des journaux AVANT de toucher quoi que ce soit.
+    local logdir="${LOG_DIR:-/tmp/calypso/logs}"
+    if [ -d "$logdir" ] && [ -n "$(ls -A "$logdir" 2>/dev/null)" ]; then
+        horodat="$(date +%Y%m%d-%H%M%S)"
+        rep="$logdir/../archives/$horodat"
+        mkdir -p "$rep" 2>/dev/null && \
+        if cp -a "$logdir/." "$rep/" 2>/dev/null; then
+            printf '  journaux archivés     %s\n' "$rep" >&2
+        fi
+
+        # [2026-07-30] MENAGE. Sans ça, les archives s'empilent sans limite :
+        # /tmp a été saturé DEUX FOIS le 30/07 (512 Mo pleins), avec pour
+        # conséquences une compilation qui échoue (« No space left on device »
+        # sur le .s du compilateur) et le module « gabarits » qui casse la
+        # relance. Les journaux du banc vivent sur un tmpfs de 512 Mo partagé
+        # avec /tmp système — mailbox.log seul monte à 230 ko/s, soit ~800 Mo/h.
+        #
+        # On cible UNIQUEMENT l'arborescence du banc. Jamais /tmp lui-même :
+        # le compilateur, dpkg et le reste y écrivent aussi.
+        #   CALYPSO_ARCHIVES_KEEP=N   nombre d'archives gardées (défaut 3)
+        #   CALYPSO_ARCHIVE_MAX_MB=N  au-delà, le fichier est archivé TRONQUÉ à
+        #                             sa TÊTE (défaut 32) — sur un emballement,
+        #                             c'est le début qui porte la cause.
+        local arcdir="$logdir/../archives"
+        local keep="${CALYPSO_ARCHIVES_KEEP:-3}"
+        local maxmb="${CALYPSO_ARCHIVE_MAX_MB:-32}"
+        local f taille avant apres
+
+        # a) tronquer dans l'archive qu'on vient de créer les fichiers énormes
+        for f in "$rep"/*; do
+            [ -f "$f" ] || continue
+            taille=$(stat -c %s "$f" 2>/dev/null || echo 0)
+            if [ "$taille" -gt $(( maxmb * 1024 * 1024 )) ]; then
+                head -c $(( maxmb * 1024 * 1024 )) "$f" > "$f.tete" 2>/dev/null &&
+                mv -f "$f.tete" "$f" 2>/dev/null &&
+                printf '  archive tronquée      %s (%s Mo -> %s Mo, tête conservée)\n' \
+                       "$(basename "$f")" "$(( taille / 1048576 ))" "$maxmb" >&2
+            fi
+        done
+
+        # b) ne garder que les N archives les plus récentes
+        if [ -d "$arcdir" ]; then
+            avant=$(du -sm "$arcdir" 2>/dev/null | cut -f1)
+            ls -1t "$arcdir" 2>/dev/null | tail -n +$(( keep + 1 )) | while read -r vieux; do
+                [ -n "$vieux" ] && rm -rf -- "$arcdir/$vieux"
+            done
+            apres=$(du -sm "$arcdir" 2>/dev/null | cut -f1)
+            [ "${avant:-0}" -gt "${apres:-0}" ] 2>/dev/null &&
+                printf '  archives purgées      %s gardées (%s Mo -> %s Mo)\n' \
+                       "$keep" "$avant" "$apres" >&2
+        fi
+
+        # c) repartir sur des journaux vides : ils viennent d'être archivés
+        rm -f "$logdir"/*.log "$logdir"/*.cfile 2>/dev/null
+        printf '  journaux remis à zéro %s\n' "$logdir" >&2
+        df -h "$logdir" 2>/dev/null | tail -1 | \
+            awk '{printf "  espace disponible     %s (%s utilisé)\n", $4, $5}' >&2
+    fi
+
+    # 3. le serveur tmux — c'est LUI qui fossilise l'environnement.
+    if command -v tmux >/dev/null 2>&1 && tmux ls >/dev/null 2>&1; then
+        tmux kill-server 2>/dev/null || true
+        printf '  serveur tmux tué      (environnement global purgé)\n' >&2
+    fi
+
+    # 4. les traînards. On cible des PID, jamais « pkill -f » à l'aveugle :
+    #    le motif attraperait le shell qui exécute ce script.
+    local motifs="qemu-system-arm osmocon osmo-bts-trx osmo-trx-ipc \
+calypso-ipc-device fake_trx trxcon grgsm_decode si_bridge.py qemu_bcch_grgsm"
+    local m p pids
+    for m in $motifs; do
+        pids="$(pgrep -f -- "$m" 2>/dev/null || true)"
+        for p in $pids; do
+            [ "$p" = "$$" ] && continue
+            [ "$p" = "${PPID:-0}" ] && continue
+            kill -TERM "$p" 2>/dev/null && n=$((n + 1))
+        done
+    done
+    [ "$n" -gt 0 ] && printf '  processus arrêtés     %d\n' "$n" >&2
+
+    # 5. sockets, FIFO et segments partagés — uniquement des artefacts d'exécution.
+    local art
+    for art in /tmp/osmocom_l2 /tmp/ms2_l2 /tmp/iq_grgsm.fifo \
+               /dev/shm/dsp_iq.fifo /dev/shm/calypso_rach \
+               /dev/shm/calypso_sdcch_ul /dev/shm/calypso_tch_dl \
+               /dev/shm/calypso_dsp_shunt; do
+        [ -e "$art" ] && rm -f "$art" 2>/dev/null && printf '  supprimé              %s\n' "$art" >&2
+    done
+
+    printf '\nÉtat propre. Relancez, la ligne de commande fera foi :\n' >&2
+    printf '   CALYPSO_MODE=native ./run.sh\n\n' >&2
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --list)        ACTION=list ;;
@@ -142,9 +260,18 @@ while [ $# -gt 0 ]; do
         --verbose)     VERBOSE=1 ;;
         --check-paths) ACTION=checkpaths ;;
         --configure)   ACTION=configure ;;
+        --reset)       ACTION=reset ;;
+        --restart)     ACTION=restart ;;
         --lang)        CALYPSO_LANG="${2:-}"; export CALYPSO_LANG; shift ;;
         -h|--help)     usage; exit 0 ;;
-        *) printf '%s\n\n' "$(t opt_inconnue "$1")" >&2; usage >&2; exit 2 ;;
+        *) # `t()` vient de i18n.sh, sourcé APRÈS le parsing : sans ce repli le
+           # message d'erreur est « t: command not found ». Corrigé 2026-07-29.
+           if command -v t >/dev/null 2>&1; then
+               printf '%s\n\n' "$(t opt_inconnue "$1")" >&2
+           else
+               printf 'option inconnue : %s\n\n' "$1" >&2
+           fi
+           usage >&2; exit 2 ;;
     esac
     shift
 done
@@ -158,6 +285,13 @@ else
     printf 'configuration introuvable : %s\n' "$HERE/environnement/load.env" >&2
     exit 2
 fi
+if [ "$ACTION" = reset ]; then _reset; exit 0; fi
+
+# --restart = --reset puis le démarrage normal. On ne ré-exécute PAS le script
+# (ça relirait load.env dans un environnement déjà pollué) : on enchaîne dans
+# le même processus, dont l'environnement est exactement la ligne de commande.
+if [ "$ACTION" = restart ]; then _reset; ACTION=start; fi
+
 LOGDIR="${LOG_DIR:-/tmp/calypso/logs}"
 mkdir -p "$LOGDIR/mod" 2>/dev/null || true
 
