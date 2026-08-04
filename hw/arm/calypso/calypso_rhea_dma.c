@@ -185,7 +185,33 @@ uint64_t calypso_rhea_dma_read(void *opaque, hwaddr off, unsigned size)
             case RD_AAD:     v = rd.ch[n].aad;     break;
             case RD_ALGTH:   v = rd.ch[n].algth;   break;
             /* DMA_START « Reading of this bit is always equal to zero » (§11.3.5) */
-            case RD_CTRL:    v = rd.ch[n].ctrl & (uint16_t)~CTRL_DMA_START; break;
+            case RD_CTRL:
+                v = rd.ch[n].ctrl & (uint16_t)~CTRL_DMA_START;
+                /* ═════════════════════════════════════════════════════════════
+                 * [2026-08-04] FIX_DMA_STATUS, patte 1/3 — EFFACEMENT A LA
+                 * LECTURE de IRQ_STATE et RHEA_ERROR.
+                 *
+                 * CAL207 §11.3.5, pour les deux bits :
+                 *     « 0 = cleared after being read »
+                 * Le modele les laissait colles : une fois poses, le firmware les
+                 * relisait indefiniment comme si l'evenement se reproduisait.
+                 *
+                 * REGLE APPLIQUEE (formulee par l'utilisateur le 04/08) : un
+                 * TEMOIN d'erreur cote DSP signale une FONCTION MATERIELLE
+                 * ABSENTE du modele. Ici les temoins etaient
+                 * `DSP_ERR_DMA_PROG/TASK/PEND` — des files circulaires de 14
+                 * entrees (ROM 0xaa83/0xaaad/0xaad1) qui debordent parce que rien
+                 * ne dit au DSP qu'un transfert est termine.
+                 * ═════════════════════════════════════════════════════════════ */
+                if (rd.ch[n].ctrl & (CTRL_IRQ_STATE | CTRL_RHEA_ERROR)) {
+                    static unsigned long long n_clr;
+                    if (n_clr++ < 20)
+                        fprintf(stderr, "[rhea-dma] DMA%d_CTRL lu = 0x%04x : "
+                                "IRQ_STATE/RHEA_ERROR effaces a la lecture "
+                                "(CAL207 §11.3.5)\n", n + 1, v);
+                    rd.ch[n].ctrl &= (uint16_t)~(CTRL_IRQ_STATE | CTRL_RHEA_ERROR);
+                }
+                break;
             case RD_CUR_OFF: v = rd.ch[n].cur_off; break;
             default: break;
             }
@@ -336,6 +362,27 @@ static bool rhea_dma_xfer_on(void)
     return on != 0;
 }
 
+static void rhea_abort_impl(const char *why)
+{
+    rd.ch[1].ctrl |= CTRL_RHEA_ERROR;
+    static unsigned long long n_ab;
+    if (n_ab++ < 20)
+        fprintf(stderr, "[rhea-dma] RHEA_ERROR pose : %s (CAL207 §11.3.5, efface a la lecture)\n", why);
+}
+#define rhea_abort(w) rhea_abort_impl(w)
+
+/* [2026-08-04] Niveau de INT10n : vrai tant qu'un canal garde IRQ_STATE.
+ * Voir l'en-tete pour le pourquoi (CAL000 §5.1 : ligne LEVEL). */
+bool calypso_rhea_dma_irq_level(void)
+{
+    if (!rhea_dma_on() || !rd.init)
+        return false;
+    for (int i = 0; i < 4; i++)
+        if (rd.ch[i].ctrl & CTRL_IRQ_STATE)
+            return true;
+    return false;
+}
+
 void calypso_rhea_dma_rx_request(C54xState *s)
 {
     if (!rhea_dma_on() || !rhea_dma_xfer_on())
@@ -344,6 +391,34 @@ void calypso_rhea_dma_rx_request(C54xState *s)
 
     const int n = 1;                 /* DMA2 = canal RIF RX (§6 Table 2) */
     uint16_t ctrl = rd.ch[n].ctrl;
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * [2026-08-04] FIX_DMA_STATUS, patte 2/3 — le bit IDLE.
+     *
+     * CAL207 §11.3.5 : « 1 IDLE : 0 = DMA transfer is running / 1 = DMA channel
+     * is idle », acces R — c'est le MATERIEL qui le pilote, reset a 1.
+     *
+     * Le modele le definissait (`CTRL_IDLE`) et ne l'ecrivait JAMAIS : zero site
+     * de pilotage, il restait donc a 1 pour toute la duree du run. Le DSP n'avait
+     * aucun moyen de distinguer « transfert en cours » de « transfert fini ».
+     *
+     * CE QUE CA PRODUISAIT, mesure et remonte a sa source dans la ROM :
+     *   ROM 0xaa83 / 0xaaad / 0xaad1 posent DMA_PROG / DMA_TASK / DMA_PEND.
+     *   Les trois ont la meme forme : une file CIRCULAIRE de 14 entrees
+     *   (`stm #0x000e` ; `stl *AR0+%` ; `banz`), et le bit se leve quand elle
+     *   DEBORDE. Le DSP empilait donc des requetes que rien ne venait clore.
+     *   Compte sur un run : DMA_PROG 948 fois, DMA_PEND 541.
+     * Cote osmocom, `layer1/sync.c:249-251` se contente d'imprimer puis
+     * d'effacer `d_error_status` — l'ARM ne corrige rien, le temoin est un
+     * rapport du DSP.
+     *
+     * ⚠️ Le bit est marque R dans la doc : le firmware ne doit jamais l'ecrire.
+     * `CTRL_RO_MASK` le protege deja des ecritures logicielles ; ici on ne
+     * touche qu'a l'etat interne, ce qui est le role du materiel.
+     * PLACEMENT : la mise a 0 se fait plus bas, APRES toutes les
+     * validations, pour qu'un retour anticipe ne laisse jamais le canal
+     * marque « en cours » alors qu'aucun transfert n'a eu lieu.
+     * ═══════════════════════════════════════════════════════════════════════ */
 
     /* On ne sert que ce que le firmware a REELLEMENT arme. */
     if (!(ctrl & CTRL_ENABLE)) {
@@ -365,6 +440,8 @@ void calypso_rhea_dma_rx_request(C54xState *s)
     /* ALGTH est une longueur en OCTETS (§11.3.3) ; la memoire API est en mots. */
     int max_words = rd.ch[n].algth ? (int)(rd.ch[n].algth / 2) : 0;
     if (max_words <= 0) {
+        rhea_abort("ALGTH nulle");   /* AVANT le if : l'etat materiel ne doit pas
+                                      * dependre du plafond de journal. */
         static unsigned n_len;
         if (n_len++ < 5)
             fprintf(stderr, "[rhea-dma] requete RX ignoree : DMA2_ALGTH=%u — aucune "
@@ -374,6 +451,7 @@ void calypso_rhea_dma_rx_request(C54xState *s)
 
     uint16_t *api = s ? s->api_ram : NULL;
     if (!api) {
+        rhea_abort("memoire API absente");
         static unsigned n_api;
         if (n_api++ < 5)
             fprintf(stderr, "[rhea-dma] requete RX ignoree : memoire API absente\n");
@@ -388,6 +466,7 @@ void calypso_rhea_dma_rx_request(C54xState *s)
         max_words = (int)(C54X_API_SIZE - dst_idx);
         static unsigned n_clip;
         if (max_words <= 0) {
+            rhea_abort("AAD hors fenetre API");
             if (n_clip++ < 5)
                 fprintf(stderr, "[rhea-dma] requete RX ignoree : AAD=0x%03x hors "
                         "memoire API\n", rd.ch[n].aad);
@@ -428,6 +507,8 @@ void calypso_rhea_dma_rx_request(C54xState *s)
      * C'est le point le moins sur de cette implementation — si le firmware
      * attendait deux tampons distincts (AAD et AAD+ALGTH), ca se verrait comme
      * un ecrasement de la premiere moitie. */
+    /* FIX_DMA_STATUS 2/3 : a partir d'ici le transfert a REELLEMENT lieu. */
+    rd.ch[n].ctrl &= (uint16_t)~CTRL_IDLE;      /* 0 = transfert en cours */
     int total = 0, pages = 0;
     /* [2026-08-04] Comptage du contenu accumule SUR TOUTES LES PAGES. L'ancienne
      * sonde bouclait sur `buf[0..total[` alors que `buf` ne contient QUE la
@@ -464,6 +545,7 @@ void calypso_rhea_dma_rx_request(C54xState *s)
     }
 
     if (total <= 0) {
+        rd.ch[n].ctrl |= CTRL_IDLE;            /* rien transfere -> au repos */
         static unsigned long long n_empty;
         if (n_empty++ == 0 || (n_empty % 5000) == 0)
             fprintf(stderr, "[rhea-dma] requete RX x%llu : recepteur RIF vide, "
@@ -473,7 +555,8 @@ void calypso_rhea_dma_rx_request(C54xState *s)
     int got = total;
 
     /* §11.3.5 : le transfert est fini -> IRQ_STATE, et DMA_START retombe. */
-    rd.ch[n].ctrl = (uint16_t)((rd.ch[n].ctrl | CTRL_IRQ_STATE) & ~CTRL_DMA_START);
+    rd.ch[n].ctrl = (uint16_t)((rd.ch[n].ctrl | CTRL_IRQ_STATE | CTRL_IDLE)
+                               & ~CTRL_DMA_START);   /* fini -> IDLE=1 */
     if (rd.ch[n].ctrl & CTRL_ONE_SHOT)
         rd.ch[n].ctrl &= (uint16_t)~CTRL_ENABLE;
 

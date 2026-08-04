@@ -31,4 +31,11 @@ bool     calypso_rhea_dma_xio(bool write, uint16_t pa, uint16_t *val, uint16_t p
 struct C54xState;
 void     calypso_rhea_dma_rx_request(struct C54xState *s);
 
+/* [2026-08-04] Niveau de la ligne INT10n. CAL000 §5.1 : « INT10n (level) -> DMA
+ * interrupt ». La ligne reste assertee tant que le canal a son IRQ_STATE pose ;
+ * c'est la LECTURE du registre qui l'efface (CAL207 §11.3.5). Sans ca le modele
+ * traite l'IT comme un FRONT et la perd des qu'elle arrive avec INTM=1 — ce qui
+ * est le cas 15 fois sur 15 dans les runs mesures. */
+bool     calypso_rhea_dma_irq_level(void);
+
 #endif /* CALYPSO_RHEA_DMA_H */

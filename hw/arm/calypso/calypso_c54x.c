@@ -3986,6 +3986,35 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
          * ne voyait que 2 des 3 copies attendues, et ne pouvait pas dire si la
          * 3e manquait ou tombait HORS zone (decalage de pointeur). */
         watch_write_zone_check(s, addr, val, "DISP-TBL", 0x43d0, 0x43dc, &wws_disp_tbl);
+    }
+    /* ═════════════════════════════════════════════════════════════════════════
+     * [2026-08-04] TRAMPO — le tremplin du vecteur 30, data[0x0158..0x015f].
+     *
+     * CHAINE ETABLIE PAR LA MESURE, maillon par maillon :
+     *   1. le DMA leve INT10n en fin de transfert          -> 15 500 appels ✓
+     *   2. le DSP ENTRE dans le vecteur 30                 -> mesure avec
+     *      CALYPSO_DEBUG=C54X, `vec=30` present ✓
+     *   3. le tremplin 0x0158 ne s'execute que 8 fois      -> ✗
+     *   4. son corps `0x728a` ne s'execute JAMAIS          -> ✗
+     * Les files du DSP debordent donc (PEND : 116 ecritures en 0x434e/0x434f,
+     * TASK : 0) et il leve DSP_ERR_DMA_PEND — le temoin qu'on cherche a
+     * supprimer en fournissant la fonction, pas en le masquant.
+     *
+     * CE QUE LA SONDE TRANCHE : qui ecrit la cellule du tremplin, quand, et avec
+     * quelle valeur. La zone API recouvre l'espace PROGRAMME (CAL000 §7.2.1 :
+     * « mixed data program memory », « API overlay over the program area »),
+     * donc une ecriture de donnee y installe du CODE.
+     *   - aucune ecriture -> le tremplin n'est jamais installe, et les 8
+     *     executions viennent d'un residu ; chercher pourquoi 0xa5cd ne pose pas.
+     *   - ecritures puis ecrasement -> quelqu'un le detruit entre deux prises du
+     *     vecteur ; le PC ecrivain le nommera.
+     *
+     * ⚠️ Meme helper que A_CD-WR : MEME condition d'emission. Lire le SUMMARY
+     * cumulatif, jamais le nombre de lignes.
+     * ═════════════════════════════════════════════════════════════════════════ */
+    {
+        static WatchWriteState wws_trampo;
+        watch_write_zone_check(s, addr, val, "TRAMPO", 0x0158, 0x015f, &wws_trampo);
         /* A_CD-BY-BURST : corrélation a_cd[] writes avec d_burst_d courant.
          * Si DSP fait burst 0→1→2→3 → ~25% des writes par burst_id.
          * Si on voit 0 writes avec burst=3 → DSP n'écrit jamais la fin de
@@ -5622,6 +5651,33 @@ static bool c54x_irq_level_check(C54xState *s)
      * bit12 pendant dans l IFR -> la prochaine fenetre INTM=0 la prend. */
     if (g_frame_it_level && frame_it_level_on()) {
         s->ifr |= (1u << 12);
+    }
+    /* ═══════════════════════════════════════════════════════════════════════
+     * [2026-08-04] NIVEAU DE INT10n (bit 14) — la ligne DMA.
+     *
+     * CAL000 §5.1 liste explicitement le SENS de chaque ligne :
+     *     INT0n  (level) -> RIF receive        INT8n  (edge) -> TPU frame
+     *     INT1n  (level) -> RIF transmit       INT9n  (edge) -> TPU programmable
+     *     INT10n (level) -> DMA interrupt      INT7n  (edge) -> CYPHER
+     * Le maintien ci-dessus ne couvrait que le bit 12 (frame-IT). Le bit 14
+     * etait donc traite en FRONT : `c54x_interrupt_ex` posait IFR une fois, et
+     * si INTM valait 1 a cet instant l'evenement etait PERDU.
+     *
+     * MESURE QUI L'IMPOSE : sur les 15 demandes vec=30 journalisees,
+     *     IMR=0x52ed (bit14 = 1, ligne DEMASQUEE)
+     *     IFR=0x4000 (bit14 = 1, IT EN ATTENTE)
+     *     INTM=1     (masque global pose)  -> 15 fois sur 15
+     * et `IRQ-LEVEL take` n'a jamais une seule ligne. Le DSP ne servait donc
+     * jamais la fin de DMA, ses files internes debordaient (PEND : 116 ecritures
+     * en 0x434e/0x434f) et il levait DSP_ERR_DMA_PEND — le temoin qu'on cherche
+     * a supprimer en FOURNISSANT la fonction, pas en le masquant.
+     *
+     * La source du niveau est IRQ_STATE du canal, que CAL207 §11.3.5 decrit
+     * comme « cleared after being read » : la ligne retombe donc quand le
+     * firmware lit le registre, exactement comme sur silicium.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    if (calypso_rhea_dma_irq_level()) {
+        s->ifr |= (1u << C54X_IT_DMA_BIT);
     }
     /* [2026-07-22] LEVELCHK-DBG (gated CALYPSO_AR0_DEBUG) : quand IMR!=0 (fenetre
      * armee), pourquoi l'IT frame n'est-elle pas prise ? Tranche INTM vs IPTR vs

@@ -255,8 +255,28 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
             static int l1rst_on = -1;
             if (l1rst_on < 0) { const char *e = getenv("CALYPSO_L1_RESET_WIRE"); l1rst_on = (e && *e == '0') ? 0 : 1; }
             if (l1rst_on) {
+                /* ═══════════════════════════════════════════════════════════
+                 * [2026-08-04] COMPTEUR CUMULATIF a cote du plafond.
+                 *
+                 * POURQUOI. Cette sonde etait plafonnee a 30 lignes SANS
+                 * compteur. Resultat : `grep -c L1-RESET` rendait 30 dans TOUS
+                 * les runs, et ce 30 a ete cite plusieurs fois comme « 30
+                 * reselections » — alors qu'il ne mesurait que le plafond. On ne
+                 * pouvait donc pas savoir si les reselections augmentaient ou
+                 * diminuaient, c'est-a-dire precisement le juge du mur restant.
+                 *
+                 * C'est le 4e artefact de ce type en une journee (RDMA_MASK,
+                 * *FCCH*, contenu 0/296, celui-ci). REGLE : toute sonde
+                 * plafonnee doit publier un TOTAL cumulatif a cote, sinon son
+                 * plafond finit par etre lu comme une mesure.
+                 * ═══════════════════════════════════════════════════════════ */
                 static unsigned nrst = 0;
-                if (nrst++ < 30) SHUNT_LOG("L1-RESET: d_dsp_page=0 -> clear latches (SI revient)\n");
+                nrst++;
+                if (nrst <= 30)
+                    SHUNT_LOG("L1-RESET #%u: d_dsp_page=0 -> clear latches (SI revient)\n", nrst);
+                else if ((nrst % 50) == 0)
+                    SHUNT_LOG("L1-RESET-TOTAL %u (plafond de lignes atteint a 30 ; "
+                              "CE nombre est le vrai compte)\n", nrst);
                 calypso_dsp_shunt_l1_reset();
             }
         }
