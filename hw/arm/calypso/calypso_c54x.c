@@ -3913,6 +3913,79 @@ static void data_write_locked(C54xState *s, uint16_t addr, uint16_t val)
          * (4) le bloc-copie de 12 mots vise 0x09D5 et l'ARM lit 23 octets a
          * &a_cd[3]. Coherent avec d_dsp_state=0x08E2 et NDB_D_FB_DET=0x08F8. */
         watch_write_zone_check(s, addr, val, "A_CD", 0x09d2, 0x09e0, &wws_a_cd);
+    }
+    /* ═════════════════════════════════════════════════════════════════════════
+     * [2026-08-04] BLK-SRC — la SOURCE du bloc-copie, zone 0x2c3c..0x2c47.
+     *
+     * POURQUOI ICI. Depuis FIX_ALU3_DST, l'en-tete d'a_cd est repare (B_BLUD
+     * survit au `or` de 0x9719, mesure : 86 x 0x8000, zero 0x0000 en 0x09d2).
+     * Mais la CHARGE UTILE reste nulle, et elle ne vient pas de l'en-tete :
+     * desassemblage du firmware en 0x971e..0x9723 —
+     *     0x971e  stm #0x2c3c    ; AR2 <- source
+     *     0x9720  stm #0x09d5    ; AR3 <- a_cd[3]
+     *     0x9722  rpt #0x0b      ; 12 fois
+     *     0x9723  mvdd           ; *AR2+ -> *AR3+
+     * Les 12 mots de charge utile sont donc une COPIE de 0x2c3c..0x2c47. Si
+     * a_cd est nul, c'est que cette zone l'est — ou que personne ne l'ecrit.
+     *
+     * CE QUE LA SONDE TRANCHE :
+     *   - aucune ligne          -> personne n'ecrit la zone : le demod ne
+     *                              publie pas son resultat, chercher en amont
+     *                              (la boucle 0x81xx ecrit via *AR5+, pas a une
+     *                              adresse fixe : suivre AR5) ;
+     *   - des lignes a val=0    -> le demod ecrit, mais du vide : le probleme
+     *                              est dans le calcul, pas dans le transport ;
+     *   - des valeurs non nulles-> la zone est bonne et c'est le `mvdd` ou son
+     *                              instant qui fautent.
+     *
+     * ⚠️ Meme helper que A_CD-WR, donc MEME condition d'emission
+     * (`total <= 500 || exec_pc != last || delta_insn > 100000`) : ne JAMAIS
+     * tirer un taux du nombre de lignes, lire le SUMMARY cumulatif.
+     * ⚠️ `exec_pc` nomme l'instruction PRECEDENTE, pas l'ecrivain — corriger
+     * mentalement avec `cur_pc`, comme pour 0x96db/0x96dd.
+     * ═════════════════════════════════════════════════════════════════════════ */
+    {
+        static WatchWriteState wws_blk_src;
+        watch_write_zone_check(s, addr, val, "BLK-SRC", 0x2c3c, 0x2c47, &wws_blk_src);
+    }
+    /* ═════════════════════════════════════════════════════════════════════════
+     * [2026-08-04] DISP-TBL — la TABLE DE DISPATCH DES TACHES, 0x43d5..0x43d9.
+     *
+     * STRUCTURE ETABLIE PAR DESASSEMBLAGE (PROM0) :
+     *   0xb4be  stm #0x43d5 ; ld #0xab35 ; rpt #0x02 ; reada *AR1+
+     *           -> copie TROIS mots prog[0xab35..0xab37] vers data[0x43d5..0x43d7]
+     *   0xbb00  st *(0x43d8), #0xab38      -> entree 3 = RET partage, par INIT
+     *   0xb0e5  add #0x43d5, A ; ld *AR3, A ; cala A
+     *           -> dispatch sur table[idx], avec garde 0 <= idx <= 3
+     *   0xb01c  ld *(0x43d8), A ; cala A
+     *           -> lit SPECIFIQUEMENT l'entree 3
+     *
+     * ⚠️ CE QUE CA CORRIGE DANS NOTRE LECTURE. Les 35 000 `CALAA tgt=0xab38`
+     * ne sont PAS un dispatcher casse : `0x43d8` est l'entree de la TACHE 3, que
+     * le chargeur ne copie volontairement pas (il n'en copie que 3), et que l'init
+     * met a un RET. Un no-op par conception. Le vrai dispatch des taches 0..2
+     * passe par 0xb0e5..0xb0ec.
+     *
+     * ⚠️ L'INDEX DE 0xb0e5 N'EST PAS `d_task_md`. Il vient de l'accumulateur A
+     * APRES le `cala` de 0xb0d7 — c'est la valeur de RETOUR du dispatch precedent.
+     * Ne pas comparer directement aux 1/5 que l'ARM ecrit en 0x0804.
+     *
+     * CE QUE LA SONDE TRANCHE : quelles valeurs contiennent reellement les quatre
+     * entrees, et QUI les ecrit (y compris en adressage indirect, que le balayage
+     * de litteraux de la ROM ne peut pas voir). Si 0x43d5..0x43d7 contiennent des
+     * adresses plausibles de handlers, la table est saine et le probleme est dans
+     * l'index ; si elles contiennent 0 ou des RET, c'est le chargeur qu'il faut
+     * instruire.
+     *
+     * ⚠️ Meme helper que A_CD-WR, donc MEME condition d'emission — lire le
+     * SUMMARY cumulatif, jamais le nombre de lignes.
+     * ═════════════════════════════════════════════════════════════════════════ */
+    {
+        static WatchWriteState wws_disp_tbl;
+        /* [2026-08-04] fenetre ELARGIE a 0x43d0..0x43dc : la version 0x43d5..0x43d9
+         * ne voyait que 2 des 3 copies attendues, et ne pouvait pas dire si la
+         * 3e manquait ou tombait HORS zone (decalage de pointeur). */
+        watch_write_zone_check(s, addr, val, "DISP-TBL", 0x43d0, 0x43dc, &wws_disp_tbl);
         /* A_CD-BY-BURST : corrélation a_cd[] writes avec d_burst_d courant.
          * Si DSP fait burst 0→1→2→3 → ~25% des writes par burst_id.
          * Si on voit 0 writes avec burst=3 → DSP n'écrit jamais la fin de
@@ -5749,6 +5822,288 @@ static inline void c54x_f4_srcdst(uint16_t op, int *src, int *dst)
     else       { *src = (op >> 8) & 1; *dst = (op >> 9) & 1; }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-04] FIX_DECODE_BRANCH — handlers MAC/bit RENDUS ATTEIGNABLES.
+ *
+ * Ces handlers etaient ecrits correctement mais places dans `case 0xF:` du
+ * switch(hi4), alors que leurs opcodes ont hi4 = 2 ou 3. Ils etaient donc MORTS
+ * PAR CONSTRUCTION, et les opcodes tombaient dans le MAC aveugle du `case 0x3:`
+ * (`A = A + T*Smem`) ou dans le `case 0x2:`.
+ *
+ * Verificateur `sweep_reach.py` : 161 handlers examines, 11 suspects, tous ici.
+ * (Un 12e, 0x9C00, etait un FAUX POSITIF : `case 0x8: case 0x9:` partage ses
+ *  etiquettes, la v1 du script ne lisait que la premiere.)
+ *
+ * LISTE : 0x2800 MAC · 0x2A00/0x2E00 MACR/MASR · 0x3000 LD Smem,T ·
+ *         0x3100 MPYA · 0x3200 LD Smem,ASM · 0x3300 MASA · 0x3400 BITT ·
+ *         0x3500 MACA · 0x3700 MACAR
+ *
+ * ⚠️ LES CORPS SONT REPRIS VERBATIM. On corrige l'ATTEIGNABILITE, pas la
+ * logique : toute subtilite de masque qui existait avant existe encore. En
+ * particulier `0x2800/FC00` couvre 0x2800..0x2BFF et absorbe donc `0x2A00`
+ * (MACR) qui est teste apres — ce recouvrement PREEXISTE, il n'est pas
+ * introduit ici, et il reste a instruire contre SPRU172C.
+ *
+ * ⚠️ APPELE AVANT le `resolve_smem` de chaque case : chaque handler fait le
+ * sien. Appeler apres provoquerait un DOUBLE post-increment des AR.
+ *
+ * Gate d'echappement `CALYPSO_FIX_DECODE_BRANCH=0` : rend -1 tout de suite,
+ * les opcodes retombent dans le comportement d'avant le 04/08.
+ *
+ * Rend -1 si non traite, sinon le nombre de mots consommes.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static int c54x_mac_bit_family(C54xState *s, uint16_t op, int consumed)
+{
+    static int fdb = -1;
+    if (fdb < 0) {
+        fdb = calypso_gate("CALYPSO_FIX_DECODE_BRANCH", 1);
+        fprintf(stderr, "[c54x] FIX_DECODE_BRANCH %s "
+                "(CALYPSO_FIX_DECODE_BRANCH=%d) — MAC/MACR/MASR/MACA/MASA/MACAR/"
+                "MPYA/LD-T/LD-ASM %s\n",
+                fdb ? "ACTIF" : "inactif", fdb,
+                fdb ? "atteignables" : "laisses morts (comportement d'avant)");
+    }
+    if (!fdb) return -1;
+            /* === MAC/MAS family Smem,SRC (0x28xx..0x2Fxx, mask FE00, 1 word).
+             * Per tic54x-opc.c + tic54x_hi8_map.md :
+             *   0x2800 mac Smem,SRC      SRC = SRC + T * data[Smem]
+             *   0x2A00 macr Smem,SRC     SRC = SRC + T * data[Smem] + 0x8000
+             *   0x2C00 mas Smem,SRC      SRC = SRC - T * data[Smem]
+             *   0x2E00 masr Smem,SRC     SRC = SRC - T * data[Smem] + 0x8000
+             * bit 8 = SRC selector (0=A, 1=B).
+             * FRCT (ST1 bit) : si set, produit shift << 1 (Q15*Q15 = Q31).
+             *
+             * BUG observé : MAC family non-implémentée → DSP correlator
+             * ne fait jamais d'accumulation, A reste stale → a_sync_ANG
+             * écrit 0x498D constant (garbage acc state).
+             * Implémentation Smem-only ici (variantes Xmem/Ymem dual-MAC
+             * 0xA000..0xBFFF non couvertes). */
+            if ((op & 0xFC00) == 0x2800) {
+                int mac_sub = (op >> 9) & 1;       /* 0=add, 1=subtract */
+                int mac_rnd = (op >> 8) & 0; /* not used here, separate below */
+                (void)mac_rnd;
+                bool mac_ind;
+                uint16_t mac_addr = resolve_smem(s, op, &mac_ind);
+                int16_t mac_mem = (int16_t)data_read(s, mac_addr);
+                int32_t mac_prod = (int32_t)(int16_t)s->t * (int32_t)mac_mem;
+                if (s->st1 & ST1_FRCT) mac_prod <<= 1;
+                /* bit 8 selects SRC accumulator (A=0/B=1).
+                 * Actually per binutils encoding bit 9 is op variant (mac/mas)
+                 * and bit 8 is round (R). The SRC selector is bit 0 of Smem?
+                 * No — looking at tic54x table: opcode 0x2800/FE00 encodes :
+                 *   bits 9..15 = op family (mac/mas/macr/masr)
+                 *   bit 8      = SRC (A=0, B=1)
+                 *   bits 0..7  = Smem
+                 * Mais l'encoding pose mac=0x28xx (bit 8=0=A), 0x29xx (bit 8=1=B). */
+                int mac_dst = (op >> 8) & 1;
+                int64_t *mac_acc = mac_dst ? &s->b : &s->a;
+                int64_t mac_term = (int64_t)(int32_t)mac_prod;
+                if (mac_sub) mac_term = -mac_term;
+                int64_t mac_new = sext40((*mac_acc + mac_term) & 0xFFFFFFFFFFULL);
+                *mac_acc = mac_new;
+                return (int)(consumed + s->lk_used);
+            }
+            /* MACR/MASR (mask FE00, base 0x2A00/0x2E00) : same + round +0x8000.
+             * bit 9 distingue add/sub : déjà géré ci-dessus via mac_sub. mais le
+             * round est sur les opcodes 0x2A.../0x2E... → bit 10 ? Re-check */
+            if ((op & 0xFE00) == 0x2A00 || (op & 0xFE00) == 0x2E00) {
+                int macr_sub = ((op & 0xFE00) == 0x2E00) ? 1 : 0;
+                bool macr_ind;
+                uint16_t macr_addr = resolve_smem(s, op, &macr_ind);
+                int16_t macr_mem = (int16_t)data_read(s, macr_addr);
+                int32_t macr_prod = (int32_t)(int16_t)s->t * (int32_t)macr_mem;
+                if (s->st1 & ST1_FRCT) macr_prod <<= 1;
+                macr_prod += 0x8000; /* round */
+                macr_prod &= ~0xFFFF; /* zero low half after round */
+                int macr_dst = (op >> 8) & 1;
+                int64_t *macr_acc = macr_dst ? &s->b : &s->a;
+                int64_t macr_term = (int64_t)(int32_t)macr_prod;
+                if (macr_sub) macr_term = -macr_term;
+                *macr_acc = sext40((*macr_acc + macr_term) & 0xFFFFFFFFFFULL);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3500 MACA Smem [, B] (mask FF00, 1 word) — B = B + A.hi * data[Smem].
+             * Spécial : utilise A.hi (= A[31:16]) comme multiplicateur. */
+            if ((op & 0xFF00) == 0x3500) {
+                bool maca_ind;
+                uint16_t maca_addr = resolve_smem(s, op, &maca_ind);
+                int16_t maca_mem = (int16_t)data_read(s, maca_addr);
+                int16_t maca_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
+                int32_t maca_prod = (int32_t)maca_ahi * (int32_t)maca_mem;
+                if (s->st1 & ST1_FRCT) maca_prod <<= 1;
+                s->b = sext40((s->b + (int64_t)(int32_t)maca_prod) & 0xFFFFFFFFFFULL);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3300 MASA Smem [, B] (mask FF00, 1 word) — B = B - A.hi * data[Smem]. */
+            if ((op & 0xFF00) == 0x3300) {
+                bool masa_ind;
+                uint16_t masa_addr = resolve_smem(s, op, &masa_ind);
+                int16_t masa_mem = (int16_t)data_read(s, masa_addr);
+                int16_t masa_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
+                int32_t masa_prod = (int32_t)masa_ahi * (int32_t)masa_mem;
+                if (s->st1 & ST1_FRCT) masa_prod <<= 1;
+                s->b = sext40((s->b - (int64_t)(int32_t)masa_prod) & 0xFFFFFFFFFFULL);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3700 MACAR Smem [, B] = MACA + round */
+            if ((op & 0xFF00) == 0x3700) {
+                bool macar_ind;
+                uint16_t macar_addr = resolve_smem(s, op, &macar_ind);
+                int16_t macar_mem = (int16_t)data_read(s, macar_addr);
+                int16_t macar_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
+                int32_t macar_prod = (int32_t)macar_ahi * (int32_t)macar_mem;
+                if (s->st1 & ST1_FRCT) macar_prod <<= 1;
+                macar_prod += 0x8000;
+                macar_prod &= ~0xFFFF;
+                s->b = sext40((s->b + (int64_t)(int32_t)macar_prod) & 0xFFFFFFFFFFULL);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3100 MPYA Smem (mask FF00, 1 word) — B = A.hi * data[Smem]. */
+            if ((op & 0xFF00) == 0x3100) {
+                bool mpya_ind;
+                uint16_t mpya_addr = resolve_smem(s, op, &mpya_ind);
+                int16_t mpya_mem = (int16_t)data_read(s, mpya_addr);
+                int16_t mpya_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
+                int32_t mpya_prod = (int32_t)mpya_ahi * (int32_t)mpya_mem;
+                if (s->st1 & ST1_FRCT) mpya_prod <<= 1;
+                s->b = sext40((int64_t)(int32_t)mpya_prod);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3000 LD Smem, T (mask FF00, 1 word) — T = data[Smem]. */
+            if ((op & 0xFF00) == 0x3000) {
+                bool ldt_ind;
+                uint16_t ldt_addr = resolve_smem(s, op, &ldt_ind);
+                s->t = data_read(s, ldt_addr);
+                return (int)(consumed + s->lk_used);
+            }
+
+            /* 0x3200 LD Smem, ASM (mask FF00, 1 word) — ASM = data[Smem] & 0x1F (5 bits). */
+            if ((op & 0xFF00) == 0x3200) {
+                bool ldasm_ind;
+                uint16_t ldasm_addr = resolve_smem(s, op, &ldasm_ind);
+                uint16_t ldasm_v = data_read(s, ldasm_addr) & ST1_ASM_MASK;
+                s->st1 = (s->st1 & ~ST1_ASM_MASK) | ldasm_v;
+                return (int)(consumed + s->lk_used);
+            }
+
+    return -1;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-04] FIX_SFTA_CARRY — SFTA doit poser la RETENUE.
+ *
+ * L'implementation precedente decalait l'accumulateur et rendait la main sans
+ * jamais toucher ST0_C. Or `ROL` lit cette retenue.
+ *
+ * CONSEQUENCE MESUREE. La boucle de transfert de bits en 0x9ac7..0x9ace du
+ * firmware DSP :
+ *     0x9ac7  sfta A      ; sort le bit de poids faible de A -> RETENUE
+ *     0x9acc  rol  B      ; B = B<<1 | RETENUE
+ *     0x9ad0  stl  *AR2+, B
+ * La retenue ne transportant rien, B restait a 0, `stl` ecrivait 0x0000 dans
+ * 0x2c3c, et le `mvdd` de 0x9723 publiait ce vide dans a_cd[3..14] — les 12
+ * mots de charge utile que l'ARM remonte en L2. L'opcode reel est `f47f`, soit
+ * shift = (0x1F) - 32 = -1 : « prends le bit 0 de A et mets-le dans C ».
+ *
+ * TI SPRU172C, page SFTA :
+ *     If SHIFT < 0 : (src((-SHIFT)-1)) -> C ; src << SHIFT -> dst
+ *                    remplissage haut = src(39) si SXM=1, sinon 0
+ *     Else         : (src(39 - SHIFT)) -> C ; src << SHIFT -> dst
+ *     Status Bits  : Affected by SXM and OVM / Affects C and OVdst
+ *
+ * ⚠️ CLASSE DIFFERENTE des correctifs precedents du jour. FIX_ALU3_DST,
+ * FIX_F4XX_SRCDST, FIX_BITT_CASE3 et FIX_DECODE_BRANCH portaient sur des
+ * handlers mal places ou des operandes inverses — detectables par
+ * `sweep_reach.py`. Celui-ci est un EFFET DE BORD DE DRAPEAU non modelise :
+ * le resultat calcule est juste, mais l'indicateur d'etat dont depend
+ * l'instruction suivante est absent. Le verificateur d'atteignabilite ne peut
+ * PAS voir ce defaut ; il faut un audit distinct croisant chaque opcode avec la
+ * ligne « Status Bits » de SPRU172C.
+ *
+ * ⚠️ Le remplissage selon SXM est ajoute ici aussi (la doc le mandate au meme
+ * endroit). Avant, le decalage droit etait toujours arithmetique, ce qui
+ * equivaut a SXM=1 en permanence.
+ *
+ * Gate d'echappement `CALYPSO_FIX_SFTA_CARRY=0` : ni retenue ni SXM, soit le
+ * comportement d'avant le 04/08.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void c54x_sfta_exec(C54xState *s, uint16_t op)
+{
+    static int fsc = -1;
+    if (fsc < 0) {
+        fsc = calypso_gate("CALYPSO_FIX_SFTA_CARRY", 1);
+        fprintf(stderr, "[c54x] FIX_SFTA_CARRY %s (CALYPSO_FIX_SFTA_CARRY=%d) — "
+                "SFTA %s la retenue (TI SPRU172C)\n",
+                fsc ? "ACTIF" : "inactif", fsc,
+                fsc ? "POSE" : "ne pose PAS");
+    }
+    int src, dst;
+    c54x_f4_srcdst(op, &src, &dst);
+    int shift = op & 0x1F;
+    if (shift > 15) shift -= 32;
+    int64_t sv = sext40(src ? s->b : s->a);
+
+    if (fsc) {
+        int cbit = (shift < 0) ? (int)((sv >> ((-shift) - 1)) & 1)
+                               : (int)((sv >> (39 - shift)) & 1);
+        if (cbit) s->st0 |= ST0_C;
+        else      s->st0 &= ~ST0_C;
+    }
+
+    if (shift >= 0) {
+        sv <<= shift;
+    } else if (fsc && !(s->st1 & ST1_SXM)) {
+        sv = (int64_t)(((uint64_t)sv & 0xFFFFFFFFFFULL) >> (-shift));
+    } else {
+        sv >>= (-shift);
+    }
+    if (dst) s->b = sext40(sv);
+    else     s->a = sext40(sv);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-04] FIX_ROL_CARRY_BIT — ROR/ROL lisaient la retenue AU MAUVAIS BIT.
+ *
+ * `ST0_C` vaut `(1 << 11)` (calypso_c54x.h:74). Or les quatre handlers ROR/ROL
+ * (dupliques dans deux branches) lisaient `(s->st0 >> 8) & 1`, soit le **bit 8**
+ * — qui appartient a `ST0_DP_MASK` (bits 8-0, pointeur de page de donnees).
+ * Ils ECRIVAIENT pourtant la retenue correctement via `s->st0 |= ST0_C`.
+ * Lecture et ecriture ne parlaient donc pas du meme bit : ROL rotationnait un
+ * bit du pointeur de page a la place de la retenue.
+ *
+ * CONSEQUENCE MESUREE. La boucle de transfert de bits du firmware DSP en
+ * 0x9ac7..0x9ace fait `sfta A` (retenue <- bit sorti) puis `rol B` (B <<= 1 | C).
+ * Meme apres FIX_SFTA_CARRY, qui pose enfin la retenue au bit 11, `rol` allait
+ * la chercher au bit 8 : B restait nul, `stl *AR2+, B` ecrivait 0x0000 dans
+ * 0x2c3c, et le `mvdd` de 0x9723 publiait ce vide dans a_cd[3..14].
+ *
+ * ⚠️ Meme CLASSE que FIX_SFTA_CARRY (drapeau d'etat), mais cause differente :
+ * ici le drapeau existe et est correctement ecrit, c'est la LECTURE qui vise a
+ * cote. Aucun verificateur structurel ne voit ca ; seul un audit croisant
+ * chaque acces a ST0/ST1 avec les macros le montrerait.
+ *
+ * Gate `CALYPSO_FIX_ROL_CARRY_BIT=0` : relit le bit 8, comportement d'avant.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static inline uint16_t c54x_carry_in(C54xState *s)
+{
+    static int frc = -1;
+    if (frc < 0) {
+        frc = calypso_gate("CALYPSO_FIX_ROL_CARRY_BIT", 1);
+        fprintf(stderr, "[c54x] FIX_ROL_CARRY_BIT %s "
+                "(CALYPSO_FIX_ROL_CARRY_BIT=%d) — ROR/ROL lisent la retenue au "
+                "bit %s\n", frc ? "ACTIF" : "inactif", frc,
+                frc ? "11 (ST0_C, correct)" : "8 (ST0_DP, comportement d'avant)");
+    }
+    return frc ? ((s->st0 & ST0_C) ? 1 : 0) : (uint16_t)((s->st0 >> 8) & 1);
+}
+
 static bool calypso_fix_enabled(const char *name)
 {
     static char buf[1024];
@@ -7470,151 +7825,21 @@ static int c54x_exec_one(C54xState *s)
                 return consumed + s->lk_used;
             }
 
-            /* === MAC/MAS family Smem,SRC (0x28xx..0x2Fxx, mask FE00, 1 word).
-             * Per tic54x-opc.c + tic54x_hi8_map.md :
-             *   0x2800 mac Smem,SRC      SRC = SRC + T * data[Smem]
-             *   0x2A00 macr Smem,SRC     SRC = SRC + T * data[Smem] + 0x8000
-             *   0x2C00 mas Smem,SRC      SRC = SRC - T * data[Smem]
-             *   0x2E00 masr Smem,SRC     SRC = SRC - T * data[Smem] + 0x8000
-             * bit 8 = SRC selector (0=A, 1=B).
-             * FRCT (ST1 bit) : si set, produit shift << 1 (Q15*Q15 = Q31).
-             *
-             * BUG observé : MAC family non-implémentée → DSP correlator
-             * ne fait jamais d'accumulation, A reste stale → a_sync_ANG
-             * écrit 0x498D constant (garbage acc state).
-             * Implémentation Smem-only ici (variantes Xmem/Ymem dual-MAC
-             * 0xA000..0xBFFF non couvertes). */
-            if ((op & 0xFC00) == 0x2800) {
-                int mac_sub = (op >> 9) & 1;       /* 0=add, 1=subtract */
-                int mac_rnd = (op >> 8) & 0; /* not used here, separate below */
-                (void)mac_rnd;
-                bool mac_ind;
-                uint16_t mac_addr = resolve_smem(s, op, &mac_ind);
-                int16_t mac_mem = (int16_t)data_read(s, mac_addr);
-                int32_t mac_prod = (int32_t)(int16_t)s->t * (int32_t)mac_mem;
-                if (s->st1 & ST1_FRCT) mac_prod <<= 1;
-                /* bit 8 selects SRC accumulator (A=0/B=1).
-                 * Actually per binutils encoding bit 9 is op variant (mac/mas)
-                 * and bit 8 is round (R). The SRC selector is bit 0 of Smem?
-                 * No — looking at tic54x table: opcode 0x2800/FE00 encodes :
-                 *   bits 9..15 = op family (mac/mas/macr/masr)
-                 *   bit 8      = SRC (A=0, B=1)
-                 *   bits 0..7  = Smem
-                 * Mais l'encoding pose mac=0x28xx (bit 8=0=A), 0x29xx (bit 8=1=B). */
-                int mac_dst = (op >> 8) & 1;
-                int64_t *mac_acc = mac_dst ? &s->b : &s->a;
-                int64_t mac_term = (int64_t)(int32_t)mac_prod;
-                if (mac_sub) mac_term = -mac_term;
-                int64_t mac_new = sext40((*mac_acc + mac_term) & 0xFFFFFFFFFFULL);
-                *mac_acc = mac_new;
-                return consumed + s->lk_used;
-            }
-            /* MACR/MASR (mask FE00, base 0x2A00/0x2E00) : same + round +0x8000.
-             * bit 9 distingue add/sub : déjà géré ci-dessus via mac_sub. mais le
-             * round est sur les opcodes 0x2A.../0x2E... → bit 10 ? Re-check */
-            if ((op & 0xFE00) == 0x2A00 || (op & 0xFE00) == 0x2E00) {
-                int macr_sub = ((op & 0xFE00) == 0x2E00) ? 1 : 0;
-                bool macr_ind;
-                uint16_t macr_addr = resolve_smem(s, op, &macr_ind);
-                int16_t macr_mem = (int16_t)data_read(s, macr_addr);
-                int32_t macr_prod = (int32_t)(int16_t)s->t * (int32_t)macr_mem;
-                if (s->st1 & ST1_FRCT) macr_prod <<= 1;
-                macr_prod += 0x8000; /* round */
-                macr_prod &= ~0xFFFF; /* zero low half after round */
-                int macr_dst = (op >> 8) & 1;
-                int64_t *macr_acc = macr_dst ? &s->b : &s->a;
-                int64_t macr_term = (int64_t)(int32_t)macr_prod;
-                if (macr_sub) macr_term = -macr_term;
-                *macr_acc = sext40((*macr_acc + macr_term) & 0xFFFFFFFFFFULL);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3500 MACA Smem [, B] (mask FF00, 1 word) — B = B + A.hi * data[Smem].
-             * Spécial : utilise A.hi (= A[31:16]) comme multiplicateur. */
-            if ((op & 0xFF00) == 0x3500) {
-                bool maca_ind;
-                uint16_t maca_addr = resolve_smem(s, op, &maca_ind);
-                int16_t maca_mem = (int16_t)data_read(s, maca_addr);
-                int16_t maca_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
-                int32_t maca_prod = (int32_t)maca_ahi * (int32_t)maca_mem;
-                if (s->st1 & ST1_FRCT) maca_prod <<= 1;
-                s->b = sext40((s->b + (int64_t)(int32_t)maca_prod) & 0xFFFFFFFFFFULL);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3300 MASA Smem [, B] (mask FF00, 1 word) — B = B - A.hi * data[Smem]. */
-            if ((op & 0xFF00) == 0x3300) {
-                bool masa_ind;
-                uint16_t masa_addr = resolve_smem(s, op, &masa_ind);
-                int16_t masa_mem = (int16_t)data_read(s, masa_addr);
-                int16_t masa_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
-                int32_t masa_prod = (int32_t)masa_ahi * (int32_t)masa_mem;
-                if (s->st1 & ST1_FRCT) masa_prod <<= 1;
-                s->b = sext40((s->b - (int64_t)(int32_t)masa_prod) & 0xFFFFFFFFFFULL);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3700 MACAR Smem [, B] = MACA + round */
-            if ((op & 0xFF00) == 0x3700) {
-                bool macar_ind;
-                uint16_t macar_addr = resolve_smem(s, op, &macar_ind);
-                int16_t macar_mem = (int16_t)data_read(s, macar_addr);
-                int16_t macar_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
-                int32_t macar_prod = (int32_t)macar_ahi * (int32_t)macar_mem;
-                if (s->st1 & ST1_FRCT) macar_prod <<= 1;
-                macar_prod += 0x8000;
-                macar_prod &= ~0xFFFF;
-                s->b = sext40((s->b + (int64_t)(int32_t)macar_prod) & 0xFFFFFFFFFFULL);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3100 MPYA Smem (mask FF00, 1 word) — B = A.hi * data[Smem]. */
-            if ((op & 0xFF00) == 0x3100) {
-                bool mpya_ind;
-                uint16_t mpya_addr = resolve_smem(s, op, &mpya_ind);
-                int16_t mpya_mem = (int16_t)data_read(s, mpya_addr);
-                int16_t mpya_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
-                int32_t mpya_prod = (int32_t)mpya_ahi * (int32_t)mpya_mem;
-                if (s->st1 & ST1_FRCT) mpya_prod <<= 1;
-                s->b = sext40((int64_t)(int32_t)mpya_prod);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3000 LD Smem, T (mask FF00, 1 word) — T = data[Smem]. */
-            if ((op & 0xFF00) == 0x3000) {
-                bool ldt_ind;
-                uint16_t ldt_addr = resolve_smem(s, op, &ldt_ind);
-                s->t = data_read(s, ldt_addr);
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3200 LD Smem, ASM (mask FF00, 1 word) — ASM = data[Smem] & 0x1F (5 bits). */
-            if ((op & 0xFF00) == 0x3200) {
-                bool ldasm_ind;
-                uint16_t ldasm_addr = resolve_smem(s, op, &ldasm_ind);
-                uint16_t ldasm_v = data_read(s, ldasm_addr) & ST1_ASM_MASK;
-                s->st1 = (s->st1 & ~ST1_ASM_MASK) | ldasm_v;
-                return consumed + s->lk_used;
-            }
-
-            /* 0x3400 BITT Smem (mask FF00, 1 word) — TC = data[Smem] bit
-             * (15 - T(3:0)). Per binutils tic54x-opc.c "bitt" 0x3400 / 0xFF00.
-             *
-             * BUG observé pré-fix : BITT non-implémenté → TC stale →
-             * ROLTC (0xF492) immédiatement après à PC=0x9abf utilise TC
-             * faux → A.LOW computé garbage → STL A,*AR2- à PC=0x9ac0
-             * écrit a_sync_ANG = 0x498D constant (= résidu, pas un vrai
-             * phase compute). DSP correlator angle inopérant.
-             * binutils : { "bitt", 1,1,1, 0x3400, 0xFF00, {OP_Smem}, FL_SMR } */
-            if ((op & 0xFF00) == 0x3400) {
-                bool bitt_ind;
-                uint16_t bitt_addr = resolve_smem(s, op, &bitt_ind);
-                uint16_t bitt_val = data_read(s, bitt_addr);
-                int bitt_idx = 15 - (s->t & 0xF);
-                int bitt_b = (bitt_val >> bitt_idx) & 1;
-                if (bitt_b) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
-                return consumed + s->lk_used;
-            }
+            /* ⛔ [2026-08-04] BLOC DEPLACE — voir c54x_mac_bit_family().
+             * Ces handlers etaient ici, dans `case 0xF:`, donc INATTEIGNABLES
+             * (leurs opcodes ont hi4 = 2 ou 3). Les corps vivent desormais dans
+             * le helper, appele depuis `case 0x2:` et `case 0x3:`. Ne rien
+             * remettre ici : ce serait a nouveau du code mort. */
+            /* ⛔ [2026-08-04] BITT ETAIT ICI — RETIRE, ET C'EST VOULU.
+             * `bitt` = 0x34xx donc hi4 = 3 : dans `case 0xF:` il etait
+             * INATTEIGNABLE. Le handler vivant est dans `case 0x3:`
+             * (chercher FIX_BITT_CASE3). La sonde BITT-WATCH etait elle aussi
+             * piegee dans ce bloc mort — d'ou son silence TOTAL au run du
+             * 04/08, pas meme sa trace d'armement.
+             * Le corps est RETIRE et non commente, pour que `sweep_reach.py`
+             * retombe a ZERO suspect : un controle en permanence rouge finit
+             * par etre ignore, et on perdrait la capacite de reperer le
+             * PROCHAIN handler egare. */
 
             /* F492/F592: ROLTC src (rotate left through TC, mask FEFF, 1 word)
              * F-AUDIT 2026-05-25 v5 : NOUVEAU handler. binutils :
@@ -7630,6 +7855,32 @@ static int c54x_exec_one(C54xState *s)
                 int old_tc = (s->st0 & ST0_TC) ? 1 : 0;
                 *acc = sext40(((v << 1) | (int64_t)old_tc) & 0xFFFFFFFFFFULL);
                 if (new_tc) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
+                /* [2026-08-04] BITT-WATCH, patte 2/2 — meme gate, meme fenetre.
+                 * Montre si le TC pose par `bitt` ENTRE reellement dans
+                 * l'accumulateur : `apres` doit valoir `avant<<1 | old_tc`.
+                 * Si `old_tc` est toujours 0 alors que la patte 1/2 compte des
+                 * TC=1, la faute est entre les deux (TC ecrase par une
+                 * instruction intercalee). Si les deux pattes voient TC=0, la
+                 * source est vide et le probleme est en amont. */
+                if (s->pc >= 0x9ab8 && s->pc <= 0x9ad2) {
+                    static int rw = -1;
+                    if (rw < 0) rw = calypso_gate("CALYPSO_BITT_WATCH", 0);
+                    if (rw) {
+                        static unsigned long long n, nz_out, tc_in;
+                        n++;
+                        if (*acc & 0xFFFFFFFFFFLL) nz_out++;
+                        if (old_tc) tc_in++;
+                        if (n <= 40 || (n % 5000) == 0)
+                            fprintf(stderr, "[c54x] ROLTC-WATCH #%llu pc=0x%04x "
+                                    "%c avant=0x%010llx old_tc=%d -> apres=0x%010llx "
+                                    "new_tc=%d | cumul: acc_non_nul=%llu/%llu "
+                                    "tc_entrant=%llu\n",
+                                    n, s->pc, src ? 'B' : 'A',
+                                    (unsigned long long)(v & 0xFFFFFFFFFFULL), old_tc,
+                                    (unsigned long long)(*acc & 0xFFFFFFFFFFLL),
+                                    new_tc, nz_out, n, tc_in);
+                    }
+                }
                 return consumed + s->lk_used;
             }
 
@@ -7672,7 +7923,7 @@ static int c54x_exec_one(C54xState *s)
             if ((op & 0xFEFF) == 0xF490) {
                 int src = (op >> 8) & 1;
                 int64_t *acc = src ? &s->b : &s->a;
-                uint16_t c = (s->st0 >> 8) & 1; /* carry */
+                uint16_t c = c54x_carry_in(s); /* carry */
                 uint16_t lsb = *acc & 1;
                 *acc = sext40(((uint64_t)(*acc & 0xFFFFFFFFFFULL) >> 1) | ((uint64_t)c << 39));
                 if (lsb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
@@ -7683,7 +7934,7 @@ static int c54x_exec_one(C54xState *s)
             if ((op & 0xFEFF) == 0xF491) {
                 int src = (op >> 8) & 1;
                 int64_t *acc = src ? &s->b : &s->a;
-                uint16_t c = (s->st0 >> 8) & 1;
+                uint16_t c = c54x_carry_in(s);
                 uint16_t msb = (*acc >> 39) & 1;
                 *acc = sext40(((*acc << 1) & 0xFFFFFFFFFFULL) | c);
                 if (msb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
@@ -7775,12 +8026,10 @@ static int c54x_exec_one(C54xState *s)
             }
 
             if ((op & 0xFCE0) == 0xF460) {
-                /* SFTA src,shift,dst — arithmetic shift accumulator */
-                int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
-                int shift = op & 0x1F; if (shift > 15) shift -= 32;
-                int64_t sv = sext40(src ? s->b : s->a);
-                if (shift >= 0) sv <<= shift; else sv >>= (-shift);
-                if (dst) s->b = sext40(sv); else s->a = sext40(sv);
+                /* SFTA — corps factorise dans c54x_sfta_exec() (FIX_SFTA_CARRY).
+                 * Deux sites identiques existaient ; les garder separes les aurait
+                 * fait diverger au premier correctif applique a un seul. */
+                c54x_sfta_exec(s, op);
                 return consumed + s->lk_used;
             }
 
@@ -7977,7 +8226,7 @@ static int c54x_exec_one(C54xState *s)
                 if ((op & 0xFEFF) == 0xF490) {
                     int src = (op >> 8) & 1;
                     int64_t *acc = src ? &s->b : &s->a;
-                    uint16_t c = (s->st0 >> 8) & 1; /* carry */
+                    uint16_t c = c54x_carry_in(s); /* carry */
                     uint16_t lsb = *acc & 1;
                     *acc = sext40(((uint64_t)(*acc & 0xFFFFFFFFFFULL) >> 1) | ((uint64_t)c << 39));
                     if (lsb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
@@ -7987,7 +8236,7 @@ static int c54x_exec_one(C54xState *s)
                 if ((op & 0xFEFF) == 0xF491) {
                     int src = (op >> 8) & 1;
                     int64_t *acc = src ? &s->b : &s->a;
-                    uint16_t c = (s->st0 >> 8) & 1;
+                    uint16_t c = c54x_carry_in(s);
                     uint16_t msb = (*acc >> 39) & 1;
                     *acc = sext40(((*acc << 1) & 0xFFFFFFFFFFULL) | c);
                     if (msb) s->st0 |= ST0_C; else s->st0 &= ~ST0_C;
@@ -8063,12 +8312,10 @@ static int c54x_exec_one(C54xState *s)
                     return consumed + s->lk_used;
                 }
                 if ((op & 0xFCE0) == 0xF460) {
-                    /* SFTA src,shift,dst — arithmetic shift accumulator */
-                    int src, dst; c54x_f4_srcdst(op, &src, &dst);   /* FIX_F4XX_SRCDST */
-                    int shift = op & 0x1F; if (shift > 15) shift -= 32;
-                    int64_t sv = sext40(src ? s->b : s->a);
-                    if (shift >= 0) sv <<= shift; else sv >>= (-shift);
-                    if (dst) s->b = sext40(sv); else s->a = sext40(sv);
+                    /* SFTA — corps factorise dans c54x_sfta_exec() (FIX_SFTA_CARRY).
+                     * Deux sites identiques existaient ; les garder separes les aurait
+                     * fait diverger au premier correctif applique a un seul. */
+                    c54x_sfta_exec(s, op);
                     return consumed + s->lk_used;
                 }
                             /* [2026-07-03] FIX-SFTL-RSBX-COLLISION (gated CALYPSO_FIX_SFTL_RSBX,
@@ -9959,7 +10206,46 @@ static int c54x_exec_one(C54xState *s)
          * (A.high → XPC override) was tried but contradicts SPRU131G and
          * did not move the symptom — reverted to canonical semantics. */
         if (hi8 == 0x7E) {
+            /* ═════════════════════════════════════════════════════════════════
+             * [2026-08-04] READA-ITER — pourquoi la 2e boucle du chargeur de
+             * table ne fait que DEUX copies au lieu de trois.
+             *
+             * MESURE QUI L'IMPOSE. Le chargeur `0xb4b6` fait deux boucles :
+             *   0xb4bc  rpt #0x4d ; reada *AR1+   -> 77 copies, 0x4387..0x43d3
+             *                                        EXACT (77 = 0x4d + 1)
+             *   0xb4c4  rpt #0x02 ; reada *AR1+   -> 2 copies, 0x43d5 et 0x43d6
+             *                                        UNE MANQUE (attendu 3)
+             * `RPT` compte donc juste dans un cas et court d'une unite dans
+             * l'autre : ce n'est PAS `RPT` en lui-meme. Consequence mesuree sur
+             * 76 passes : `data[0x43d7]`, entree 2 de la table de dispatch des
+             * taches, n'est JAMAIS initialisee.
+             *
+             * CE QUE LA SONDE TRANCHE : a chaque execution de la 2e boucle, on
+             * imprime AR1 AVANT resolve_smem, l'adresse resolue, et l'etat du
+             * repeat. Deux issues :
+             *   - trois lignes, la 3e avec une adresse hors 0x43d7 -> le pointeur
+             *     derape (probleme d'adressage `*AR1+`) ;
+             *   - deux lignes seulement -> la 3e iteration n'a pas lieu, et c'est
+             *     l'interaction repeat/instruction qu'il faut instruire.
+             *
+             * Bornee au PC de la SECONDE boucle (0xb4c5) pour ne pas noyer le
+             * journal avec les 77 copies de la premiere. Plafond 60 lignes.
+             * ═════════════════════════════════════════════════════════════════ */
+            uint16_t _ar1_before = s->ar[1];
             addr = resolve_smem(s, op, &ind);
+            if (s->pc == 0xb4c5) {
+                static unsigned _ri;
+                if (_ri < 60) {
+                    _ri++;
+                    fprintf(stderr, "[c54x] READA-ITER #%u AR1 0x%04x -> 0x%04x "
+                            "addr=0x%04x A_low=0x%04x mvpd_src=0x%04x "
+                            "rpt_active=%d rpt_count=%u rpt_fresh=%d insn=%u\n",
+                            _ri, _ar1_before, s->ar[1], addr,
+                            (unsigned)(s->a & 0xFFFF), s->mvpd_src,
+                            s->rpt_active, s->rpt_count, s->rpt_fresh,
+                            s->insn_count);
+                }
+            }
             /* GAP-1/Phase B fix (2026-06-24) : sous RPT, la 1ere iteration part
              * de A_low (base source), PAS du mvpd_src stale d'un READA precedent.
              * Sans ca, `RPT #N ; READA *ARx+` copiait depuis la mauvaise zone ROM
@@ -9975,7 +10261,10 @@ static int c54x_exec_one(C54xState *s)
             uint16_t v = prog_read(s, psrc);
             data_write(s, addr, v);
             s->mvpd_src = psrc + 1;
-            { static int reada_log = 0; if (reada_log++ < 20)
+            { /* [2026-08-04] plafond 20 -> 200 : la PREMIERE boucle (rpt #0x4d = 77
+                 * copies) le consommait entierement, rendant la SECONDE
+                 * (rpt #0x02 vers la table de dispatch 0x43d5) invisible. */
+                static int reada_log = 0; if (reada_log++ < 200)
                 C54_LOG("READA: prog[0x%04x]=0x%04x → data[0x%04x] PC=0x%04x rpt=%d insn=%u",
                         psrc, v, addr, s->pc, s->rpt_count, s->insn_count); }
             return consumed + s->lk_used;
@@ -10799,6 +11088,11 @@ static int c54x_exec_one(C54xState *s)
     }
 
     case 0x3:
+        {   /* [2026-08-04] handlers MAC/bit rendus atteignables — AVANT tout
+             * resolve_smem, chaque handler fait le sien. */
+            int _h = c54x_mac_bit_family(s, op, consumed);
+            if (_h >= 0) return _h;
+        }
         /* 3xxx: MAC / MAS — mais d'ABORD SQURA (§4-A, fix 2026-06-23). */
         addr = resolve_smem(s, op, &ind);
         {
@@ -10811,6 +11105,57 @@ static int c54x_exec_one(C54xState *s)
              * anticipée → saute le corps qui pousse ST1 → POPM ST1@0x7706 sur-pope
              * (1er pop orphelin insn 146) → DP=0x124 → handler garbage → SP collapse.
              * SQURA accumule un CARRÉ (contribution ≥0) → A>0 → RCD ne prend pas. */
+            /* ═════════════════════════════════════════════════════════════════
+             * [2026-08-04] FIX_BITT_CASE3 — BITT etait DANS LA MAUVAISE BRANCHE.
+             *
+             * Le handler existait deja (`(op & 0xFF00) == 0x3400`), correctement
+             * ecrit, mais place dans `case 0xF:` du switch(hi4). Or `bitt` est
+             * `0x34xx`, donc hi4 = 3 : il etait INATTEIGNABLE PAR CONSTRUCTION, et
+             * `0x348e` tombait ici, dans le MAC aveugle du `case 0x3`.
+             *
+             * TI SPRU172C : `BITT Smem` -> `TC = Smem(15 - T(3-0))`, encodage
+             * `0011 0100 IAAAAAAA`, « Status Bits: Affects TC » — ET RIEN D'AUTRE.
+             * Le MAC etait donc faux deux fois : TC jamais pose (il restait
+             * PERIME), et l'accumulateur A CORROMPU par une accumulation qui n'a
+             * pas lieu d'etre.
+             *
+             * CONSEQUENCE MESUREE (04/08) : l'assembleur de bits 0x9ab8..0x9ad2
+             * (`bitt *AR6-` -> `roltc A` -> `stl *AR2-,A`) empaquetait de la
+             * bouillie dans 0x2c3c..0x2c47, que le `mvdd` de 0x9723 publiait dans
+             * a_cd[3..]. Sonde ROLTC-WATCH : tc_entrant = 1445/5000 (~29 %), du
+             * bruit, pas un test de bit.
+             * ⚠️ A etait NON NUL et d'allure plausible (0x33c7eed1bb...) — c'etait
+             * de la bouillie MAC. Une valeur non nulle n'est pas une valeur juste.
+             *
+             * PRECEDENT SUIVI : SQURA (juste en dessous) avait deja ete extrait de
+             * ce meme MAC aveugle en juin, pour la meme raison.
+             *
+             * ⚠️ Le commentaire de l'ancien handler (~l.7634) decrit exactement ce
+             * bug et le dit CORRIGE. Il l'etait sur le papier ; le code n'etait pas
+             * atteint. Un commentaire « corrige » ne prouve rien sans preuve
+             * d'atteignabilite.
+             *
+             * Gate d'echappement `CALYPSO_FIX_BITT_CASE3=0` : restaure le MAC
+             * aveugle, pour isoler une regression sans toucher au code.
+             * ═════════════════════════════════════════════════════════════════ */
+            if ((op & 0xFF00) == 0x3400) {
+                static int fb = -1;
+                if (fb < 0) {
+                    fb = calypso_gate("CALYPSO_FIX_BITT_CASE3", 1);
+                    fprintf(stderr, "[c54x] FIX_BITT_CASE3 %s "
+                            "(CALYPSO_FIX_BITT_CASE3=%d) — bitt %s (TI SPRU172C)\n",
+                            fb ? "ACTIF" : "inactif", fb,
+                            fb ? "pose TC et ne touche PAS l'accumulateur"
+                               : "retombe dans le MAC aveugle (comportement d'avant)");
+                }
+                if (fb) {
+                    int bitt_idx = 15 - (s->t & 0xF);
+                    if ((val >> bitt_idx) & 1) s->st0 |= ST0_TC;
+                    else                       s->st0 &= ~ST0_TC;
+                    return consumed + s->lk_used;
+                }
+            }
+
             if ((op & 0xFE00) == 0x3800) {
                 int64_t sq = (int64_t)(int16_t)val * (int64_t)(int16_t)val;
                 if (s->st1 & ST1_FRCT) sq <<= 1;
@@ -10832,6 +11177,11 @@ static int c54x_exec_one(C54xState *s)
         return consumed + s->lk_used;
 
     case 0x2:
+        {   /* [2026-08-04] handlers MAC/bit rendus atteignables — AVANT tout
+             * resolve_smem, chaque handler fait le sien. */
+            int _h = c54x_mac_bit_family(s, op, consumed);
+            if (_h >= 0) return _h;
+        }
         /* 2xxx: MPY, SQUR, MAS, MAC variants */
         {
             int sub = (op >> 8) & 0xF;
@@ -14968,6 +15318,11 @@ int c54x_run(C54xState *s, int n_insns)
             }
         }
         uint16_t exec_op = prog_fetch(s, s->pc);
+        /* [2026-08-04] FIX_RPT_COUNT, patte 1/2 : etat du repeat AVANT execution.
+         * Sert a distinguer « le repeat etait deja actif » de « l'instruction
+         * qu'on vient d'executer EST le RPT qui vient de l'armer ». Voir la
+         * patte 2/2 dans le bloc RPT en fin de boucle. */
+        bool rpt_was_active = s->rpt_active;
         /* === FBWATCH-ALIVE (canary) : PROUVE que la sonde est armée + sample PC
          * foreground. Si CE log sort, g_fbwatch_on=1 et le silence des autres
          * FBWATCH est RÉEL. S'il ne sort PAS, les probes étaient mortes. Fire
@@ -18329,6 +18684,56 @@ int c54x_run(C54xState *s, int n_insns)
         /* RPT: after executing an instruction while repeat is active,
          * re-execute the SAME instruction (don't advance PC) until count=0. */
         if (s->rpt_active && !s->idle) {
+            /* ═════════════════════════════════════════════════════════════════
+             * [2026-08-04] FIX_RPT_COUNT, patte 2/2 — `RPT #k` faisait k
+             * repetitions au lieu de k+1.
+             *
+             * MECANISME. Le handler `RPT` pose `rpt_active=1`, avance le PC et
+             * rend la main. Ce bloc, execute juste apres, voyait `rpt_active`
+             * deja vrai et decrementait `rpt_count` — donc **l'instruction RPT
+             * elle-meme consommait une repetition**. L'instruction repetee ne
+             * s'executait plus que k fois.
+             *
+             * TI SPRU172C : « RPT #k : repeat next instruction k+1 times ».
+             *
+             * MESURE (sonde READA-ITER, chargeur de table 0xb4c4) :
+             *     rpt #0x02 ; reada *AR1+
+             *     #1 addr=0x43d5 rpt_count=1   <- devrait etre 2
+             *     #2 addr=0x43d6 rpt_count=0
+             *     (pas de #3)  -> data[0x43d7] JAMAIS initialise
+             * Et la 1ere boucle du meme chargeur, `rpt #0x4d`, ecrit
+             * 0x4387..0x43d3 = 77 mots = k, alors que k+1 = 78 irait a 0x43d4.
+             * Les deux boucles sont donc courtes d'exactement UNE copie.
+             *
+             * PORTEE : TOUTES les boucles `RPT` du firmware, y compris le
+             * bloc-copie `rpt #0x0b ; mvdd` qui alimente a_cd[3..14] — il ne
+             * copiait que 11 des 12 mots de charge utile L2.
+             *
+             * ⚠️ Ce n'est PAS une erreur dans le calcul de `rpt_count` (les 8
+             * poseurs sont corrects) : c'est la boucle qui consomme une fois de
+             * trop. On corrige donc ICI, une seule fois, plutot que sur chaque
+             * poseur — et ca couvre toutes les formes (RPT #k8, #lk, Smem, RPTZ).
+             *
+             * Gate `CALYPSO_FIX_RPT_COUNT=0` : restaure le comportement d'avant.
+             * ═════════════════════════════════════════════════════════════════ */
+            {
+                static int frc = -1;
+                if (frc < 0) {
+                    frc = calypso_gate("CALYPSO_FIX_RPT_COUNT", 1);
+                    fprintf(stderr, "[c54x] FIX_RPT_COUNT %s "
+                            "(CALYPSO_FIX_RPT_COUNT=%d) — RPT #k fait %s "
+                            "(TI SPRU172C)\n", frc ? "ACTIF" : "inactif", frc,
+                            frc ? "k+1 repetitions" : "k (comportement d'avant)");
+                }
+                if (frc && !rpt_was_active) {
+                    /* L'instruction qu'on vient d'executer EST le RPT : elle ne
+                     * doit pas consommer de repetition. PC deja avance par le
+                     * handler, on relance sans decrementer. */
+                    s->cycles++;
+                    executed++;
+                    continue;
+                }
+            }
             if (s->rpt_count > 0) {
                 s->rpt_count--;
                 /* Don't advance PC — re-execute same instruction next cycle */
