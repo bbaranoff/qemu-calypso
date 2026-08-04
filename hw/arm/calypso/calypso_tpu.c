@@ -102,20 +102,25 @@ static void seq_exec_move(uint8_t addr, uint8_t data, uint32_t fn)
     switch (addr) {
     case TPUI_DSP_INT_PG:
         if (seq.dsp && (data & 0x01)) {
-            /* tpu_enq_dsp_irq(): sequenceur -> DSP directement. Seul
-             * appelant reel (tpu_window.c:199) = l1s_tx_multi_win_ctrl()
-             * (TX multislot), PAS l1s_rx_win_ctrl() (RX/FB) -- confirme
-             * runtime (2026-07-23, 0 hit sur un run FB/SB natif complet).
-             * Geree quand meme (vrai trou de modelisation sinon). BRINT0
-             * (vec21, IMR bit5) = seul vecteur natif dont le handler ROM
-             * est installe (stub RETE) mais jamais pris avant ce fix.
-             * Log inconditionnel (pas besoin de CALYPSO_DEBUG) : evenement
-             * rare/diagnostique cle. */
+            /* [2026-08-03] CORRIGE d'apres CAL000 §5.1 (ti-calypso1.pdf p.24).
+             * AVANT : vec21/bit5, au motif que c'etait "le seul vecteur natif
+             * dont le handler ROM est installe". Or §5.1 donne bit5 = XINT =
+             * SPI TRANSMIT : on envoyait l'evenement TPU sur le peripherique
+             * SPI, dont le handler ROM est un stub RETE — d'ou l'absence
+             * totale d'effet, et non parce que l'evenement etait rare.
+             * MAINTENANT : INT9n = "TPU programmable interrupt" = bit13/vec29.
+             * §5.1 le decrit mot pour mot comme ce MOVE : « generation of a DSP
+             * interrupt at a dedicated time with a quarter of GSM bit accuracy
+             * [...] set in a scenario by using a time-stamped instruction ».
+             * C'est aussi le second bit du `IMR |= 0x3000` du ROM (12=AINT,
+             * 13=INT9n) : le ROM l'attend, personne ne l'emettait.
+             * Log inconditionnel : evenement rare/diagnostique cle. */
             static int dsp_int_pg_log = 0;
             if (++dsp_int_pg_log <= 20)
                 fprintf(stderr, "[calypso-tpu] DSP_INT_PG MOVE data=0x%02x fn=%u "
-                        "-> BRINT0 (vec21) #%d\n", data, fn, dsp_int_pg_log);
-            c54x_interrupt_ex(seq.dsp, 21, 5);
+                        "-> INT9n TPU programmable (vec%d/bit%d) #%d\n", data, fn,
+                        C54X_IT_TPU_PROG_VEC, C54X_IT_TPU_PROG_BIT, dsp_int_pg_log);
+            c54x_interrupt_ex(seq.dsp, C54X_IT_TPU_PROG_VEC, C54X_IT_TPU_PROG_BIT);
         }
         break;
     case TPUI_GAUGING_EN:
@@ -259,13 +264,36 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * Sans ces deux conditions on n'emet rien — un firmware qui n'arme pas l'IT ne la
  * recoit pas, comme sur silicium.
  *
- * ⚠️ CE QUI RESTE UNE HYPOTHESE : le NUMERO de vecteur. La table des interruptions
- * du DSP Calypso n'est nulle part dans le depot. On prend 30 par defaut parce que
- * c'est le slot MESURE : la tache FB arme `data[0x0158..0159] = call 0x728a`, et ce
- * tremplin n'est atteignable que par le slot 30 (`data[0x00F8-0x00FB]` = `fb 0x0158`,
- * recopie de PDROM 0xe399 par le reada de 0xb4c9). IMR bit = vec - 16 (regle de
- * calypso_dma.c:185, validee par la mesure : IT trame vue a PC=0x00f0 = slot 28 =
- * bit 12). Reglable par CALYPSO_TPU_DSP_FRAME_VEC pour balayer si 30 est faux.
+ * [2026-08-03] LE NUMERO DE VECTEUR N'EST PLUS UNE HYPOTHESE. Le commentaire qui
+ * etait ici disait « la table des interruptions du DSP Calypso n'est nulle part
+ * dans le depot » et prenait 30 par defaut. Elle est dans CAL000 §5.1
+ * (ti-calypso1.pdf p.24) : l'IT trame du TPU est INT8n = IMR bit 11 = vec 27.
+ * Le 30 retenu jusqu'ici est INT10n = l'IT DMA — un autre evenement, qui existe
+ * bel et bien (§6 : RIF-RX a un canal DMA dedie) mais qui n'est pas celui-la.
+ * [2026-08-03, MESURE] MAIS LE 27 NE PASSE PAS, ET ON SAIT POURQUOI.
+ * Run native_twl avec ce fil arme : l'IT est bien emise sur vec27/bit11, le bit 11
+ * apparait dans l'IFR (`IFR=0x1820` = bits 5+11+12) — et il y RESTE. Sur ~30 000
+ * releves, l'IMR du ROM prend six valeurs (0x52ef, 0x52ed, 0x72ed, 0x50ef, 0x50ed,
+ * 0x3000) et **aucune n'ouvre le bit 11**, alors que le bit 12 est ouvert dans
+ * toutes. Ce qui est reellement dispatche est `PC=0x00f0` = slot 28 = bit 12.
+ *
+ * Or osmocom ne signale QUE par l'IT trame du TPU (dsp_end_scenario ; AINT n'est
+ * jamais levee, son registre de controle n'est meme pas reference dans le
+ * firmware). Un DSP qui masque a vie la seule interruption par laquelle on lui
+ * parle n'a pas de sens. Conclusion : dans la zone AINT/INT8n, l'ordre de la liste
+ * en prose du §5.1 est decale d'un cran — l'IT trame TPU est **bit 12 / vec 28**,
+ * et AINT est bit 11 / vec 27 (jamais demasquee, ce qui est coherent avec le fait
+ * qu'osmocom ne s'en sert pas). Le reste de la table (TINT=bit3, SPI=bit4/5,
+ * DMA=bit14) reste confirme par ailleurs.
+ *
+ * [2026-08-03, RESOLU PAR LE DOC] Cette deduction etait juste, et on a depuis
+ * trouve la table qui fait autorite : CAL207 §15.1 donne l'EMPLACEMENT de chaque
+ * vecteur en hexa (INT8n = 0x70 -> vec 28 -> bit 12) au lieu d'un ordre en prose
+ * a interpreter. AINT est en 0x64 -> vec 25 -> bit 9, et le bit 11 est INT7n =
+ * CYPHER — d'ou le fait qu'il ne soit jamais demasque. Voir calypso_c54x.h.
+ *
+ * Defaut = 28. CALYPSO_TPU_DSP_FRAME_VEC reste disponible pour re-balayer, et
+ * poser 27 reproduit l'observation ci-dessus (IT emise, jamais prise).
  *
  * GATE : CALYPSO_TPU_DSP_FRAME_IT, defaut 0 le temps de valider. Quand ce sera
  * valide, le defaut doit passer a 1 et les bequilles CALYPSO_FORCE_VEC **et
@@ -274,7 +302,7 @@ void calypso_tpu_run_scenario_regs(uint16_t *tpu_ram, C54xState *dsp,
  * FAIT QUAND : `0x728a` s'execute sans CALYPSO_FORCE_VEC. */
 static void tpu_frame_irq_to_dsp(uint32_t fn)
 {
-    static int gate = -1, vec = 30;
+    static int gate = -1, vec = C54X_IT_TPU_FRAME_VEC;   /* INT8n, CAL207 §15.1 */
 
     if (gate < 0) {
         gate = calypso_gate("CALYPSO_TPU_DSP_FRAME_IT", 0);

@@ -29,7 +29,7 @@
 #
 #      Conséquence pratique : `./run.sh` rend la main au lieu de basculer dans
 #      tmux. C'est ce qui permet de l'appeler depuis un autre script ou une CI —
-#      et notamment de ne pas bloquer osmo-nitb-for-calypso/start-direct.sh.
+#      et notamment de ne pas bloquer osmo_egprs/start-direct.sh.
 # -----------------------------------------------------------------------------
 MOD_REGISTER attach "Reprise en main de la session tmux"
 MOD_REQUIRED[attach]=0

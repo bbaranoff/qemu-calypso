@@ -15,6 +15,14 @@
 > « idiomes », « MORTES » et « pièges » ont été corrigées en conséquence ; le recensement détaillé
 > par lot, lui, reste le snapshot du 28 et n'a PAS été réécrit — ses colonnes « IDIOME » disant
 > `EXISTS` sont donc historiques.
+>
+> **Mise à jour du 2026-08-03** — quatre gates ne pouvaient PAS être coupées à la main :
+> `INJECT_SB`, `TRF_RXLEV` (3 sites) et `SHUNT_REAL_FB` utilisaient l'idiome
+> `(gate=='1') || (parapluie=='1')`, où le parapluie **écrase** un `=0` explicite. C'est le
+> bug déjà corrigé sur `INJECT_ACD` le 30/07, resté sur ces sites-là. Tous migrés vers
+> `calypso_gate(nom, defaut_du_parapluie)` : le parapluie n'est plus qu'un **défaut**.
+> Trois gates nouvelles : `CALYPSO_IT_TABLE_DOC`, `CALYPSO_SHUNT_SB_MAX_AGE`, et
+> `CALYPSO_SHUNT_NO_CANNED` qui devient **implicite sous parapluie**.
 
 ---
 
@@ -32,7 +40,24 @@ Certaines variables en **reposent** d'autres, silencieusement. Trois cas mesuré
 |---|---|
 | `CALYPSO_NATIVE_HELPED=1` | `FB_CORR_ENTRY=0x9500`, `FB_ENERGY=1`, `FB_IQ_DARAM=1`, `FB_IQ_BASE=0x9210` |
 | `CALYPSO_DSP=c54x` | `C54X_IRQ_LEVEL` et `DSP_FRAME_VEC28` — deux comportements non demandés |
-| `CALYPSO_DECAN=1` | implique `SHUNT_REAL_FB` |
+| `CALYPSO_DECAN=1` | implique `SHUNT_REAL_FB` (**défaut** depuis le 03/08, plus un écrasement) |
+| `CALYPSO_SHUNT_LEGIT` (toute valeur) | `CALYPSO_SHUNT_NO_CANNED=1` — **nouveau 03/08** |
+
+### Les gates ajoutées / corrigées le 2026-08-03
+
+| Variable | Idiome | Défaut | Effet |
+|---|---|---|---|
+| `CALYPSO_IT_TABLE_DOC` | `calypso_gate` | 0 (sas) | Émet TINT sur **vec19/bit3** (CAL000 §5.1) au lieu de vec20/bit4 (= RINT/SPI receive, table SPRU131 du C54x générique). **Pas inerte** : l'IMR mesurée 0x52ed a le bit 3 démasqué et le bit 4 masqué — l'IT passe de « jetée » à « dispatchée ». À tester sous charge, cf. `environnement/fixes.env`. |
+| `CALYPSO_SHUNT_SB_MAX_AGE` | entier (trames) | 104 sous `shunt_legit`, sinon 0 | Âge maximum de la SB republiée. `sb_valid` ne redescend jamais : sans ce garde-fou un unique SCH est rejoué indéfiniment avec sa FN d'origine. 0/absent = replay infini + simple log de signalement. |
+| `CALYPSO_FBSB_TIMEOUT` | entier (trames) | 100 ; **2000** en `native` | Budget d'une tentative FBSB, transmis dans le `L1CTL_FBSB_REQ`. Était le littéral `100` dans `gsm322.c` — 461 ms de temps GSM, soit ~10 s de mur ici (tick TDMA à ~10 Hz au lieu de 217). C'est ce qui cadençait la boucle de reset L1. **Côté `mobile`**, pas côté QEMU : patch `osmo_egprs/patches/osmocom-bb-fbsb-timeout-scan-to.patch`. |
+| `CALYPSO_SCAN_TO` | entier (secondes) | 4 ; **240** en `native` | Garde-fou couche 3 (`support.c`, `sup->scan_to`). N'avait **aucune commande VTY** — donc irréglable depuis `mobile.cfg`. Doit dépasser la durée mur de `FBSB_TIMEOUT` trames, sinon il devient le facteur limitant. Plafond 255 (uint8). |
+| `CALYPSO_SHUNT_NO_CANNED` | `*e=='1'` | **1 sous parapluie** | Auparavant il fallait écrire `CALYPSO_SHUNT_LEGIT=NO_CANNED` ; un `=1` (ou une surcharge CLI) faisait retomber en mode canné **sans le dire**, donc avec des sorties DSP fabriquées. Seul un `=0` explicite re-canne. |
+| `CALYPSO_INJECT_SB` | `calypso_gate` | parapluie | **CORRIGÉ** : `=0` coupe enfin. |
+| `CALYPSO_TRF_RXLEV` | `calypso_gate` | parapluie | **CORRIGÉ** (3 sites : `c54x.c`, `dsp_helper.c`, `dsp_shunt.c`) : `=0` coupe enfin. La note « TRF_RXLEV est OFF en natif » était infaisable dès que le parapluie était levé. |
+| `CALYPSO_SHUNT_REAL_FB` | `calypso_gate` | `DECAN` | **CORRIGÉ** : `DECAN=1` n'écrase plus un `=0` explicite. |
+
+Variable **morte** supprimée le 03/08 : `calypso_shunt_legit.env` posait `CALYPSO_NO_CANNED`,
+qui n'existe pas dans le code (le vrai nom est `CALYPSO_SHUNT_NO_CANNED`).
 
 Conséquence pratique : retirer `FB_CORR_ENTRY` de la ligne de commande **ne supprime pas** le
 reroute — il revient à sa valeur par défaut. Une demi-journée a été perdue sur cette confusion.

@@ -23,7 +23,7 @@ MOD_TIMEOUT[mailbox-dissam]=15
 MOD_ENABLED_IF[mailbox-dissam]='[ "${CALYPSO_MAILBOX:-0}" != 0 ]'
 
 : "${CALYPSO_MAILBOX_DISSAM:=${QEMU_TREE}/tools/mailbox-annote.py}"
-: "${CALYPSO_MAILBOX_DISSAM_OUT:=${LOG_DIR:-/tmp/calypso/logs}/mail_dissam.log}"
+: "${CALYPSO_MAILBOX_DISSAM_OUT:=${LOG_DIR:-/root/calypso/logs}/mail_dissam.log}"
 : "${CALYPSO_MAILBOX_DISSAM_PERIODE:=2}"     # secondes entre deux régénérations
 : "${CALYPSO_MAILBOX_DISSAM_TOP:=60}"        # nb de lignes du tableau
 
@@ -51,9 +51,9 @@ mod_mailbox_dissam_status() {
 }
 
 mod_mailbox_dissam_start() {
-    local src="${LOG_DIR:-/tmp/calypso/logs}/mailbox.log"
+    local src="${LOG_DIR:-/root/calypso/logs}/mailbox.log"
     local out="$CALYPSO_MAILBOX_DISSAM_OUT"
-    local log="${LOG_DIR:-/tmp/calypso/logs}/mod/mailbox-dissam.log"
+    local log="${LOG_DIR:-/root/calypso/logs}/mod/mailbox-dissam.log"
     local boucle="${RUN_DIR:-/tmp/calypso}/mailbox-dissam-boucle.sh"
 
     mod_say "source   : $src"

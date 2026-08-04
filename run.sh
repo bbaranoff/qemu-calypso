@@ -102,7 +102,7 @@ _configure() {
                               hybrid calypso faketrx core)"
     mode="$(_cfg_demander     'Mode d émulation du DSP' \
                               "${CALYPSO_MODE:-shunt_legit}" \
-                              empty none bare shunt_legit shunt_legit_no_inject native native_twl native_helped)"
+                              empty none bare shunt_legit shunt_legit_no_inject native native_twl native_twl_host_demod native_helped)"
     pipeline="$(_cfg_demander 'Chaîne radio' \
                               "${CALYPSO_PIPELINE:-full-grgsm}" \
                               full-grgsm full shunt shunt-ipc bridge bare free)"
@@ -154,7 +154,7 @@ _reset() {
     "$0" --stop >/dev/null 2>&1 || true
 
     # 2. archivage des journaux AVANT de toucher quoi que ce soit.
-    local logdir="${LOG_DIR:-/tmp/calypso/logs}"
+    local logdir="${LOG_DIR:-/root/calypso/logs}"
     if [ -d "$logdir" ] && [ -n "$(ls -A "$logdir" 2>/dev/null)" ]; then
         horodat="$(date +%Y%m%d-%H%M%S)"
         rep="$logdir/../archives/$horodat"
@@ -292,7 +292,7 @@ if [ "$ACTION" = reset ]; then _reset; exit 0; fi
 # le même processus, dont l'environnement est exactement la ligne de commande.
 if [ "$ACTION" = restart ]; then _reset; ACTION=start; fi
 
-LOGDIR="${LOG_DIR:-/tmp/calypso/logs}"
+LOGDIR="${LOG_DIR:-/root/calypso/logs}"
 mkdir -p "$LOGDIR/mod" 2>/dev/null || true
 
 # --- affichage ----------------------------------------------------------------

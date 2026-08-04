@@ -39,9 +39,9 @@ MOD_ENABLED_IF[demod-bridge]='{ [ "${CALYPSO_DSP_SHUNT:-0}" = 1 ] || [ "${CALYPS
 # Chemins et réglages propres au module — idiome `:=` pour rester surchargeable
 # depuis la ligne de commande, et pour ne rien poser dans environnement/.
 # Le pont de demodulation est un script du depot RESEAU (gr-gsm), range dans
-# outils/. On le cherche la, puis aux emplacements historiques.
-if [ -r "${NITB_ROOT:-}/outils/qemu_bcch_grgsm.py" ]; then
-    : "${CALYPSO_DEMOD_BRIDGE:=${NITB_ROOT}/outils/qemu_bcch_grgsm.py}"
+# tools/. On le cherche la, puis aux emplacements historiques.
+if [ -r "${NITB_ROOT:-}/tools/qemu_bcch_grgsm.py" ]; then
+    : "${CALYPSO_DEMOD_BRIDGE:=${NITB_ROOT}/tools/qemu_bcch_grgsm.py}"
 elif [ -r "${NITB_ROOT:-}/qemu_bcch_grgsm.py" ]; then
     : "${CALYPSO_DEMOD_BRIDGE:=${NITB_ROOT}/qemu_bcch_grgsm.py}"
 else

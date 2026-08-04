@@ -65,7 +65,7 @@ _pty_from_log() {
 # Une valeur posée par l'opérateur (OSMOCON_PTY=... ./run.sh) est respectée :
 # on ne recalcule que si elle est vide ou ne désigne plus un périphérique.
 _pty_resolve() {
-    local log="${LOG_DIR:-/tmp/calypso/logs}/qemu.log" p
+    local log="${LOG_DIR:-/root/calypso/logs}/qemu.log" p
     if [ -z "${OSMOCON_PTY:-}" ] || [ ! -c "${OSMOCON_PTY:-/nonexistent}" ]; then
         p="$(_pty_from_monitor "$QEMU_MON_SOCK" serial0)"
         [ -n "$p" ] || p="$(_pty_from_log "$log" serial0)"
@@ -84,7 +84,7 @@ mod_pty_check() {
         # Pas bloquant : le journal suffit tant qu'il n'a pas été tronqué.
         mod_say "socat absent : lecture du moniteur impossible, secours par le journal seulement"
     fi
-    [ -S "$QEMU_MON_SOCK" ] || [ -r "${LOG_DIR:-/tmp/calypso/logs}/qemu.log" ] || {
+    [ -S "$QEMU_MON_SOCK" ] || [ -r "${LOG_DIR:-/root/calypso/logs}/qemu.log" ] || {
         mod_hint "le module qemu doit avoir démarré : ./run.sh --only qemu"
         mod_fail "ni moniteur ($QEMU_MON_SOCK) ni journal QEMU : rien à interroger"
         return $MOD_RC_FAIL
@@ -123,7 +123,7 @@ mod_pty_wait() {
             return $MOD_RC_OK
         fi
         if [ "$qpid" != 0 ] && ! kill -0 "$qpid" 2>/dev/null; then
-            modb_tail "${LOG_DIR:-/tmp/calypso/logs}/qemu.log" 20
+            modb_tail "${LOG_DIR:-/root/calypso/logs}/qemu.log" 20
             mod_hint "cause typique : machine type, ROM du DSP ou firmware invalide"
             mod_fail "QEMU (pid $qpid) s'est arrêté avant d'allouer son PTY"
             return $MOD_RC_FAIL

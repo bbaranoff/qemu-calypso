@@ -49,7 +49,7 @@ MOD_ENABLED_IF[gen-doc]='[ "${CALYPSO_AUTO_GEN_DOC:-0}" = 1 ]'
 : "${CALYPSO_PYTEST_VERBOSITY:=v}"
 : "${CALYPSO_PYTEST_SCOPE:=default}"
 : "${CALYPSO_TESTS_DIR:=${QEMU_TREE:-${QEMU_TREE}}/tests}"
-: "${CALYPSO_TEST_OUT:=${LOG_DIR:-/tmp/calypso/logs}}"
+: "${CALYPSO_TEST_OUT:=${LOG_DIR:-/root/calypso/logs}}"
 
 _gendoc_pytest() {
     if command -v pytest >/dev/null 2>&1; then printf '%s' "pytest"

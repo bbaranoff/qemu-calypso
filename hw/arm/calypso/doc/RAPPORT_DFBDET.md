@@ -67,7 +67,12 @@ ARM d_task_md=5 (FB_DSP_TASK, ×22)
   → 0xa4e4  →  dispatcher 0xb0xx  →  LD *(0x43d8)  →  0xab38 = RET
   ✗ la routine résultat FB n'est jamais atteinte
 ```
-`fb0_att ≈ 190`, `fb0_ret = 0`, `snr/toa/ang/pm = 0`.
+`fb0_att ≈ 190`, `snr/toa/ang/pm = 0`.
+
+> ⚠️ **[2026-08-03]** ce paragraphe citait aussi `fb0_ret = 0`. C'était un
+> **compteur mort** (déclaré, remis à 0, imprimé, jamais incrémenté) : il valait 0
+> quoi qu'il arrive et n'étayait rien. Retiré ici et dans les cinq autres endroits
+> qui le citaient. Cf. `doc/ETAT_ACTUEL.md` §14.3.
 
 ---
 

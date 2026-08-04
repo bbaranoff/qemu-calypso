@@ -620,11 +620,59 @@ static uint64_t calypso_dsp_read(void *opaque, hwaddr offset, unsigned size)
     if (offset >= 0x03A0 && offset <= 0x03BD && (offset & 1) == 0) {
         static unsigned arm_rd_a_cd = 0;
         arm_rd_a_cd++;
+        /* [2026-08-03] DEGATE. Cette ligne passait par TRX_LOG, donc par
+         * `CALYPSO_DEBUG=TRX` — eteinte dans tous les runs courants. Consequence :
+         * le compteur valait 0 au journal QUOI QU'IL ARRIVE, et ce zero pouvait se
+         * lire comme « l'ARM ne lit jamais a_cd » alors qu'il ne disait rien du
+         * tout. C'est le meme defaut que le compteur mort `fb0_ret` (§14.3) : un
+         * temoin qui a l'air d'une mesure et n'est branche sur rien.
+         *
+         * Or cette sonde est la PATTE COMPLEMENTAIRE du juge `A_CD-WR` (cote DSP,
+         * lui sans gate) — le commentaire ci-dessus decrit exactement la lecture
+         * croisee des deux. Elle doit donc etre visible par defaut, comme son
+         * pendant. Plafonnee (200 premieres + 1/1000), donc sans risque de flot. */
         if (arm_rd_a_cd <= 200 || (arm_rd_a_cd % 1000) == 0) {
             unsigned word_idx = (unsigned)((offset - 0x03A0) / 2);
-            TRX_LOG("ARM RD a_cd[%u] [arm=0x%04x dsp_word=0x%04x] = 0x%04x sz=%d fn=%u #%u",
+            fprintf(stderr,
+                    "[calypso-trx] ARM RD a_cd[%u] [arm=0x%04x dsp_word=0x%04x] "
+                    "= 0x%04x sz=%d fn=%u #%u\n",
                     word_idx, (unsigned)offset, (unsigned)(offset/2 + 0x0800),
                     (unsigned)val, size, s->fn, arm_rd_a_cd);
+        }
+    }
+    {   /* [2026-08-03] DTASKD-WATCH patte 2/3 : ce que `l1s_nb_resp()` LIT
+         * REELLEMENT (db_r->d_task_d), APRES toute la logique de ce chemin —
+         * donc bequille comprise.
+         *
+         * ⚠ BEQUILLE SUR CE CHEMIN, a connaitre avant d'interpreter : quelques
+         * dizaines de lignes plus haut, `if (val == 0) val = 24;` fabrique
+         * ALLC_DSP_TASK pour eviter precisement le `EMPTY` de prim_rx_nb.c:74.
+         * Elle est conditionnee a (SHUNT_LEGIT || SHUNT_NO_LEGIT) && si_valid().
+         * En `native_twl` ces deux gates valent 0 : la bequille est ETEINTE, et
+         * c'est pour ca qu'on voit `EMPTY`. Le `EMPTY` n'est donc pas un fait
+         * nouveau — c'est une condition connue, habituellement masquee.
+         * La sonde imprime la valeur SERVIE : si elle vaut 24 sans que le DSP
+         * n'ait rien ecrit (patte 3 vide), c'est la bequille qu'on regarde. */
+        static int _dw = -1;
+        if (_dw < 0) {
+            _dw = calypso_gate("CALYPSO_DTASKD_WATCH", 0);
+            if (_dw) {
+                fprintf(stderr, "[dtaskd] patte 2/3 armee (ARM<RD db_r) : "
+                        "R p0=off0x0050 R p1=off0x0078\n");
+            }
+        }
+        if (_dw && size == 2 && (offset == 0x0050 || offset == 0x0078)) {
+            static unsigned long long _n = 0, _nz = 0;
+            _n++;
+            if (val) _nz++;
+            if (_n <= 40 || (_n % 500) == 0) {
+                fprintf(stderr,
+                        "[dtaskd] ARM<RD  R p%d  off=0x%04x (mot 0x%04x) -> 0x%04x  "
+                        "%s(total=%llu non_nuls=%llu)  fn=%u\n",
+                        (offset == 0x0050) ? 0 : 1, (unsigned)offset,
+                        (unsigned)(0x0800 + offset / 2), (unsigned)val,
+                        val ? "" : "EMPTY-> ", _n, _nz, s->fn);
+            }
         }
     }
     return val;
@@ -654,10 +702,58 @@ static void calypso_rach_publish(uint8_t ra, uint8_t bsic, uint32_t fn)
     if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
 }
 
+/* [2026-08-03] DTASKD-WATCH — CALYPSO_DTASKD_WATCH=1, defaut 0, LECTURE SEULE.
+ *
+ * Trois pattes, deux fichiers :
+ *   1/3  ARM>WR sur db_w->d_task_d   (ici, calypso_dsp_write)   off 0x0000/0x0028
+ *   2/3  ARM<RD sur db_r->d_task_d   (ici, calypso_dsp_read)    off 0x0050/0x0078
+ *   3/3  DSP>WR sur db_r->d_task_d   (calypso_c54x.c, data_write_locked)
+ *
+ * POURQUOI TROIS. Le firmware ecrit la commande RX dans db_w et relit db_r —
+ * deux structures DIFFERENTES (dsp_api.h:20-23), pas deux vues d'une meme
+ * cellule. La patte 3 est celle qui tranche : si le DSP n'ecrit jamais
+ * data[0x0828]/[0x083C], `EMPTY` (prim_rx_nb.c:74) est explique et le probleme
+ * est « le DSP n'acquitte pas la tache », pas « l'ecriture ARM se perd ».
+ *
+ * VERDICT ATTENDU, ecrit d'avance pour ne pas l'ajuster apres coup :
+ *   - patte 1 non nulle + patte 3 vide  -> le DSP n'acquitte jamais.
+ *   - patte 1 non nulle + patte 3 non nulle + patte 2 lit 0 -> quelqu'un efface
+ *     entre l'ecriture DSP et la lecture ARM (chercher l'effaceur, cf. le
+ *     precedent « page R ecrasee avant lecture »).
+ *   - patte 1 vide -> l1s_nb_cmd n'ecrit pas ce qu'on croit ; tout le reste
+ *     de l'analyse du 03/08 est a refaire.
+ *
+ * SUSPECT ANNEXE (non couvert par cette sonde) : CAL000 §7.2.1, en mode HOM le
+ * DSP n'accede plus a la RAM API. Le firmware bascule HOM<->SAM a CHAQUE trame
+ * et le modele ignore l'arbitrage — donc dans le modele aucune ecriture n'est
+ * perdue de ce fait, mais sur silicium le timing compterait. */
 static void calypso_dsp_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
 {
     CalypsoTRX *s = opaque;
     if (offset >= CALYPSO_DSP_SIZE) return;
+    {   /* DTASKD-WATCH patte 1/3 : ce que la L1 COMMANDE (db_w->d_task_d). */
+        static int _dw = -1;
+        if (_dw < 0) {
+            _dw = calypso_gate("CALYPSO_DTASKD_WATCH", 0);
+            if (_dw) {
+                fprintf(stderr, "[dtaskd] patte 1/3 armee (ARM>WR db_w) : "
+                        "W p0=off0x0000 W p1=off0x0028\n");
+            }
+        }
+        if (_dw && size == 2 && (offset == 0x0000 || offset == 0x0028)) {
+            static unsigned long long _n = 0, _nz = 0;
+            _n++;
+            if (value) _nz++;
+            if (_n <= 40 || (_n % 500) == 0) {
+                fprintf(stderr,
+                        "[dtaskd] ARM>WR  W p%d  off=0x%04x (mot 0x%04x) <- 0x%04x  "
+                        "(total=%llu non_nuls=%llu)  fn=%u\n",
+                        (offset == 0x0000) ? 0 : 1, (unsigned)offset,
+                        (unsigned)(0x0800 + offset / 2), (unsigned)value,
+                        _n, _nz, s->fn);
+            }
+        }
+    }
     {   /* [2026-07-28] BOOTCMD cote ARM : commande bootloader DSP (voir en-tete). */
         static int _bc = -1; static unsigned _bcn = 0;
         if (_bc < 0) _bc = calypso_gate("CALYPSO_BOOTCMD", 0);

@@ -273,8 +273,18 @@ void calypso_arm2dsp_on_dsp_step(C54xState *s, uint16_t exec_pc)
             if (a2d_bgen_a >= A2D_API_BASE && s->api_ram) {
                 s->api_ram[a2d_bgen_a - A2D_API_BASE] = a2d_bgen_val;
             }
+            /* [2026-08-03] BUG CORRIGE : ecrivait a2d_bgen_val, pas a2d_bgen_val_c.
+             * data[0x098c] recevait donc la bonne valeur et api_ram[0x098c] la
+             * MAUVAISE — or dans la fenetre API (>= 0x0800) c'est api_ram que le DSP
+             * lit (calypso_c54x.c:2194). Consequence directe : poser
+             * CALYPSO_ARM2DSP_BGEN_VAL_C=0 — le remede documente en tete de ce
+             * fichier depuis le 29/07 — ne pouvait PAS fonctionner : la cellule que
+             * le DSP consulte restait a 1, et 0xde86 rebouclait indefiniment.
+             * Mesure du 03/08 (profil native_twl) : PHASE-SM-EA #3 100 000 a
+             * pc=0xde86 avec d[0x098c]=0x0001. La phase-SM n'atteint jamais 0xde9c,
+             * donc le DSP ne sort jamais du go-live vers le correlateur FB. */
             if (a2d_bgen_c >= A2D_API_BASE && s->api_ram) {
-                s->api_ram[a2d_bgen_c - A2D_API_BASE] = a2d_bgen_val;
+                s->api_ram[a2d_bgen_c - A2D_API_BASE] = a2d_bgen_val_c;
             }
             a2d_bgen_done = 1;
             a2d_bgen_posts++;

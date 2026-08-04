@@ -16,11 +16,11 @@ TMUX_RESUME="5 fenêtres : radio · coeur · ms · voix · shell"
 
 tmux_layout_premiere() {
     printf "tail -n 200 -F '%s/fake-trx.log' 2>/dev/null | stdbuf -oL tr -d '\\\\007' || sleep infinity" \
-           "${LOG_DIR:-/tmp/calypso/logs}"
+           "${LOG_DIR:-/root/calypso/logs}"
 }
 
 tmux_layout() {
-    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    local L="${LOG_DIR:-/root/calypso/logs}"
 
     tmux select-pane -t "$TMUX_SESSION:radio" -T \
         "fake_trx | commutateur de bursts UDP - remplace modem et RF" 2>/dev/null

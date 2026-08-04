@@ -102,7 +102,7 @@ MOD_ENABLED_IF[core]='[ -z "${MOD_DESC[stp]+x}" ] && [ -z "${MOD_DESC[hlr]+x}" ]
 
 : "${OSMO_CORE_STATUS:=${OSMOCOM_CFG:-/etc/osmocom}/status.sh}"
 : "${OSMO_CORE_START:=${OSMOCOM_CFG:-/etc/osmocom}/osmo-start.sh}"
-: "${OSMO_CORE_LOG:=${LOG_DIR:-/tmp/calypso/logs}/osmo-core.log}"
+: "${OSMO_CORE_LOG:=${LOG_DIR:-/root/calypso/logs}/osmo-core.log}"
 # Ports VTY, tels que déclarés dans l'en-tête de osmo-start.sh.
 : "${OSMO_VTY_HLR:=4258}"
 : "${OSMO_VTY_MSC:=4254}"

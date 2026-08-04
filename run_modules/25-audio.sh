@@ -6,7 +6,7 @@
 #    Lever le démon PulseAudio système, créer le sink `gsm_audio`, puis lancer
 #    osmo-gapk qui transcode le RTP du MGW vers ce sink. Reprend, sans les
 #    réécrire, ensure_pulse / ensure_gapk / ensure_host_audio de
-#    start-direct.sh.legacy (L566-722), extraites dans osmo-nitb-for-calypso/lib/audio.sh.
+#    start-direct.sh.legacy (L566-722), extraites dans osmo_egprs/lib/audio.sh.
 #
 #  ------------------------------------------------------------------ POURQUOI
 #
@@ -64,7 +64,7 @@ _audio_gapk_vivant() {
 
 mod_audio_check() {
     if [ ! -r "$AUDIO_LIB" ]; then
-        mod_hint "la bibliothèque est l'extraction de start-direct.sh.legacy L566-722 ; elle accompagne osmo-nitb-for-calypso"
+        mod_hint "la bibliothèque est l'extraction de start-direct.sh.legacy L566-722 ; elle accompagne osmo_egprs"
         mod_skip "bibliothèque audio absente ($AUDIO_LIB) : pont audio non monté"
         return $MOD_RC_SKIP
     fi

@@ -6,8 +6,8 @@
  *
  * Configuration :
  *   CALYPSO_DMA=1            active le module (défaut OFF)
- *   CALYPSO_DMA_VEC_BASE=23  vecteur de DMAC0 (défaut 23 = IMR bit 7 + 16,
- *                            formule de calypso_c54x.h)
+ *   CALYPSO_DMA_VEC_BASE=30  vecteur de l'IT DMA (defaut 30 = INT10n = IMR
+ *                            bit 14 + 16, CAL000 §5.1 ; partage par les 4 canaux)
  *   CALYPSO_DMA_MAX_MOTS=…   garde-fou par transfert (défaut 4096)
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -21,7 +21,13 @@
 int calypso_dma_actif = -1;   /* -1 = à initialiser au premier accès */
 
 static int      g_init;
-static int      g_vec_base = 23;      /* DMAC0 ; DMACn = base + n */
+/* [2026-08-03] CORRIGE d'apres CAL000 §5.1. AVANT : 23, au motif « DMAC0 =
+ * IMR bit 7 + 16 » — c'est la table du C54x GENERIQUE (SPRU131). Sur Calypso le
+ * bit 7 est INT4n = MCSI TRANSMIT, et il n'existe pas de vecteurs DMAC0..3 : le
+ * DSP ne voit qu'UNE ligne DMA, INT10n = bit 14 = vec 30. Les quatre canaux
+ * (§3.5.15) partagent donc ce meme vecteur ; le canal se lit dans les registres,
+ * pas dans le numero d'IT. */
+static int      g_vec_base = C54X_IT_DMA_VEC;   /* INT10n, partage par les 4 canaux */
 static unsigned g_max_mots = 4096;
 static unsigned g_log;
 
@@ -176,13 +182,12 @@ void calypso_dma_tick(C54xState *s)
         if (g_log < 40) {
             g_log++;
             fprintf(stderr, "[dma] canal %u TRANSFÉRÉ %u mots 0x%04x -> 0x%04x, "
-                    "interruption DMAC%u (vec %d, IMR bit %d)\n",
-                    c, n, src, dst, c, g_vec_base + (int)c,
-                    g_vec_base + (int)c - 16);
+                    "interruption DMA INT10n (canal %u, vec %d, IMR bit %d)\n",
+                    c, n, src, dst, c, g_vec_base, g_vec_base - 16);
         }
 
-        /* Complétion : c'est CE signal qui manquait. DMACn = vec base+n,
-         * IMR bit = vec - 16 (formule de calypso_c54x.h). */
-        c54x_interrupt_ex(s, g_vec_base + (int)c, g_vec_base + (int)c - 16);
+        /* Completion : c'est CE signal qui manquait. §5.1 : ligne unique INT10n
+         * pour les 4 canaux, IMR bit = vec - 16 (formule de calypso_c54x.h). */
+        c54x_interrupt_ex(s, g_vec_base, g_vec_base - 16);
     }
 }

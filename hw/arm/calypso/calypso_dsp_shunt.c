@@ -110,6 +110,20 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
             setenv("CALYPSO_DSP_RUN_C54X", "1", 1);        /* lance le c54x en // */
         if (strstr(v, "NO_CANNED") || strstr(v, "no_canned"))
             setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);     /* mode sans cannes */
+        /* [2026-08-03] NO_CANNED EST DESORMAIS LE DEFAUT SOUS PARAPLUIE.
+         * Avant, il fallait l'ecrire : `CALYPSO_SHUNT_LEGIT=NO_CANNED`. Un simple
+         * `=1` (ou une surcharge CLI, l'idiome `:=` laissant la CLI gagner) faisait
+         * retomber le banc en mode canne SANS LE DIRE — c'est-a-dire avec des
+         * sorties DSP fabriquees (d_fb_det=1, TOA=23, PM/SNR=0x7000) qui masquent
+         * les echecs de decode. Le defaut sur = pas de valeur fabriquee.
+         * Seul un `=0` EXPLICITE re-canne ; une variable absente OU VIDE compte ici
+         * comme non posee (on ne peut pas distinguer "vide" de "declaree" dans les
+         * .env, cf. armdsp.env qui ecrit `: "${CALYPSO_SHUNT_NO_CANNED:=}"`). */
+        {
+            const char *nc = getenv("CALYPSO_SHUNT_NO_CANNED");
+            if (!nc || !*nc)
+                setenv("CALYPSO_SHUNT_NO_CANNED", "1", 1);
+        }
         setenv(keys[k], "1", 1);   /* canonicalise -> checks *e=='1' OK */
     }
     /* Manifeste de run : dump les CALYPSO_* EFFECTIVES (post value-list) en tete
@@ -332,9 +346,25 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
     if (g_shunt.d_task_md == PM_DSP_TASK)
         shunt_dispatch_pm(page_idx);
 
-    SHUNT_LOG("LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
-        page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
-        g_shunt.d_task_ra, g_shunt.d_fn);
+    /* [2026-08-03] meme traitement que DISPATCH SB : on n'imprime que les
+     * changements. 2 554 lignes sur 20 000 pour un contenu qui ne bouge pas. */
+    {
+        static uint32_t l_key = 0xFFFFFFFFu; static unsigned long long rep = 0;
+        uint32_t key = ((uint32_t)page_idx << 24)
+                     ^ ((uint32_t)g_shunt.d_task_md << 16)
+                     ^ ((uint32_t)g_shunt.d_task_d  << 8)
+                     ^ ((uint32_t)g_shunt.d_task_u)
+                     ^ ((uint32_t)g_shunt.d_task_ra << 12);
+        if (key != l_key) {
+            if (rep) SHUNT_LOG("LATCH × %llu (identique, non repete)\n", rep);
+            l_key = key; rep = 0;
+            SHUNT_LOG("LATCH page=%u task_md=%u task_d=%u task_u=%u task_ra=%u fn=%u\n",
+                page_idx, g_shunt.d_task_md, g_shunt.d_task_d, g_shunt.d_task_u,
+                g_shunt.d_task_ra, g_shunt.d_fn);
+        } else if (++rep % 2000 == 0) {
+            SHUNT_LOG("LATCH × %llu (identique, fn=%u)\n", rep, g_shunt.d_fn);
+        }
+    }
 }
 
 /* ---- Canned tuning ----
@@ -615,19 +645,28 @@ static void shunt_route_to_c54x_run(void)
             c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
         else
             c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
-        /* [2026-07-23] TINT0 MASTER CLOCK sync frame : fire TINT0 vec20/bit4 au
-         * MEME tick TDMA (pas per-2000-insn). Handler 0x72d3 = driver slots op. */
+        /* [2026-07-23] TINT MASTER CLOCK sync frame : fire TINT au MEME tick TDMA
+         * (pas per-2000-insn). Handler 0x72d3 = driver slots op.
+         * [2026-08-03] CAL000 §5.1 : TINT = bit3/vec19, pas bit4/vec20 (= RINT/SPI
+         * receive). Bascule sous le sas CALYPSO_IT_TABLE_DOC, cf. calypso_c54x.c. */
         {
             /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
              *              defaut OFF hors profil WIRE)
              *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
-             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT0
-             *             (vec20/bit4) a la cadence trame.
+             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT
+             *             a la cadence trame.
              *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
              */
             static int _t0m = -1;
             if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
-            if (_t0m) c54x_interrupt_ex(dsp, 20, 4);   /* TINT0 : vec20, IMR bit4 */
+            if (_t0m) {
+                static int _doc = -1;
+                if (_doc < 0) _doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
+                if (_doc)   /* §5.1 : TINT = IMR bit 3 / vec 19 */
+                    c54x_interrupt_ex(dsp, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+                else        /* legacy SPRU131 : en fait RINT / SPI receive */
+                    c54x_interrupt_ex(dsp, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);
+            }
         }
     }
     c54x_wake(dsp);
@@ -786,7 +825,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
          * demande explicitement PUBLISH_FB=1 — donc `legit=0` tuait tout le
          * bloc, transport COMPRIS (AFC ferme, a_pm, rx_toa). Mesure du 30/07 :
          *   [shunt] PUBLISH_FB = 1 (transport=0)
-         *   [fbsb]  fb0_att=13 sb_att=8 fb0_ret=0  api[](det=0 ...)
+         *   [fbsb]  fb0_att=13 sb_att=8  api[](det=0 ...)
+         * ([2026-08-03] le `fb0_ret=0` de cette trace est retire : compteur mort,
+         *  jamais incremente. C'est `api[](det=0)` qui portait la demonstration.)
          * L'hote ne publiait donc RIEN, alors que le profil promet « FB/SB =
          * TWL ». Le mobile recevait un SB (INJECT_SB -> BSIC=7) mais jamais de
          * detection FB, d'ou une reselection de cellule en boucle toutes les 10 s.
@@ -851,7 +892,9 @@ void calypso_dsp_shunt_on_frame_tick(void)
                  * mesuree le 30/07 en `native_twl` :
                  *     api[] (det=1 toa=23 pm=20929 ang=-186 snr=0x735b)
                  *     data[](det=0 toa=0  pm=0     ang=0    snr=0x0000)
-                 *     fb0_att=17  sb_att=9  fb0_ret=0
+                 *     fb0_att=17  sb_att=9
+                 * ([2026-08-03] `fb0_ret=0` retire de cette trace : compteur
+                 *  mort. La divergence api[]/data[] ci-dessus est la mesure.)
                  * L'hote a dit a l'ARM que la FB etait trouvee, et ne l'a JAMAIS
                  * dit au DSP : sa machine d'etat reste bloquee a l'etape FB,
                  * cherche 17 fois, et n'atteint jamais le CCCH — c'est-a-dire la
@@ -957,10 +1000,10 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 {
                     static int trf = -1, target = -60;
                     if (trf < 0) {
-                        const char *d = getenv("CALYPSO_TRF_RXLEV");
+                        /* [2026-08-03] cf. calypso_c54x.c : `=0` explicite doit couper. */
                         const char *l = getenv("CALYPSO_SHUNT_LEGIT");
                         const char *t = getenv("CALYPSO_TRF_TARGET_RF");
-                        trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                        trf = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                         if (t && *t) target = atoi(t);
                     }
                     if (trf) {
@@ -1696,6 +1739,7 @@ static void shunt_sch_read(void *opaque)
         g_shunt.sb_fn    = (uint32_t)fn;
         g_shunt.sb_toa   = (int16_t)toa;
         g_shunt.sb_valid = true;
+        g_shunt.sb_capture_fn = calypso_trx_get_fn();   /* horodatage : cf. fraicheur */
         static unsigned schlog = 0;
         if (first || schlog++ < 20 || (schlog % 200) == 0)
             SHUNT_LOG("SCH reel (gr-gsm): BSIC=%d "
@@ -2125,7 +2169,12 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          *             RIEN.
          */
         static int real_fb = -1;
-        if (real_fb < 0) { const char *e = getenv("CALYPSO_SHUNT_REAL_FB"); const char *dm = getenv("CALYPSO_DECAN"); real_fb = ((e && *e == '1') || (dm && dm[0] == '1')) ? 1 : 0; }  /* master DECAN implique REAL_FB */
+        /* [2026-08-03] `CALYPSO_SHUNT_REAL_FB=0` ne coupait pas quand DECAN=1 :
+         * un maitre a le droit d'IMPLIQUER un sous-gate, pas d'ECRASER un 0 pose a
+         * la main. DECAN devient le DEFAUT. */
+        if (real_fb < 0) { const char *dm = getenv("CALYPSO_DECAN");
+                           real_fb = calypso_gate("CALYPSO_SHUNT_REAL_FB",
+                                                  (dm && dm[0] == '1') ? 1 : 0); }
         if (real_fb) {
             int nc = n / 2;
             if (nc >= 8) {

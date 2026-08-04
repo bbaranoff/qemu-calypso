@@ -15,11 +15,11 @@ TMUX_RESUME="7 fenêtres : radio · coeur · dsp · asm · ms1 · voix · shell"
 
 tmux_layout_premiere() {   # commande de la fenêtre créée avec la session
     printf "tail -n 200 -F '%s/qemu.log' 2>/dev/null | stdbuf -oL tr -d '\\\\007' || sleep infinity" \
-           "${LOG_DIR:-/tmp/calypso/logs}"
+           "${LOG_DIR:-/root/calypso/logs}"
 }
 
 tmux_layout() {
-    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    local L="${LOG_DIR:-/root/calypso/logs}"
 
     # ── 1 · radio — la chaîne du téléphone émulé, de l'ARM jusqu'à l'antenne ─
     tmux select-pane -t "$TMUX_SESSION:radio" -T \

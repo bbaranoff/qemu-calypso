@@ -31,7 +31,7 @@ MOD_ENABLED_IF[ipc-device]='[ "${CALYPSO_SKIP_IPC_DEVICE:-0}" != "1" ]'
 : "${CALYPSO_IPC_DEVICE:=${QEMU_TOOLS:-${QEMU_TREE:-${QEMU_TREE}}/tools}/calypso-ipc-device/calypso-ipc-device}"
 : "${IPC_SOCK_DIR:=/tmp}"
 : "${IPC_MSOCK_PATH:=$IPC_SOCK_DIR/ipc_sock0}"
-: "${IPC_DEVICE_LOG:=${LOG_DIR:-/tmp/calypso/logs}/calypso-ipc-device.log}"
+: "${IPC_DEVICE_LOG:=${LOG_DIR:-/root/calypso/logs}/calypso-ipc-device.log}"
 # Paramètres du pont, repris tels quels du legacy (L1950). Idiome `:=` : une
 # valeur posée en ligne de commande ou par environnement/ gagne toujours.
 : "${CALYPSO_IPC_RELAY:=0}"

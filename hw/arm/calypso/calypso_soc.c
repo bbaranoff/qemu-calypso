@@ -37,6 +37,8 @@ CalypsoUARTState *g_uart_irda;
 #define CALYPSO_IRAM_SIZE     (256 * 1024)
 
 /* ---- Peripheral addresses ---- */
+#include "hw/arm/calypso/calypso_rhea_dma.h"
+
 #define CALYPSO_INTH_BASE     0xFFFFFA00
 #define CALYPSO_TIMER1_BASE   0xFFFE3800
 #define CALYPSO_TIMER2_BASE   0xFFFE3C00
@@ -65,6 +67,12 @@ static const MemoryRegionOps calypso_mmio8_ops = {
 
 static uint64_t calypso_mmio16_read(void *o, hwaddr a, unsigned s) { return 0; }
 static void calypso_mmio16_write(void *o, hwaddr a, uint64_t v, unsigned s) {}
+static const MemoryRegionOps calypso_rhea_dma_ops = {
+    .read = calypso_rhea_dma_read, .write = calypso_rhea_dma_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .impl = { .min_access_size = 2, .max_access_size = 2 },
+};
+
 static const MemoryRegionOps calypso_mmio16_ops = {
     .read = calypso_mmio16_read, .write = calypso_mmio16_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
@@ -378,7 +386,13 @@ static void calypso_soc_realize(DeviceState *dev, Error **errp)
     add_stub(sysmem, "calypso.mmio_f0xx",  0xFFFFF000, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.rhea",       0xFFFFF900, &calypso_mmio16_ops);
     add_stub(sysmem, "calypso.clkm",       0xFFFFFB00, &calypso_mmio16_ops);
-    add_stub(sysmem, "calypso.mmio_fcxx",  0xFFFFFC00, &calypso_mmio16_ops);
+    /* [2026-08-03] Le stub muet de 0xFFFFFC00 est remplace par le bloc de
+     * registres du controleur DMA RHEA (CAL207 §11). Il ne fait AUCUN transfert :
+     * il enregistre, restitue les valeurs de reset du doc et journalise chaque
+     * ecriture decodee. Motif : `DMA1_AAD` donne en clair l'adresse ou l'ARM
+     * demande que le burst RIF-RX soit depose — la seule facon de trancher
+     * 0x2a00 / 0x4c00 / fenetre API sans hypothese. Voir calypso_rhea_dma.c. */
+    add_stub(sysmem, "calypso.rhea_dma", CALYPSO_RHEA_DMA_BASE, &calypso_rhea_dma_ops);
     /* CNTL (EXTRA_CONF) - controls IRAM-at-zero mapping */
     memory_region_init_io(&s->cntl_iomem, OBJECT(dev), &calypso_cntl_ops, s,
                           "calypso.cntl", 0x100);

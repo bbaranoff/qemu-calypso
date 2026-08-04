@@ -38,7 +38,7 @@ MOD_ENABLED_IF[trx-ipc]='[ "${CALYPSO_SKIP_TRX_IPC:-0}" != "1" ]'
 
 : "${OSMO_TRX_IPC:=}"
 : "${OSMO_TRX_IPC_CFG:=}"
-: "${OSMO_TRX_IPC_LOG:=${LOG_DIR:-/tmp/calypso/logs}/osmo-trx-ipc.log}"
+: "${OSMO_TRX_IPC_LOG:=${LOG_DIR:-/root/calypso/logs}/osmo-trx-ipc.log}"
 : "${TRX_BASE_PORT:=5700}"
 
 _trxipc_trxd_up() {

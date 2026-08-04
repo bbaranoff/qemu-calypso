@@ -2,7 +2,7 @@
 # =============================================================================
 #  start-clean.sh — point d'entrée historique, conservé pour compatibilité
 # =============================================================================
-#  Appelé par osmo-nitb-for-calypso/start-direct.sh (mode « qemu ») et par l'habitude.
+#  Appelé par osmo_egprs/start-direct.sh (mode « qemu ») et par l'habitude.
 #
 #  Il ne fait plus rien lui-même : run.sh charge désormais la configuration
 #  (environnement/load.env) et construit son plan. Ce fichier reste pour que la

@@ -3,11 +3,11 @@
 # =============================================================================
 #
 #  RÔLE
-#    Substituer les jetons des gabarits d'osmo-nitb-for-calypso (__ENCRYPTION__, __MCC__,
+#    Substituer les jetons des gabarits d'osmo_egprs (__ENCRYPTION__, __MCC__,
 #    __MNC__, __KI__, __ARFCN__, __RCTX_*__ …) puis déposer le résultat dans
 #    /etc/osmocom, /etc/asterisk et ~/.osmocom/bb. Reprend, sans les réécrire,
 #    apply_config_templates + install_configs_native de start-direct.sh.legacy
-#    (L174-258), extraites dans osmo-nitb-for-calypso/lib/gabarits.sh.
+#    (L174-258), extraites dans osmo_egprs/lib/gabarits.sh.
 #
 #  ------------------------------------------------------------------ POURQUOI
 #
@@ -40,7 +40,7 @@
 #     personne ne consommerait serait un faux positif. Au-delà d'un opérateur,
 #     ce module échoue en le disant.
 #
-#  PRÉREQUIS : osmo-nitb-for-calypso présent (ses gabarits et sa bibliothèque), root.
+#  PRÉREQUIS : osmo_egprs présent (ses gabarits et sa bibliothèque), root.
 #  SUCCÈS    : cf. POURQUOI 3.
 #  JOURNAL   : $LOG_DIR/mod/gabarits.log
 # -----------------------------------------------------------------------------
@@ -76,12 +76,12 @@ _gab_installes() {
 
 mod_gabarits_check() {
     if [ ! -d "$EGPRS_DIR/configs" ]; then
-        mod_hint "posez EGPRS_DIR=<racine osmo-nitb-for-calypso> si l'arborescence a bougé"
-        mod_skip "osmo-nitb-for-calypso introuvable ($EGPRS_DIR) : les gabarits ne sont pas de ce dépôt"
+        mod_hint "posez EGPRS_DIR=<racine osmo_egprs> si l'arborescence a bougé"
+        mod_skip "osmo_egprs introuvable ($EGPRS_DIR) : les gabarits ne sont pas de ce dépôt"
         return $MOD_RC_SKIP
     fi
     if [ ! -r "$EGPRS_LIB" ]; then
-        mod_hint "la bibliothèque est l'extraction de start-direct.sh.legacy L174-258 ; elle doit accompagner osmo-nitb-for-calypso"
+        mod_hint "la bibliothèque est l'extraction de start-direct.sh.legacy L174-258 ; elle doit accompagner osmo_egprs"
         mod_fail "bibliothèque de gabarits absente : $EGPRS_LIB"
         return $MOD_RC_FAIL
     fi
@@ -103,7 +103,7 @@ mod_gabarits_status() { return $MOD_RC_FAIL; }
 
 mod_gabarits_start() {
     # Les fonctions extraites lisent `configs/*.cfg` et `scripts/*` en chemin
-    # RELATIF, comme dans l'original : on se place donc dans osmo-nitb-for-calypso, et on
+    # RELATIF, comme dans l'original : on se place donc dans osmo_egprs, et on
     # revient d'où l'on vient — le moteur n'a pas à hériter de ce cd.
     local retour="$PWD" rc=0
     cd "$EGPRS_DIR" || { mod_fail "impossible d'entrer dans $EGPRS_DIR"; return $MOD_RC_FAIL; }

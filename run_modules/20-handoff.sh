@@ -7,7 +7,7 @@
 #
 #          cd <arbre> && CALYPSO_SHUNT_LEGIT=1 CALYPSO_SHUNT_NO_CANNED=1 \
 #                        CALYPSO_SHUNT_REAL_FB=1 ./start-clean.sh
-#          et, côté osmo-nitb-for-calypso :   MODE=qemu ./start-direct.sh
+#          et, côté osmo_egprs :   MODE=qemu ./start-direct.sh
 #
 #      Le mode « qemu » de start-direct.sh ne fait qu'UNE chose : il se place
 #      dans l'arbre QEMU et fait `exec ./start-clean.sh`. Tout ce que
@@ -42,7 +42,7 @@
 #
 #  JOURNAL
 #      $LOG_DIR/mod/handoff.log : points d'entrée trouvés, arbre appelé par
-#      osmo-nitb-for-calypso, et la liste des CALYPSO_* qui franchiront la frontière.
+#      osmo_egprs, et la liste des CALYPSO_* qui franchiront la frontière.
 # -----------------------------------------------------------------------------
 MOD_REGISTER handoff "Raccord du point d'entrée historique"
 MOD_REQUIRED[handoff]=0
@@ -51,7 +51,7 @@ MOD_DEPS[handoff]="profil"
 MOD_PROFILES[handoff]="calypso faketrx hybrid core"
 MOD_TIMEOUT[handoff]=10
 
-# Arbre visé par osmo-nitb-for-calypso/start-direct.sh (QEMU_SRC y est codé en dur).
+# Arbre visé par osmo_egprs/start-direct.sh (QEMU_SRC y est codé en dur).
 : "${QEMU_SRC:=${QEMU_TREE}}"
 : "${HANDOFF_ENTREES:=start-clean.sh start-oqc.sh}"
 
@@ -62,7 +62,7 @@ mod_handoff_check() {
         p="$tree/$e"
         if [ ! -f "$p" ]; then manquantes="$manquantes $e"; continue; fi
         [ -x "$p" ] || { mod_hint "chmod +x $p"
-                         mod_fail "$e existe mais n'est pas exécutable : la chaîne osmo-nitb-for-calypso MODE=qemu échouerait"
+                         mod_fail "$e existe mais n'est pas exécutable : la chaîne osmo_egprs MODE=qemu échouerait"
                          return $MOD_RC_FAIL; }
         grep -q 'run\.sh' "$p" || {
             mod_hint "ce point d'entrée doit se terminer par :  exec ./run.sh \"\$@\""
@@ -97,7 +97,7 @@ mod_handoff_start() {
         mod_say "point d'entrée : ${QEMU_TREE}/$e"
     done
     if [ -e "$QEMU_SRC" ] && [ "$(cd "$QEMU_SRC" 2>/dev/null && pwd -P)" != "$(cd "${QEMU_TREE}" 2>/dev/null && pwd -P)" ]; then
-        mod_say "ATTENTION : osmo-nitb-for-calypso/start-direct.sh (MODE=qemu) lance $QEMU_SRC,"
+        mod_say "ATTENTION : osmo_egprs/start-direct.sh (MODE=qemu) lance $QEMU_SRC,"
         mod_say "            pas cet arbre (${QEMU_TREE}) — deux configurations parallèles."
     fi
     mod_say "--- réglages qui franchiront la frontière vers QEMU ---"

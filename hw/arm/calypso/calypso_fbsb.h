@@ -106,12 +106,16 @@ typedef struct CalypsoFbsb {
     uint16_t        *ndb;          /* points into ARM dsp_ram[] (word-addressed) */
     uint16_t         api_base;     /* DSP-side word base (0x0800) */
 
-    /* Per-attempt counters mirroring prim_fbsb.c. */
+    /* Per-attempt counters mirroring prim_fbsb.c. Ceux-ci sont REELLEMENT
+     * incrementes (calypso_fbsb_on_dsp_task_change). */
     uint8_t          fb0_attempt;
     uint8_t          fb1_attempt;
     uint8_t          sb_attempt;
-    uint8_t          fb0_retries;
-    uint8_t          afc_retries;
+    /* [2026-08-03] fb0_retries / afc_retries SUPPRIMES — meme defaut que les
+     * quatre champs last_* decrits juste dessous, et passe inapercu au meme
+     * menage : declares, remis a 0, imprimes, jamais incrementes. Le `fb0_ret=0`
+     * qui en sortait a ete cite comme mesure dans six endroits, dont
+     * doc/ETAT_ACTUEL.md §13.1. Detail : note dans calypso_fbsb_dump(). */
 
     /* [2026-07-29] Vue ARM. `ndb` pointe sur data[] cote DSP ; `api` pointe sur
      * api_ram, c est-a-dire ce que le firmware lit REELLEMENT (prim_fbsb.c

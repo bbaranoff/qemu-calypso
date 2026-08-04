@@ -92,7 +92,22 @@ done
 # SYNTHESE et PLAN_APPLICATION sans re-editer ce script a chaque nouveau rapport.
 # [2026-07-29] start-oqc.sh : point d'entrée du dépôt frère (osmo-nitb), appelé
 # par la documentation ; il vivait à la racine sans être suivi par l'overlay.
-ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md RAPPORT_*.md PLAN_*.md start-oqc.sh TODO.md}"
+# [2026-08-04] `tools/*.py` AJOUTE — les 11 outils d'analyse Calypso qui vivent a
+# la racine de tools/ (corr_iq.py, tic54x-dis.py, mailbox-annote.py, fcch_*.py,
+# gmsk_grgsm.py, iq_proxy.py, doppler.py, dsp_txt2bin.py, irda_capture.py,
+# mailbox-gdb.py) n'etaient couverts par RIEN : ADD_ROOTS ne liste que
+# `tools/calypso-ipc-device`, et la passe 1 ne voit que ce qui est deja tracke.
+# Un outil NOUVEAU restait donc hors overlay, hors image et hors ISO **sans aucun
+# message** — exactement le mode d'echec que la passe 2 avait ete ecrite pour
+# supprimer (les 102 fichiers du lanceur, cf. le commentaire du 29/07).
+#
+# ⚠️ POURQUOI UN GLOB ET PAS UNE RACINE `tools`. `tools/` n'est PAS 100 % Calypso :
+# il contient `ebpf/` et `i386/`, qui sont du QEMU vanilla. L'ajouter a ADD_ROOTS
+# ferait entrer du vanilla dans l'overlay et casserait le principe overlay+genuine.
+# Le glob ne prend que les `.py` de la RACINE de tools/, tous Calypso (verifie le
+# 04/08 : 11 fichiers, aucun vanilla). Si un jour QEMU livre un `tools/*.py`
+# vanilla, ce glob devra etre restreint a une liste explicite.
+ROOT_GLOBS="${CALYPSO_OVERLAY_ROOT_GLOBS:-calypso*.env QUICK_START.md run_results.md RAPPORT_*.md PLAN_*.md start-oqc.sh TODO.md tools/*.py}"
 for pat in $ROOT_GLOBS; do
     for f in $SRC/$pat; do
         [ -f "$f" ] || continue
@@ -100,8 +115,12 @@ for pat in $ROOT_GLOBS; do
         if (cd "$OVERLAY" && git ls-files --error-unmatch "$rel" >/dev/null 2>&1); then
             continue   # deja tracke -> passe 1
         fi
-        echo "  add   $rel  (racine)"
+        echo "  add   $rel"
         if [ "$DRY" = 0 ]; then
+            # [2026-08-04] mkdir -p ajoute : depuis que ROOT_GLOBS accepte un
+            # sous-repertoire (tools/*.py), la destination peut ne pas exister
+            # dans l'overlay. Sans ca, `cp` echouait et `set -e` tuait le script.
+            mkdir -p "$OVERLAY/$(dirname "$rel")"
             cp -a "$f" "$OVERLAY/$rel"
             (cd "$OVERLAY" && git add "$rel")
         fi

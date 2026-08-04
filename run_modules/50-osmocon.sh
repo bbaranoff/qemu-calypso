@@ -48,7 +48,7 @@ MOD_TIMEOUT[osmocon]=30          # legacy : 30 tentatives × 1 s (L1933-1936)
 # hériterait et croirait devoir l'ouvrir lui-même (cf. 05-config.sh, POURQUOI 4).
 : "${L1CTL_SOCK_PATH:=/tmp/osmocom_l2}"
 
-_osmocon_log() { printf '%s\n' "${LOG_DIR:-/tmp/calypso/logs}/osmocon.log"; }
+_osmocon_log() { printf '%s\n' "${LOG_DIR:-/root/calypso/logs}/osmocon.log"; }
 
 # `pgrep -f osmocon` attraperait aussi les « tail -F .../osmocon.log » de la
 # session tmux — la barrière voyait alors un tail et déclarait le service prêt.

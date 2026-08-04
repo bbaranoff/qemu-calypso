@@ -40,7 +40,7 @@ MOD_ENABLED_IF[bts]='[ "${CALYPSO_SKIP_BTS:-0}" != "1" ]'
 
 : "${OSMO_BTS_TRX:=}"
 : "${BTS_CFG:=${OSMOCOM_CFG:-/etc/osmocom}/osmo-bts-trx.cfg}"
-: "${BTS_LOG:=${LOG_DIR:-/tmp/calypso/logs}/bts.log}"
+: "${BTS_LOG:=${LOG_DIR:-/root/calypso/logs}/bts.log}"
 : "${OSMO_VTY_BTS:=4241}"
 
 mod_bts_check() {

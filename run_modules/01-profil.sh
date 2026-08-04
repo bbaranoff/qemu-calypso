@@ -36,7 +36,12 @@ MOD_PROFILES[profil]="calypso faketrx hybrid core"
 MOD_TIMEOUT[profil]=10
 
 # Profils connus — doit rester aligné sur le `case` de environnement/modes.env.
-: "${CONFIG_MODES_CONNUS:=empty none bare shunt_legit shunt_legit_no_inject native native_twl native_helped}"
+# ⚠️ [2026-08-03] CETTE LISTE EST LA TROISIÈME COPIE du même ensemble : il y a
+# aussi le `case` de environnement/modes.env et la ligne de `run.sh` (--configure).
+# Ajouter un mode dans le `case` seul ne suffit PAS — le garde-fou le rejette
+# avant, avec « CALYPSO_MODE inconnu », alors que le profil est bel et bien écrit.
+# Vécu le 03/08 en ajoutant native_twl_host_demod. Les trois doivent bouger ensemble.
+: "${CONFIG_MODES_CONNUS:=empty none bare shunt_legit shunt_legit_no_inject native native_twl native_twl_host_demod native_helped}"
 
 mod_profil_check() {
     local m="${CALYPSO_MODE:-}" connu=0 x

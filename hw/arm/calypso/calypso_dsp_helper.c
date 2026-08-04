@@ -165,6 +165,8 @@ uint32_t rp_base(uint8_t page_idx) {
 
 bool shunt_is_canned(unsigned bit) { return (g_canned & bit) != 0; }
 
+static uint16_t shunt_snr_val(void);   /* cf. @BEQUILLE SNR FABRIQUE, plus bas */
+
 /* [2026-07-22] Echo de d_burst_d pour RP_D_BURST_D. Le shunt echo le burst
  * COMMANDE (WP_D_BURST_D), mais l1s_nb_resp attend le burst DEMODULE (decale du
  * pipeline cmd->resp + toggle w_page/r_page) -> mismatch systematique +1
@@ -281,7 +283,7 @@ void shunt_dispatch_fb(uint8_t page_idx)
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : g_shunt.last_pm);
     shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
+    shunt_write_w(BASE_API_NDB + NDB_A_SYNC_DEMOD + D_SNR   * 2, shunt_snr_val());
 
     /* Ack on the read page (echo). Not strictly required for the FB path
      * (firmware reads d_fb_det from NDB, not read-page) but mirrors the
@@ -294,6 +296,50 @@ void shunt_dispatch_fb(uint8_t page_idx)
         SHUNT_CANNED_ANGLE, SHUNT_CANNED_SNR);
 }
 
+/* [2026-08-03] @BEQUILLE — SNR FABRIQUE  (CALYPSO_SHUNT_SNR_CANNED, defaut 1)
+ *
+ *   (1) C'EST UNE BEQUILLE : le SNR ecrit dans a_sync_demod / a_serv_demod n'est
+ *       PAS mesure. C'est la constante SHUNT_CANNED_SNR = 0x7000 — le meme mot que
+ *       celui repere dans le champ de puissance sous le nom des « 448 dBm », et qui
+ *       se trouve etre l'adresse de base de PROM0. Une adresse dans un champ de
+ *       grandeur physique.
+ *
+ *   (2) CE QU'ELLE MASQUE : le DSP n'ecrit jamais son propre SNR. Le raisonnement
+ *       d'origine — « gr-gsm a decode, donc le SNR etait forcement suffisant » —
+ *       est defendable ; ce qui ne l'est pas, c'est de le traduire par une
+ *       constante magique ET de la faire echapper a l'interrupteur prevu pour ca.
+ *
+ *   (3) LE DEFAUT CORRIGE ICI : l'expression etait
+ *           (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0
+ *       Le `|| sb_valid` ecrivait la valeur cannee des que gr-gsm avait decode,
+ *       SANS PASSER par CALYPSO_SHUNT_NO_CANNED. Mesure du 03/08, profil
+ *       native_twl avec NO_CANNED=1 et CALYPSO_CANNED vide : `snr=0x7000` present
+ *       dans data[] ET api[] a chaque releve, pendant que `pm` (20929/20595/19927)
+ *       et `ang` (-186/-710) variaient — eux sont reels. Un profil qui declare
+ *       « jamais de valeur fabriquee » en fabriquait une.
+ *
+ *   (4) QUAND LA RETIRER : quand le DSP ecrit a_sync_demod[D_SNR] lui-meme.
+ *
+ *   DEFAUT = 1 = comportement historique STRICTEMENT inchange. C'est deliberé :
+ *   le basculer pendant un bissect en cours melangerait deux variables. Poser
+ *   CALYPSO_SHUNT_SNR_CANNED=0 fait ecrire 0 a la place — a tester dans un run
+ *   DEDIE, parce qu'un SNR nul peut faire rejeter la SB et casser le camp en
+ *   shunt_legit. */
+static uint16_t shunt_snr_val(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = calypso_gate("CALYPSO_SHUNT_SNR_CANNED", 1);
+        if (!on)
+            fprintf(stderr, "[shunt] SNR_CANNED=0 : plus de SNR fabrique "
+                    "(0x%04x) — on ecrit 0. Le firmware peut rejeter la SB.\n",
+                    SHUNT_CANNED_SNR);
+    }
+    if (!on)
+        return 0;
+    return (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0;
+}
+
 /* ---- DISPATCH : SB writes READ PAGE only ---- */
 void shunt_dispatch_sb(uint8_t page_idx)
 {
@@ -302,7 +348,17 @@ void shunt_dispatch_sb(uint8_t page_idx)
      *             ici l'encodage vient du SCH decode par gr-gsm.
      *   retirer : quand le correlateur natif enchaine FB -> SB.
      */
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_SB"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF ; CALYPSO_INJECT_SB=1 OU CALYPSO_SHUNT_LEGIT=1 (option3: ecrit le SB au format db_r read-page natif) */
+    /* [2026-08-03] CONVERTI a calypso_gate — un `=0` EXPLICITE doit couper.
+     * Avant : `_ginj = (INJECT_SB=='1'); if (!_ginj) _ginj = (SHUNT_LEGIT=='1');`
+     * donc le parapluie ECRASAIT le 0 pose a la main : sous SHUNT_LEGIT=1 il etait
+     * IMPOSSIBLE d'eteindre l'injection SB, et un banc qui posait INJECT_SB=0 au
+     * manifeste mesurait quand meme le SB fabrique. C'est le bug corrige sur
+     * INJECT_ACD le 30/07 (cf. shunt_dispatch_allc juste en dessous) ; ce site-la
+     * etait reste en arriere. Desormais le parapluie n'est qu'un DEFAUT. */
+    { static int _ginj = -1;
+      if (_ginj < 0) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT");
+                       _ginj = calypso_gate("CALYPSO_INJECT_SB", (_l && *_l == '1') ? 1 : 0); }
+      if (!_ginj) return; }
     uint32_t rp = rp_base(page_idx);
 
     /* gr-gsm (= le DSP) a-t-il poste un vrai SCH (BSIC/FN reels via UDP 4731) ?
@@ -320,6 +376,50 @@ void shunt_dispatch_sb(uint8_t page_idx)
             SHUNT_LOG("SB: pas encore de SCH reel (gr-gsm) "
                     "-> pas de dispatch (no-canned, le firmware attend)\n");
         return;
+    }
+
+    /* ---- FRAICHEUR DE LA SB (2026-08-03) -----------------------------------
+     * DEFAUT CONSTATE : `sb_valid` ne redescend JAMAIS. Une fois qu'un seul SCH est
+     * arrive, ce dispatch republie indefiniment le MEME (bsic, fn, toa) a chaque
+     * tache SB, sur les deux pages de lecture. Mesure sur run sain : 7039 dispatches
+     * pour 690 FN distinctes (x10 de replay) — benin, la SB a ~10 trames d'age.
+     * Mesure sur un run degrade : `FN=20278` republie pendant que l'horloge trame
+     * atteignait 22534, soit ~2250 trames (~10 s) de peremption, SANS AUCUN SIGNAL.
+     * Le firmware recale son horloge sur cette FN a chaque re-sync : il se recale
+     * donc dans le passe, et decroche. Candidat direct au « ca marche puis on perd
+     * au bout de quelques secondes ».
+     *
+     * On mesure l'age TOUJOURS (diagnostic gratuit, plafonne). L'EXPIRATION, elle,
+     * est gatee : CALYPSO_SHUNT_SB_MAX_AGE=<trames>, absente/0 = comportement
+     * historique inchange. Quand elle est posee et l'age depasse, on ne dispatch
+     * PAS — le firmware voit « pas de SB » et continue de chercher, comme un vrai
+     * mobile, au lieu de recevoir une FN fausse. Meme philosophie que le no-canned
+     * juste au-dessus : un echec VISIBLE plutot qu'un succes fabrique.
+     * Valeur raisonnable : 104 (= 2 multitrames de 51, ~0,48 s ; le SCH arrive
+     * toutes les 10 trames en regime normal, la marge est large). */
+    if (g_shunt.sb_valid) {
+        static int max_age = -1;
+        if (max_age < 0) {
+            const char *e = getenv("CALYPSO_SHUNT_SB_MAX_AGE");
+            max_age = (e && *e) ? atoi(e) : 0;
+            if (max_age > 0)
+                SHUNT_LOG("SB-FRAICHEUR : peremption armee a %d trames "
+                          "(au-dela -> pas de dispatch, echec visible)\n", max_age);
+        }
+        uint32_t age = calypso_trx_get_fn() - g_shunt.sb_capture_fn;   /* wrap-safe */
+        int seuil = (max_age > 0) ? max_age : 104;   /* seuil de SIGNALEMENT */
+        if ((int)age > seuil) {
+            static unsigned stale_log = 0;
+            if (stale_log++ < 20 || (stale_log % 500) == 0)
+                SHUNT_LOG("SB PERIMEE : age=%u trames (SCH capture a trx_fn=%u, "
+                          "FN publiee=%u) — %s\n", age, g_shunt.sb_capture_fn,
+                          g_shunt.sb_fn,
+                          (max_age > 0) ? "PAS de dispatch (peremption armee)"
+                                        : "republiee quand meme (peremption NON armee, "
+                                          "poser CALYPSO_SHUNT_SB_MAX_AGE=104)");
+            if (max_age > 0)
+                return;
+        }
     }
 
     /* BSIC/FN : REELS (gr-gsm decode_sch) si dispo, sinon canned (legacy only).
@@ -353,14 +453,34 @@ void shunt_dispatch_sb(uint8_t page_idx)
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_TOA   * 2, shunt_toa_val());
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_PM    * 2, shunt_is_canned(CAN_PM)    ? SHUNT_CANNED_PM    : g_shunt.last_pm);
     shunt_write_w(rp + RP_A_SERV_DEMOD + D_ANGLE * 2, shunt_is_canned(CAN_ANGLE) ? SHUNT_CANNED_ANGLE : 0);
-    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, (shunt_is_canned(CAN_SNR) || g_shunt.sb_valid) ? SHUNT_CANNED_SNR : 0);
+    shunt_write_w(rp + RP_A_SERV_DEMOD + D_SNR   * 2, shunt_snr_val());
 
     /* Ack on read page. */
     shunt_write_w(rp + RP_D_TASK_MD, SB_DSP_TASK);
 
-    SHUNT_LOG("DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
-        page_idx, sb, bsic, fn,
-        g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
+    /* [2026-08-03] DEDUPE. Cette ligne pesait 62 % du journal QEMU (12 421 sur
+     * 20 000 lignes releves), pour 55 ko/s au total : tmux, qui est mono-thread,
+     * passait son temps a la rendre et le defilement devenait pateux.
+     *
+     * Le contenu est IDENTIQUE d'une trame a l'autre — c'est le meme SB republie
+     * (cf. la note « fraicheur de la SB » plus haut : ~10 rejeux par SCH). On
+     * n'imprime donc que ce qui CHANGE, plus un resume periodique pour garder la
+     * cadence visible. Aucune information n'est perdue : chaque SB distinct
+     * sort toujours. Diagnostic seul, zero effet sur le comportement. */
+    {
+        static uint32_t l_sb = 0xFFFFFFFFu; static uint8_t l_bsic = 0xFF;
+        static uint32_t l_fn = 0xFFFFFFFFu; static unsigned long long rep = 0;
+        if (sb != l_sb || bsic != l_bsic || fn != l_fn) {
+            if (rep)
+                SHUNT_LOG("DISPATCH SB × %llu (identique, non repete)\n", rep);
+            rep = 0; l_sb = sb; l_bsic = bsic; l_fn = fn;
+            SHUNT_LOG("DISPATCH SB page=%u → sb=0x%08x BSIC=%u FN=%u %s TOA=%d\n",
+                page_idx, sb, bsic, fn,
+                g_shunt.sb_valid ? "(gr-gsm REEL)" : "(canned legacy)", shunt_toa_val());
+        } else if (++rep % 2000 == 0) {
+            SHUNT_LOG("DISPATCH SB × %llu (meme SB rejoue, FN=%u)\n", rep, fn);
+        }
+    }
 }
 
 void shunt_dispatch_allc(uint8_t page_idx)
@@ -792,10 +912,12 @@ void shunt_dispatch_pm(uint8_t page_idx)
              */
             static int trf = -1, target = -60;
             if (trf < 0) {
-                const char *d = getenv("CALYPSO_TRF_RXLEV");
+                /* [2026-08-03] `CALYPSO_TRF_RXLEV=0` ne coupait pas sous
+                 * SHUNT_LEGIT=1 : le parapluie ecrasait un 0 explicite. Il
+                 * devient un DEFAUT (cf. calypso_c54x.c, meme correction). */
                 const char *t = getenv("CALYPSO_TRF_TARGET_RF");
                 const char *l = getenv("CALYPSO_SHUNT_LEGIT");
-                trf = ((d && *d == '1') || (l && *l == '1')) ? 1 : 0;
+                trf = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                 if (t && *t) target = atoi(t);
             }
             pm_val = trf ? calypso_trf6151_apm_for_rf(target) : SHUNT_CANNED_PM;

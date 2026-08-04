@@ -89,7 +89,7 @@ _fenetre_dsp() {
     #
     # Fenêtre séparée à dessein : ces deux vues méritent de la place, et les
     # écraser dans `radio` rendrait les quatre panes existants illisibles.
-    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    local L="${LOG_DIR:-/root/calypso/logs}"
     _w     dsp "mailbox x desassemblage | quelle instruction touche quelle cellule" \
         "while :; do clear; cat '$L/mail_dissam.log' 2>/dev/null || echo 'en attente du premier cycle...'; sleep 2; done" \
         "${C_RADIO:-}"
@@ -110,7 +110,7 @@ _fenetre_asm() {
     #
     # Le désassemblage est mis en cache par PC côté outil : une boucle serrée ne
     # coûte qu'une recherche, pas une par ligne.
-    local L="${LOG_DIR:-/tmp/calypso/logs}"
+    local L="${LOG_DIR:-/root/calypso/logs}"
     local T="${QEMU_TREE:-/opt/GSM/osmo-qemu-calypso}"
     _w     asm "croisement | cellule x instruction, agrege, rafraichi 2s" \
         "while :; do clear; cat '$L/mail_dissam.log' 2>/dev/null || echo 'en attente du premier cycle...'; sleep 2; done" \
@@ -121,7 +121,7 @@ _fenetre_asm() {
 }
 
 _fenetre_voix() {
-    local L="${LOG_DIR:-/tmp/calypso/logs}" O="${OSMO_LOG_DIR:-/var/log/osmocom}"
+    local L="${LOG_DIR:-/root/calypso/logs}" O="${OSMO_LOG_DIR:-/var/log/osmocom}"
     _w     voix "gapk | transcodage GSM-FR <-> PCM (actif pendant un appel)" \
         "$(_tail "'$L/gapk-auto.log'")" "$C_VOIX"
     _split voix "SIP | passerelle MNCC <-> SIP vers Asterisk" \

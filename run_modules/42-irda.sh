@@ -33,7 +33,7 @@ MOD_ENABLED_IF[irda]='[ "${CALYPSO_IRDA_PEER:-0}" = "1" ]'
 
 : "${IRDA_PEER:=${OSMOCOM_BB:-${GSM_ROOT}/osmocom-bb}/src/target/firmware/tools/irda_peer.py}"
 : "${IRDA_PTY_LINK:=/tmp/irda.pty.link}"
-: "${FW_IRDA_LOG:=${LOG_DIR:-/tmp/calypso/logs}/fw-irda.log}"
+: "${FW_IRDA_LOG:=${LOG_DIR:-/root/calypso/logs}/fw-irda.log}"
 
 mod_irda_check() {
     # Script absent = on IGNORE, on n'échoue pas : c'est un outil de debug
@@ -66,7 +66,7 @@ mod_irda_start() {
 
     IRDA_ROLE=primary IRDA_PTY="$IRDA_PTY_LINK" \
         python3 -u "$IRDA_PEER" \
-        >>"$FW_IRDA_LOG" 2>>"${LOG_DIR:-/tmp/calypso/logs}/irda_peer.stderr.log" </dev/null &
+        >>"$FW_IRDA_LOG" 2>>"${LOG_DIR:-/root/calypso/logs}/irda_peer.stderr.log" </dev/null &
     printf '%s\n' "$!" > "${RUN_DIR:-/tmp/calypso}/irda_peer.pid"
     mod_ok
 }
@@ -76,7 +76,7 @@ mod_irda_start() {
 # PROCESSUS, pas une durée.
 mod_irda_wait() {
     wait_until "${MOD_TIMEOUT[irda]}" "pair irda_peer.py" have_proc "irda_peer.py" || {
-        modb_tail "${LOG_DIR:-/tmp/calypso/logs}/irda_peer.stderr.log" 15
+        modb_tail "${LOG_DIR:-/root/calypso/logs}/irda_peer.stderr.log" 15
         mod_hint "python3 -u $IRDA_PEER à la main pour voir l'erreur d'import"
         mod_fail "irda_peer.py s'est arrêté immédiatement"
         return $MOD_RC_FAIL

@@ -33,7 +33,7 @@ MOD_TIMEOUT[bridge-py]=15
 MOD_ENABLED_IF[bridge-py]='[ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != "1" ]'
 
 : "${BRIDGE_PY:=${QEMU_TREE:-${QEMU_TREE}}/bridge.py}"
-: "${BRIDGE_LOG:=${LOG_DIR:-/tmp/calypso/logs}/bridge.py.log}"
+: "${BRIDGE_LOG:=${LOG_DIR:-/root/calypso/logs}/bridge.py.log}"
 : "${BRIDGE_BSP_IQ:=1}"
 _BRIDGE_PYTHON=""       # résolu par mod_bridge_py_check (lecture seule)
 

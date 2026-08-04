@@ -25,7 +25,7 @@
 #
 #  Ce fichier ne contient volontairement aucune logique : run.sh construit le
 #  plan à partir de run_modules/ et l'exécute. Les points d'entrée historiques
-#  (start-clean.sh, appelé par osmo-nitb-for-calypso/start-direct.sh) continuent de
+#  (start-clean.sh, appelé par osmo_egprs/start-direct.sh) continuent de
 #  fonctionner et aboutissent ici.
 # -----------------------------------------------------------------------------
 set -euo pipefail
