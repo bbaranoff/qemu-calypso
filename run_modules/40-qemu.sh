@@ -70,6 +70,45 @@ _qemu_save_head() {
     return 0
 }
 
+# ── ANNEAU DE LA TRACE ASM (CALYPSO_ASM = taille en Mo) ───────────────────────
+#
+# La trace `-d` de QEMU est colossale et n'a pas de plafond : quelques dizaines de
+# Mo par seconde avec `exec`. On garde donc une FENÊTRE GLISSANTE de la fin, qui
+# est la partie qu'on veut quand on cherche pourquoi ça vient de casser.
+#
+# POURQUOI PAS UNE FIFO. Le montage évident — QEMU écrit dans une FIFO, un lecteur
+# maintient l'anneau — a un défaut rédhibitoire ICI : si le lecteur décroche, la
+# FIFO se remplit et **QEMU BLOQUE EN ÉCRITURE**. Dans ce projet un gel de
+# quelques centaines de ms ne ralentit pas le modèle, il change le COMPORTEMENT
+# de la L1 (mêmes conséquences que le piège CALYPSO_DSP_YIELD). Une sonde qui
+# modifie ce qu'elle observe ne vaut rien. On écrit donc dans un fichier ordinaire
+# et on le tronque par l'extérieur : QEMU n'attend jamais.
+#
+# ⚠️ PIÈGE MESURÉ SUR CE MOTIF : après `: > fichier`, QEMU garde son descripteur
+# et son OFFSET. Les écritures suivantes atterrissent donc à l'ancien offset et
+# créent un TROU : la taille APPARENTE (`stat -c %s`) ne redescend jamais, alors
+# que l'occupation disque, elle, repart de zéro. Se garder sur %s ferait tourner
+# ce garde-fou en boucle dès la première rotation. On mesure donc les BLOCS
+# RÉELLEMENT ALLOUÉS (`stat -c %b`, unités de 512 o).
+#
+# Lecture du résultat : `cat qemu-asm.prev qemu-asm.log` — le .prev contient la
+# moitié la plus ancienne encore conservée, le .log la plus récente.
+_qemu_asm_ring() {
+    local f="$1" mo="$2" qpid="$3" n=0
+    local max_blocs=$(( mo * 1024 * 2 ))          # Mo -> blocs de 512 o
+    local garde_o=$(( mo * 1024 * 1024 / 2 ))     # on preserve la moitie
+    while kill -0 "$qpid" 2>/dev/null; do
+        if [ -f "$f" ] && [ "$(stat -c %b "$f" 2>/dev/null || echo 0)" -gt "$max_blocs" ]; then
+            tail -c "$garde_o" "$f" > "${f%.log}.prev" 2>/dev/null
+            : > "$f"
+            n=$((n+1))
+        fi
+        sleep 2
+    done
+    [ "$n" -gt 0 ] && printf '\n--- anneau asm : %d rotations de %s Mo ---\n' "$n" "$mo" >> "$f"
+    return 0
+}
+
 _qemu_log_guard() {
     local f="$1" max="$2" qpid="$3" n=0
     while kill -0 "$qpid" 2>/dev/null; do
@@ -121,12 +160,35 @@ mod_qemu_start() {
         mod_say "drapeaux : aucun (CALYPSO_ICOUNT=${CALYPSO_ICOUNT:-<vide>})"
     fi
 
+    # ── TRACE ASM (CALYPSO_ASM = taille de l'anneau en Mo, vide/0 = eteint) ──
+    # `-D` envoie la trace dans un fichier SEPARE, et c'est deliberé : melangee a
+    # qemu.log elle noierait les sondes du modele, qui ecrivent sur stderr.
+    #
+    # ⚠️ `in_asm` N'EST PAS UNE TRACE D'EXECUTION. QEMU ne vide un bloc de
+    # traduction qu'UNE FOIS, a l'instant ou il le traduit : une boucle executee
+    # un million de fois n'apparait qu'a sa premiere traduction. Pour suivre
+    # l'execution il faut `exec` ET `nochain` — sans `nochain` les blocs chaines
+    # s'enchainent sans repasser par le journal, et la trace ment par omission.
+    # D'ou le defaut `in_asm` (voir ce que le firmware contient) et la vanne
+    # CALYPSO_ASM_FLAGS pour demander autre chose en connaissance de cause.
+    local -a dflags=()
+    local asm_out=""
+    local asm_mo="${CALYPSO_ASM:-0}"
+    case "$asm_mo" in ''|*[!0-9]*) asm_mo=0 ;; esac
+    if [ "$asm_mo" -gt 0 ]; then
+        asm_out="${CALYPSO_ASM_OUT:-${LOG_DIR}/qemu-asm.log}"
+        : > "$asm_out"
+        dflags=(-d "${CALYPSO_ASM_FLAGS:-in_asm}" -D "$asm_out")
+        mod_say "trace asm : -d ${CALYPSO_ASM_FLAGS:-in_asm} -> $asm_out (anneau ${asm_mo} Mo)"
+    fi
+
     "$QEMU_BIN" -M "$mach" -cpu arm946 \
-        "${xflags[@]}" $gdbflag -serial pty -serial pty \
+        "${xflags[@]}" "${dflags[@]}" $gdbflag -serial pty -serial pty \
         -monitor "unix:${RUN_DIR}/qemu-monitor.sock,server,nowait" \
         -kernel "$FIRMWARE_ELF" >>"$qlog" 2>&1 &
     local qpid=$!
     printf '%s\n' "$qpid" > "${RUN_DIR}/qemu.pid"
+    [ -n "$asm_out" ] && _qemu_asm_ring "$asm_out" "$asm_mo" "$qpid" &
     _qemu_save_manifest "$qlog" "${LOG_DIR}/qemu-manifest.log" &
     _qemu_save_head     "$qlog" "${LOG_DIR}/qemu-tete.log" "${QEMU_LOG_HEAD:-8388608}" &
     _qemu_log_guard     "$qlog" "$QEMU_LOG_MAX" "$qpid" &

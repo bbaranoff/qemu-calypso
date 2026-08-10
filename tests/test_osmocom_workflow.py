@@ -34,7 +34,7 @@ INSIDE = os.path.exists("/.dockerenv")
 QEMU_SRC = "/opt/GSM/osmo-qemu-calypso"
 FW_ELF = os.environ.get(
     "FW_ELF",
-    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf")
+    "/opt/GSM/qemu-src/target/firmware/board/compal_e88/layer1.highram.elf")
 SIM_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_sim.c"
 SIM_H = f"{QEMU_SRC}/include/hw/arm/calypso/calypso_sim.h"
 TRX_C = f"{QEMU_SRC}/hw/arm/calypso/calypso_trx.c"

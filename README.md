@@ -1,143 +1,121 @@
 # QEMU-Calypso
 
-Fork de QEMU émulant le **baseband GSM TI Calypso** d'un téléphone Osmocom
-(Compal E88 / Motorola C1xx). Deux processeurs émulés tournent ensemble :
+Émulation du **baseband GSM TI Calypso** (Compal E88 / Motorola C1xx) sous QEMU.
+Deux cœurs tournent ensemble, reliés par la mailbox API RAM du vrai SoC :
 
-- **ARM946** — cœur QEMU (ARMv5TE) qui **modélise le vrai ARM7TDMI / ARMv4T** du
-  Calypso (choix assumé, cf. `hw/arm/calypso/calypso_mb.c:303`) ; exécute le firmware
-  [osmocom-bb](https://osmocom.org/projects/baseband) (Layer 1 temps réel).
-- **TMS320C54x** — exécute la **vraie mask-ROM DSP** de TI (FB/SB/démod).
+- **ARM** — exécute le firmware [osmocom-bb](https://osmocom.org/projects/baseband)
+  **d'origine, non patché** (Layer 1 temps réel).
+- **TMS320C54x** — exécute la **vraie mask-ROM DSP** de TI.
 
-Reliés par une **API RAM** MMIO (mailbox ARM↔DSP à `0xFFD00000`). En face, un cœur
-réseau Osmocom (BTS + fake_trx/osmo-trx + gr-gsm) fournit un vrai downlink GSM.
+À ma connaissance, aucun autre émulateur de baseband ne fait tourner à la fois le
+firmware constructeur non modifié *et* le DSP de couche 1. FirmWire (Shannon,
+MediaTek) émule le cœur applicatif et stubbe la L1 ; `virt_phy` d'osmocom-bb
+n'exécute aucun code ARM et injecte au-dessus de la couche 1. Ici les deux cœurs
+sont émulés et se parlent par la mailbox `0xFFD00000`.
 
-**Résultat (modes shunt)** : le mobile émulé **campe sur la cellule, effectue sa
-Location Update** (`LOCATION UPDATING ACCEPT`) et **fait des SMS MO/MT en A5/0**, via
-une chaîne host qui décode le downlink réel et alimente l'API RAM du DSP au format
-natif. Le mode **natif** (corrélateur DSP seul) reste en cours — voir la matrice
-statut × mode.
-
-**Nouveau (05/08/2026)** : en profil `native_twl`, la sonde `WATCH-ACD` remonte des
-écritures **opcode** du DSP dans `a_cd` (`data[0x09d2..0x09de]`, PC `0x9723` puis
-`0xa2c8`, répétées trame après trame). C'est le DSP qui décode le SI lui-même —
-le critère d'acceptation du profil est rempli. Voir §[Statut](#état--todo--done) ligne 16.
+> **Le firmware est interchangeable.** N'importe quel `layer1.highram.elf` issu de
+> l'arbre osmocom-bb boote sans adaptation — aucune version précise requise, aucun
+> patch. C'est le test qui distingue « j'émule la plateforme » de « j'ai fait
+> marcher *ce* binaire-là ». Voir [Vérifier soi-même](#vérifier-soi-même).
 
 ---
 
-## Liens
+## Où en est le projet, honnêtement
 
-| | |
-|---|---|
-| 📖 **Doc complète (bundle rendu)** | https://bastienbaranoff-calypso-qmd.share.connect.posit.cloud |
-| 📖 Doc `osmo_egprs` (le cœur réseau) | https://bastienbaranoff-osmo-egprs.share.connect.posit.cloud/ |
-| 💾 Dépôt émulateur | https://github.com/bbaranoff/qemu-calypso |
-| 💾 Dépôt cœur réseau | https://github.com/bbaranoff/osmo_egprs |
-| 📀 Release ISO | https://github.com/bbaranoff/osmo_egprs/releases/tag/main |
-| 🐳 Docker Hub | https://hub.docker.com/r/bastienbaranoff/free-bb |
-| 🚀 Installeur | https://pl4y.store/ |
-| 🎥 Démos | [vidéo 1](https://www.youtube.com/watch?v=0oXj8pyAHq0) · [vidéo 2](https://www.youtube.com/watch?v=XHZYM9Vl1hA) |
+Le statut **dépend entièrement du mode**, et c'est le point le plus important de ce
+README. Deux familles :
+
+| | qui acquiert FB/SB | qui décode les SI | ce que ça prouve |
+|---|---|---|---|
+| **shunt** | hôte | gr-gsm | la pile de bout en bout, jusqu'à l'audio. **Rien sur le DSP.** |
+| **natif** | DSP | DSP | la vérité sur l'acquisition. **Ne campe pas aujourd'hui.** |
+
+En famille **shunt**, le mobile campe sur la cellule, effectue sa Location Update
+(`LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`), fait du SMS MO et MT, et
+tient un TCH/F avec audio bidirectionnel.
+Mais dans ce mode c'est gr-gsm qui démodule : le firmware ARM tourne pour de vrai,
+le DSP non.
+
+En mode **natif**, le corrélateur mask-ROM s'exécute réellement (il atteint
+`0x8d00`, `DETECTOR-RUN @0x9ac0`, `d_fb_mode=1`) mais `d_fb_det[0x08f8]` reste à 0 :
+pas encore d'acquisition. Le buffer d'échantillons IQ du DSP n'est pas câblé au
+récepteur on-chip. C'est **le** chantier ouvert.
+
+**La voix (TCH/F) passe en `shunt_legit`, avec audio.** Le firmware d'origine traite
+l'`ASSIGNMENT COMMAND`, reconfigure sa L1, tient le canal et transporte des trames
+voix : le test d'écho (Asterisk, 600) renvoie un audio audible, ce qui prouve la
+boucle complète — encodage uplink, transport, décodage downlink, rendu. À lire avec
+la même réserve que le reste de la famille shunt : la démodulation du downlink est
+faite par gr-gsm, donc le résultat porte sur la pile L1/L2/L3 du firmware réel,
+**pas sur le DSP**. Non atteint en natif.
+
+Autre limite à connaître : l'ARM est modélisé par un cœur ARM946 (ARMv5TE) là où le
+Calypso a un ARM7TDMI (ARMv4T). Choix assumé, voir `hw/arm/calypso/calypso_mb.c:303`.
+
+### Matrice détaillée
+
+| # | Objectif | shunt | natif | preuve |
+|---|---|---|---|---|
+| 1 | FB/SB (sync) | ✅ | 🔧 WIP | `DISPATCH SB BSIC=7` ; natif : corrélateur tourne, `d_fb_det=0` |
+| 2 | RXLEV serving | ✅ | ✅ | `RLA_C -53 dBm`, C1/C2 > 0 |
+| 3 | Camp (C3) | ✅ | ⬜ | `normal service` |
+| 4 | Location Update | ✅ | ⬜ | `LOCATION UPDATING ACCEPT`, `On Network` |
+| 5 | SMS MO | ✅ | ⬜ | `SMS successful` (flaky en `DSP,NO_CANNED`) |
+| 6 | SMS MT | ✅ | ⬜ | `SMS from 777` / `SMS from 10002` |
+| 7 | Service tenu post-SMS | ✅ | ⬜ | `MM connection active → MM IDLE` |
+| 8 | Ctrl-C / re-camp | ✅ | ⬜ | reset L1 câblé (`d_dsp_page=0`) |
+| 9 | Union SDCCH SS0-7 (/4 + /8) | ✅ | — | LU quelle que soit la sous-voie |
+| 10 | Reset L1 câblé | ✅ | — | SI reprend + Ctrl-C recover |
+| 11 | FB-STREAM, entrée `0x9213/0x9215` | ✅ | ✅ | rampe relue par le démod |
+| 12 | **Voix (TCH/F)** | ✅ | ⬜ | audio en sortie sur le test d'écho (Asterisk 600) — boucle UL+DL complète ; démod DL par gr-gsm |
+| 13 | SMS MT occasionnel perdu | ⬜ | ⬜ | 1 `MMSMS_REL_IND` prématuré résiduel |
+| 14 | `d_fb_det` natif | — | ⬜ | corrélateur tourne, fenêtre + dispatch par-frame à finir |
+
+Source de vérité par mode :
+**[`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md)**. En cas de conflit entre
+docs, c'est lui qui prime.
 
 ---
 
-## Essayer sans rien builder
+## Démarrer
 
 ```bash
-# one-liner
-bash <(wget -qO- pl4y.store)
-```
-
-Ou pas-à-pas — ⚠️ **le `docker tag` n'est pas optionnel**, la stack cherche l'image
-sous le nom `osmocom-nitb` :
-
-```bash
-docker pull bastienbaranoff/free-bb
-docker tag  bastienbaranoff/free-bb osmocom-nitb
 git clone https://github.com/bbaranoff/osmo_egprs
 cd osmo_egprs
-sudo ./start.sh
+./build.sh
 ```
 
-Image GHCR alternative :
+Puis `osmo-nitb-for-calypso/start-direct.sh`. Build seul :
+`cd build && ninja qemu-system-arm`.
 
-```bash
-docker pull ghcr.io/bbaranoff/osmo_egprs:main
-```
+Détail des modes, commandes et vérifications :
+**[QUICK_START.md](QUICK_START.md)**.
 
-## Démarrage (depuis les sources)
+## Vérifier soi-même
 
-👉 **[QUICK_START.md](QUICK_START.md)** — build, lancer, modes, vérifications.
+Ce projet fait deux affirmations vérifiables en quelques minutes. Les deux sont
+faites pour être cassées :
 
-```bash
-cd build && ninja qemu-system-arm
-```
+**1. Le firmware est le vrai, non modifié.** Prenez un `layer1.highram.elf`
+construit depuis n'importe quel commit d'osmocom-bb, remplacez celui fourni,
+relancez. S'il ne boote pas, l'affirmation est fausse — ouvrez une issue.
 
-## 📊 Résultats chiffrés
+**2. Les ✅ shunt ne prouvent rien sur le DSP.** C'est écrit partout ici, mais
+vérifiez-le : passez en `CALYPSO_MODE=native`, le mobile ne campe pas.
 
-**[`run_results.md`](run_results.md)** — mesures reproductibles (profondeur ring,
-débits, temps LU, éviction), chaque chiffre confronté à une règle de décision.
-C'est là que se trouve le dur, pas dans les affirmations.
+## Résultats chiffrés
 
-**[`RAPPORT_DFBDET.md`](RAPPORT_DFBDET.md)** — enquête multi-agents sur la cause
-racine de `d_fb_det = 0` en mode natif : chaîne causale citée ligne à ligne,
-hypothèses écartées **avec leur preuve d'écartement**, test décisif à règle posée
-d'avance, et recoupement avec le firmware osmocom-bb réel. Diagnostic en lecture
-seule — rien n'a été corrigé sur la foi de ce rapport.
-
-## État — TODO / DONE
-
-> ⚠️ **Le statut DÉPEND DU MODE.** Les ✅ ci-dessous valent pour la **famille shunt**
-> (`SHUNT_LEGIT=1`, `SHUNT_NO_LEGIT=1`, ou la combinaison « SHUNT_LEGIT + DSP
-> natif + NO_CANNED » — ⚠️ **notation en prose, PAS une valeur** : posé
-> littéralement, `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` ne fait **rien du tout**.
-> Les 16 tests du modèle comparent `*e == '1'` et `calypso.env:19` teste
-> `= "1"` : toute autre valeur est fausse partout, et on croit tourner en
-> famille shunt alors qu'on est en natif nu. La combinaison se pose
-> aujourd'hui par `CALYPSO_MODE=shunt_legit_no_inject` ou `native_twl`,
-> qui la traduisent en gates individuelles — vérifié le 30/07) ; en mode
-> **natif** (`CALYPSO_NATIVE=1` / `NATIVE_HELPED`) plusieurs lignes sont WIP/TODO
-> (FB/SB, Camp, LU, SMS, Ctrl-C). **La vérité-terrain par mode est la
-> [matrice statut × mode d'`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md)** —
-> non dupliquée ici.
-
-| # | Objectif | Statut (famille shunt) | Détail / preuve |
-|---|---|---|---|
-| 1 | FB/SB (sync) | ✅ DONE · natif WIP | `DISPATCH SB BSIC=7` (gr-gsm réel) ; natif : corrélateur tourne mais `d_fb_det=0` |
-| 2 | RXLEV serving | ✅ DONE (tous modes) | `RLA_C -53 dBm`, C1/C2 > 0 |
-| 3 | Camp (C3) | ✅ DONE · natif TODO | `normal service` |
-| 4 | Location Update + registration | ✅ DONE · natif TODO | `LOCATION UPDATING ACCEPT` + `TMSI REALLOC COMPLETE`, `On Network` |
-| 5 | SMS MO (A5/0) | ✅ DONE · `DSP,NO_CANNED` flaky · natif TODO | passe du 1er coup, `SMS successful` |
-| 6 | SMS MT (A5/0) | ✅ DONE · `DSP,NO_CANNED` WIP · natif TODO | `SMS from 777` / `SMS from 10002` reçus (bidirectionnel) |
-| 7 | Service tenu post-SMS | ✅ DONE | `MM connection active → MM IDLE, normal service` |
-| 8 | Ctrl-C mobile / re-camp | ✅ DONE · natif TODO | reset L1 câblé (`d_dsp_page=0` API-RAM) |
-| 9 | Union SDCCH SS0-7 (/4 + /8) | ✅ DONE | UA présentée sur toute la région SDCCH → LU quelle que soit la sous-voie |
-| 10 | Reset L1 câblé (`shunt_latch_task`) | ✅ DONE | SI reprend + Ctrl-C recover (`CALYPSO_L1_RESET_WIRE=0` désactive) |
-| 11 | Value-list env (`DSP` / `NO_CANNED`) | ✅ DONE | `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` |
-| 12 | FB-STREAM + entrée native `0x9213/0x9215` | ✅ DONE | rampe relue par le démod (prouvé) |
-| 13 | **Voix (TCH/F)** | 🔧 WIP (tous modes) | `ASSIGNMENT COMMAND` atteint → `ASSIGNMENT FAILURE` (shunt ne présente pas le TCH DL) ; call `fake_trx` = ACTIVE + audio ⇒ réseau OK |
-| 14 | SMS MT occasionnel à la trappe | ⬜ TODO | 1 transaction `MMSMS_REL_IND` prématurée résiduelle |
-| 15 | `d_fb_det` natif (corrélateur DSP) | ⬜ TODO (natif) | corrélateur **tourne** (atteint `0x8d00`, DETECTOR-RUN `@0x9ac0`, `d_fb_mode=1`) mais `d_fb_det[0x08f8]=0` : reste fenêtre + dispatch par-frame |
-| 16 | **SI décodé par le DSP (`native_twl`)** | ✅ **DONE 05/08** | `WATCH-ACD DSP-opcode-write data[0x09d2..0x09de]` — deux sites ROM (`PC=0x9723` bloc complet, `PC=0xa2c8` affinage cellule par cellule), répétés par trame. `FEED_SI=0` + `INJECT_ACD=0` au manifeste ⇒ aucune porte gr-gsm vers `a_cd` |
-
-> Détails : [`QUICK_START.md`](QUICK_START.md), [`hw/arm/calypso/doc/ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md) (matrice par mode) et [`hw/arm/calypso/doc/TODO.md`](hw/arm/calypso/doc/TODO.md).
-
-### Comment on vérifie la ligne 16
-
-`WATCH-ACD` trace les écritures **opcode** dans `data[0x09D2..0x09E0]` = `a_cd`
-(`calypso_c54x.c:2535`, plafond 60 lignes). Une écriture opcode vient du DSP ; une
-écriture directe du shunt n'en est pas une — c'est exactement ce que la sonde
-distingue, et c'est pour ça qu'elle a été écrite. **Zéro est une réponse — négative —
-pas un échec de run.**
-
-```bash
-grep -a "WATCH-ACD" /root/qemu.log | head -10
-```
-
-⚠️ `WATCH_ACD` est une gate **`EXISTS`** : la poser à `0` **l'active**. Seul `unset`
-la coupe. Idem pour 9 autres sondes du lot — voir `ETAT_ACTUEL.md`.
+- **[`run_results.md`](run_results.md)** — mesures reproductibles (profondeur ring,
+  débits, temps LU, éviction), chaque chiffre confronté à une règle de décision
+  posée d'avance.
+- **[`RAPPORT_DFBDET.md`](RAPPORT_DFBDET.md)** — enquête sur la cause racine de
+  `d_fb_det = 0` en natif : chaîne causale citée ligne à ligne, hypothèses écartées
+  **avec leur preuve d'écartement**, test décisif à règle posée d'avance. Diagnostic
+  en lecture seule — rien n'a été corrigé sur la foi de ce rapport.
 
 ---
 
-## Architecture (résumé)
+## Architecture
 
 ```
    osmo-bts / fake_trx / osmo-trx  ──►  downlink GSM réel (I/Q 4 SPS)
@@ -145,97 +123,68 @@ la coupe. Idem pour 9 autres sondes du lot — voir `ETAT_ACTUEL.md`.
                     ┌─────────────────────┴───────────────────┐
                     │  QEMU-Calypso (machine `calypso`)        │
                     │                                          │
-                    │   ARM946 ◄──API RAM (0xFFD00000)──► DSP  │
-                    │   (osmocom-bb)                    (C54x) │
+                    │   ARM ◄────API RAM (0xFFD00000)────► DSP │
+                    │   (osmocom-bb, non patché)        (C54x) │
                     │        ▲                                 │
                     │        │ real_fb_read (intercept MMIO)   │
                     │   gr-gsm + twl3025/DECAN + trf6151       │
                     └──────────────────────────────────────────┘
-                                          │
-                                    camp + Location Update
 ```
 
-- **Chaîne host (opérationnelle, modes shunt)** : gr-gsm décode SB/SI, les modèles RF
-  (twl3025/DECAN, gain trf6151) produisent AFC/PM/rxlev, le tout injecté dans l'API RAM
-  → l'ARM campe.
-- **DSP natif** : vrai corrélateur mask-ROM ; son buffer d'échantillons IQ n'est pas
-  câblé au récepteur on-chip en QEMU. Point d'injection prouvé inscriptible =
-  `data[0x9213]/[0x9215]` (voir `CALYPSO_FB_STREAM`).
+**Chaîne host** (modes shunt) : gr-gsm décode SB/SI, les modèles RF (twl3025/DECAN,
+gain trf6151) produisent AFC/PM/rxlev, le tout injecté dans l'API RAM → l'ARM campe.
 
-### Ce que le shunt substitue exactement
+**DSP natif** : vrai corrélateur mask-ROM ; son buffer IQ n'est pas câblé au
+récepteur on-chip sous QEMU. Point d'injection prouvé inscriptible :
+`data[0x9213]/[0x9215]` (cf. `CALYPSO_FB_STREAM`).
 
-À ne pas confondre, et c'est la distinction qui rend les mesures lisibles :
-
-- **supplée un bloc absent** — TWL, transport, `feed_si`/`a_cd` : tient la place d'un
-  matériel ou d'un décodage que le DSP ne fait pas encore. Légitime, et nécessaire
-  pour mesurer autre chose.
-- **écrase un résultat** — `SHUNT_REAL_FB`, `rx_fb_det=1`, `INJECT_SB` canné : recopie
-  une valeur par-dessus celle que le DSP aurait produite. C'est **cela seul** qui
-  interdit de juger le corrélateur, et seulement sur la cellule concernée.
-
-Le TWL3025 est **déjà appliqué en natif, sur l'entrée** (`calypso_bsp.c:1595`, hors
-de toute garde de shunt) : le corrélateur natif reçoit des échantillons corrigés en
-AFC/phase. Ce que `SHUNT_LEGIT` ajoute n'est pas le front analogique — c'est le
-**verdict**.
-
-**Règle de lecture, unique** : `data[]` = ce que le DSP a écrit ; `api[]` = ce que
-l'hôte a écrit. Aucun jugement sur le corrélateur ne se prend sur `api[]`.
-
-## Composants clés (`hw/arm/calypso/`)
+### Composants (`hw/arm/calypso/`)
 
 | Fichier | Rôle |
 |---|---|
 | `calypso_c54x.c` | Cœur DSP TMS320C54x (décodeur ISA, MMIO, IT) |
-| `calypso_dsp_shunt.c` | Chaîne host FBSB : real_fb_read, feed_iq, feed_si, injections |
+| `calypso_dsp_shunt.c` | Chaîne host FBSB : real_fb_read, feed_iq, feed_si |
 | `calypso_bsp.c` | BSP : livraison bursts DARAM, tee IQ, BRINT0 |
-| `calypso_trx.c` | Horloge/FN, mirroir MMIO ARM↔DSP |
-| `calypso_arm2dsp.c` | Pont ARM→DSP (go-live, d_ctrl_system) |
-| `calypso_tpu.c` / `calypso_tsp.c` | Séquenceur TPU + protocole TSP (RF frontend) |
+| `calypso_trx.c` | Horloge/FN, miroir MMIO ARM↔DSP |
+| `calypso_arm2dsp.c` | Pont ARM→DSP (go-live, `d_ctrl_system`) |
+| `calypso_tpu.c` / `calypso_tsp.c` | Séquenceur TPU + protocole TSP (frontend RF) |
 
-## Configuration
+---
 
-### Profils (`CALYPSO_MODE=…`) — un profil dit QUI FAIT QUOI
+## Modes
 
-| profil | FB / SB (acquisition) | SI (décodage) | ce qu'il prouve |
+| profil | FB/SB | SI | ce qu'il prouve |
 |---|---|---|---|
-| `shunt_legit` | hôte | gr-gsm | la pile de bout en bout : camp, LU, SMS. Rien sur le DSP |
-| `native_twl` | hôte / TWL | **DSP** | **le DSP traite-t-il le SI ?** — ✅ oui depuis le 05/08 (`WATCH-ACD` non nul). On lui donne la synchro pour poser la question sans attendre le FB/SB natif |
+| `shunt_legit` | hôte | gr-gsm | la pile de bout en bout : camp, LU, SMS, TCH/F + audio out |
+| `native_twl` | hôte / TWL | **DSP** | le DSP traite-t-il le SI ? On lui donne la synchro pour poser la question sans attendre le FB/SB natif |
 | `native` | DSP | DSP | la vérité sur l'acquisition. Ne campe pas aujourd'hui |
 | `native_helped` | DSP, entrée reroutée | DSP | ⚠️ **sous béquille** — toute mesure prise ici doit être citée comme telle |
-| `empty` | rien de posé | rien de posé | construire un banc gate par gate ; neutralise `modes.env`, **et lui seul** |
+| `empty` | rien | rien | banc gate par gate ; neutralise `modes.env`, et lui seul |
 
-Le partage n'est pas « analogique vs numérique » mais **acquisition vs décodage** :
-
-```
-native_twl  ==  FB/SB = TWL (hôte)   |   SI = DSP
-native      ==  FB/SB = DSP          |   SI = DSP
-```
-
-Frontière à ne pas franchir sans changer de nom : **dès que les SI viennent de
-gr-gsm, on shunte le DSP — c'est `shunt_legit`**, pas un mode natif. Les deux
-seules portes sont `CALYPSO_SHUNT_FEED_SI` et `CALYPSO_INJECT_ACD` ;
+**Frontière à ne pas franchir sans changer de nom** : dès que les SI viennent de
+gr-gsm, on shunte le DSP — c'est `shunt_legit`, pas un mode natif. Les deux seules
+portes sont `CALYPSO_SHUNT_FEED_SI` et `CALYPSO_INJECT_ACD` ;
 `run_modules/01-profil.sh` proteste si elles sont rallumées sous un profil natif.
 
-Détail, critères de décision et commandes de vérification : **[QUICK_START.md
-§3bis](QUICK_START.md)**. Définitions exécutables : `environnement/modes.env`.
+### Piège connu : notation en prose ≠ valeur
+
+La combinaison « SHUNT_LEGIT + DSP natif + NO_CANNED » est une **description**, pas
+une valeur d'environnement. Posé littéralement,
+`CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED` **ne fait rien** : les 16 tests du modèle
+comparent `*e == '1'` et `calypso.env:19` teste `= "1"`. Toute autre valeur est
+fausse partout — on croit tourner en famille shunt alors qu'on est en natif nu.
+
+La combinaison se pose par `CALYPSO_MODE=shunt_legit_no_inject` ou `native_twl`,
+qui la traduisent en gates individuelles (vérifié le 30/07).
 
 ### Variables
 
-Tout se pilote par variables d'environnement `CALYPSO_*` (voir `calypso.env`, **toutes
-overridables en CLI**). Un profil ne pose que des `:=` : la CLI garde le dernier
-mot, et **la seule source de vérité sur ce qu'un run a réellement obtenu est le
-manifeste imprimé par le modèle**, jamais la ligne de commande. Lancement via
-`osmo-nitb-for-calypso/start-direct.sh` → `start-clean.sh` (source `calypso.env`) →
-`run.sh`.
+Tout se pilote par `CALYPSO_*` (voir `calypso.env`), **toutes overridables en CLI**.
+Un profil ne pose que des `:=` : la CLI garde le dernier mot, et **la seule source de
+vérité sur ce qu'un run a réellement obtenu est le manifeste imprimé par le
+modèle**, jamais la ligne de commande.
 
-⚠️ Trois pièges qui coûtent des heures :
-
-- `CALYPSO_NATIVE_HELPED=1` **n'est pas** le mode natif : c'est un paquet de béquilles
-  qui repose silencieusement `FB_CORR_ENTRY`, `FB_ENERGY`, `FB_IQ_DARAM`.
-- Les value-lists (`SHUNT_LEGIT=DSP,NO_CANNED`) sont parsées dans un **constructeur,
-  avant `main()`**, et créent des variables de toutes pièces par `setenv()`.
-- Retirer une variable de la ligne de commande ne la supprime pas si un profil ou
-  `CALYPSO_MODE` la repose. **Lire les lignes `[calypso-manifest]`, jamais la CLI.**
+---
 
 ## Documentation
 
@@ -243,39 +192,19 @@ Toute la doc vit sous `hw/arm/calypso/doc/`.
 
 | Doc | Contenu |
 |---|---|
-| **[ETAT_ACTUEL.md](hw/arm/calypso/doc/ETAT_ACTUEL.md)** | ⭐ **Source de vérité unique** : ce qui marche (par mode), l'architecture réelle, l'état du DSP natif, les fausses pistes. |
-| [QUICK_START.md](QUICK_START.md) | Build, lancer, modes, vérifications. |
-| [TODO.md](hw/arm/calypso/doc/TODO.md) | TODO consolidé (P0/P1/P2) — cadré par mode. |
-| [README.md (index doc)](hw/arm/calypso/doc/README.md) | Index de la doc courante sous `hw/arm/calypso/doc/`. |
-| [SHUNT_LEGIT_ADDRESS_MAP.md](hw/arm/calypso/doc/SHUNT_LEGIT_ADDRESS_MAP.md) | Mapping canonique des cellules DSP (data/api_ram), chaîne FB/SB/rxlev/a_cd. |
-| [DSP_ADDRESS_MAP.md](hw/arm/calypso/doc/DSP_ADDRESS_MAP.md) · [DSP_ARM_LINKAGE.md](hw/arm/calypso/doc/DSP_ARM_LINKAGE.md) | Cartes d'adresses DSP + correspondance ARM↔DSP (référence durable). |
-| [VOIX_PLAN.md](hw/arm/calypso/doc/VOIX_PLAN.md) | Plan d'implémentation voix (TCH/F) host-side — pour le TODO P1 « Voix ». |
-| [CALYPSO_HW.md](hw/arm/calypso/doc/CALYPSO_HW.md) · [hardware-map.md](hw/arm/calypso/doc/hardware-map.md) | Carte matérielle du SoC Calypso. |
-| [C54X_INSTRUCTIONS.md](hw/arm/calypso/doc/C54X_INSTRUCTIONS.md) · [opcodes/](hw/arm/calypso/doc/opcodes/) | Jeu d'instructions TMS320C54x (décodeur). |
-| [DSP_ROM_MAP.md](hw/arm/calypso/doc/DSP_ROM_MAP.md) | Carte de la mask-ROM DSP. |
-| [SERCOMM_GATE_ARCHITECTURE.md](hw/arm/calypso/doc/SERCOMM_GATE_ARCHITECTURE.md) | Canal Sercomm/L1CTL. |
-| [datasheets/](hw/arm/calypso/doc/datasheets/README.md) | PDF constructeur (TI SPRU, FreeCalypso). |
-| [archive/](hw/arm/calypso/doc/archive/README.md) | Doc historique (sessions datées, rapports d'étape, pistes closes). |
-
-> En cas de conflit entre docs, **`ETAT_ACTUEL.md` prime**.
-
-## Contribuer
-
-Les deux points où de l'aide extérieure débloquerait le plus :
-
-1. **Le dispatch du corrélateur FB dans la mask-ROM.** Les slots de handler de tâche
-   (`data[0x43c0]` / `[0x4387]` / `[0x43d8]`) résolvent vers le stub `0xab38` (un `RET`
-   nu = entrée de table vide) ou vers `0xf074` (base de LUT → déraille), au lieu du
-   pointeur handler FB énergie `0x94f5`. Le corrélateur énergie `0xa076` n'est donc
-   jamais sélectionné. ⚠️ Piste `0x43d8` **dépassée depuis le 03/08** — le dispatcher
-   vivant est `0xb05f`.
-2. **Le pont de contrôle ARM→DSP.** `d_ctrl_system` (`data[0x0810]`) et le shadow IMR
-   (`data[0x435b]`) ne sont jamais écrits. Conséquence mesurée : `0xa4c7` fait
-   `ORM #0x3000,IMR` (bit12/vec28 posé), puis la queue du scheduler `0xa509` fait
-   `STM #0x0010,IMR` et le retire → `IMR=0x0050` → frame IT masquée avant l'arrivée
-   d'IFR bit12. `CALYPSO_FORCE_IMR=0x3000` confirme le diagnostic (frame IT prise 90×
-   + démod NB réelle) — mais c'est une béquille, pas un correctif.
+| **[ETAT_ACTUEL.md](hw/arm/calypso/doc/ETAT_ACTUEL.md)** | ⭐ Source de vérité : ce qui marche par mode, l'architecture réelle, les fausses pistes |
+| [QUICK_START.md](QUICK_START.md) | Build, lancer, modes, vérifications |
+| [TODO.md](hw/arm/calypso/doc/TODO.md) | TODO consolidé (P0/P1/P2), cadré par mode |
+| [SHUNT_LEGIT_ADDRESS_MAP.md](hw/arm/calypso/doc/SHUNT_LEGIT_ADDRESS_MAP.md) | Mapping canonique des cellules DSP, chaîne FB/SB/rxlev/a_cd |
+| [DSP_ADDRESS_MAP.md](hw/arm/calypso/doc/DSP_ADDRESS_MAP.md) · [DSP_ARM_LINKAGE.md](hw/arm/calypso/doc/DSP_ARM_LINKAGE.md) | Cartes d'adresses DSP + correspondance ARM↔DSP |
+| [VOIX_PLAN.md](hw/arm/calypso/doc/VOIX_PLAN.md) | Plan d'implémentation TCH/F host-side |
+| [CALYPSO_HW.md](hw/arm/calypso/doc/CALYPSO_HW.md) · [hardware-map.md](hw/arm/calypso/doc/hardware-map.md) | Carte matérielle du SoC |
+| [C54X_INSTRUCTIONS.md](hw/arm/calypso/doc/C54X_INSTRUCTIONS.md) · [opcodes/](hw/arm/calypso/doc/opcodes/) | Jeu d'instructions TMS320C54x |
+| [DSP_ROM_MAP.md](hw/arm/calypso/doc/DSP_ROM_MAP.md) | Carte de la mask-ROM DSP |
+| [SERCOMM_GATE_ARCHITECTURE.md](hw/arm/calypso/doc/SERCOMM_GATE_ARCHITECTURE.md) | Canal Sercomm/L1CTL |
+| [datasheets/](hw/arm/calypso/doc/datasheets/README.md) | PDF constructeur (TI SPRU, FreeCalypso) |
+| [archive/](hw/arm/calypso/doc/archive/README.md) | Doc historique, pistes closes |
 
 ---
 
-*Basé sur QEMU. La documentation QEMU amont d'origine est conservée sous `docs/`.*
+*Basé sur QEMU. La documentation amont d'origine est conservée sous `docs/`.*

@@ -40,7 +40,8 @@ KNOWN_BUSY_LOOPS = [
 
 # Path firmware ELF pour résoudre rxDoneFlag via nm.
 FW_ELF_CANDIDATES = [
-    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf",
+    "/opt/GSM/qemu-src/target/firmware/board/compal_e88/layer1.highram.elf",
+    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf",   # repli : depot d artefacts
     os.environ.get("FW_ELF", ""),
 ]
 

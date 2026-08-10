@@ -101,6 +101,67 @@ static L1CTLSock g_l1ctl;
 volatile uint32_t g_last_rach_conf_fn = 0;
 volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
 extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
+extern void calypso_dsp_shunt_set_dcch(int kind, int ss);  /* fenetre SDCCH du shunt */
+extern void calypso_dsp_shunt_set_dcch_active(int on);     /* garde SI pendant le dedie */
+extern int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33); /* sonde TCH-DL */
+
+/* ---- SONDE CALYPSO_TCH_DL_PROBE : les octets FR qui partent VRAIMENT ---------
+ *
+ * Confronte les 33 octets de voix d'un TRAFFIC_IND a l'anneau des trames que le
+ * shunt a reellement ecrites dans a_dd_0 (cf. le commentaire de la sonde dans
+ * calypso_dsp_shunt.c). Repond a UNE question : le firmware relaie-t-il ce qu'on
+ * lui donne, ou autre chose ?
+ *
+ * Cadrage : TRAFFIC_IND = l1ctl_hdr(4) + l1ctl_info_dl(12) + data(33) = 49, ce
+ * que confirme le `len=49` deja journalise. On ne touche a rien si la taille
+ * n'est pas celle-la — une sonde qui devine son cadrage ne prouve rien.
+ *
+ * Compteurs CUMULATIFS (jamais un taux : cf. les deux chiffres faux annonces le
+ * 09/08 en divisant des `grep -c` sur un journal bufferise). */
+static void l1ctl_tch_dl_probe(const uint8_t *payload, int plen)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("CALYPSO_TCH_DL_PROBE");
+        on = (e && *e == '1') ? 1 : 0;
+        /* Une sonde muette est indecidable : elle s'annonce, dans les deux sens. */
+        L1CTL_LOG("SONDE TCH-DL-PROBE %s (CALYPSO_TCH_DL_PROBE)",
+                  on ? "ACTIVE" : "inactive");
+    }
+    if (!on || payload[0] != 0x1e /* L1CTL_TRAFFIC_IND */)
+        return;
+
+    static unsigned long long n = 0, ok = 0, bad = 0, mauvais_cadrage = 0;
+    n++;
+    if (plen != 49) {
+        mauvais_cadrage++;
+        if (mauvais_cadrage <= 3)
+            L1CTL_LOG("TCH-DL-PROBE : TRAFFIC_IND de %d o, attendu 49 "
+                      "(4 hdr + 12 info_dl + 33 FR) -- cadrage a reverifier "
+                      "avant toute conclusion", plen);
+    } else {
+        const uint8_t *fr = payload + 16;
+        int seq = calypso_dsp_shunt_tch_dl_written(fr);
+        if (seq >= 0) {
+            ok++;
+        } else {
+            bad++;
+            if (bad <= 5) {
+                char h[64];
+                int p = 0;
+                for (int i = 0; i < 12; i++)
+                    p += snprintf(h + p, sizeof(h) - p, "%02x ", fr[i]);
+                L1CTL_LOG("TCH-DL-PROBE ECART #%llu : sortant sig=0x%x [%s...] ne "
+                          "correspond a AUCUNE des 8 dernieres trames ecrites "
+                          "dans a_dd_0", bad, fr[0] >> 4, h);
+            }
+        }
+    }
+    if ((n % 250) == 0)
+        L1CTL_LOG("TCH-DL-PROBE : %llu TRAFFIC_IND -- identiques a a_dd_0 : %llu, "
+                  "differentes : %llu, cadrage inattendu : %llu",
+                  n, ok, bad, mauvais_cadrage);
+}
 
 /* ---- Sercomm helpers ---- */
 
@@ -254,8 +315,95 @@ static void sercomm_frame_complete(L1CTLSock *s)
             g_rach_conf_fn[g_last_recorded_ra] = g_last_rach_conf_fn;   /* per-ra : keye par le ra de la derniere RACH */
             L1CTL_LOG("FN-FIX: RACH_CONF fn=%u capture (memo mobile, ra=0x%02x)", g_last_rach_conf_fn, g_last_recorded_ra);
         }
+        /* ═══════════════════════════════════════════════════════════════════
+         * CANAL DEDIE COURANT -> /dev/shm/calypso_dcch_cfg  (2026-08-08)
+         *
+         * OU LE LIRE. Premiere tentative : depuis les IMM ASSIGN du CCCH, cote
+         * si_bridge. FAUX — le CCCH porte ceux de TOUS les abonnes (68 de
+         * RA=0x07, 12 de RA=0x0a pour un RACH a nous de RA=0x08) : la sous-voie
+         * active sautait 60 fois par run. Deuxieme tentative : DM_EST_REQ dans
+         * l1ctl_client_readable. FAUX AUSSI, et pour une raison structurelle
+         * documentee en tete de ce fichier : ce socket est INACTIF, osmocon
+         * detient /tmp/osmocom_l2 et relaie par le pty. Mesure : `RX←mobile` = 0
+         * occurrence sur tout le journal, alors qu'osmocon voit bien 6 DM_EST.
+         *
+         * ICI, en revanche, on est dans le sens firmware->mobile, qui est le
+         * SEUL flux L1CTL que QEMU parse reellement. DATA_CONF (0x0f) et
+         * DATA_IND (0x03) portent l1ctl_info_dl.chan_nr en payload[4], rempli
+         * par le firmware depuis SON ordonnanceur mframe : c'est donc bien le
+         * canal que NOTRE mobile utilise, pas celui d'un voisin.
+         *
+         * chan_nr (GSM 08.58 9.3.1) : 001SSTTT = SDCCH/4, 01SSSTTT = SDCCH/8.
+         * BCCH (0x80) / CCCH (0x90) / TCH (00001TTT) sont ignores ici.
+         * ═══════════════════════════════════════════════════════════════════ */
+        if ((payload[0] == 0x0f || payload[0] == 0x03) && plen >= 5) {
+            uint8_t chan_nr = payload[4];
+            int kind = -1, ss = 0;
+            if ((chan_nr & 0xE0) == 0x20)      { kind = 0; ss = (chan_nr >> 3) & 0x03; }
+            else if ((chan_nr & 0xC0) == 0x40) { kind = 1; ss = (chan_nr >> 3) & 0x07; }
+            static uint8_t last_chan_nr = 0xFF;
+            /* [2026-08-09] FRONT DE LIBERATION DU DEDIE, dans le sens que QEMU
+             * parse REELLEMENT. Premiere tentative : accrocher DM_REL_REQ (0x12)
+             * dans le bloc mobile->firmware plus bas. C'est du CODE MORT ici :
+             * le socket l1ctl de QEMU est orphelin (le mobile parle a osmocon),
+             * mesure « RX←mobile » = 0 occurrence sur tout le journal. Ce meme
+             * bloc porte aussi la remise a zero du Kc a chaque DM_EST/DM_REL —
+             * elle ne s'execute donc jamais non plus, a verifier avant d'activer
+             * l'A5/1.
+             * Ici on est dans DATA_CONF/DATA_IND, qui EST parse : quand chan_nr
+             * repasse sur du non-dedie (BCCH 0x80 / CCCH 0x90), le canal est
+             * termine et la garde SI doit se lever. Sans ce front, seule la
+             * peremption de 60 s la libere, et le camp reste prive de SI. */
+            /* [2026-08-09] REMANENCE, PAS UN FRONT. Version precedente : lever la
+             * garde des qu un chan_nr non-dedie passait. Mesure : 121 armements
+             * et 121 levees pour 2 canaux dedies — parce qu en dedie le mobile
+             * lit AUSSI les BCCH voisines pour ses mesures, donc chan_nr bascule
+             * sans arret. La garde clignotait et le camp reprenait la main entre
+             * deux blocs. On rafraichit donc sur chaque bloc DEDIE et on laisse
+             * la peremption faire la fermeture. */
+            /* [2026-08-09] LE DEDIE NE SE RESUME PAS AU SDCCH.
+             * `kind` ne vaut >= 0 que pour SDCCH/4 et SDCCH/8 : il sert a
+             * calculer la fenetre de presentation a_cd, qui n a de sens que la.
+             * Mais la GARDE, elle, doit tenir sur tout canal dedie -- TCH/F et
+             * TCH/H compris, dont le SACCH passe aussi par a_cd.
+             * Sans ca, pendant un appel voix kind restait -1 en permanence, la
+             * garde n etait jamais rafraichie, elle perimait au bout de 2 s et le
+             * camp reecrivait son SI dans a_cd. Mesure du 09/08 : 0 armement
+             * journalise, 121 peremptions, et 8 « Short header message type 0x07
+             * unsupported » en rafale reguliere PENDANT la communication.
+             * Codage GSM 08.58 du chan_nr (bits 7..3) :
+             *   00001TTT TCH/F | 0001xTTT TCH/H | 001..... SDCCH/4 | 01...... SDCCH/8 */
+            bool dedie = ((chan_nr & 0xF8) == 0x08)      /* TCH/F   */
+                      || ((chan_nr & 0xF0) == 0x10)      /* TCH/H   */
+                      || ((chan_nr & 0xE0) == 0x20)      /* SDCCH/4 */
+                      || ((chan_nr & 0xC0) == 0x40);     /* SDCCH/8 */
+            if (dedie) calypso_dsp_shunt_set_dcch_active(1);   /* rafraichit */
+            if (kind >= 0 && chan_nr != last_chan_nr) {
+                static uint32_t dcch_seq;
+                last_chan_nr = chan_nr;
+                dcch_seq++;
+                uint8_t b[16];
+                memset(b, 0, sizeof(b));
+                memcpy(b, &dcch_seq, 4);
+                b[4] = (uint8_t)kind; b[5] = (uint8_t)ss;
+                b[6] = chan_nr & 0x07; b[7] = chan_nr;
+                int dfd = open("/dev/shm/calypso_dcch_cfg",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (dfd >= 0) {
+                    if (write(dfd, b, sizeof(b)) < 0) { /* ignore */ }
+                    close(dfd);
+                }
+                L1CTL_LOG("DCCH #%u : chan_nr=0x%02x -> SDCCH/%d SS=%d TN=%u "
+                          "(vu sur %s)", dcch_seq, chan_nr, kind ? 8 : 4, ss,
+                          chan_nr & 0x07, l1ctl_tname(payload[0]));
+                /* La MEME verite pilote la fenetre de presentation a_cd du shunt,
+                 * qui suivait jusqu'ici les IMM ASSIGN des autres abonnes. */
+                calypso_dsp_shunt_set_dcch(kind, ss);
+            }
+        }
         L1CTL_LOG("TX→mobile: dlci=%d len=%d type=0x%02x %s", dlci, plen, payload[0],
                   l1ctl_tname(payload[0]));
+        l1ctl_tch_dl_probe(payload, plen);
         l1ctl_send_to_mobile(s, payload, plen);
     }
     /* Ignore other DLCIs (debug console, loader, etc.) */
@@ -351,7 +499,13 @@ static void l1ctl_client_readable(void *opaque)
             uint8_t algo = payload[8];
             uint8_t klen = payload[9];
             if (klen > 16) klen = 16;
-            if (10 + (int)klen <= msglen) {
+            /* [2026-08-08] GARDE SUR algo, parite avec l'ecrivain VIVANT
+             * (osmocon.c:1300). Ce chemin-ci est mort (osmocon detient
+             * /tmp/osmocom_l2 ; « RX<-mobile » = 0 occurrence mesuree), mais il
+             * ecrivait un seq NON NUL meme pour algo=0/klen=0 : un lecteur y
+             * verrait un Kc « present » et chiffrerait avec une cle nulle. Fusil
+             * charge pose sur la table — on met la securite. */
+            if (algo >= 1 && algo <= 3 && 10 + (int)klen <= msglen) {
                 static uint32_t kc_seq = 0;
                 uint8_t kbuf[32];
                 memset(kbuf, 0, sizeof(kbuf));
@@ -377,6 +531,11 @@ static void l1ctl_client_readable(void *opaque)
          * nouveau canal demarre EN CLAIR jusqu'a son propre CIPHER MODE COMMAND
          * (sinon un Kc perime chiffrerait la SABM du canal suivant). */
         if (payload[0] == 0x05 || payload[0] == 0x12) {   /* DM_EST_REQ / DM_REL_REQ */
+            /* ⚠️ CE BLOC EST MORT dans la configuration actuelle : « RX←mobile »
+             * ne compte 0 occurrence, le socket l1ctl de QEMU etant orphelin (le
+             * mobile parle a osmocon). La remise a zero du Kc ci-dessous ne
+             * s'execute donc JAMAIS — a verifier avant d'activer l'A5/1. La garde
+             * SI du dedie est branchee plus haut, sur DATA_CONF/DATA_IND. */
             int kfd = open("/dev/shm/calypso_kc",
                            O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (kfd >= 0) {
@@ -384,6 +543,7 @@ static void l1ctl_client_readable(void *opaque)
                 if (write(kfd, z, sizeof(z)) < 0) { /* ignore */ }
                 close(kfd);
             }
+
         }
 
         /* Wrap in sercomm and inject into UART RX */

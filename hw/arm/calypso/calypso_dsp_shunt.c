@@ -150,6 +150,49 @@ static void __attribute__((constructor)) shunt_env_value_list(void)
 static uint32_t g_rach_l1s_fn[256];
 volatile uint8_t g_last_recorded_ra = 0;   /* per-ra FN-FIX : ra de la derniere RACH (lu par l1ctl_sock.c) */
 static uint8_t  g_rach_l1s_valid[256];
+/* [2026-08-08] Fenetre de presentation du SDCCH, posee par la SOURCE AUTORITAIRE.
+ *
+ * g_shunt.sdcch_ss etait pose dans feed_agch, donc par N'IMPORTE QUEL IMM ASSIGN
+ * traversant le CCCH — y compris ceux destines aux autres abonnes (mesure du
+ * 08/08 : 68 IMM ASSIGN de RA=0x07 et 12 de RA=0x0a pour un RACH a nous de
+ * RA=0x08). La fenetre ou le shunt presente a_cd suivait donc le trafic des
+ * voisins, et le descendant du canal dedie tombait a cote.
+ *
+ * Appele depuis l1ctl_sock quand le FIRMWARE annonce son propre chan_nr
+ * (DATA_CONF / DATA_IND). kind : 0 = SDCCH/4 combine, 1 = SDCCH/8.
+ * Base DL fn%51 : /4 -> {22,26,32,36}[ss] ; /8 -> ss*4. */
+/* Declaration anticipee : set_dcch (plus bas) appelle set_dcch_active, defini
+ * seulement vers la ligne 833. Idiome du fichier, il n y a pas d en-tete. */
+void calypso_dsp_shunt_set_dcch_active(int on);
+void calypso_dsp_shunt_set_dcch(int kind, int ss);   /* -Werror=missing-prototypes */
+void calypso_dsp_shunt_set_dcch(int kind, int ss)
+{
+    static const uint8_t b4[4] = { 22, 26, 32, 36 };
+    uint8_t base = kind ? (uint8_t)((ss & 7) * 4) : b4[ss & 3];
+    /* [2026-08-09] LA GARDE S ARME AVANT LE RETOUR ANTICIPE.
+     * Elle etait posee plus bas, apres le « if inchange » : a la DEUXIEME
+     * ouverture d un dedie sur la MEME sous-voie, la fonction sortait avant de
+     * l atteindre et la fenetre restait ouverte. Mesure : mobile passe en dedie
+     * 2 fois, une seule ligne DCCH-WINDOW, 10 « 0x07 » toujours la.
+     * Cet appel signale une OUVERTURE de canal, pas un changement de sous-voie —
+     * la garde doit donc suivre l appel, pas la comparaison. */
+    g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;
+    /* [2026-08-09] On passe par set_dcch_active au lieu de poser le drapeau a
+     * la main : cet armement-ci etait MUET, d ou un compte de 0 armements pour
+     * 121 peremptions -- un silence indecidable. Une seule porte, qui journalise
+     * la transition. */
+    calypso_dsp_shunt_set_dcch_active(1);
+    if (g_shunt.sdcch_ss_set && g_shunt.sdcch_ss == base
+        && g_shunt.sdcch_ch8 == (kind != 0))
+        return;                                  /* sous-voie inchangee */
+    g_shunt.sdcch_ss     = base;
+    g_shunt.sdcch_ss_set = true;
+    g_shunt.sdcch_ch8    = (kind != 0);
+    SHUNT_LOG("DCCH-WINDOW : SDCCH/%d SS=%d -> presentation a_cd sur fn%%51 %u-%u "
+              "(source unique = chan_nr du firmware ; feed_agch n'y touche plus)\n",
+              kind ? 8 : 4, ss, base, base + 3);
+}
+
 void calypso_dsp_shunt_record_rach(uint8_t ra)
 {
     if (!g_shunt.active) return;
@@ -202,8 +245,261 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
     if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
 }
 
+static uint16_t shunt_pm_decan_apm(int fallback_target);   /* fwd : defini plus bas */
+
+/* Coherence interne des #define de repli (l'arithmetique NDB_W, pas l'accord
+ * avec le firmware — c'est le role du resolveur DWARF ci-dessous). */
+QEMU_BUILD_BUG_ON(!(NDB_W_CHECK));
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * OFFSETS NDB RESOLUS DU DWARF DU FIRMWARE VIVANT (2026-08-08)
+ *
+ * Un #define ne peut pas savoir que le firmware a ete recompile. Si la struct
+ * T_NDB_MCU_DSP bouge, QEMU ecrit A COTE **sans rien dire**, et le symptome
+ * sort tres loin en aval : le 2026-06-02, a_cd suppose a 0x1DC donnait
+ * num_biterr=0xff + CRC fail, et il a fallu des jours pour remonter jusqu'a
+ * l'offset. Le seul juge d'une struct est le binaire qui la contient.
+ *
+ * On lit donc les offsets au demarrage, dans le DWARF de l'ELF reellement
+ * charge (`-kernel`), via binutils-arm-none-eabi. Meme principe que
+ * shunt_fw_sym(), qui resout deja les SYMBOLES du firmware pour la meme raison
+ * — ceci en est le pendant pour les CHAMPS.
+ *
+ * Politique en cas d'echec : on GARDE les #define et on le DIT fort. Un repli
+ * silencieux redonnerait exactement le mode de panne qu'on cherche a tuer.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+struct ndb_offsets {
+    uint32_t a_cd, a_fd, a_dd_0, a_cu, a_fu, a_du_1;
+    bool     resolved;
+};
+static struct ndb_offsets g_ndb = {
+    .a_cd = NDB_A_CD, .a_fd = NDB_A_FD, .a_dd_0 = NDB_A_DD_0,
+    .a_cu = NDB_A_CU, .a_fu = NDB_A_FU, .a_du_1 = NDB_A_DU_1,
+    .resolved = false,
+};
+
+/* Adresse MOT dans c54x->data[] d'un offset NDB (version runtime de NDB_W). */
+static inline unsigned ndb_w(uint32_t off)
+{
+    return 0x0800u + ((0x01A8u + off) >> 1);
+}
+
+static void shunt_ndb_resolve_offsets(void)
+{
+    const char *elf = shunt_fw_elf_path();
+    if (!elf || !*elf) {
+        SHUNT_ERR("NDB-OFFSETS : chemin de l'ELF firmware inconnu -> offsets #define "
+                  "conserves (NON verifies contre le firmware)");
+        return;
+    }
+    const char *tool = getenv("CALYPSO_NDB_TOOL");
+    char toolbuf[1024];
+    if (!tool || !*tool) {
+        const char *tree = getenv("QEMU_TREE");
+        snprintf(toolbuf, sizeof(toolbuf), "%s/tools/ndb-offsets.py",
+                 (tree && *tree) ? tree : "/opt/GSM/qemu-src");
+        tool = toolbuf;
+    }
+    const char *readelf = getenv("CALYPSO_READELF");
+    if (!readelf || !*readelf) readelf = "arm-none-eabi-readelf";
+
+    char cmd[2600];
+    snprintf(cmd, sizeof(cmd), "python3 '%s' '%s' '%s' 2>/dev/null", tool, elf, readelf);
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        SHUNT_ERR("NDB-OFFSETS : popen(%s) impossible -> offsets #define conserves", tool);
+        return;
+    }
+    struct { const char *name; uint32_t *slot; uint32_t def; } map[] = {
+        { "a_cd",   &g_ndb.a_cd,   NDB_A_CD   },
+        { "a_fd",   &g_ndb.a_fd,   NDB_A_FD   },
+        { "a_dd_0", &g_ndb.a_dd_0, NDB_A_DD_0 },
+        { "a_cu",   &g_ndb.a_cu,   NDB_A_CU   },
+        { "a_fu",   &g_ndb.a_fu,   NDB_A_FU   },
+        { "a_du_1", &g_ndb.a_du_1, NDB_A_DU_1 },
+    };
+    int got = 0, diff = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), p)) {
+        char key[64]; unsigned val;
+        if (sscanf(line, "%63[^=]=0x%x", key, &val) != 2)
+            continue;
+        for (unsigned i = 0; i < ARRAY_SIZE(map); i++) {
+            if (strcmp(key, map[i].name))
+                continue;
+            *map[i].slot = val;
+            got++;
+            if (val != map[i].def) {
+                diff++;
+                SHUNT_ERR("NDB-OFFSETS : %s = 0x%03x dans le firmware, mais 0x%03x "
+                          "en dur dans le code — le DWARF fait foi, #define PERIME",
+                          map[i].name, val, map[i].def);
+            }
+        }
+    }
+    int rc = pclose(p);
+    if (got != (int)ARRAY_SIZE(map)) {
+        SHUNT_ERR("NDB-OFFSETS : %d/%zu champs resolus (rc=%d) -> offsets #define "
+                  "conserves pour les manquants. Verifier %s et %s sur %s",
+                  got, ARRAY_SIZE(map), rc, tool, readelf, elf);
+        return;
+    }
+    g_ndb.resolved = true;
+    /* La sonde s'annonce TOUJOURS, meme quand tout concorde : un silence ne doit
+     * jamais pouvoir passer pour une verification reussie. */
+    SHUNT_LOG("NDB-OFFSETS resolus du DWARF de %s : a_cd=0x%03x a_fd=0x%03x "
+              "a_dd_0=0x%03x a_cu=0x%03x a_fu=0x%03x a_du_1=0x%03x (%s)\n",
+              elf, g_ndb.a_cd, g_ndb.a_fd, g_ndb.a_dd_0, g_ndb.a_cu,
+              g_ndb.a_fu, g_ndb.a_du_1,
+              diff ? "DIVERGENCES ci-dessus" : "identiques aux #define");
+    /* Le chemin a_cd du camp ecrit data[0x9D2] en CONSTANTE LITTERALE (hors de
+     * ce resolveur). On ne le reecrit pas — il campe — mais on refuse qu'il
+     * derive en silence. */
+    if (ndb_w(g_ndb.a_cd) != 0x9D2u)
+        SHUNT_ERR("NDB-OFFSETS : a_cd resolu tombe sur data[0x%03x], or le bloc SI du "
+                  "camp ecrit data[0x9D2] EN DUR -> il ecrit desormais A COTE. "
+                  "Corriger ces litteraux avant de se fier au camp.",
+                  ndb_w(g_ndb.a_cd));
+}
+
+/* ---- TCH UL : trois sidebands, un par flux (2026-08-08) --------------------
+ *
+ * POURQUOI TROIS FICHIERS ET PAS UN SEUL AVEC UN CHAMP « TYPE ».
+ * FACCH, SACCH et voix coexistent sur le meme canal a des cadences differentes
+ * (voix 50/s, SACCH 1 bloc / 26 trames, FACCH sporadique). Dans un slot unique,
+ * la voix ecraserait la FACCH avant que le consommateur (un pread par trame)
+ * ne l'echantillonne — exactement la panne PUBLISH-NO-IDLE deja rencontree sur
+ * le sideband SDCCH, ou l'idle effacait la SABM. Un fichier par flux supprime
+ * la classe de panne au lieu de la filtrer.
+ *
+ * Layout 48 o des deux flux de signalisation : IDENTIQUE a calypso_sdcch_ul
+ * (seq@0 l1s_fn@4 fn@8 task_u@12 l1s%51@14 l2[23]@16) -> le consommateur reutilise
+ * le meme lecteur. Voix : 64 o, seq@0 l1s_fn@4 fn@8 fr[33]@16. */
+#define TCH_UL_FACCH_PATH  "/dev/shm/calypso_tch_facch_ul"
+#define TCH_UL_SACCH_PATH  "/dev/shm/calypso_tch_sacch_ul"
+#define TCH_UL_SPEECH_PATH "/dev/shm/calypso_tch_ul"
+
+static void tch_ul_publish_l2(const char *path, int *fdp, uint32_t *seq,
+                              const uint8_t *l2,
+                              uint16_t task_u, uint32_t fn, uint32_t l1s_fn)
+{
+    if (*fdp == -2) {
+        *fdp = open(path, O_CREAT | O_RDWR, 0644);
+        if (*fdp >= 0 && ftruncate(*fdp, 48) < 0) { /* best-effort */ }
+    }
+    if (*fdp < 0) return;
+    (*seq)++;
+    uint8_t buf[48] = {0};
+    memcpy(buf + 4,  &l1s_fn, sizeof(l1s_fn));
+    memcpy(buf + 8,  &fn,     sizeof(fn));
+    memcpy(buf + 12, &task_u, sizeof(task_u));
+    buf[14] = (uint8_t)(l1s_fn % 51);
+    memcpy(buf + 16, l2, 23);
+    memcpy(buf + 0,  seq, sizeof(*seq));   /* seq en dernier = publication atomique */
+    if (pwrite(*fdp, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
+}
+
+static void tch_ul_publish_speech(const uint8_t *fr, uint32_t fn, uint32_t l1s_fn)
+{
+    static int fd = -2;
+    if (fd == -2) {
+        fd = open(TCH_UL_SPEECH_PATH, O_CREAT | O_RDWR, 0644);
+        if (fd >= 0 && ftruncate(fd, 64) < 0) { /* best-effort */ }
+    }
+    if (fd < 0) return;
+    static uint32_t seq = 0; seq++;
+    uint8_t buf[64] = {0};
+    memcpy(buf + 4,  &l1s_fn, sizeof(l1s_fn));
+    memcpy(buf + 8,  &fn,     sizeof(fn));
+    memcpy(buf + 16, fr, 33);
+    memcpy(buf + 0,  &seq, sizeof(seq));
+    if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
+}
+
+/* Lit un bloc UL de 23 o de L2 a NDB+off (L2 a [3] = +6, la ou
+ * dsp_memcpy_to_api l'a ecrit — pas de fenetre a scanner ici, contrairement a
+ * a_cu sur SDCCH dont l'en-tete L1 SACCH decale la trame).
+ *
+ * CONSOMMATION. On efface B_BLUD apres lecture, comme le fait le DSP reel :
+ * le firmware ARME le bit a chaque nouveau bloc mais ne l'efface JAMAIS
+ * (prim_tch.c:443 et 495 posent (1<<B_BLUD), rien ne le retire). Sans effacement
+ * cote shunt, « bloc present » resterait vrai a vie et on republierait la meme
+ * trame a chaque trame TDMA : le premier ASSIGNMENT COMPLETE deviendrait un flux
+ * continu et on ne saurait plus distinguer une retransmission T200 reelle d'un
+ * echo. Effacer, c'est rendre la fraicheur DECIDABLE. */
+static bool shunt_ndb_take_ul(uint32_t ndb_off, uint8_t *out, int n)
+{
+    uint16_t *d = (g_shunt.c54x && g_shunt.c54x->data) ? g_shunt.c54x->data : NULL;
+    if (!d) return false;
+    unsigned w = ndb_w(ndb_off);
+    if (!(d[w] & (1u << B_BLUD)))
+        return false;                       /* pas de bloc neuf */
+    for (int i = 0; i < n; i += 2) {
+        uint16_t v = d[w + 3 + i / 2];
+        if (n == 33) {                      /* voix : BE=1 */
+            out[i] = (uint8_t)(v >> 8);
+            if (i + 1 < n) out[i + 1] = (uint8_t)(v & 0xff);
+        } else {                            /* L2 : BE=0 */
+            out[i] = (uint8_t)(v & 0xff);
+            if (i + 1 < n) out[i + 1] = (uint8_t)(v >> 8);
+        }
+    }
+    d[w] &= (uint16_t)~(1u << B_BLUD);      /* consomme */
+    return true;
+}
+
+/* Capture UL du canal dedie TCH, routee par d_task_u.
+ *   TCHT(13) -> a_fu   = FACCH montante  (ASSIGNMENT COMPLETE, puis L3 de l'appel)
+ *            -> a_du_1 = voix montante   (PIEGE #1 : sub0 lit a_du_1, pas a_du_0)
+ *   TCHA(14) -> a_cu   = SACCH montante  (rapports de mesure ; sans eux la BTS
+ *                                         declare une defaillance de lien radio)
+ *   TCHD(28) -> rien   (tache muette : RX-only, aucune donnee UL a relayer)
+ * Rend true si la tache a ete traitee ici (le chemin SDCCH ne doit alors pas
+ * tourner : il lirait a_cu avec la fenetre SDCCH et publierait sur le mauvais
+ * sideband — c'est ce que faisait le code du 27/07, 4804 fois par run). */
+static bool shunt_capture_tch_ul(uint16_t task_u)
+{
+    static int fd_facch = -2, fd_sacch = -2;
+    static uint32_t seq_facch = 0, seq_sacch = 0;
+    uint16_t t = task_u & 0x7FFF;
+    uint32_t fn = calypso_trx_get_fn(), l1s = shunt_l1s_fn();
+
+    if (t == TCHT_DSP_TASK) {
+        uint8_t l2[23], fr[33];
+        if (shunt_ndb_take_ul(g_ndb.a_fu, l2, 23)) {
+            tch_ul_publish_l2(TCH_UL_FACCH_PATH, &fd_facch, &seq_facch, l2, task_u, fn, l1s);
+            static unsigned n = 0;
+            if (n++ < 40 || (n % 50) == 0)
+                SHUNT_LOG("TCH-FACCH-UL #%u a_fu -> sideband : %02x %02x %02x %02x %02x %02x\n",
+                          n, l2[0], l2[1], l2[2], l2[3], l2[4], l2[5]);
+        }
+        if (shunt_ndb_take_ul(g_ndb.a_du_1, fr, 33)) {
+            tch_ul_publish_speech(fr, fn, l1s);
+            static unsigned n = 0;
+            if (n++ < 10 || (n % 500) == 0)
+                SHUNT_LOG("TCH-SPEECH-UL #%u a_du_1 -> sideband (sig=0x%x)\n", n, fr[0] >> 4);
+        }
+        return true;
+    }
+    if (t == TCHA_DSP_TASK) {
+        uint8_t l2[23];
+        if (shunt_ndb_take_ul(g_ndb.a_cu, l2, 23)) {
+            tch_ul_publish_l2(TCH_UL_SACCH_PATH, &fd_sacch, &seq_sacch, l2, task_u, fn, l1s);
+            static unsigned n = 0;
+            if (n++ < 40 || (n % 50) == 0)
+                SHUNT_LOG("TCH-SACCH-UL #%u a_cu -> sideband : %02x %02x %02x %02x %02x %02x\n",
+                          n, l2[0], l2[1], l2[2], l2[3], l2[4], l2[5]);
+        }
+        return true;
+    }
+    if (t == TCHD_DSP_TASK)
+        return true;                        /* tache muette : rien a relayer */
+    return false;                           /* pas du TCH -> chemin SDCCH */
+}
+
 static void shunt_poll_si_shm(void);                /* fwd : poll SI shm (gr-gsm→a_cd) */
 static bool shunt_grgsm_off(void);                  /* fwd : CALYPSO_SHUNT_NO_GRGSM */
+static void shunt_poll_tch_cfg(void);               /* fwd : /dev/shm/calypso_tch_cfg */
 
 /* ---- LATCH : called on ARM write to NDB+0 (d_dsp_page) ---- */
 /* [2026-07-30] ONE_PAGE — la page de lecture courante, et elle seule.
@@ -320,7 +616,17 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
      * DUL_DSP_TASK=12 en dédié), lire la L2 a_cu[3..] (23o @ NDB 0x264+6, octets
      * packés 2/mot) et la PUBLIER vers le sideband pour qemu_wrap (encode+module+
      * injecte). a_cu[0..2]=header. La L2 porte le SABM / SACCH meas / I-frames. */
-    if (g_shunt.d_task_u != 0) {
+    /* [2026-08-08] ROUTAGE PAR TACHE — le TCH d'abord.
+     * Avant : ce bloc lisait a_cu (0x264, fenetre SDCCH) pour TOUT d_task_u non nul.
+     * Sur canal dedie TCH, d_task_u vaut 13 (TCHT) ou 14 (TCHA) : la FACCH montante
+     * vit dans a_fu (0x282), pas dans a_cu — on lisait donc a cote, et on publiait le
+     * resultat sur le sideband SDCCH, qui l'injecte sur le slot SDCCH/4 SS0. Mesure du
+     * run 08/08 : 4804 latch task_u=13 et 200 task_u=14, pour 6 SDCCH-UL publies (tous
+     * task_u=12). L'ASSIGNMENT COMPLETE ne pouvait donc pas partir, et l'appel mourait
+     * en ASSIGNMENT FAILURE (cause #1) six secondes plus tard, MO comme MT. */
+    if (g_shunt.d_task_u != 0 && shunt_capture_tch_ul(g_shunt.d_task_u)) {
+        /* traite par le chemin TCH ; ne pas retomber sur la fenetre SDCCH */
+    } else if (g_shunt.d_task_u != 0) {
         uint8_t l2[23];
         /* a_cu UL : l'offset exact de la trame LAPDm varie (header L1 SACCH 2o /
          * type SABM-I-fill / packing) -> un offset fixe rate. On lit une FENETRE et
@@ -496,46 +802,531 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
         page_idx, task_d);
 }
 
+/* [2026-08-09] GARDE SI PENDANT L OUVERTURE D UN CANAL DEDIE.
+ *
+ * DEFAUT CORRIGE : le bloc SI du camp s ecrit dans a_cd a CHAQUE tick, garde par
+ * !sdcch_valid. Or sdcch_valid ne passe a vrai qu a la PREMIERE trame SDCCH
+ * decodee par gr-gsm — environ 480 ms apres l ouverture du canal. Pendant cette
+ * fenetre le mobile est DEJA en dedie : il lit les blocs SI, cadres BCCH, comme
+ * des SACCH. gsm48_rr_rx_acch() (osmocom-bb) ne distingue B4 de Bter QUE PAR LA
+ * LONGUEUR — 19 octets contre 21 — donc un bloc de 21 est pris pour un en-tete
+ * court et son msg_type est lu sur des bits arbitraires. D ou le
+ * « Short header message type 0x07 unsupported ».
+ *
+ * MESURE QUI L ETABLIT : 42 occurrences cote Calypso, 0 cote MS2 sur fake_trx
+ * (qui ne passe pas par le shunt) ; et zero pendant un TCH etabli — 70 blocs
+ * SACCH lus sans une erreur — parce que la, c est tch_cfg_valid qui garde.
+ * Le motif « hors appel oui, pendant l appel non » designe exactement le SDCCH.
+ *
+ * DUREE : du DM_EST_REQ au DM_REL_REQ. Le TTL n est plus la duree nominale mais
+ * un FILET DE SECURITE (~60 s) : si le DM_REL_REQ est manque, la garde se leve
+ * seule plutot que d affamer le camp en SI pour toujours — le defaut
+ * no-cell-info a deja ete paye une fois. CALYPSO_DCCH_SI_GUARD=0 la desactive
+ * entierement, une autre valeur change le filet (en ticks de 4,6 ms). */
+/* [2026-08-09] LES DEUX FRONTS DU CANAL DEDIE.
+ * Appele depuis l1ctl_sock.c sur DM_EST_REQ (0x05) et DM_REL_REQ (0x12), dans le
+ * sens mobile->firmware — le meme point qui remet deja le chiffrement a zero, donc
+ * un chemin exerce a chaque appel.
+ * POURQUOI DEUX FRONTS ET PAS UNE FENETRE. Premiere version : garde de 120 ticks
+ * a l ouverture. Mesure : les « 0x07 » tombent a +3, +5, +7 ... +16 s apres
+ * l entree en dedie, pas dans la premiere demi-seconde. Le camp ne clobbe pas
+ * seulement au demarrage : il clobbe dans TOUS les trous entre deux presentations
+ * SDCCH, parce que sdcch_valid retombe entre les blocs. Il faut donc tenir la
+ * garde du debut a la fin du canal, pas la temporiser. */
+/* prototype : voir la declaration anticipee en tete de fichier */
+void calypso_dsp_shunt_set_dcch_active(int on)
+{
+    if (on) {
+        bool was = g_shunt.dcch_guard_armed;
+        g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;   /* rafraichi a chaque bloc dedie */
+        g_shunt.dcch_guard_armed = true;
+        if (!was)                                      /* journaliser la TRANSITION seule :
+                                                        * une ligne par bloc noierait le journal
+                                                        * (121 paires mesurees en un run). */
+            SHUNT_LOG("DCCH-GARDE : ARMEE -- SI du camp supprime dans a_cd\n");
+    } else {
+        if (g_shunt.dcch_guard_armed)
+            SHUNT_LOG("DCCH-GARDE : levee -- SI du camp retabli\n");
+        g_shunt.dcch_guard_armed = false;
+    }
+}
+
+static bool shunt_dcch_si_guard(void)
+{
+    static int ttl = -1;
+    if (ttl < 0) { const char *e = getenv("CALYPSO_DCCH_SI_GUARD");
+                   ttl = (e && *e) ? atoi(e) : 430; }     /* ~2 s sans bloc dedie = canal termine */
+    if (ttl == 0 || !g_shunt.dcch_guard_armed) return false;
+    if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
+        g_shunt.dcch_guard_armed = false;      /* plus de bloc dedie depuis ttl : canal fini */
+        SHUNT_LOG("DCCH-GARDE : levee (peremption) -- SI du camp retabli\n");
+        return false;
+    }
+    return true;
+}
+
 /* ---- TCH/F DL (JALON 1) : sideband /dev/shm/calypso_tch_dl -> a_dd_0 ----
  * Producteur = qemu_wrap/gr-gsm (decode 8 bursts -> gsm0503_tch_fr_decode -> 33o FR) ou
  * l'injecteur de test (tone 600). Layout 48o : seq@0(u32 LE) fn@4(u32 LE) fr[33]@8.
  * Consume-once par seq (modele calypso_rach_read). */
+/* Sideband voix DL — ANNEAU de 16 trames (2026-08-08).
+ *
+ * POURQUOI UN ANNEAU. C'etait un SLOT UNIQUE : si_bridge y ecrit a 50 trames/s
+ * (le debit plein d'un TCH/F) et QEMU le relit au rythme de son tick. Toute
+ * irregularite du tick ecrase une trame avant lecture, DEFINITIVEMENT et SANS
+ * TRACE. Mesure du run 21:34 : 659 trames decodees par gr-gsm, 500 presentees
+ * dans a_dd_0, 491 TRAFFIC_IND -> ~25 % perdues dans le passage, soit ~37/s au
+ * lieu de 50/s. C'est exactement ce que l'oreille entend comme un son
+ * intermittent : la chaine est bonne, elle fuit au transfert.
+ *
+ * Layout : entete 8 o [w_seq(u32) | n_slots(u32)] puis 16 x 48 o, slot k =
+ * ((seq-1) % 16). Le producteur ecrit le slot PUIS publie w_seq (ordre
+ * important : un lecteur ne doit jamais voir un seq annonce dont le slot n'est
+ * pas encore ecrit). Compat : si le fichier fait 48 o (ancien format), on
+ * retombe sur le slot unique.
+ *
+ * PERTE COMPTEE, PAS DEDUITE : si le producteur a pris plus de 16 trames
+ * d'avance, on saute et on l'annonce avec un TOTAL CUMULATIF. Une perte
+ * silencieuse redeviendrait indiscernable d'un decodage incomplet en amont. */
+#define TCH_DL_RING_N 16
+#define TCH_DL_SLOT   48
+
+#define TCH_DL_Q_N 8
+/* [2026-08-09] MARGE ENTRE LE POLL ET LE DISPATCH.
+ * Le poll tourne a chaque tick de trame (~217/s), le dispatch ne consomme que
+ * sur les ticks TCHT (~50/s). Avec un emplacement unique, la moindre gigue
+ * faisait tomber le dispatch sur du vide : 20 ms de voix perdus, gapk prive de
+ * bloc, sa sortie ALSA en famine. C'est ce qui rendait le patch de
+ * dimensionnement gapk necessaire — il compensait EN AVAL un manque de marge
+ * cree ICI. Quelques trames d'avance suffisent a l'absorber.
+ * On ne re-presente JAMAIS une trame consommee (cf. la consommation unique du
+ * 08/08) : on en garde d'avance, ce qui est different d'un doublon.
+ * CALYPSO_TCH_DL_PREFETCH=1 retablit le comportement d'un seul emplacement. */
+static int shunt_tch_dl_prefetch(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CALYPSO_TCH_DL_PREFETCH");
+                 v = (e && *e) ? atoi(e) : 4;
+                 if (v < 1) v = 1;
+                 if (v > TCH_DL_Q_N) v = TCH_DL_Q_N; }
+    return v;
+}
+static unsigned shunt_tch_dl_qdepth(void)
+{ return g_shunt.tch_dl_q_tail - g_shunt.tch_dl_q_head; }
+static void shunt_tch_dl_qpush(const uint8_t *fr, uint32_t seq)
+{
+    unsigned i = g_shunt.tch_dl_q_tail % TCH_DL_Q_N;
+    memcpy(g_shunt.tch_dl_q[i], fr, 33);
+    g_shunt.tch_dl_q_seq[i] = seq;
+    g_shunt.tch_dl_q_tail++;
+}
+static bool shunt_tch_dl_qpop(uint8_t *fr, uint32_t *seq, int peek)
+{
+    if (g_shunt.tch_dl_q_head == g_shunt.tch_dl_q_tail) return false;
+    unsigned i = g_shunt.tch_dl_q_head % TCH_DL_Q_N;
+    memcpy(fr, g_shunt.tch_dl_q[i], 33);
+    if (seq) *seq = g_shunt.tch_dl_q_seq[i];
+    if (!peek) g_shunt.tch_dl_q_head++;
+    return true;
+}
+
 static void calypso_tch_dl_poll(void)
 {
     static int fd = -2;
     if (fd == -2)
-        fd = open("/dev/shm/calypso_tch_dl", O_CREAT | O_RDWR, 0644); /* cree -> open une fois */
+        fd = open("/dev/shm/calypso_tch_dl", O_CREAT | O_RDWR, 0644);
     if (fd < 0)
         return;
-    uint8_t buf[48];
-    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf))
+
+    uint8_t hdr[8];
+    if (pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr))
         return;
-    uint32_t seq;
-    memcpy(&seq, buf, 4);
-    if (seq == 0 || seq == g_shunt.tch_dl_seq)
-        return;                         /* pas de nouvelle trame */
-    g_shunt.tch_dl_seq = seq;
+    uint32_t w_seq, n_slots;
+    memcpy(&w_seq, hdr, 4);
+    memcpy(&n_slots, hdr + 4, 4);
+
+    if (n_slots == 0 || n_slots > 4096) {       /* ancien format 48 o : slot unique */
+        uint8_t buf[TCH_DL_SLOT];
+        if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf))
+            return;
+        uint32_t seq; memcpy(&seq, buf, 4);
+        if (seq == 0 || seq == g_shunt.tch_dl_seq)
+            return;
+        g_shunt.tch_dl_seq = seq;
+        memcpy(g_shunt.tch_dl_fr, buf + 8, 33);
+        g_shunt.tch_dl_valid = true;
+        shunt_tch_dl_qpush(buf + 8, seq);
+        return;
+    }
+
+    if (w_seq == 0 || w_seq == g_shunt.tch_dl_seq)
+        return;                                  /* rien de neuf */
+
+    /* [2026-08-08] LE PRODUCTEUR REPART A 1 A CHAQUE APPEL. si_bridge recree son
+     * tailer par session TCH, avec un `seq` local remis a zero, alors qu'ici
+     * tch_dl_seq garde la valeur de l'appel precedent. Au nouvel appel on avait
+     * donc w_seq(1) < tch_dl_seq(655), et la soustraction NON SIGNEE ci-dessous
+     * debordait : le journal a affiche « 4294966626 trames sautees » (= 2^32-670),
+     * un compteur de perte absurde qui aurait fait chercher une fuite inexistante.
+     * Un recul du seq ne peut signifier qu'une chose : nouveau producteur. */
+    if (w_seq < g_shunt.tch_dl_seq) {
+        SHUNT_LOG("TCH-DL : le producteur a redemarre (w_seq=%u < %u) -> "
+                  "resynchronisation\n", w_seq, g_shunt.tch_dl_seq);
+        g_shunt.tch_dl_seq = 0;
+        g_shunt.tch_dl_valid = false;
+        g_shunt.tch_dl_q_head = g_shunt.tch_dl_q_tail = 0;   /* file videe avec le producteur */
+    }
+    if (shunt_tch_dl_qdepth() >= (unsigned)shunt_tch_dl_prefetch())
+        return;                                  /* on a deja assez d'avance */
+
+    uint32_t next = g_shunt.tch_dl_seq + 1;
+    if (g_shunt.tch_dl_seq == 0 || (w_seq - next) >= n_slots) {
+        /* Le producteur a debordé l'anneau : on repart sur la plus ancienne
+         * trame encore intacte, et on COMPTE ce qu'on saute. */
+        /* Borne explicite : ce compteur a deja affiche 2^32-670 par debordement.
+         * Un compteur de perte faux est pire que pas de compteur. */
+        uint32_t behind = (w_seq > next) ? (w_seq - next) : 0;
+        uint32_t skipped = (g_shunt.tch_dl_seq == 0 || behind < n_slots)
+                         ? 0 : behind - (n_slots - 1);
+        /* [2026-08-08] ON PREND LA PLUS RECENTE, PAS LA PLUS ANCIENNE.
+         * Prendre w_seq-(N-1) visait a « ne rien perdre », mais c'est le slot que
+         * le producteur va ECRASER EN PREMIER : a 50 trames/s le controle
+         * `sseq != next` echouait presque toujours, on repartait sans avancer, et
+         * comme tch_dl_seq ne bougeait pas on retombait sur le meme slot au tour
+         * suivant. INTERBLOCAGE : mesure du 22:10, le sideband avancait a 50/s
+         * (w_seq 1429->1579) pendant que TRAFFIC_IND restait a 0/s.
+         * La plus recente vient d'etre publiee : elle est stable ~20 ms, et pour
+         * de la voix c'est de toute facon la bonne a garder. */
+        next = w_seq;
+        if (skipped) {
+            static unsigned long long lost_total = 0; static unsigned nlog = 0;
+            lost_total += skipped;
+            if (nlog++ < 20 || (nlog % 50) == 0)
+                SHUNT_LOG("TCH-DL DEBORDEMENT : %u trames sautees (TOTAL CUMULE %llu) "
+                          "-- l'anneau de %u ne suit pas ; c'est un trou AUDIBLE, "
+                          "pas un defaut de decodage\n",
+                          skipped, lost_total, n_slots);
+        }
+    }
+
+    uint8_t buf[TCH_DL_SLOT];
+    off_t off = 8 + (off_t)((next - 1) % n_slots) * TCH_DL_SLOT;
+    if (pread(fd, buf, sizeof(buf), off) != (ssize_t)sizeof(buf))
+        return;
+    uint32_t sseq; memcpy(&sseq, buf, 4);
+    if (sseq != next)
+        return;                                  /* slot pas encore ecrit : on repassera */
+    g_shunt.tch_dl_seq = next;
     memcpy(g_shunt.tch_dl_fr, buf + 8, 33);
     g_shunt.tch_dl_valid = true;
+    shunt_tch_dl_qpush(buf + 8, next);
 }
 
-/* Ecrit la trame FR 33o dans a_dd_0 (sub0). Le firmware (prim_tch.c:322 sub0->a_dd_0) la
- * lit en fin-de-bloc (FN%13 in {3,7,11}) ssi a_dd_0[0]&B_BLUD, puis L1CTL_TRAFFIC_IND->gapk.
- * PIEGE #2 : packing BIG-ENDIAN intra-mot (dsp_memcpy_from_api BE=1, dsp.c:278) = l'INVERSE
- * du a_cd existant (BE=0, lo|(hi<<8)). word = (fr[i]<<8)|fr[i+1] ; mot impair = fr[32]<<8. */
+
+/* ---- TCH : primitives d'ecriture NDB (2026-08-08) --------------------------
+ *
+ * POURQUOI ECRIRE data[] DIRECTEMENT ET PAS shunt_write_w().
+ * shunt_write_w passe par dma_memory_write -> calypso_dsp_write, qui prend
+ * calypso_pcb_daram_lock. Ce verrou n'est PAS recursif, et ces dispatch sont
+ * appeles depuis on_frame_tick — le meme contexte qui a impose shunt_c54x_api_rd()
+ * en lecture directe (cf le commentaire de cette fonction). Le chemin a_cd du camp,
+ * lui, ecrit deja data[0x9D2] en direct et c'est CE chemin qui campe. On aligne
+ * donc les buffers TCH sur le chemin prouve, pas sur le chemin theorique.
+ *
+ * PACKING. Le firmware relit avec dsp_memcpy_from_api(dst, src, n, BE) :
+ *   BE=0 (a_cd / a_fd, 23 o de L2)   -> mot = lo | (hi << 8)
+ *   BE=1 (a_dd_0, 33 o de FR)        -> mot = (hi << 8) | lo   [l'INVERSE]
+ * Les deux conventions coexistent dans la MEME struct ; les melanger donne un
+ * bloc qui passe le CRC cote shunt et sort en charabia cote gapk. */
+static inline uint16_t *shunt_ndb_data(void)
+{
+    return (g_shunt.c54x && g_shunt.c54x->data) ? g_shunt.c54x->data : NULL;
+}
+
+/* En-tete d'un bloc NDB : [0] = statut, [1] libre, [2] = num_biterr.
+ * blud=true -> B_BLUD arme + bits FIRE a 0 = « bloc present, CRC bon ». */
+static void shunt_ndb_hdr(uint16_t *d, unsigned w, bool blud)
+{
+    d[w + 0] = blud ? (uint16_t)(1u << B_BLUD) : 0x0000;
+    d[w + 1] = 0x0000;
+    d[w + 2] = 0x0000;                  /* num_biterr = 0 */
+}
+
+/* 23 o de L2 -> [3..14], packing BE=0 (comme a_cd). Bourrage LAPDm 0x2B. */
+static void shunt_ndb_put_l2(uint16_t *d, unsigned w, const uint8_t *l2)
+{
+    for (int i = 0; i < 23; i += 2) {
+        uint8_t lo = l2[i], hi = (i + 1 < 23) ? l2[i + 1] : 0x2B;
+        d[w + 3 + i / 2] = (uint16_t)(lo | (hi << 8));
+    }
+}
+
+/* 33 o de FR -> [3..], packing BE=1 (a_dd_0/a_du_*). Mot impair = fr[32] en
+ * poids FORT (le firmware ne lit que l'octet haut du dernier mot). */
+static void shunt_ndb_put_fr(uint16_t *d, unsigned w, const uint8_t *fr)
+{
+    for (int i = 0; i < 32; i += 2)
+        d[w + 3 + i / 2] = (uint16_t)(((uint16_t)fr[i] << 8) | fr[i + 1]);
+    d[w + 3 + 16] = (uint16_t)((uint16_t)fr[32] << 8);
+}
+
+/* a_serv_demod des READ PAGES (mots 8..11 : page0 data[0x830..0x833], page1
+ * data[0x844..0x847]).
+ *
+ * INDISPENSABLE SUR TCH, et c'est mesurable : l1s_tch_resp (prim_tch.c:214-231)
+ * lit ces 4 mots A CHAQUE burst pour alimenter afc_input(), toa_input() et
+ * rffe_compute_gain(). Sans eux le mobile a publie, run du 08/08, des
+ * « MEAS REP: meas-invalid=1 rxlev-full=-110 » une fois par seconde pendant
+ * toute la fenetre TCH — c'est-a-dire un canal juge muet, plus une AFC nourrie
+ * au hasard. Meme raisonnement, memes valeurs et memes gates DECAN que le bloc
+ * a_cd du camp : on ne fabrique une constante que la ou le modele ne fournit
+ * rien encore, et le gate le dit. */
+static void shunt_tch_serv_demod(uint16_t *d)
+{
+    static int dc_toa = -1, dc_snr, dc_ang;
+    if (dc_toa < 0) {
+        const char *M = getenv("CALYPSO_DECAN");
+        int m = (M && M[0] == '1');
+        const char *t = getenv("CALYPSO_DECAN_TOA");
+        const char *s = getenv("CALYPSO_DECAN_SNR");
+        const char *a = getenv("CALYPSO_DECAN_ANGLE");
+        dc_toa = m || (t && t[0] == '1');
+        dc_snr = m || (s && s[0] == '1');
+        dc_ang = m || (a && a[0] == '1');
+    }
+    /* @BEQUILLE — a_serv_demod du TCH  (gates CALYPSO_DECAN*, OFF par defaut)
+     *   masque  : l'absence de mesure per-burst sur le canal dedie. gr-gsm decode
+     *             le TCH mais ne publie pas (encore) TOA/PM/ANGLE/SNR par burst,
+     *             donc OFF on repose les memes constantes que le camp.
+     *   retirer : quand le pont TCH publiera ses mesures par burst, comme le SCH
+     *             publie deja BSIC/FN/TOA sur 4731.
+     */
+    uint16_t toa_v = (dc_toa && g_shunt.sb_valid) ? (uint16_t)g_shunt.rx_toa : 23;
+    uint16_t pm_v  = shunt_pm_decan_apm(-60);
+    uint16_t ang_v = dc_ang ? (uint16_t)g_shunt.rx_afc : 0;
+    uint16_t snr_v = dc_snr ? g_shunt.rx_snr : 0x7000;
+    /* page 0 */ d[0x830] = toa_v; d[0x831] = pm_v; d[0x832] = ang_v; d[0x833] = snr_v;
+    /* page 1 */ d[0x844] = toa_v; d[0x845] = pm_v; d[0x846] = ang_v; d[0x847] = snr_v;
+}
+
+/* Age maximum (en ticks) d'une trame de signalisation DL avant d'arreter de la
+ * re-presenter. Meme garde-fou que SHUNT_SB_MAX_AGE : une trame tenue sans borne
+ * finit par etre rejouee en silence, et le journal ment (on croit voir un flux,
+ * on voit un echo). 0 = pas de peremption. */
+/* Gate A/B commun aux trois flux DL du TCH (voix, FACCH, SACCH) :
+ * CALYPSO_TCH_DL_REPEAT=1 retablit la re-presentation d'avant le 08/08. */
+static bool shunt_tch_dl_repeat(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CALYPSO_TCH_DL_REPEAT"); v = (e && *e == '1') ? 1 : 0; }
+    return v != 0;
+}
+
+static uint32_t shunt_tch_dl_ttl(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CALYPSO_TCH_DL_TTL"); v = (e && *e) ? atoi(e) : 26; }
+    return (uint32_t)v;
+}
+
+static bool shunt_tch_fresh(bool valid, uint32_t tick)
+{
+    uint32_t ttl = shunt_tch_dl_ttl();
+    if (!valid) return false;
+    return (ttl == 0) || ((uint32_t)(g_shunt.tick_cnt - tick) <= ttl);
+}
+
+/* ---- SONDE CALYPSO_TCH_DL_PROBE : ce qu'on ECRIT vs ce qui PART ------------
+ *
+ * [2026-08-09] Constat qui l'impose : chaine descendante mesuree saine jusqu'au
+ * sideband (50,0 trames/s, 250/250 distinctes, 0 % de silence), la chaine de
+ * lecture GAPK du mobile s'execute bien ~50 fois/s (prouve : gapk_io_dequeue_ul
+ * n'a qu'UN appelant, juste apres gapk_io_enqueue_dl -> les 48,7 TRAFFIC_REQ/s
+ * mesures ne peuvent venir que d'autant de TRAFFIC_IND enfiles), et pourtant
+ * l'ecouteur du MS est du ZERO NUMERIQUE EXACT (crete 0 sur 48000 echantillons).
+ * Il ne reste qu'une hypothese testable : les octets FR qui arrivent au mobile
+ * ne sont pas ceux qu'on a ecrits dans a_dd_0.
+ *
+ * On memorise donc les N dernieres trames REELLEMENT ecrites, et l1ctl_sock
+ * confronte a cet anneau les 33 octets qui partent vraiment. L'anneau (et non
+ * la seule derniere trame) parce que le firmware relit a_dd_0 avec un retard de
+ * quelques ticks : comparer a la derniere ecrite fabriquerait des ecarts qui
+ * n'existent pas.
+ *
+ * Sonde de comparaison, pas de taux : elle rend des compteurs CUMULATIFS. */
+#define TCH_DL_PROBE_N 8
+static struct { uint8_t fr[33]; uint32_t seq; } g_tch_dl_probe[TCH_DL_PROBE_N];
+static unsigned g_tch_dl_probe_w;
+
+static void shunt_tch_dl_probe_note(const uint8_t *fr, uint32_t seq)
+{
+    unsigned i = g_tch_dl_probe_w++ % TCH_DL_PROBE_N;
+    memcpy(g_tch_dl_probe[i].fr, fr, 33);
+    g_tch_dl_probe[i].seq = seq;
+}
+
+/* Rend le seq de la trame ecrite qui correspond, ou -1. Appele par l1ctl_sock. */
+int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33);
+int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33)
+{
+    for (unsigned i = 0; i < TCH_DL_PROBE_N; i++)
+        if (g_tch_dl_probe[i].seq && !memcmp(g_tch_dl_probe[i].fr, fr33, 33))
+            return (int)g_tch_dl_probe[i].seq;
+    return -1;
+}
+
+/* TCHT (13) DL = voix (a_dd_0) + FACCH (a_fd) + mesures. Le firmware relit
+ * a_dd_0 en fin de bloc (fn%13%4==3) ssi B_BLUD, et a_fd au meme instant.
+ * On presente les deux : la FACCH porte le CONNECT/ALERTING, la voix le son. */
 static void shunt_dispatch_tch_dl(uint8_t page_idx)
 {
-    (void)page_idx;                     /* a_dd_0 non page (T_NDB partage) */
-    if (!g_shunt.tch_dl_valid)
+    (void)page_idx;                     /* a_dd_0/a_fd non pages (T_NDB partage) */
+    uint16_t *d = shunt_ndb_data();
+    if (!d)
         return;
-    uint32_t aa = BASE_API_NDB + NDB_A_DD_0;
-    shunt_write_w(aa + 0, (1u << B_BLUD));   /* a_dd_0[0] : B_BLUD=1, FIRE=00 (no error) */
-    shunt_write_w(aa + 2, 0x0000);           /* a_dd_0[1] : inutilise */
-    shunt_write_w(aa + 4, 0x0000);           /* a_dd_0[2] : num_biterr = 0 */
-    const uint8_t *fr = g_shunt.tch_dl_fr;   /* a_dd_0[3..] = 33o @ aa+6, BE=1 */
-    for (int i = 0; i < 32; i += 2)
-        shunt_write_w(aa + 6 + i, ((uint16_t)fr[i] << 8) | fr[i + 1]);
-    shunt_write_w(aa + 6 + 32, (uint16_t)fr[32] << 8);  /* octet impair en poids fort */
+
+    shunt_tch_serv_demod(d);            /* toujours : les mesures valent pour tout burst */
+
+    /* ---- voix : CONSOMMATION UNIQUE (2026-08-08, correctif) ----------------
+     *
+     * Avant, ce bloc reecrivait a_dd_0 a CHAQUE dispatch TCHT tant que
+     * tch_dl_valid, or ce drapeau ne redescendait jamais. Une trame decodee
+     * etait donc re-presentee jusqu'a l'arrivee de la suivante, avec B_BLUD
+     * arme : le firmware la comptait comme un bloc NEUF a chaque fois. Mesure
+     * du run 17:33 : 5000 presentations pour 371 trames REELLEMENT decodees par
+     * gr-gsm, soit ~3 TRAFFIC_IND sur 4 qui etaient des doublons. Le mobile
+     * recevait un flux d'apparence continue, en fait bourre de repetitions —
+     * exactement le « replay infini » deja rencontre sur sb_valid, et corrige
+     * la-bas par SHUNT_SB_MAX_AGE.
+     *
+     * On consomme donc la trame : presentee une fois, puis plus de B_BLUD tant
+     * que gr-gsm n'en fournit pas une nouvelle. Les trous deviennent VISIBLES —
+     * et c'est voulu : gapk a un ECU (« ecu/fr » dans sa chaine) dont le role
+     * est precisement de masquer les blocs manquants. Mieux vaut un trou traite
+     * par l'etage prevu pour ca qu'un doublon presente comme une trame fraiche.
+     * CALYPSO_TCH_DL_REPEAT=1 retablit l'ancien comportement pour comparer. */
+    static int repeat = -1;
+    if (repeat < 0) { const char *e = getenv("CALYPSO_TCH_DL_REPEAT");
+                      repeat = (e && *e == '1') ? 1 : 0; }
+    uint8_t _fr[33]; uint32_t _sq = 0;
+    /* [2026-08-09] NE PAS ECRASER UNE TRAME NON LUE -- MAIS BORNER L ATTENTE.
+     *
+     * LE DEFAUT. Le lecteur ne prend a_dd_0 qu en fin de bloc (fn%13%4==3), soit
+     * une fois pour quatre bursts, alors que le dispatch TCHT tourne a ~200/s.
+     * Quand deux trames arrivent entre deux lectures, la seconde ecrase la
+     * premiere avant qu elle ait ete vue. Mesure sur appel etabli : 13000 trames
+     * servies contre 11000 TRAFFIC_IND, soit 2000 perdues (15 %), ecart huit fois
+     * superieur au pas des compteurs. La sonde disait « identiques a a_dd_0 :
+     * 11000, differentes : 0 » : aucune trame abimee, donc ecrasees, pas
+     * corrompues. Une trame sur sept qui saute = le son hache.
+     *
+     * POURQUOI BORNER. Premiere version : attendre INDEFINIMENT que B_BLUD
+     * retombe. Mesure : 40000 retenues et une file collee a 8 sur 8, sa capacite
+     * -- une fois pleine, le collecteur cesse de prendre les trames de l anneau,
+     * on ajoute 160 ms de retard et on perd a l entree ce qu on a cesse de perdre
+     * a la sortie. J avais deplace le probleme, pas supprime.
+     *
+     * LE COMPROMIS. On attend au plus HOLD dispatches. Au-dela, on presente quand
+     * meme : perdre UNE trame vaut mieux que bloquer la file entiere. Le defaut 3
+     * vient du rapport mesure entre les cadences (4 dispatches par trame de
+     * parole) : trois attentes couvrent le cas normal sans jamais saturer.
+     *
+     * CALYPSO_TCH_DL_HOLD=0 revient a l ecrasement systematique (comportement
+     * d avant, pour l A/B). Une valeur elevee revient a la version qui saturait.
+     * Les deux compteurs sont CUMULATIFS et la sonde s annonce : un forcage
+     * frequent voudrait dire que le lecteur decroche, et ca doit se voir. */
+    static int hold = -1;
+    if (hold < 0) {
+        const char *e = getenv("CALYPSO_TCH_DL_HOLD");
+        hold = (e && *e) ? atoi(e) : 3;
+        if (hold < 0) hold = 0;
+        SHUNT_LOG("TCH-DL garde anti-ecrasement : attente max %d dispatches%s\n",
+                  hold, hold ? "" : " -- DESACTIVEE (ecrasement systematique)");
+    }
+    static unsigned attente = 0;
+    static unsigned long long retenues = 0, forcages = 0;
+    if (hold > 0 && (d[ndb_w(g_ndb.a_dd_0)] & (uint16_t)(1u << B_BLUD))) {
+        if (attente < (unsigned)hold) {
+            attente++; retenues++;
+            if (retenues <= 3 || (retenues % 2000) == 0)
+                SHUNT_LOG("TCH-DL retenue #%llu : precedente pas lue, on garde "
+                          "(profondeur=%u, forcages=%llu)\n",
+                          retenues, shunt_tch_dl_qdepth(), forcages);
+            goto tch_dl_fin;          /* rien a presenter ce tick */
+        }
+        forcages++;                   /* attente epuisee : on presente quand meme */
+        if (forcages <= 3 || (forcages % 2000) == 0)
+            SHUNT_LOG("TCH-DL forcage #%llu : lecteur en retard apres %d attentes, "
+                      "presentation forcee (profondeur=%u)\n",
+                      forcages, hold, shunt_tch_dl_qdepth());
+    }
+    attente = 0;
+    if (shunt_tch_dl_qpop(_fr, &_sq, repeat)) {
+        shunt_ndb_hdr(d, ndb_w(g_ndb.a_dd_0), true);
+        shunt_ndb_put_fr(d, ndb_w(g_ndb.a_dd_0), _fr);
+        shunt_tch_dl_probe_note(_fr, _sq);
+        g_shunt.tch_dl_valid = (shunt_tch_dl_qdepth() > 0);
+        static unsigned n = 0, dup = 0;
+        if (repeat) dup++;
+        if (n++ < 20 || (n % 250) == 0)
+            SHUNT_LOG("TCH-DL #%u a_dd_0 <- FR seq=%u sig=0x%x profondeur=%u%s\n",
+                      n, _sq, _fr[0] >> 4, shunt_tch_dl_qdepth(),
+                      repeat ? " (REPEAT : doublons possibles)" : "");
+    }
+tch_dl_fin:
+    if (shunt_tch_fresh(g_shunt.facch_dl_valid, g_shunt.facch_dl_tick)) {
+        shunt_ndb_hdr(d, ndb_w(g_ndb.a_fd), true);
+        shunt_ndb_put_l2(d, ndb_w(g_ndb.a_fd), g_shunt.facch_dl);
+        /* [2026-08-08] CONSOMMATION UNIQUE, comme la voix.
+         * Ce bloc reecrivait a_fd a CHAQUE dispatch TCHT tant que le TTL tenait
+         * (26 ticks), en rearmant B_BLUD a chaque fois : le firmware remontait
+         * donc la MEME trame LAPDm des dizaines de fois. Mesure du run 21:25 :
+         * 12 « MDL-Error (cause 6) » en UNE seconde, cause 6 =
+         * MDL_CAUSE_UNSOL_SPRV_RESP (lapd_core.h:38) = trame de supervision NON
+         * SOLLICITEE — c'est-a-dire la meme supervision relivree en boucle.
+         * Le firmware efface lui-meme l'en-tete apres lecture (prim_tch.c:293,
+         * a_fd[0] = 1<<B_FIRE1), donc ne plus reecrire ne perd rien : le bloc
+         * reste disponible jusqu'a ce qu'il le consomme. */
+        if (!shunt_tch_dl_repeat())
+            g_shunt.facch_dl_valid = false;
+        static unsigned n = 0;
+        if (n++ < 40 || (n % 100) == 0)
+            SHUNT_LOG("TCH-FACCH-DL #%u a_fd <- %02x %02x %02x %02x (age=%u ticks)\n",
+                      n, g_shunt.facch_dl[0], g_shunt.facch_dl[1],
+                      g_shunt.facch_dl[2], g_shunt.facch_dl[3],
+                      g_shunt.tick_cnt - g_shunt.facch_dl_tick);
+    }
+}
+
+/* TCHA (14) DL = SACCH du canal dedie -> a_cd (l1s_tch_a_resp, prim_tch.c:667).
+ *
+ * PIEGE : ce chemin partage a_cd avec le BCCH du camp, MAIS PAS LA CONVENTION
+ * D'EN-TETE. l1s_nb_resp (BCCH) ne teste que les bits FIRE et le camp ecrit donc
+ * a_cd[0]=0x0000 ; l1s_tch_a_resp teste `a_cd[0] & (1<<B_BLUD)` et ce meme 0x0000
+ * le ferait sauter le bloc en silence. Ici : B_BLUD arme. */
+static void shunt_dispatch_tch_sacch(uint8_t page_idx)
+{
+    (void)page_idx;
+    uint16_t *d = shunt_ndb_data();
+    if (!d)
+        return;
+
+    shunt_tch_serv_demod(d);
+
+    if (!shunt_tch_fresh(g_shunt.tsacch_dl_valid, g_shunt.tsacch_dl_tick))
+        return;
+    shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);          /* B_BLUD : cf piege ci-dessus */
+    shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), g_shunt.tsacch_dl);
+    /* Consommation unique, meme raison que la FACCH ci-dessus : l1s_tch_a_resp
+     * efface a_cd[0] apres lecture (prim_tch.c:700), donc re-presenter ne fait
+     * que dupliquer des blocs de signalisation deja livres. */
+    if (!shunt_tch_dl_repeat())
+        g_shunt.tsacch_dl_valid = false;
+    static unsigned n = 0;
+    if (n++ < 40 || (n % 50) == 0)
+        SHUNT_LOG("TCH-SACCH-DL #%u a_cd <- %02x %02x %02x %02x %02x %02x\n",
+                  n, g_shunt.tsacch_dl[0], g_shunt.tsacch_dl[1], g_shunt.tsacch_dl[2],
+                  g_shunt.tsacch_dl[3], g_shunt.tsacch_dl[4], g_shunt.tsacch_dl[5]);
 }
 
 /* CALYPSO_DSP=c54x : pilote le VRAI DSP depuis le frame tick du shunt.
@@ -765,6 +1556,7 @@ void calypso_dsp_shunt_on_frame_tick(void)
         return;
     shunt_poll_si_shm();   /* gr-gsm a-t-il ecrit un nouveau SI dans le shm ? */
     calypso_tch_dl_poll(); /* nouvelle trame FR DL dans le sideband ? (toujours, hors gate pending) */
+    shunt_poll_tch_cfg();  /* canal dedie TCH arme/libere par si_bridge (ASSIGNMENT COMMAND) */
 
     /* [2026-07-24] CADENCE FIX : le run C54x (wake+IT-frame+c54x_run) ne
      * depend d'AUCUNE donnee fraiche de dispatch (page_idx/d_fn) -- seul le
@@ -1157,7 +1949,16 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 if (_agex_on && g_shunt.agch_valid && (uint32_t)(g_shunt.tick_cnt - g_shunt.agch_tick) > (uint32_t)_agex)
                     g_shunt.agch_valid = false;
             }
-            if (g_shunt.si_valid && !g_shunt.sdcch_valid
+            /* [2026-08-08] ... ni quand un TCH est arme. a_cd est partage : le camp
+             * y met les SI, et l1s_tch_a_resp y lit la SACCH du canal dedie. Ce bloc
+             * tourne a CHAQUE tick (hors gate pending) tandis que le dispatch SACCH
+             * ne tourne qu'au tick pending -> sans cette condition, la SACCH du dedie
+             * serait ecrasee par un SI entre deux dispatch, et le mobile lirait un SI
+             * la ou il attend un rapport de mesure. Meme raison, meme forme que le
+             * garde-fou sdcch_valid juste a cote. En dedie le mobile ne lit pas le
+             * BCCH : aucun SI n'est perdu. */
+            if (g_shunt.si_valid && !g_shunt.sdcch_valid && !shunt_dcch_si_guard()
+                && !g_shunt.tch_cfg_valid
                 && !(g_shunt.agch_valid && (g_shunt.agch_buf[2] == 0x3f
                      || g_shunt.agch_buf[2] == 0x3a || g_shunt.agch_buf[2] == 0x3b))
                 && g_shunt.c54x && g_shunt.c54x->data) {
@@ -1329,10 +2130,26 @@ void calypso_dsp_shunt_on_frame_tick(void)
         shunt_dispatch_sb(page);
     } else if (td == ALLC_DSP_TASK) {
         shunt_dispatch_allc(page);
-    } else if ((td & 0x7FFF) == TCHT_DSP_TASK) {   /* TCH/F DL (JALON 1) : sub0 -> a_dd_0 */
-        shunt_dispatch_tch_dl(page);
-    } else if (td != 0) {
+    } else if (td != 0 && (td & 0x7FFF) != TCHT_DSP_TASK
+                       && (td & 0x7FFF) != TCHA_DSP_TASK
+                       && (td & 0x7FFF) != TCHD_DSP_TASK) {
         shunt_dispatch_nb(page, td);
+    }
+
+    /* ---- TCH DL : COMMUN AUX DEUX BRANCHES (2026-08-08) --------------------
+     * Le dispatch TCH etait le dernier `else if` de la chaine ci-dessus, donc
+     * dans la branche « pas de route c54x » UNIQUEMENT. Or shunt_route_c54x()
+     * ne teste que CALYPSO_DSP=c54x — que calypso_shunt_legit.env pose, avec
+     * CALYPSO_DSP_RUN_C54X=0. En profil shunt_legit c'est donc TOUJOURS la
+     * premiere branche qui s'execute, et shunt_dispatch_tch_dl n'a JAMAIS ete
+     * appele : du code mort dans le seul profil qui devait s'en servir. Le
+     * symptome cote mobile etait un canal dedie parfaitement muet
+     * (rxlev-full=-110, meas-invalid=1) — indiscernable d'un probleme de RF.
+     * On sort donc le TCH de la chaine : il ne depend pas de la route c54x. */
+    switch (td & 0x7FFF) {
+    case TCHT_DSP_TASK: shunt_dispatch_tch_dl(page);    break;   /* voix + FACCH */
+    case TCHA_DSP_TASK: shunt_dispatch_tch_sacch(page); break;   /* SACCH dediee */
+    default: break;
     }
     /* RA UL (d_task_ra) handled separately — TBD when TX flow gated */
 
@@ -1406,6 +2223,8 @@ static const MemoryRegionOps shunt_ndb_trigger_ops = {
 #define GSMTAP_CHANNEL_SDCCH4   0x07   /* SDCCH/4 SS0 DL (UA/AUTH / #2) */
 #define GSMTAP_CHANNEL_ACCH     0x80   /* bit ACCH (SACCH) GSMTAP */
 #define GSMTAP_CHANNEL_SACCH    (GSMTAP_CHANNEL_SDCCH4 | GSMTAP_CHANNEL_ACCH) /* 0x87 : SI5/SI6 reels */
+#define GSMTAP_CHANNEL_TCH_F    0x08   /* FACCH/F du canal dedie (2026-08-08) */
+#define GSMTAP_CHANNEL_TCH_ACCH (GSMTAP_CHANNEL_TCH_F | GSMTAP_CHANNEL_ACCH)  /* 0x88 : SACCH du TCH */
 static int g_gsmtap_fd = -1;
 
 /* AGCH (#11) : range l'IMM ASSIGN forwardé par si_bridge (tag GSMTAP AGCH 0x04)
@@ -1466,8 +2285,17 @@ static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
             _ss = (cd0 >> 3) & 0x07; _ct = "SDCCH/8";
             _base = _ss * 4;                    /* 0,4,8,12,16,20,24,28 (mod 51) */
         }
-        if (_base >= 0) { g_shunt.sdcch_ss = (uint8_t)_base; g_shunt.sdcch_ss_set = true;
-                          g_shunt.sdcch_ch8 = ((cd0 & 0xC0) == 0x40); }  /* base + type /4|/8 */
+        /* [2026-08-08] CE CHEMIN N'ECRIT PLUS LA FENETRE. Il la posait depuis
+         * N'IMPORTE QUEL IMM ASSIGN du CCCH — donc aussi ceux des autres
+         * abonnes (mesure : 68 de RA=0x07 et 12 de RA=0x0a pour un RACH a nous
+         * de RA=0x08). Ajouter la source autoritaire sans retirer celle-ci ne
+         * suffisait pas : les deux ecrivains se marchaient dessus, et le test
+         * anti-repetition du setter le faisait sortir en silence quand feed_agch
+         * avait deja pose la valeur (constate au run 18:31 : DCCH #2 SS=1 detecte,
+         * aucune DCCH-WINDOW correspondante). La fenetre vient desormais
+         * UNIQUEMENT de calypso_dsp_shunt_set_dcch(), appelee sur le chan_nr que
+         * le firmware annonce lui-meme. On garde la sonde ci-dessous, qui reste
+         * utile pour voir ce que le reseau distribue. */
         static unsigned _iac = 0;
         if (_iac++ < 80) {
             fprintf(stderr, "[dsp-shunt] IMM-ASS chan_desc=[%02x %02x %02x] %s SS=%d base=%d TN=%u req-ref=[%02x %02x %02x]\n",
@@ -1630,6 +2458,93 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
                 (l2[rr + 1] == 0x1d) ? 5 : 6, n, l2[rr + 1]);
 }
 
+/* ---- TCH DL de signalisation : FACCH et SACCH-du-dedie (2026-08-08) --------
+ * Source = le grgsm TCHF lance par si_bridge sur le timeslot assigne, achemine
+ * en GSMTAP 4730 (sous-types 0x08 / 0x88). Aucune fabrication ici : si gr-gsm
+ * ne decode pas, rien n'est presente et le mobile le voit — c'est le point de
+ * la doctrine shunt_legit (le decodeur hote tient le role du DSP, il ne l'imite
+ * pas). Gate commun aux deux : CALYPSO_INJECT_TCH, sinon SHUNT_LEGIT. */
+static bool shunt_tch_inject_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CALYPSO_INJECT_TCH");
+        v = (e && *e == '1') ? 1 : 0;
+        if (!v) { const char *l = getenv("CALYPSO_SHUNT_LEGIT"); v = (l && *l == '1') ? 1 : 0; }
+    }
+    return v != 0;
+}
+
+static void calypso_dsp_shunt_feed_facch(const uint8_t *l2, int len)
+{
+    if (!shunt_tch_inject_on() || !l2 || len < 3) return;
+    int n = len < 23 ? len : 23;
+    memcpy(g_shunt.facch_dl, l2, n);
+    for (int i = n; i < 23; i++) g_shunt.facch_dl[i] = 0x2B;
+    g_shunt.facch_dl_valid = true;
+    g_shunt.facch_dl_tick  = g_shunt.tick_cnt;
+    static unsigned nf = 0;
+    if (nf++ < 40 || (nf % 25) == 0)
+        SHUNT_LOG("feed_facch: %do -> a_fd (%02x %02x %02x %02x) #%u\n",
+                  n, l2[0], l2[1], l2[2], (n > 3) ? l2[3] : 0, nf);
+}
+
+static void calypso_dsp_shunt_feed_tch_sacch(const uint8_t *l2, int len)
+{
+    if (!shunt_tch_inject_on() || !l2 || len < 3) return;
+    int n = len < 23 ? len : 23;
+    uint8_t *s = g_shunt.tsacch_dl;
+    memcpy(s, l2, n);
+    for (int i = n; i < 23; i++) s[i] = 0x2B;
+    /* En-tete L1 SACCH (2 o : ordre de puissance / avance de temps). gr-gsm rend
+     * le bloc tel qu'il est passe sur l'air ; on le laisse INTACT, contrairement
+     * a feed_sacch qui le zerote. Raison : sur canal dedie le mobile APPLIQUE ces
+     * deux octets (gsm48_rr.c « DL SACCH indicates ta / tx_power »), et un TA
+     * force a 0 sur un lien qui en demande 4 desaligne l'emission montante. */
+    g_shunt.tsacch_dl_valid = true;
+    g_shunt.tsacch_dl_tick  = g_shunt.tick_cnt;
+    static unsigned nf = 0;
+    if (nf++ < 40 || (nf % 25) == 0)
+        SHUNT_LOG("feed_tch_sacch: %do -> a_cd (pwr=%02x ta=%02x, %02x %02x %02x) #%u\n",
+                  n, s[0], s[1], s[2], s[3], s[4], nf);
+}
+
+/* Config du canal dedie, publiee par si_bridge apres decodage de l'ASSIGNMENT
+ * COMMAND : /dev/shm/calypso_tch_cfg, 16 o = seq@0(u32) tn@4 tsc@5 arfcn@6(u16)
+ * chan_nr@8. seq==0 -> pas de TCH en cours. Le shunt s'en sert pour le journal
+ * et pour savoir qu'un dedie TCH est arme ; qemu_wrap s'en sert pour le slot UL. */
+static void shunt_poll_tch_cfg(void)
+{
+    static int fd = -2;
+    if (fd == -2)
+        fd = open("/dev/shm/calypso_tch_cfg", O_CREAT | O_RDWR, 0644);
+    if (fd < 0) return;
+    uint8_t b[16];
+    if (pread(fd, b, sizeof(b), 0) != (ssize_t)sizeof(b)) return;
+    uint32_t seq; memcpy(&seq, b, 4);
+    static uint32_t last = 0;
+    if (seq == 0) {
+        if (g_shunt.tch_cfg_valid) {
+            g_shunt.tch_cfg_valid = false;
+            /* canal libere : ne PAS re-presenter la signalisation du dedie precedent */
+            g_shunt.facch_dl_valid = g_shunt.tsacch_dl_valid = false;
+            SHUNT_LOG("TCH-CFG: canal dedie libere (seq=0)\n");
+        }
+        last = 0;
+        return;
+    }
+    if (seq == last) return;
+    last = seq;
+    g_shunt.tch_tn  = b[4];
+    g_shunt.tch_tsc = b[5];
+    memcpy(&g_shunt.tch_arfcn, b + 6, 2);
+    g_shunt.tch_cfg_valid = true;
+    /* nouveau canal : la signalisation de l'ancien n'a plus cours */
+    g_shunt.facch_dl_valid = g_shunt.tsacch_dl_valid = false;
+    SHUNT_LOG("TCH-CFG #%u: TN=%u TSC=%u ARFCN=%u chan_nr=0x%02x\n",
+              seq, g_shunt.tch_tn, g_shunt.tch_tsc, g_shunt.tch_arfcn, b[8]);
+}
+
 static void shunt_gsmtap_read(void *opaque)
 {
     uint8_t buf[512];
@@ -1651,7 +2566,11 @@ static void shunt_gsmtap_read(void *opaque)
          * PAS 0x06 pour sub_type 0x07. */
         if (n < GSMTAP_HDR_LEN + 3)
             continue;
+        /* [2026-08-08] Le TCH est exempte du filtre « PD RR » au meme titre que le
+         * SDCCH/4 : FACCH et SACCH du dedie portent de la LAPDm (buf[17] = controle),
+         * pas un PD RR. Les exiger a 0x06 jetterait tout le trafic de l'appel. */
         if (sub_type != GSMTAP_CHANNEL_SDCCH4 && sub_type != GSMTAP_CHANNEL_SACCH &&
+            sub_type != GSMTAP_CHANNEL_TCH_F  && sub_type != GSMTAP_CHANNEL_TCH_ACCH &&
             buf[GSMTAP_HDR_LEN + 1] != 0x06)
             continue;                               /* pas RR PD (BCCH/AGCH) */
         uint8_t mt = buf[GSMTAP_HDR_LEN + 2];
@@ -1684,6 +2603,15 @@ static void shunt_gsmtap_read(void *opaque)
             /* SACCH SS0 DL : SI5/SI6 REELS (si_bridge fn%51 {42-45}) -> sacch_buf
              * REEL (presente fn%51 {42-45}). Remplace la fabrication SI3->SI6. */
             calypso_dsp_shunt_feed_sacch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
+        } else if (sub_type == GSMTAP_CHANNEL_TCH_F) {
+            /* FACCH du canal dedie -> a_fd. C'est la que passent ASSIGNMENT
+             * COMPLETE (montant, cf shunt_capture_tch_ul) et, en descendant,
+             * ALERTING / CONNECT / DISCONNECT de l'appel. */
+            calypso_dsp_shunt_feed_facch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
+        } else if (sub_type == GSMTAP_CHANNEL_TCH_ACCH) {
+            /* SACCH du canal dedie -> a_cd. Sans elle le mobile decompte les
+             * blocs SACCH manquants et declare une defaillance de lien radio. */
+            calypso_dsp_shunt_feed_tch_sacch(buf + GSMTAP_HDR_LEN, (int)n - GSMTAP_HDR_LEN);
         }
         /* autres canaux : drop */
     }
@@ -2484,6 +3412,10 @@ void calypso_dsp_shunt_init(MemoryRegion *system_memory, AddressSpace *as)
                                         BASE_API_NDB + NDB_D_DSP_PAGE,
                                         trigger,
                                         /*priority=*/10);
+
+    /* Offsets NDB : lus dans le DWARF du firmware CHARGE, avant tout dispatch.
+     * A faire en premier — tout ce qui suit ecrit dans ces buffers. */
+    shunt_ndb_resolve_offsets();
 
     /* Pont gr-gsm → a_cd : écoute le SI décodé (GSMTAP) et l'injecte. */
     shunt_gsmtap_init();

@@ -54,29 +54,42 @@ void shunt_write_w(uint32_t addr, uint16_t v)
 /* [2026-07-27] Resolution DYNAMIQUE d'un symbole du firmware ELF (robuste aux
  * rebuilds). Chemin = env CALYPSO_FIRMWARE_ELF, sinon l'arg -kernel de
  * /proc/self/cmdline. Parse ELF32 LE .symtab. Retourne 0 si introuvable. */
-static uint32_t shunt_fw_sym(const char *want)
+/* [2026-08-08] Extrait de shunt_fw_sym : le MEME ELF sert desormais a deux
+ * lecteurs — les symboles ici, et les offsets de champs NDB resolus du DWARF
+ * cote shunt (shunt_ndb_resolve_offsets). Une seule source de verite pour le
+ * chemin : deux copies divergeraient le jour ou l'une des deux change. */
+const char *shunt_fw_elf_path(void)
 {
-    char path[1024]; path[0] = 0;
+    static char path[1024];
+    static int done;
+    if (done) return path[0] ? path : NULL;
+    done = 1;
     const char *env = getenv("CALYPSO_FIRMWARE_ELF");
-    if (env && *env) { snprintf(path, sizeof(path), "%s", env); }
-    else {
-        FILE *cf = fopen("/proc/self/cmdline", "rb");
-        if (cf) {
-            static char cl[16384];
-            size_t nr = fread(cl, 1, sizeof(cl) - 1, cf);
-            fclose(cf);
-            cl[nr] = 0;
-            for (size_t i = 0; i < nr; ) {
-                size_t l = strlen(cl + i);
-                if (!strcmp(cl + i, "-kernel") && i + l + 1 < nr) {
-                    snprintf(path, sizeof(path), "%s", cl + i + l + 1);
-                    break;
-                }
-                i += l + 1;
+    if (env && *env) { snprintf(path, sizeof(path), "%s", env); return path; }
+    FILE *cf = fopen("/proc/self/cmdline", "rb");
+    if (cf) {
+        static char cl[16384];
+        size_t nr = fread(cl, 1, sizeof(cl) - 1, cf);
+        fclose(cf);
+        cl[nr] = 0;
+        for (size_t i = 0; i < nr; ) {
+            size_t l = strlen(cl + i);
+            if (!strcmp(cl + i, "-kernel") && i + l + 1 < nr) {
+                snprintf(path, sizeof(path), "%s", cl + i + l + 1);
+                break;
             }
+            i += l + 1;
         }
     }
-    if (!path[0]) return 0;
+    return path[0] ? path : NULL;
+}
+
+static uint32_t shunt_fw_sym(const char *want)
+{
+    const char *p = shunt_fw_elf_path();
+    if (!p) return 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s", p);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);

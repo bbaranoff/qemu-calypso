@@ -43,9 +43,41 @@ mod_asterisk_check() {
 mod_asterisk_status() { _ast_ready; }
 
 mod_asterisk_start() {
-    core_svc_start "$ASTERISK_UNIT" "$(command -v asterisk)" -g -f -p -U asterisk \
-        || { mod_fail "systemctl start $ASTERISK_UNIT a échoué"
-             mod_hint "journalctl -u $ASTERISK_UNIT -n 30"; return $MOD_RC_FAIL; }
+    # [2026-08-09] LANCEMENT DIRECT — ce module ne passe PLUS par systemd.
+    #
+    # POURQUOI. L'unité systemd lançait /usr/sbin/asterisk -g -f -p -U asterisk
+    # DERRIÈRE ce module. Mesuré : l'ancien scripts/run.sh tuait Asterisk puis
+    # lançait `asterisk -cvvv` en tmux, et systemd le relançait aussitôt en
+    # démon — le `-cvvv` finissait en simple `rasterisk` attaché à l'instance
+    # de systemd. Deux propriétaires pour un seul /etc/asterisk.
+    #
+    # ⚠️ core_svc_start ne retombe sur le lancement direct que si l'unité
+    # N'EXISTE PAS. Une unité MASQUÉE existe toujours : `systemctl start`
+    # échoue, et le module échouait avec elle. On ne lui laisse donc plus le
+    # choix — on lance le binaire, un point c'est tout.
+    if _ast_ready; then mod_say "déjà actif — on ne relance pas"; mod_ok; return 0; fi
+
+    local bin pf log
+    bin="$(command -v asterisk)"
+    pf="$(core_pidfile "$ASTERISK_UNIT")"
+    log="${LOG_DIR}/${ASTERISK_UNIT}.log"
+    mkdir -p "$RUN_DIR" "$LOG_DIR" 2>/dev/null || true
+
+    # -f : reste au premier plan (pas de double fork), donc le PID qu'on note
+    #      est bien celui d'Asterisk et core_alive peut le suivre.
+    # -U : abandonne les privilèges vers l'utilisateur asterisk.
+    # On n'utilise ni -p (priorité temps réel : refusée sans les capacités, et
+    # elle ne sert à rien ici) ni -g (dump core).
+    mod_say "lancement direct : $bin -f -U asterisk"
+    setsid "$bin" -f -U asterisk >>"$log" 2>&1 </dev/null &
+    printf '%s\n' "$!" > "$pf"
+
+    sleep 1
+    if ! kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
+        mod_hint "tail -30 $log"
+        mod_fail "asterisk est mort dans la seconde qui a suivi le lancement"
+        return $MOD_RC_FAIL
+    fi
     mod_ok
 }
 
@@ -56,9 +88,15 @@ mod_asterisk_wait() {
         mod_hint "asterisk -rx 'core show uptime' ; journalctl -u $ASTERISK_UNIT -n 40"
         return $MOD_RC_FAIL
     fi
-    if core_restarted_since "$ASTERISK_UNIT"; then
-        mod_hint "journalctl -u $ASTERISK_UNIT -n 50 : module ou conf en faute"
-        mod_fail "Asterisk a redémarré depuis le lancement"
+    # Le contrôle « a-t-il redémarré ? » reposait sur le compteur NRestarts de
+    # systemd, qui n'a plus de sens en lancement direct : personne ne relance
+    # Asterisk, donc une mort est définitive et se voit au PID. On vérifie donc
+    # que le PID noté au démarrage est TOUJOURS celui qui tourne — un Asterisk
+    # remplacé par un autre serait invisible au seul test « la CLI répond ».
+    local pf; pf="$(core_pidfile "$ASTERISK_UNIT")"
+    if [ -f "$pf" ] && ! kill -0 "$(cat "$pf" 2>/dev/null)" 2>/dev/null; then
+        mod_hint "tail -50 ${LOG_DIR}/${ASTERISK_UNIT}.log"
+        mod_fail "le PID lancé n'existe plus : Asterisk est mort ou a été remplacé"
         return $MOD_RC_FAIL
     fi
     mod_ok

@@ -238,6 +238,9 @@ calypso-ipc-device fake_trx trxcon grgsm_decode si_bridge.py qemu_bcch_grgsm"
     for art in /tmp/osmocom_l2 /tmp/ms2_l2 /tmp/iq_grgsm.fifo \
                /dev/shm/dsp_iq.fifo /dev/shm/calypso_rach \
                /dev/shm/calypso_sdcch_ul /dev/shm/calypso_tch_dl \
+               /dev/shm/calypso_tch_facch_ul /dev/shm/calypso_tch_sacch_ul \
+               /dev/shm/calypso_tch_cfg /dev/shm/calypso_tch_sacch_air /dev/shm/calypso_dcch_cfg /dev/shm/calypso_tch_speech.gsm \
+               /tmp/iq_grgsm_tch.fifo /tmp/iq_grgsm_sdcch.fifo \
                /dev/shm/calypso_dsp_shunt; do
         [ -e "$art" ] && rm -f "$art" 2>/dev/null && printf '  supprimé              %s\n' "$art" >&2
     done
