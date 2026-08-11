@@ -44,6 +44,39 @@ MOD_ENABLED_IF[l2]='[ "${CALYPSO_SKIP_L2:-0}" != 1 ]'
 : "${CALYPSO_L1CTL_SOCK:=/tmp/osmocom_l2}"
 # Masque de catégories du mobile (L2075) ; séparateur `:`, pas `,`.
 : "${CALYPSO_MOBILE_DEBUG:=DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK}"
+
+# ── DESCENDANT MUET : géométrie du tampon ALSA du mobile ─────────────────────
+# [2026-08-10] RACINE MESURÉE, pas déduite. `osmo-gapk/src/pq_alsa.c` (l.87-135)
+# ouvre le périphérique en ne fixant QUE access/format/rate/channels : il ne
+# contraint jamais buffer_size ni period_size et accepte ce que le greffon
+# propose. Le greffon ALSA-PulseAudio accorde alors :
+#     buffer_size = 2097152 trames (262144 ms !)   period_size = 2048 (256 ms)
+# Face à des écritures de 160 trames (20 ms, une trame GSM), CHAQUE
+# `snd_pcm_writei` rend -EPIPE. Or `pq_alsa.c` l.61-66 traite l'EPIPE par un
+# `snd_pcm_prepare()` + réécriture, SANS AUCUN LOGP — et dans le greffon pulse
+# ce `prepare` démonte et remonte le flux. D'où le tableau observé : sink-input
+# PulseAudio détruit/recréé 50 fois par seconde, `Buffer Latency = 0`, RMS et
+# crête EXACTEMENT nuls sur gsm_audio.monitor, et pas une ligne d'erreur nulle
+# part. Tout l'amont est sain (50,1 TRAFFIC.ind/s, charges FR valides).
+#
+# Reproduit hors de toute la pile GSM par un programme de 60 lignes qui rejoue
+# la même séquence d'ouverture (`/tmp/repro_alsa.c`) :
+#     sans la variable : 749 EPIPE / 750 écritures
+#     PULSE_LATENCY_MSEC=40 : 0/750    =60 : 1/750    =80 : 0/750
+#
+# 80 ms = 4 trames GSM : zéro underrun avec de la marge sur le jitter mesuré du
+# descendant (médiane 18,58 ms, max 23,72 ms), et négligeable devant les ~240 ms
+# qu'affiche naturellement un flux sain.
+#
+# CE N'EST PAS UNE BÉQUILLE : on ne masque pas un symptôme, on donne au greffon
+# la géométrie que l'application aurait dû négocier. Le correctif propre serait
+# un `snd_pcm_set_params()` dans pq_alsa.c — hors périmètre (infra osmo).
+#
+# JUGE (pendant un appel ÉTABLI) : l'index du sink-input du mobile doit rester
+# FIXE. Il bouge de +50/s ⇒ le défaut est de retour.
+#     pactl list short sink-inputs | awk '$2==1{print $1}'   # 2 relevés à 1 s
+# Poser la variable à vide DÉSACTIVE le correctif (retour au défaut du greffon).
+: "${CALYPSO_PULSE_LATENCY_MSEC:=80}"
 # Marqueur « le firmware tourne » émis par osmocon à la fin du romload. Chaîne
 # relevée dans le binaire osmocon : « Received DOWNLOAD ACK from phone, your
 # code is running now! ». Remplace le `sleep 3` de L2131.
@@ -152,7 +185,11 @@ mod_l2_start() {
         mobile)
             mod_say "cfg      : $cfg"
             mod_say "debug    : $CALYPSO_MOBILE_DEBUG"
-            mobile -c "$cfg" -d "$CALYPSO_MOBILE_DEBUG" >>"$log" 2>&1 & ;;
+            # PULSE_LATENCY_MSEC : cf. le bloc « DESCENDANT MUET » en tête de
+            # module. Sans elle, le descendant est muet une fois sur deux.
+            mod_say "latence  : PULSE_LATENCY_MSEC=${CALYPSO_PULSE_LATENCY_MSEC:-<defaut greffon>}"
+            PULSE_LATENCY_MSEC="$CALYPSO_PULSE_LATENCY_MSEC" \
+                mobile -c "$cfg" -d "$CALYPSO_MOBILE_DEBUG" >>"$log" 2>&1 & ;;
         ccch_scan)  ccch_scan -a "$arfcn" >>"$log" 2>&1 & ;;
         bcch_scan)  bcch_scan -a "$arfcn" >>"$log" 2>&1 & ;;
         cell_log)   cell_log            >>"$log" 2>&1 & ;;

@@ -1357,17 +1357,84 @@ static int tch_ul_build_burst(int8_t *ab, uint32_t fn, uint8_t tsc, uint8_t tn,
     if (t13 == 12) return 0;                          /* trame de garde du TCH/F */
     uint32_t bid = t13 % 4;
 
+    /* ── FILE FACCH MONTANTE ─────────────────────────────────────────────────
+     * [2026-08-10] RACINE DES ASSIGNMENTS RATES, mesuree : sur un meme run,
+     * 28 FACCH publiees par le shunt (« TCH-FACCH-UL ... -> sideband ») pour
+     * seulement 19 injectees sur l'air (« TCH-UL inject ... FACCH ») — UNE SUR
+     * TROIS PERDUE, sans une ligne de journal. Or l'ASSIGNMENT COMPLETE est un
+     * SABM porte par la FACCH : le perdre, c'est `rll_ready=no` cote BSC, donc
+     * « Assignment failed ... RADIO INTERFACE MESSAGE FAILURE », donc
+     * ASSIGNMENT FAILURE cote MS et RELEASE en etat CC INITIATED.
+     *
+     * MECANISME : `tch_ul_publish_l2` (calypso_dsp_shunt.c) ecrit dans un SLOT
+     * UNIQUE de 48 o avec un `seq`, sans aucun accuse de consommation. Le
+     * lecteur, lui, ne consultait ce slot QUE dans la branche `bid == 0`, soit
+     * une fois par bloc (~20 ms) — exactement la cadence a laquelle le shunt
+     * publie (a_fu est lu a chaque tache TCHT). Deux cadences egales et NON
+     * synchronisees : des qu'une publication tombe entre deux lectures, elle
+     * est ecrasee par la suivante et disparait.
+     *
+     * CORRECTIF : on decouple la LECTURE de la CONSOMMATION.
+     *  - lecture a CHAQUE trame (un pread de 48 o, negligeable) : plus aucune
+     *    publication ne peut passer entre deux regards ;
+     *  - les trames lues sont empilees dans une petite file ; `bid == 0` en
+     *    depile une. La signalisation ne peut donc plus etre ecrasee par la
+     *    suivante avant d'etre emise.
+     *
+     * Correctif cote LECTEUR uniquement : ni le format du fichier ni le shunt
+     * ne bougent, donc aucun autre consommateur de ces sidebands n'est touche.
+     *
+     * OBSERVABILITE — le defaut ne doit plus jamais etre silencieux. Deux
+     * compteurs, tous deux CUMULATIFS (jamais un taux) :
+     *  - `perdues` : ecart de `seq` > 1 = une publication ratee AU FICHIER.
+     *    Doit rester a 0 ; s'il monte, la lecture par trame ne suffit plus.
+     *  - `debordees` : file pleine = on publie plus vite qu'on n'emet.
+     * JUGE du correctif : « TCH-FACCH-UL ... -> sideband » (qemu.log) et
+     * « TCH-UL inject ... FACCH » (calypso-ipc-device.log) doivent compter
+     * PAREIL sur un meme run. */
+    enum { FACCH_Q = 8 };
+    static uint8_t  fq[FACCH_Q][23];
+    static unsigned fq_head = 0, fq_tail = 0;
+    static uint32_t fq_perdues = 0, fq_debordees = 0;
+    {
+        uint8_t l2q[23]; uint32_t sq = 0;
+        if (calypso_ul_sb_read("/dev/shm/calypso_tch_facch_ul", &fd_facch, l2q, &sq)
+            && sq != seq_facch) {
+            /* Un saut de seq > 1 signale une publication perdue AVANT nous : la
+             * seule chose qu'on puisse encore faire est de le DIRE. */
+            if (seq_facch && sq > seq_facch + 1) {
+                fq_perdues += sq - seq_facch - 1;
+                LOGP(DDEV, LOGL_ERROR,
+                     "TCH-UL FACCH PERDUE : seq %u -> %u (cumul perdues=%u) — "
+                     "le slot a ete ecrase avant lecture\n",
+                     seq_facch, sq, fq_perdues);
+            }
+            seq_facch = sq;
+            unsigned nxt = (fq_head + 1) % FACCH_Q;
+            if (nxt == fq_tail) {
+                fq_debordees++;
+                LOGP(DDEV, LOGL_ERROR,
+                     "TCH-UL FACCH file PLEINE (cumul debordees=%u) — publication "
+                     "plus rapide que l'emission\n", fq_debordees);
+            } else {
+                memcpy(fq[fq_head], l2q, 23);
+                fq_head = nxt;
+            }
+        }
+    }
+
     if (bid == 0) {
         memmove(&tx_bursts[0], &tx_bursts[4 * TCH_BPLEN], 20 * TCH_BPLEN * sizeof(ubit_t));
         memset(&tx_bursts[20 * TCH_BPLEN], 0, 4 * TCH_BPLEN * sizeof(ubit_t));
 
         /* FACCH prioritaire sur la voix (trxcon fait de meme) : la signalisation
-         * de l'appel ne doit jamais attendre derriere 20 ms de son. */
-        uint8_t l2[23], fr[33]; uint32_t sq = 0;
-        if (calypso_ul_sb_read("/dev/shm/calypso_tch_facch_ul", &fd_facch, l2, &sq)
-            && sq != seq_facch) {
-            seq_facch = sq;
-            memcpy(pend_facch, l2, 23);
+         * de l'appel ne doit jamais attendre derriere 20 ms de son.
+         * On DEPILE ici ce que la lecture par trame a empile plus haut ; la
+         * lecture du sideband elle-meme n'a plus lieu dans cette branche. */
+        uint8_t fr[33]; uint32_t sq = 0;
+        if (fq_tail != fq_head) {
+            memcpy(pend_facch, fq[fq_tail], 23);
+            fq_tail = (fq_tail + 1) % FACCH_Q;
             pend_facch_valid = 1;
         }
         if (pend_facch_valid) {
@@ -2081,6 +2148,49 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
         if (calypso_tch_cfg_read(&tn, &tsc, &tarfcn)) {
             const int SLOT = CALYPSO_FRAME_SAMPLES / 8;             /* 625 */
             int abs_off = (3 + (int)tn) * SLOT;                     /* montant = DL + 3 slots */
+            /* ── TOA du burst normal montant : CALYPSO_UL_TCH_SMP_OFS ────────
+             * [2026-08-10] osmo-trx mesure le montant Calypso a un TOA CONSTANT
+             * de 4,63672 bit : 24729 detections « NB-DET » sur 24786 a la valeur
+             * strictement identique (99,8 %), et elle ne bouge pas d'un iota
+             * quand le TA ordonne monte (verifie a TA=20 : toujours 4,63672 sur
+             * 2991/3000). Le burst est donc injecte a offset FIXE, sans aucun
+             * lien avec le TA — la boucle de controle du BTS est OUVERTE.
+             *
+             * Consequence : `osmo-bts/src/common/ta_control.c` calcule
+             * `delta_ta = toa256/256` ecrete a TA_MAX_INC_STEP=2, puis
+             * `new_ta = ms_tx_ta + delta_ta`. Avec toa=4,64 le delta vaut +2 a
+             * CHAQUE intervalle, indefiniment : le TA ordonne rampe jusqu'a
+             * TA_MAX=63 en ~55 s puis y reste, et la boucle de puissance
+             * diverge de meme jusqu'a 0x0f (puissance minimale).
+             *
+             * 4,63672 bit x 4 echantillons/symbole (rx-sps=4) = 18,55
+             * echantillons. Les retirer ramene le TOA a ~0, donc delta_ta a 0,
+             * donc un TA qui se FIGE au lieu de ramper.
+             *
+             * ⚠️ Ceci DEPLACE le burst montant : a valider par un appel.
+             *   JUGE 1 : grep -oE 'toa=[0-9.]+' osmo-trx-ipc.log | sort | uniq -c
+             *            -> doit basculer de 4,63672 vers ~0
+             *   JUGE 2 : « DL SACCH indicates ta » (mobile.log) cesse de ramper
+             *   JUGE 3 : NON-REGRESSION — les assignments doivent continuer de
+             *            passer (0 « ASSIGNMENT FAILURE », 0 « rll_ready=no »
+             *            sur du TCH) et la fenetre de detection reste large
+             *            (CALYPSO_NB_MAXDLY=40, on vise 0, donc bien dedans).
+             * REVERT : poser CALYPSO_UL_TCH_SMP_OFS=0 (comportement d'avant).
+             *
+             * ⚠️ Ne PAS confondre avec CALYPSO_UL_SLOT_OFFSET, qui est le TOA
+             * du RACH : son detecteur correle a une position DIFFERENTE de
+             * celle du burst normal (cf. qemu_wrap.c, injection SDCCH), et
+             * « toa~4.6 = bon » de calypso.env:152 ne vaut QUE pour lui. */
+            static int tch_smp = -999999;
+            if (tch_smp == -999999) {
+                const char *e = getenv("CALYPSO_UL_TCH_SMP_OFS");
+                tch_smp = (e && *e) ? atoi(e) : -19;   /* 4,63672 bit x 4 sps */
+                LOGP(DDEV, LOGL_NOTICE,
+                     "TCH-UL TOA : CALYPSO_UL_TCH_SMP_OFS=%d echantillons "
+                     "(0 = comportement d'avant le 10/08)\n", tch_smp);
+            }
+            abs_off += tch_smp;
+            if (abs_off < 0) abs_off = 0;
             int phase   = (abs_off / CALYPSO_SHM_BUFSIZE) * CALYPSO_SHM_BUFSIZE;
             int local   = abs_off - phase;
             int burst_n = CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR;   /* 592 */

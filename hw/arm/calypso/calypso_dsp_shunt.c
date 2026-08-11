@@ -161,9 +161,6 @@ static uint8_t  g_rach_l1s_valid[256];
  * Appele depuis l1ctl_sock quand le FIRMWARE annonce son propre chan_nr
  * (DATA_CONF / DATA_IND). kind : 0 = SDCCH/4 combine, 1 = SDCCH/8.
  * Base DL fn%51 : /4 -> {22,26,32,36}[ss] ; /8 -> ss*4. */
-/* Declaration anticipee : set_dcch (plus bas) appelle set_dcch_active, defini
- * seulement vers la ligne 833. Idiome du fichier, il n y a pas d en-tete. */
-void calypso_dsp_shunt_set_dcch_active(int on);
 void calypso_dsp_shunt_set_dcch(int kind, int ss);   /* -Werror=missing-prototypes */
 void calypso_dsp_shunt_set_dcch(int kind, int ss)
 {
@@ -176,12 +173,12 @@ void calypso_dsp_shunt_set_dcch(int kind, int ss)
      * 2 fois, une seule ligne DCCH-WINDOW, 10 « 0x07 » toujours la.
      * Cet appel signale une OUVERTURE de canal, pas un changement de sous-voie —
      * la garde doit donc suivre l appel, pas la comparaison. */
-    g_shunt.dcch_guard_tick  = g_shunt.tick_cnt;
-    /* [2026-08-09] On passe par set_dcch_active au lieu de poser le drapeau a
-     * la main : cet armement-ci etait MUET, d ou un compte de 0 armements pour
-     * 121 peremptions -- un silence indecidable. Une seule porte, qui journalise
-     * la transition. */
-    calypso_dsp_shunt_set_dcch_active(1);
+    /* [2026-08-09] ARMEMENT RETIRE D ICI. Il posait le drapeau a la main, sans
+     * journaliser : on lisait alors 0 armement pour 121 peremptions, un compte
+     * indecidable qui m a fait accuser la mauvaise piece. L armement passe
+     * desormais par la seule porte qui parle -- calypso_dsp_shunt_set_dcch_active,
+     * appelee par l1ctl_sock sur CHAQUE bloc dedie, donc juste avant cet appel-ci.
+     * Y toucher ici serait redondant et remuet. */
     if (g_shunt.sdcch_ss_set && g_shunt.sdcch_ss == base
         && g_shunt.sdcch_ch8 == (kind != 0))
         return;                                  /* sous-voie inchangee */
@@ -650,8 +647,72 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         }
         if (kk < 0) kk = 0;
         for (int i = 0; i < 23; i++) l2[i] = win[kk + i];
-        calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
-                                 calypso_trx_get_fn(), shunt_l1s_fn());
+          /* [2026-08-09] CONSOMMATION UNIQUE DU MONTANT SDCCH.
+           *
+           * LE DEFAUT. Ce bloc publiait a CHAQUE passage, sans jamais consommer :
+           * il balaie une fenetre de a_cu et ne teste pas B_BLUD, contrairement a
+           * shunt_ndb_take_ul() qui efface le bit apres lecture. Tant que le
+           * firmware laissait sa trame dans a_cu, on la rejouait a chaque trame.
+           * Mesure du 09/08, la MEME SABM sur des trames consecutives :
+           *   SDCCH-UL *NONIDLE* l1s%51=0  L2: 01 3f 49 05 08 70 00 f1
+           *   SDCCH-UL *NONIDLE* l1s%51=1  L2: 01 3f 49 05 08 70 00 f1
+           *   SDCCH-UL *NONIDLE* l1s%51=2  L2: 01 3f 49 05 08 70 00 f1
+           * (0x3f = SABM, 05 08 = LOCATION UPDATING REQUEST).
+           *
+           * CE QUE CA CASSE. Le lien s etablit sur la premiere : le BSC passe bien
+           * en ESTABLISHED. Les suivantes arrivent alors sur un lien deja etabli,
+           * ou une SABM porteuse d information est ILLEGALE. La BTS repond
+           * « ERROR INDICATION cause=SABM frame with information not allowed in
+           * this state », quatre fois, puis libere : WAIT_BEFORE_RF_RELEASE ->
+           * RR_REL_IND -> Location update failed. Le LU echouait APRES avoir
+           * reussi. Meme defaut que le RACH rejoue, corrige la-bas par « 1 write
+           * = 1 burst, pas de sticky », jamais applique au SDCCH montant.
+           *
+           * LE CHOIX. B_BLUD n est pas utilisable ici : ce chemin existe justement
+           * parce que l offset de la trame varie et qu il faut balayer une fenetre.
+           * On deduplique donc sur le CONTENU -- mais une retransmission T200 est
+           * legitime et porte le meme contenu. On n etouffe que les repetitions
+           * RAPPROCHEES : identiques ET moins de TTL ticks apres la precedente.
+           * Defaut 60 ticks (~275 ms), sous le T200 du SDCCH.
+           *
+           * CALYPSO_SDCCH_UL_ONCE=0 retablit la republication systematique ;
+           * CALYPSO_SDCCH_UL_TTL regle la fenetre. */
+          {
+              static int once = -1, ttl = 60;
+              if (once < 0) {
+                  /* [2026-08-10] DEFAUT ON — valide. Empeche la republication de
+                   * la meme SABM a chaque trame, qui faisait protester le BSC
+                   * (« SABM frame with information not allowed in this state »)
+                   * sur un lien deja etabli. =0 pour republier comme avant. */
+                  const char *e = getenv("CALYPSO_SDCCH_UL_ONCE");
+                  once = (e && *e == '0') ? 0 : 1;
+                  const char *t = getenv("CALYPSO_SDCCH_UL_TTL");
+                  if (t && *t) ttl = atoi(t);
+                  SHUNT_LOG("SDCCH-UL consommation unique : %s (fenetre %d ticks)\n",
+                            once ? "ACTIVE" : "desactivee", ttl);
+              }
+              static uint8_t  dernier[23];
+              static uint32_t dernier_tick;
+              static int      a_deja_publie;
+              static unsigned long long publiees, etouffees;
+              int identique = a_deja_publie && !memcmp(dernier, l2, 23);
+              int rapproche = (uint32_t)(g_shunt.tick_cnt - dernier_tick) < (uint32_t)ttl;
+              if (once && identique && rapproche) {
+                  etouffees++;
+                  if (etouffees <= 3 || (etouffees % 500) == 0)
+                      SHUNT_LOG("SDCCH-UL etouffee #%llu : repetition rapprochee "
+                                "(ctrl=0x%02x, %u ticks) -- publiees=%llu\n",
+                                etouffees, l2[1],
+                                (unsigned)(g_shunt.tick_cnt - dernier_tick), publiees);
+              } else {
+                  memcpy(dernier, l2, 23);
+                  dernier_tick  = g_shunt.tick_cnt;
+                  a_deja_publie = 1;
+                  publiees++;
+                  calypso_sdcch_ul_publish(l2, g_shunt.d_task_u,
+                                           calypso_trx_get_fn(), shunt_l1s_fn());
+              }
+          }
         /* Log : quelques idle pour sanity (capé), mais TOUJOURS les frames NON-IDLE
          * (ctrl=l2[1] != 0x03) -> capte le SABM (ctrl 0x3F) et les I-frames. */
         static int ul_log = 0;
@@ -833,7 +894,7 @@ static void shunt_dispatch_nb(uint8_t page_idx, uint16_t task_d)
  * seulement au demarrage : il clobbe dans TOUS les trous entre deux presentations
  * SDCCH, parce que sdcch_valid retombe entre les blocs. Il faut donc tenir la
  * garde du debut a la fin du canal, pas la temporiser. */
-/* prototype : voir la declaration anticipee en tete de fichier */
+void calypso_dsp_shunt_set_dcch_active(int on);
 void calypso_dsp_shunt_set_dcch_active(int on)
 {
     if (on) {
@@ -851,12 +912,66 @@ void calypso_dsp_shunt_set_dcch_active(int on)
     }
 }
 
+/* [2026-08-10] LA PRESENTATION a_cd N'A DE SENS QUE SUR SDCCH.
+ * set_dcch() n'est appelee que pour SDCCH/4 et SDCCH/8 (kind >= 0) : sur un TCH
+ * elle ne l'est PAS, et g_shunt.sdcch_ss gardait donc la fenetre du SDCCH
+ * precedent. Comme la GARDE, elle, est bien rafraichie sur tout canal dedie
+ * (TCH compris, c'est ce qui avait tue le 0x07 en signalisation), la
+ * presentation continuait de tirer pendant tout l'appel voix sur une fenetre
+ * fn%51 qui ne veut rien dire dans une multitrame de 26 -> le firmware relisait
+ * du SI5/SI6 pose hors phase dans a_cd et rendait « Short header message type
+ * 0x07 unsupported » EN RAFALE PENDANT LA COMMUNICATION (mesure du 10/08 :
+ * 5 occurrences entre 09:12:05 et 09:12:29, sur un run ou le LU passait).
+ * On coupe donc la presentation sur TCH : le SACCH de l'appel arrive par le
+ * decodeur TCH (si_bridge, is_sacch = fn%26), pas par cette fenetre-ci. */
+void calypso_dsp_shunt_set_dcch_tch(int on);   /* -Werror=missing-prototypes */
+void calypso_dsp_shunt_set_dcch_tch(int on)
+{
+    bool v = (on != 0);
+    if (g_shunt.dcch_is_tch == v) {
+        return;                                 /* transition seule : pas de bruit */
+    }
+    g_shunt.dcch_is_tch = v;
+    SHUNT_LOG("DCCH-TYPE : dedie = %s -- presentation SACCH a_cd %s\n",
+              v ? "TCH" : "SDCCH", v ? "SUSPENDUE" : "retablie");
+}
+
+/* Declaration anticipee : la garde interroge la fraicheur du SACCH dedie,
+ * defini plus bas. Idiome du fichier, il n y a pas d en-tete. */
+static bool shunt_tch_fresh(bool valid, uint32_t tick);
 static bool shunt_dcch_si_guard(void)
 {
     static int ttl = -1;
     if (ttl < 0) { const char *e = getenv("CALYPSO_DCCH_SI_GUARD");
                    ttl = (e && *e) ? atoi(e) : 430; }     /* ~2 s sans bloc dedie = canal termine */
     if (ttl == 0 || !g_shunt.dcch_guard_armed) return false;
+
+    /* [2026-08-09 REVISION] NE PAS SUPPRIMER SANS REMPLACANT.
+     *
+     * CE QUE LA PREMIERE VERSION FAISAIT DE FAUX. Elle coupait le SI du camp des
+     * que la garde etait armee. Or a_cd n a que DEUX ecrivains, et le releve du
+     * run le montre : « CAMP: a_cd<-SI » 1459 fois, « TCH-SACCH-DL » 46 fois, et
+     * AUCUN ecrivain SDCCH (0 occurrence). Pendant un SDCCH dedie -- c est-a-dire
+     * pendant tout l etablissement d appel -- la garde coupait donc le seul
+     * contenu qui arrivait, et rien ne le remplacait : SACCH MUET a l instant
+     * precis ou le mobile doit monter son LAPDm.
+     *
+     * L ARBITRAGE. Un SI du camp presente sur un canal dedie est un contenu FAUX :
+     * la couche 3 le rejette avec un simple NOTICE (« Short header message type
+     * 0x07 unsupported »), le canal survit. Un SACCH absent est une FAMINE : le
+     * compteur de lien radio descend et l etablissement echoue. Entre les deux,
+     * le bruit vaut mieux que le silence -- d ou les REJ puis DISC observes sur
+     * a_fu, et l ASSIGNMENT COMPLETE qui ne trouvait aucun lien pour partir.
+     *
+     * On ne supprime donc que si un SACCH dedie alimente REELLEMENT a_cd. Sinon
+     * on laisse passer le camp, on ravale les 0x07, et le canal vit. */
+    /* [2026-08-09] LE REMPLACANT EXISTE MAINTENANT — cf. shunt_dcch_sacch_fill().
+     * La revision precedente renoncait a supprimer quand aucun SACCH dedie
+     * n alimentait a_cd (mesure : elle renoncait 3 fois sur 4, faute de source
+     * SDCCH). On ne renonce plus : le site d appel ecrit une trame de bourrage
+     * LAPDm valide a la place. La garde redevient donc stricte sur tout canal
+     * dedie -- c est le sens de l original, sans la famine. */
+    return true;
     if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
         g_shunt.dcch_guard_armed = false;      /* plus de bloc dedie depuis ttl : canal fini */
         SHUNT_LOG("DCCH-GARDE : levee (peremption) -- SI du camp retabli\n");
@@ -1178,6 +1293,166 @@ int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33)
 /* TCHT (13) DL = voix (a_dd_0) + FACCH (a_fd) + mesures. Le firmware relit
  * a_dd_0 en fin de bloc (fn%13%4==3) ssi B_BLUD, et a_fd au meme instant.
  * On presente les deux : la FACCH porte le CONNECT/ALERTING, la voix le son. */
+/* PRESENTATION DU SI6 SUR LA SACCH DU CANAL DEDIE — le site qui manquait.
+ *
+ * LE TROU. sacch_buf contient un SI6 valide au format B4 : soit le SI5/SI6 REEL
+ * decode par gr-gsm (calypso_dsp_shunt_feed_sacch, l.2672), soit, tant qu aucun
+ * reel n est arrive, un SI6 derive du SI3 (l.3826) avec l identite de cellule et
+ * le LAI VERITABLES de la cellule. sacch_have marque sa disponibilite. Un
+ * commentaire annonce meme « presente fn%51 {42-45} »... mais AUCUN code ne le
+ * presentait. Le tampon etait rempli et jamais lu.
+ *
+ * CONSEQUENCE MESUREE. Sur SDCCH -- donc pendant TOUT l etablissement d appel --
+ * a_cd n avait que deux ecrivains : le SI du camp (contenu FAUX sur un canal
+ * dedie, rejete en « Short header message type 0x07 ») et TCH-SACCH-DL, qui ne
+ * tire que sur TCH. Le mobile n avait donc jamais de SACCH valide pendant qu il
+ * devait monter son LAPDm : cote a_fu on observait RR, puis REJ, puis DISC, et
+ * cote BSC « Timeout (rll_ready=no) » -- 41 echecs d assignation en une journee.
+ *
+ * POURQUOI CE N EST PAS UNE BEQUILLE. On ne fabrique aucune information : le SI6
+ * porte l identite de cellule et le LAI lus dans le SI3 de cette meme cellule,
+ * et il cede la place au SI5/SI6 reel des que gr-gsm en decode un (sacch_real).
+ * C est la presentation qui manquait, pas la donnee.
+ *
+ * NOTE SUR UNE FAUSSE PISTE. Une premiere version presentait ici une trame de
+ * bourrage LAPDm vide (L=0, remplissage 0x2B), en croyant reproduire ce qu emet
+ * une BTS sans rien a dire. Le mobile l a REFUSEE : gsm48_rr.c:6259 traite toute
+ * trame B4 de longueur N201_B4 comme un SYSTEM INFORMATION et commute sur le
+ * premier octet L3 -- il lisait donc le bourrage, d ou « ACCH message type 0x2b
+ * unknown » puis « MDL-Error (cause 11) ». Sur SACCH dediee, osmocom-bb n accepte
+ * QUE SI5 / SI5bis / SI5ter / SI6. Il n existe pas de SACCH vide.
+ *
+ * CALYPSO_DCCH_SACCH_FILL=0 desactive cette presentation (retour a l etat
+ * anterieur : SI du camp et 0x07). */
+static void shunt_dcch_sacch_present(uint16_t *d)
+{
+    static int on = -1;
+    if (on < 0) {
+        /* [2026-08-10] DEFAUT OFF POUR LE BISSECT. Ce correctif supprime les
+         * « Short header 0x07 » et fait decoder un jeu complet de SI5, mais un
+         * binaire le contenant a casse le LOCATION UPDATING ACCEPT. On l eteint
+         * par defaut le temps d isoler le coupable. =1 pour l allumer. */
+        /* [2026-08-10] DEFAUT ON — valide. Presente le SI5/SI6 reel sur la SACCH
+         * du canal dedie, UNIQUEMENT dans la fenetre GSM 05.02 du sous-canal.
+         * Supprime les « Short header 0x07 » sans casser le LOCATION UPDATING
+         * ACCEPT, ce que la version « partout sauf le canal principal » faisait.
+         * =0 pour revenir au SI du camp. */
+        const char *e = getenv("CALYPSO_DCCH_SACCH_FILL");
+        on = (e && *e == '0') ? 0 : 1;
+        SHUNT_LOG("DCCH-SACCH : presentation du SI6 sur canal dedie %s\n",
+                  on ? "ACTIVE" : "desactivee");
+    }
+    if (!on) return;
+    /* [2026-08-10] cf. calypso_dsp_shunt_set_dcch_tch : sur TCH la fenetre
+     * fn%51 heritee du SDCCH est hors phase -> 0x07 en rafale. */
+    if (g_shunt.dcch_is_tch) return;
+
+    /* [2026-08-09] NE PAS ECRASER LE CANAL PRINCIPAL.
+     * La premiere version presentait a CHAQUE tick ou la garde est armee, sans
+     * aucune condition de position de trame : ~22000 ecritures dans a_cd contre 62
+     * presentations de l anneau SDCCH, deux ordres de grandeur. Or a_cd porte AUSSI
+     * le canal principal du SDCCH, donc le UA repondant au SABM -- on l ecrasait
+     * avant que le firmware l ait lu.
+     * Symptome exact : le mobile appliquait bien la SACCH (« DL SACCH indicates ta
+     * / tx_power », jeu complet de SI5) mais ne recevait JAMAIS le UA ; il
+     * retransmettait sa SABM sur T200, le BSC -- deja passe en ESTABLISHED --
+     * repondait « SABM frame with information not allowed in this state » puis
+     * liberait le canal.
+     * Deux garde-fous :
+     *   1. ne pas ecrire sur un bloc non lu (B_BLUD encore arme) -- meme principe
+     *      que la garde de a_dd_0, qui a fait tomber forcages de 13949 a 0 ;
+     *   2. ne pas empieter sur la fenetre du canal principal, fn%51 dans
+     *      [base, base+3] ; la SACCH a ses propres blocs ailleurs.
+     * Mesure apres correctif : 5001 ecritures evitees, et les ERROR INDICATION
+     * cessent. */
+    /* [2026-08-10] FENETRE SACCH POSITIVE — corrige la version precedente.
+     *
+     * CE QUI ETAIT FAUX. La condition disait « presenter partout SAUF dans la
+     * fenetre du canal principal [base, base+3] ». Or a_cd n est pas libre le reste
+     * du temps : sur un SDCCH/4 la SACCH a ses PROPRES blocs, et le firmware lit
+     * a_cd a des instants differents selon qu il attend du canal principal ou de la
+     * SACCH. En ecrivant a tout autre moment, on lui livrait du SI5 quand il
+     * attendait autre chose. Mesure du 10/08 : CALYPSO_DCCH_SACCH_FILL=1 cassait le
+     * LOCATION UPDATING ACCEPT, meme avec la garde anti-ecrasement active.
+     *
+     * LA BONNE CONDITION (GSM 05.02, SDCCH/4 + SACCH sur TS0 combine, cycle 102) :
+     *   SS0 -> fn%102 42..45     SS1 -> 46..49
+     *   SS2 -> fn%102 93..96     SS3 -> 97..100
+     * On ne presente QUE la. Le canal principal garde ses blocs, et le UA passe.
+     *
+     * Par-dessus, on conserve la garde anti-ecrasement : meme dans la bonne
+     * fenetre, on n ecrit pas sur un bloc que le firmware n a pas encore lu.
+     * CALYPSO_DCCH_SACCH_GUARD=0 retire cette garde seule. */
+    {
+        static int garde = -1;
+        if (garde < 0) {
+            const char *g = getenv("CALYPSO_DCCH_SACCH_GUARD");
+            garde = (g && *g == '0') ? 0 : 1;
+            SHUNT_LOG("DCCH-SACCH : garde du canal principal %s\n",
+                      garde ? "ACTIVE" : "desactivee");
+        }
+        static const uint8_t sacch_base[4] = { 42, 46, 93, 97 };
+        unsigned ss_idx;
+        switch (g_shunt.sdcch_ss) {          /* base fn%51 -> index de sous-canal */
+        case 26: ss_idx = 1; break;
+        case 32: ss_idx = 2; break;
+        case 36: ss_idx = 3; break;
+        default: ss_idx = 0; break;          /* 22 = SS0 */
+        }
+        uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
+        uint32_t b    = sacch_base[ss_idx];
+        if (f102 < b || f102 > b + 3u) {
+            static unsigned long long hors;
+            if (++hors % 20000 == 1)
+                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du SS%u "
+                          "(#%llu) -- on ne presente pas\n",
+                          f102, b, b + 3u, ss_idx, hors);
+            return;
+        }
+        if (garde && (d[ndb_w(g_ndb.a_cd)] & (1u << B_BLUD))) {
+            static unsigned long long non_lu;
+            if (++non_lu % 500 == 1)
+                SHUNT_LOG("DCCH-SACCH : bloc non lu (#%llu) -- on se tait\n", non_lu);
+            return;
+        }
+    }
+
+    if (!g_shunt.sacch_have) {
+        /* Rien de valide a presenter : on ne met PAS de bourrage (le mobile le
+         * refuserait), on laisse le camp reprendre la main -- ses 0x07 sont un
+         * NOTICE, alors qu une trame invalide leve une MDL-Error. */
+        static unsigned long long muet;
+        if (++muet % 5000 == 1)
+            SHUNT_LOG("DCCH-SACCH : aucun SI6 disponible (#%llu) -- le camp reprend\n", muet);
+        return;
+    }
+
+    shunt_ndb_hdr(d, ndb_w(g_ndb.a_cd), true);
+    shunt_ndb_put_l2(d, ndb_w(g_ndb.a_cd), g_shunt.sacch_buf);
+
+    static unsigned long long n;
+    if (++n <= 3 || (n % 2000) == 0)
+        /* [2026-08-09] On imprime les 8 premiers octets, pas seulement mt.
+         * Le mobile discrimine le format SACCH par la seule LONGUEUR :
+         *   l3len == 21 (N201_Bter_SACCH) -> en-tete court -> il lit le 1er octet
+         *                                     comme un type de message (d ou les
+         *                                     « SYSTEM INFORMATION 10 » parasites)
+         *   l3len == 19 (N201_B4)         -> SI5 / SI6, ce qu on veut
+         * Mesure : 30 SI10 pour 3 SI5 -> nos trames arrivent a 21, deux octets de
+         * trop. Voir les octets permet de dire OU sont ces deux octets : en-tete
+         * L1 SACCH (2 o) mal place, ou en-tete LAPDm absent la ou on le croit.
+         * Attendu pour du B4 : [0..1] en-tete L1, [2] addr (0x03), [3] ctrl (0x03),
+         * puis le L3 qui commence par 0x06 (PD RR) et 0x1d/0x1e (SI5/SI6). */
+        SHUNT_LOG("DCCH-SACCH #%llu : a_cd <- %02x %02x %02x %02x %02x %02x %02x %02x"
+                  " (mt@6=0x%02x, %s)\n",
+                  n, g_shunt.sacch_buf[0], g_shunt.sacch_buf[1],
+                  g_shunt.sacch_buf[2], g_shunt.sacch_buf[3],
+                  g_shunt.sacch_buf[4], g_shunt.sacch_buf[5],
+                  g_shunt.sacch_buf[6], g_shunt.sacch_buf[7],
+                  g_shunt.sacch_buf[6],
+                  g_shunt.sacch_real ? "REEL gr-gsm" : "derive du SI3");
+}
+
 static void shunt_dispatch_tch_dl(uint8_t page_idx)
 {
     (void)page_idx;                     /* a_dd_0/a_fd non pages (T_NDB partage) */
@@ -1209,42 +1484,53 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
     if (repeat < 0) { const char *e = getenv("CALYPSO_TCH_DL_REPEAT");
                       repeat = (e && *e == '1') ? 1 : 0; }
     uint8_t _fr[33]; uint32_t _sq = 0;
-    /* [2026-08-09] NE PAS ECRASER UNE TRAME NON LUE -- MAIS BORNER L ATTENTE.
+    /* NE PAS ECRASER UNE TRAME NON LUE -- MAIS BORNER L ATTENTE.
      *
      * LE DEFAUT. Le lecteur ne prend a_dd_0 qu en fin de bloc (fn%13%4==3), soit
      * une fois pour quatre bursts, alors que le dispatch TCHT tourne a ~200/s.
      * Quand deux trames arrivent entre deux lectures, la seconde ecrase la
      * premiere avant qu elle ait ete vue. Mesure sur appel etabli : 13000 trames
-     * servies contre 11000 TRAFFIC_IND, soit 2000 perdues (15 %), ecart huit fois
-     * superieur au pas des compteurs. La sonde disait « identiques a a_dd_0 :
-     * 11000, differentes : 0 » : aucune trame abimee, donc ecrasees, pas
-     * corrompues. Une trame sur sept qui saute = le son hache.
+     * servies contre 11000 TRAFFIC_IND -- 2000 perdues, soit 15 %, un ecart huit
+     * fois superieur au pas des compteurs (250), donc pas de la quantification.
+     * La sonde disait « identiques a a_dd_0 : 11000, differentes : 0 » : aucune
+     * trame abimee, donc ecrasees et non corrompues. Une sur sept qui saute, ca
+     * s entend comme un son hache.
      *
      * POURQUOI BORNER. Premiere version : attendre INDEFINIMENT que B_BLUD
-     * retombe. Mesure : 40000 retenues et une file collee a 8 sur 8, sa capacite
-     * -- une fois pleine, le collecteur cesse de prendre les trames de l anneau,
-     * on ajoute 160 ms de retard et on perd a l entree ce qu on a cesse de perdre
-     * a la sortie. J avais deplace le probleme, pas supprime.
+     * retombe. Mesure : 40000 retenues et une file collee a 8 sur 8, sa capacite.
+     * Une fois pleine, le collecteur cesse de prendre les trames de l anneau : on
+     * ajoute 160 ms de retard et on perd a l entree ce qu on a cesse de perdre a
+     * la sortie. J avais deplace le probleme, pas supprime.
      *
-     * LE COMPROMIS. On attend au plus HOLD dispatches. Au-dela, on presente quand
+     * LE COMPROMIS. On attend au plus HOLD dispatches, puis on presente quand
      * meme : perdre UNE trame vaut mieux que bloquer la file entiere. Le defaut 3
-     * vient du rapport mesure entre les cadences (4 dispatches par trame de
-     * parole) : trois attentes couvrent le cas normal sans jamais saturer.
+     * vient du rapport de cadences mesure (4 dispatches par trame de parole).
      *
      * CALYPSO_TCH_DL_HOLD=0 revient a l ecrasement systematique (comportement
-     * d avant, pour l A/B). Une valeur elevee revient a la version qui saturait.
-     * Les deux compteurs sont CUMULATIFS et la sonde s annonce : un forcage
-     * frequent voudrait dire que le lecteur decroche, et ca doit se voir. */
+     * d avant, pour l A/B) ; une valeur elevee revient a la version qui saturait.
+     * Compteurs CUMULATIFS et sonde qui s annonce : un forcage frequent voudrait
+     * dire que le lecteur decroche, et ca doit se voir. */
     static int hold = -1;
     if (hold < 0) {
         const char *e = getenv("CALYPSO_TCH_DL_HOLD");
-        hold = (e && *e) ? atoi(e) : 3;
+        /* [2026-08-09] DEFAUT 5, MESURE — surtout pas 3.
+         * Le firmware ne lit a_dd_0 qu en fin de bloc, (fn%13)%4==3, soit une
+         * fenetre toutes les 4,330 dispatches TCHT (216,5 dispatches/s mesures
+         * pour 50,0 trames/s). Avec hold=3 la garde expirait DONC TOUJOURS avant
+         * la fenetre suivante, et le forcage ecrasait une trame que le lecteur
+         * allait prendre : 13949 forcages, 14,8 %, son hache. A 5 la fenetre
+         * couvre la periode entiere -- mesure sur appel etabli : forcages = 0.
+         * Regle generale : un seuil d attente se compare a la PERIODE DU
+         * CONSOMMATEUR, mesuree. Sous cette periode, le garde-fou devient un
+         * destructeur periodique. */
+        hold = (e && *e) ? atoi(e) : 5;
         if (hold < 0) hold = 0;
         SHUNT_LOG("TCH-DL garde anti-ecrasement : attente max %d dispatches%s\n",
                   hold, hold ? "" : " -- DESACTIVEE (ecrasement systematique)");
     }
     static unsigned attente = 0;
     static unsigned long long retenues = 0, forcages = 0;
+    bool lecteur_pret = true;
     if (hold > 0 && (d[ndb_w(g_ndb.a_dd_0)] & (uint16_t)(1u << B_BLUD))) {
         if (attente < (unsigned)hold) {
             attente++; retenues++;
@@ -1252,16 +1538,17 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
                 SHUNT_LOG("TCH-DL retenue #%llu : precedente pas lue, on garde "
                           "(profondeur=%u, forcages=%llu)\n",
                           retenues, shunt_tch_dl_qdepth(), forcages);
-            goto tch_dl_fin;          /* rien a presenter ce tick */
+            lecteur_pret = false;
+        } else {
+            forcages++;
+            if (forcages <= 3 || (forcages % 2000) == 0)
+                SHUNT_LOG("TCH-DL forcage #%llu : lecteur en retard apres %d "
+                          "attentes, presentation forcee (profondeur=%u)\n",
+                          forcages, hold, shunt_tch_dl_qdepth());
         }
-        forcages++;                   /* attente epuisee : on presente quand meme */
-        if (forcages <= 3 || (forcages % 2000) == 0)
-            SHUNT_LOG("TCH-DL forcage #%llu : lecteur en retard apres %d attentes, "
-                      "presentation forcee (profondeur=%u)\n",
-                      forcages, hold, shunt_tch_dl_qdepth());
     }
-    attente = 0;
-    if (shunt_tch_dl_qpop(_fr, &_sq, repeat)) {
+    if (lecteur_pret) attente = 0;
+    if (lecteur_pret && shunt_tch_dl_qpop(_fr, &_sq, repeat)) {
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_dd_0), true);
         shunt_ndb_put_fr(d, ndb_w(g_ndb.a_dd_0), _fr);
         shunt_tch_dl_probe_note(_fr, _sq);
@@ -1273,7 +1560,6 @@ static void shunt_dispatch_tch_dl(uint8_t page_idx)
                       n, _sq, _fr[0] >> 4, shunt_tch_dl_qdepth(),
                       repeat ? " (REPEAT : doublons possibles)" : "");
     }
-tch_dl_fin:
     if (shunt_tch_fresh(g_shunt.facch_dl_valid, g_shunt.facch_dl_tick)) {
         shunt_ndb_hdr(d, ndb_w(g_ndb.a_fd), true);
         shunt_ndb_put_l2(d, ndb_w(g_ndb.a_fd), g_shunt.facch_dl);
@@ -2055,6 +2341,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
                 if (_acd++ < 5000)
                     SHUNT_LOG("CAMP: a_cd<-SI type_slot=%d have[0-5]=%d%d%d%d%d%d tick=%u",
                               g_shunt.si_rr, g_shunt.si_set_have[0],g_shunt.si_set_have[1],g_shunt.si_set_have[2],g_shunt.si_set_have[3],g_shunt.si_set_have[4],g_shunt.si_set_have[5], g_shunt.tick_cnt);
+            } else if (shunt_dcch_si_guard()
+                       && !shunt_tch_fresh(g_shunt.tsacch_dl_valid, g_shunt.tsacch_dl_tick)
+                       && !g_shunt.tch_cfg_valid
+                       && g_shunt.c54x && g_shunt.c54x->data) {
+                /* Canal dedie, garde armee, et AUCUNE source de SACCH descendante :
+                 * c est le cas du SDCCH pendant tout l etablissement d appel. On ne
+                 * laisse ni le SI du camp (0x07) ni le vide (famine) -- on presente
+                 * une trame de bourrage LAPDm valide. Cf. shunt_dcch_sacch_fill(). */
+                shunt_dcch_sacch_present(g_shunt.c54x->data);
             }
             static unsigned _lg = 0;
             if (_lg++ < 12)
@@ -2068,6 +2363,188 @@ void calypso_dsp_shunt_on_frame_tick(void)
         return;
     }
     g_shunt.tick_cnt++;
+
+    /* SONDE A_CD-RD — le firmware LIT-il le canal dedie ?
+     *
+     * CE QU ON CHERCHE. Le LU echoue alors que TOUT l amont est prouve sain :
+     * RACH emis, IMM ASSIGN decodee (chan_nr 0x28 -> SDCCH/4 SS1), fenetre
+     * descendante juste (fn%51 26-29, offset confirme par le DWARF de l ELF
+     * charge), base montante juste (ul_base=UL4[ss], dcch_cfg present et exact),
+     * UA present a l entree du shunt (10 blocs c=0x73), sorti du ring sans
+     * debordement ni eviction, et la MSC recoit la demande et alloue un TMSI.
+     * Un seul ecart mesure : les DATA_IND remontes au mobile portent uniquement
+     * chan_nr 0x80 (BCCH) et 0x90 (CCCH), JAMAIS 0x2x/0x3x. Rien du canal dedie
+     * ne franchit la couche L1CTL.
+     *
+     * Le segment non instrumente est donc : presentation dans a_cd -> lecture par
+     * le firmware -> emission du DATA_IND. Cette sonde coupe ce segment en deux.
+     *
+     * L INSTRUMENT. Meme principe que A_DD_0-RD, qui a tranche pour la voix :
+     * le lecteur est le firmware emule, on ne peut pas l instrumenter, mais
+     * chaque transition 1 -> 0 de B_BLUD EST une lecture, et chaque 0 -> 1 une
+     * presentation. Ne consomme rien.
+     *
+     * ⚠️ LIMITE CONNUE, a garder en tete avant d interpreter : on echantillonne
+     * en tete de tick et APRES le retour anticipe « if (!g_shunt.pending) », donc
+     * on est aveugle aux cycles sub-tick. Sur a_dd_0 la meme sonde sous-comptait
+     * d environ 9 %. Elle repond a « le firmware lit-il, oui ou non », PAS a
+     * « combien exactement ».
+     *
+     * CALYPSO_ACD_PROBE=1 pour l activer ; inerte sinon. */
+    {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("CALYPSO_ACD_PROBE");
+            on = (e && *e == '1') ? 1 : 0;
+            SHUNT_LOG("SONDE A_CD-RD %s\n", on ? "ACTIVE" : "inactive");
+        }
+        if (on && g_shunt.c54x && g_shunt.c54x->data) {
+            uint16_t *dd = g_shunt.c54x->data;
+            unsigned wcd = ndb_w(g_ndb.a_cd);
+            int arme = (dd[wcd] & (1u << B_BLUD)) ? 1 : 0;
+            static int precedent = -1;
+            static unsigned long long presentations, lectures, pose_tick, attente_max;
+            if (precedent < 0) precedent = arme;
+            if (precedent == 0 && arme == 1) {
+                presentations++;
+                pose_tick = g_shunt.tick_cnt;
+            } else if (precedent == 1 && arme == 0) {
+                unsigned long long dt = g_shunt.tick_cnt - pose_tick;
+                lectures++;
+                if (dt > attente_max) attente_max = dt;
+            }
+            precedent = arme;
+            /* Un seul point d impression, pour que les deux compteurs soient
+             * CO-TEMPORELS : les comparer depuis deux lignes differentes du
+             * journal fabrique un ratio imaginaire (paye le 09/08). */
+            static unsigned long long tick_dernier;
+            if (g_shunt.tick_cnt - tick_dernier >= 2000) {
+                tick_dernier = g_shunt.tick_cnt;
+                SHUNT_LOG("A_CD-RD : presentations=%llu lectures=%llu "
+                          "non_lues=%lld pire_attente=%llu ticks\n",
+                          presentations, lectures,
+                          (long long)presentations - (long long)lectures,
+                          attente_max);
+            }
+        }
+    }
+
+    /* SONDE A_DD_0-RD — a quelle cadence le FIRMWARE lit-il la voix ?
+     *
+     * CE QU ON CHERCHE. La garde bornee compte 1000 forcages pour ~5250 trames
+     * servies : une sur cinq est presentee alors que la precedente n avait pas
+     * ete lue, donc ecrasee. Et « profondeur=0 » pendant les retenues montre que
+     * la file est VIDE quand on attend : le goulot n est pas entre le poll et le
+     * dispatch, il est dans la lecture de a_dd_0 par le firmware, qui ne suit pas
+     * 50/s. Reste a le CHIFFRER au lieu de le deduire.
+     *
+     * L INSTRUMENT. Le lecteur n est pas du code QEMU : c est le firmware emule
+     * qui efface B_BLUD apres avoir pris le bloc. On ne peut donc pas l instrumenter
+     * directement -- mais chaque transition 1 -> 0 du bit EST une lecture. On
+     * echantillonne en tete de tick, avant que le dispatch ne reecrive.
+     *
+     * Ce qu on en tire : le nombre de lectures, l intervalle moyen en ticks entre
+     * deux lectures (attendu ~4 si le firmware suit, plus si il decroche), et le
+     * temps qu une trame passe non lue. Compteurs CUMULATIFS, sonde qui s annonce.
+     * CALYPSO_ADD_PROBE=1 pour l activer ; inerte sinon. */
+    {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("CALYPSO_ADD_PROBE");
+            on = (e && *e == '1') ? 1 : 0;
+            SHUNT_LOG("SONDE A_DD_0-RD %s\n", on ? "ACTIVE" : "inactive");
+        }
+        if (on && g_shunt.c54x && g_shunt.c54x->data) {
+            uint16_t *dd = g_shunt.c54x->data;
+            unsigned wdd = ndb_w(g_ndb.a_dd_0);
+            int arme = (dd[wdd] & (1u << B_BLUD)) ? 1 : 0;
+            static int precedent = -1;
+            static unsigned long long lectures, ticks_cumules, pose_tick, attente_max;
+            if (precedent < 0) precedent = arme;
+            if (precedent == 0 && arme == 1) {
+                pose_tick = g_shunt.tick_cnt;          /* le shunt vient de deposer */
+            } else if (precedent == 1 && arme == 0) {
+                unsigned long long dt = g_shunt.tick_cnt - pose_tick;
+                lectures++; ticks_cumules += dt;
+                if (dt > attente_max) attente_max = dt;
+                if (lectures <= 3 || (lectures % 500) == 0)
+                    SHUNT_LOG("A_DD_0-RD #%llu : lue apres %llu ticks "
+                              "(moyenne %llu.%02llu, pire %llu)\n",
+                              lectures, dt,
+                              ticks_cumules / lectures,
+                              (ticks_cumules * 100 / lectures) % 100,
+                              attente_max);
+            }
+            precedent = arme;
+        }
+    }
+
+    /* SONDE A_FU — l ASSIGNMENT COMPLETE atteint-il seulement le tampon ?
+     *
+     * CE QU ON CHERCHE. Le BSC echoue 41 fois aujourd hui sur
+     * « Timeout (rll_ready=no, rtp_require=yes, voice_ready=yes) » : tout est
+     * pret sauf l etablissement LAPDm sur le TCH. Le mobile, lui, journalise
+     * « ASSIGNMENT COMPLETE (cause #0) » puis « ASSIGNMENT FAILURE (cause #1) ».
+     * Or la capture FACCH montante du shunt ne rend que des trames de
+     * supervision VIDES : RR (0x91), REJ (0x59), DISC (0x53), toutes avec un
+     * octet de longueur a 0x01, c est-a-dire zero octet de L3. Jamais de SABM,
+     * jamais de contenu.
+     *
+     * DEUX LECTURES POSSIBLES, et c est cette sonde qui tranche :
+     *   (a) le firmware ne depose PAS l ASSIGNMENT COMPLETE dans a_fu ;
+     *   (b) il l y depose, mais la fenetre de tache TCHT(13) du shunt rate la
+     *       rafale qui le porte et ne voit que la supervision qui suit.
+     * On regarde donc a_fu a CHAQUE tick, hors de toute fenetre de tache. Si un
+     * bloc a longueur non nulle passe ici sans etre vu par la voie normale,
+     * c est (b) -- ma fenetre. Si rien ne passe jamais, c est (a) -- en amont.
+     *
+     * NE CONSOMME RIEN : B_BLUD n est pas efface, sinon la sonde volerait les
+     * blocs au chemin reel et fabriquerait la panne qu elle observe.
+     * Compteurs CUMULATIFS, et elle s annonce au demarrage : une sonde muette
+     * rend un silence indecidable. CALYPSO_AFU_PROBE=1 pour l activer.
+     * Diagnostic pur : aucun effet sur le flux quand elle est eteinte. */
+    {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("CALYPSO_AFU_PROBE");
+            on = (e && *e == '1') ? 1 : 0;
+            SHUNT_LOG("SONDE A_FU %s\n", on ? "ACTIVE" : "inactive");
+        }
+        if (on && g_shunt.c54x && g_shunt.c54x->data) {
+            uint16_t *dd = g_shunt.c54x->data;
+            unsigned wfu = ndb_w(g_ndb.a_fu);
+            /* [2026-08-09] ON DETECTE UN CHANGEMENT, PAS UN DRAPEAU.
+             * Premiere version : journaliser des que B_BLUD etait arme. Mesure :
+             * 1600 lignes au contenu STRICTEMENT identique (e4 f4 74 f0), une par
+             * tick, des avant le premier appel -- B_BLUD reste arme en permanence
+             * a cet endroit et la charge est remanente. Une sonde qui parle sans
+             * arret est aussi inutile qu une sonde muette : elle noie le signal.
+             * On ne signale donc que les mots qui CHANGENT. */
+            static unsigned long long vus, avec_l3, derniere_vue;
+            static uint32_t precedent = 0xFFFFFFFFu;
+            uint32_t courant = ((uint32_t)dd[wfu + 3] << 16) | dd[wfu + 4];
+            if ((dd[wfu] & (1u << B_BLUD)) && courant != precedent) {
+                precedent = courant;
+                uint16_t w0 = dd[wfu + 3], w1 = dd[wfu + 4];
+                uint8_t b0 = (uint8_t)(w0 & 0xff), b1 = (uint8_t)(w0 >> 8);
+                uint8_t b2 = (uint8_t)(w1 & 0xff), b3 = (uint8_t)(w1 >> 8);
+                unsigned l3 = (unsigned)(b2 >> 2);      /* champ longueur LAPDm */
+                vus++;
+                if (l3) avec_l3++;
+                /* On journalise TOUT bloc porteur de L3 (le cas recherche), et
+                 * seulement un echantillon des blocs vides, qui defilent. */
+                if (l3 || vus <= 5 || (vus % 500) == 0) {
+                    SHUNT_LOG("A_FU-PROBE #%llu : %02x %02x %02x %02x  L3=%u o  "
+                              "task_u=0x%04x task_md=0x%04x  (avec L3 : %llu, "
+                              "delta_tick=%llu)\n",
+                              vus, b0, b1, b2, b3, l3,
+                              g_shunt.d_task_u, g_shunt.d_task_md,
+                              avec_l3, (unsigned long long)g_shunt.tick_cnt - derniere_vue);
+                }
+                derniere_vue = g_shunt.tick_cnt;
+            }
+        }
+    }
 
     uint8_t  page = g_shunt.page_idx;
     uint16_t md   = g_shunt.d_task_md;
@@ -2233,12 +2710,33 @@ static int g_gsmtap_fd = -1;
  * alors chan_nr=0x90 -> gsm48_rr_rx_pch_agch -> gsm48_rr_rx_imm_ass). */
 static void calypso_dsp_shunt_feed_agch(const uint8_t *l2, int len)
 {
-    /* @BEQUILLE — INJECT_AGCH  (CALYPSO_INJECT_AGCH=1, fallback CALYPSO_SHUNT_LEGIT=1)
-     *   masque  : la reception AGCH par le DSP — l'IMM ASSIGN est capte hors bande
-     *             (GSMTAP gr-gsm) puis presente dans a_cd sur un bloc CCCH.
-     *   retirer : quand le decodage AGCH natif alimente a_cd.
-     */
-    { static int _ginj = -1; if (_ginj < 0) { const char *_e = getenv("CALYPSO_INJECT_AGCH"); _ginj = (_e && *_e == '1') ? 1 : 0; if (!_ginj) { const char *_l = getenv("CALYPSO_SHUNT_LEGIT"); _ginj = (_l && *_l == '1') ? 1 : 0; } } if (!_ginj) return; }  /* [2026-07-23] HACK injection sortie, DEFAUT OFF (natif) ; =CALYPSO_INJECT_AGCH=1 pour reactiver */
+    /* [2026-08-09] BLOC D APPRENTISSAGE DE LA SOUS-VOIE : SUPPRIME.
+     *
+     * Il lisait le chan_nr des IMM ASSIGN passant sur le CCCH pour poser la
+     * fenetre de presentation, en pretendant ne retenir que la NOTRE via
+     * l2[7] == g_last_recorded_ra. Ce filtre ne filtrait rien : 5 acceptations
+     * sur 5 avec ra=0x07 quand le mobile emettait 0x0c/0x04/0x03, puis 0 sur 25.
+     * Deux mobiles partagent ce CCCH, donc il apprenait les assignations de
+     * l autre -- l objection exacte que le commentaire l.155 avait deja actee.
+     *
+     * PIRE : il a fabrique le symptome qu il devait expliquer. Les fenetres
+     * « SDCCH/8 SS=0,1,2 -> fn%51 0-3 » attribuees au firmware venaient de LUI,
+     * seul second appelant de set_dcch(). Avec le bloc inerte, la mesure donne
+     * chan_nr=0x28 -> SDCCH/4 SS=1 -> fenetre 26-29 : le decodage etait juste
+     * depuis le debut (offset confirme par le DWARF de l ELF charge).
+     * Et le LU echoue a l identique fenetres justes : cette piste n etait ni
+     * necessaire ni suffisante.
+     *
+     * set_dcch() retrouve donc la source unique que son propre commentaire
+     * revendique : le chan_nr annonce par le firmware, via l1ctl_sock.
+     *
+     * ⚠️ DEFAUT LATENT MIS AU JOUR AU PASSAGE, non corrige ici : une IMM ASSIGN
+     * etrangere basculait g_shunt.sdcch_ch8 a true, et calypso_dsp_shunt_l1_reset()
+     * ne remet PAS ce drapeau a false (seulement sdcch_ss_set). La fenetre-union
+     * de calypso_dsp_helper.c:629 restait alors collee a [0,31] a travers tout
+     * reset L1 -- excluant 32-39 (SDCCH/4 SS2 et SS3) et acceptant a tort les
+     * blocs CCCH 0-21. Supprimer l apprentissage retire la seule facon connue
+     * d armer ce piege, mais le drapeau reste non reinitialise. */
     if (!l2 || len < 3) return;
 
     /* Priorite IMM ASSIGN : ne pas laisser un PAGING REQUEST (mt 0x21/0x22/0x24)
@@ -2448,8 +2946,30 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
     uint8_t *s = g_shunt.sacch_buf;
     memcpy(s, l2, n);
     for (int i = n; i < 23; i++) s[i] = 0x2b;
-    s[0] = 0x00;                              /* L1 SACCH header : tx_power -> neutre */
-    s[1] = 0x00;                              /* L1 SACCH header : TA       -> neutre */
+    /* [2026-08-09] ON N ECRASE PLUS LES DEUX PREMIERS OCTETS.
+     *
+     * L ANCIEN CODE les forcait a zero, en les croyant systematiquement l en-tete
+     * L1 SACCH (puissance ordonnee / avance de temps). Mais le balayage juste
+     * au-dessus, « for (i = 2; i < 8) » a la recherche de 06 1d / 06 1e, dit le
+     * contraire : la position de l en-tete RR VARIE, donc le bloc rendu par gr-gsm
+     * ne porte pas toujours ses deux octets L1. Quand il ne les porte pas, l2[0] et
+     * l2[1] sont l ADRESSE et le CONTROLE LAPDm -- et on les remplacait par 0x00.
+     *
+     * CONSEQUENCE MESUREE (09/08). Le LAPDm du mobile ne reconnait alors plus
+     * l en-tete, retombe sur le format Bter et rend 21 octets de L3 au lieu de 19.
+     * Or gsm48_rr_rx_acch() discrimine par la seule LONGUEUR :
+     *   l3len == 21 (N201_Bter_SACCH) -> en-tete court, il lit le 1er octet comme
+     *                                    un type de message -> « New SYSTEM
+     *                                    INFORMATION 10 » et « SI10: BA_IND 0 !=
+     *                                    BA_IND 1 of SI5! »
+     *   l3len == 19 (N201_B4)         -> SI5 / SI6, ce qu on veut
+     * Comptage sur un run : 30 SI10 pour 3 SI5 et 1 SI6.
+     *
+     * LA VOIE TCH NE FAISAIT DEJA PAS CETTE ERREUR : feed_tch_sacch laisse les deux
+     * octets intacts et le commentaire y explique pourquoi -- le mobile APPLIQUE
+     * ces valeurs (« DL SACCH indicates ta / tx_power »), et un TA force a 0 sur un
+     * lien qui en demande 4 desaligne l emission montante. La meme raison vaut ici.
+     * On aligne donc les deux voies sur celle qui fonctionne : on ne touche a rien. */
     g_shunt.sacch_have = true;
     g_shunt.sacch_real = true;                /* coupe la fabrication SI3->SI6 */
     static unsigned nf = 0;

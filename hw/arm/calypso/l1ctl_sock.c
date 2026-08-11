@@ -102,6 +102,7 @@ volatile uint32_t g_last_rach_conf_fn = 0;
 volatile uint32_t g_rach_conf_fn[256] = {0};  /* per-ra FN-FIX : RACH_CONF fn keye par g_last_recorded_ra */
 extern volatile uint8_t g_last_recorded_ra;   /* defini dans calypso_dsp_shunt.c (record_rach) */
 extern void calypso_dsp_shunt_set_dcch(int kind, int ss);  /* fenetre SDCCH du shunt */
+extern void calypso_dsp_shunt_set_dcch_tch(int on);        /* dedie = TCH ? */
 extern void calypso_dsp_shunt_set_dcch_active(int on);     /* garde SI pendant le dedie */
 extern int calypso_dsp_shunt_tch_dl_written(const uint8_t *fr33); /* sonde TCH-DL */
 
@@ -132,6 +133,17 @@ static void l1ctl_tch_dl_probe(const uint8_t *payload, int plen)
         return;
 
     static unsigned long long n = 0, ok = 0, bad = 0, mauvais_cadrage = 0;
+    /* [2026-08-10] L'EN-TETE DECIDE DU SORT DE LA TRAME, PAS SEULEMENT SON CONTENU.
+     * La chaine de lecture du mobile est 'source/tch_fb -> ... -> ecu/fr -> codec/fr
+     * -> sink/alsa' : l'ECU remplace toute trame marquee ERRONEE par du confort,
+     * c'est-a-dire du silence -- sans une ligne de journal. On observe justement
+     * 50 TRAFFIC_IND/s dont les 33 octets sont IDENTIQUES a a_dd_0 (donc de la
+     * vraie parole, 250/250 trames distinctes mesurees dans l'anneau) et un sink
+     * PulseAudio a crete 0. Il faut donc lire fire_crc et num_biterr, qui portent
+     * ce verdict. Cadrage l1ctl_info_dl (offset relatif a payload+4) :
+     *   chan_nr(0) link_id(1) band_arfcn(2..3) frame_nr(4..7)
+     *   rx_level(8) snr(9) num_biterr(10) fire_crc(11) */
+    static unsigned long long fire_crc_nz = 0, biterr_nz = 0;
     n++;
     if (plen != 49) {
         mauvais_cadrage++;
@@ -141,6 +153,14 @@ static void l1ctl_tch_dl_probe(const uint8_t *payload, int plen)
                       "avant toute conclusion", plen);
     } else {
         const uint8_t *fr = payload + 16;
+        uint8_t nbiterr = payload[14], fcrc = payload[15];
+        if (fcrc)    fire_crc_nz++;
+        if (nbiterr) biterr_nz++;
+        if ((fcrc || nbiterr) && (fire_crc_nz + biterr_nz) <= 3)
+            L1CTL_LOG("TCH-DL-PROBE : trame MARQUEE ERRONEE -- fire_crc=%u "
+                      "num_biterr=%u rx_level=%u snr=%u : l'ECU du mobile la "
+                      "remplacera par du silence", fcrc, nbiterr,
+                      payload[12], payload[13]);
         int seq = calypso_dsp_shunt_tch_dl_written(fr);
         if (seq >= 0) {
             ok++;
@@ -159,8 +179,9 @@ static void l1ctl_tch_dl_probe(const uint8_t *payload, int plen)
     }
     if ((n % 250) == 0)
         L1CTL_LOG("TCH-DL-PROBE : %llu TRAFFIC_IND -- identiques a a_dd_0 : %llu, "
-                  "differentes : %llu, cadrage inattendu : %llu",
-                  n, ok, bad, mauvais_cadrage);
+                  "differentes : %llu, cadrage inattendu : %llu, "
+                  "MARQUEES ERRONEES : fire_crc!=0 %llu, num_biterr!=0 %llu",
+                  n, ok, bad, mauvais_cadrage, fire_crc_nz, biterr_nz);
 }
 
 /* ---- Sercomm helpers ---- */
@@ -378,6 +399,13 @@ static void sercomm_frame_complete(L1CTLSock *s)
                       || ((chan_nr & 0xE0) == 0x20)      /* SDCCH/4 */
                       || ((chan_nr & 0xC0) == 0x40);     /* SDCCH/8 */
             if (dedie) calypso_dsp_shunt_set_dcch_active(1);   /* rafraichit */
+            /* [2026-08-10] et on dit AU SHUNT de quel type de dedie il s'agit :
+             * la fenetre de presentation a_cd n'a de sens que sur SDCCH. */
+            if (dedie) {
+                bool tch = ((chan_nr & 0xF8) == 0x08)      /* TCH/F */
+                        || ((chan_nr & 0xF0) == 0x10);     /* TCH/H */
+                calypso_dsp_shunt_set_dcch_tch(tch ? 1 : 0);
+            }
             if (kind >= 0 && chan_nr != last_chan_nr) {
                 static uint32_t dcch_seq;
                 last_chan_nr = chan_nr;

@@ -23,6 +23,10 @@ MOD_TIMEOUT[sidecar-mobile]=30
 
 : "${SC_MOBILE_BIN:=mobile}"
 : "${SC_MOBILE_DELAY:=3}"
+# Géométrie du tampon ALSA — MÊME défaut et MÊME raison que pour le MS#1 : voir
+# le bloc « DESCENDANT MUET » en tête de 70-l2.sh. Ce mobile-ci écrit dans le
+# MÊME sink `gsm_audio`, il est exposé au même défaut de négociation du greffon.
+: "${CALYPSO_PULSE_LATENCY_MSEC:=80}"
 
 mod_sidecar_mobile_check() {
     command -v "$SC_MOBILE_BIN" >/dev/null 2>&1 || {
@@ -48,7 +52,9 @@ mod_sidecar_mobile_start() {
     fi
     mod_say "mobile -c $SC_MOBILE_CFG (VTY $SC_MOBILE_VTY_PORT)"
     mod_say "journal : $log"
-    stdbuf -oL -eL "$SC_MOBILE_BIN" -c "$SC_MOBILE_CFG" >>"$log" 2>&1 &
+    mod_say "latence : PULSE_LATENCY_MSEC=${CALYPSO_PULSE_LATENCY_MSEC:-<defaut greffon>}"
+    PULSE_LATENCY_MSEC="$CALYPSO_PULSE_LATENCY_MSEC" \
+        stdbuf -oL -eL "$SC_MOBILE_BIN" -c "$SC_MOBILE_CFG" >>"$log" 2>&1 &
     radio_save_pid sidecar-mobile $!
     mod_ok
 }
