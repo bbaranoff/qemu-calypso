@@ -107,6 +107,8 @@ def handle_line(line):
             if nsd <= 20 or nsd % 50 == 0:
                 print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
                       % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
+            # ARMEMENT DU TCH : l'ASSIGNMENT COMMAND passe par ce meme bloc DL.
+            check_assignment(by, sd_fn)
     # --- SACCH (SDCCH/4 SS0) DL : SI5(0x1d)/SI6(0x1e) REELS -> feed_sacch ---
     # Slots SACCH SS0 (combine CCCH+SDCCH/4) : fn%51 in {42-45}. grgsm donne le
     # bloc 23o = [L1 hdr 2][LAPDm: 03 03 len 06 mt L3...]. On detecte le RR header
@@ -177,6 +179,146 @@ def spawn_grgsm(fifo, algo=0, kc_hex=None, binary="grgsm_decode", errlog=None):
         cmd += ["-e", str(algo), "-k", kc_hex]
     err = open(errlog, "w") if errlog else subprocess.DEVNULL
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+
+# =============================================================================
+# ARMEMENT DU TCH : ASSIGNMENT COMMAND -> calypso_tch_cfg -> 3e grgsm_decode
+# =============================================================================
+# [2026-08-11] RECONSTRUIT. Cette logique existait (08/08) et a disparu de
+# l'arbre le 11/08. Sans elle la panne est en cascade et SILENCIEUSE :
+#   calypso_tch_cfg reste a 0 octet -> aucun `grgsm_decode -m TCHF` -> aucun
+#   GSMTAP dedie -> feed_tch_sacch JAMAIS appele -> la SACCH du TCH n'est pas
+#   alimentee -> le MS y lit le SI5/SI6 du camp (a_cd est PARTAGE camp<->TCH,
+#   avec DEUX conventions d'en-tete) -> "Short header message type 0x07
+#   unsupported" une fois par seconde, a partir de ~30 s apres l'ASSIGNMENT.
+#
+# CONTRAT DU FICHIER — lu chez son CONSOMMATEUR (qemu_wrap.c
+# calypso_tch_cfg_read), jamais devine :
+#   0..3 seq uint32 LE (≠0)   4 TN   5 TSC   6..7 ARFCN uint16 LE   (16 o)
+# Le seq est ecrit EN DERNIER : publication atomique, le lecteur ne voit jamais
+# un demi-enregistrement.
+#
+# JUGES : calypso_tch_cfg non vide ; un process `-m TCHF` vivant ;
+#         `feed_tch_sacch` > 0 dans qemu.log ; `Short header 0x07` = 0.
+TCH_CFG_PATH = "/dev/shm/calypso_tch_cfg"
+TCH_FIFO     = os.environ.get("CALYPSO_TCH_FIFO", "/tmp/iq_grgsm_tch.fifo")
+TCH_SPEECH   = "/dev/shm/calypso_tch_speech.gsm"
+_tch_proc = None
+_tch_cur  = None          # (tn, tsc, arfcn) actuellement arme
+_tch_seq  = 0
+
+def _tch_write_cfg(tn, tsc, arfcn):
+    """Publie TN/TSC/ARFCN. seq en dernier = publication atomique."""
+    global _tch_seq
+    _tch_seq += 1
+    buf = bytearray(16)
+    buf[4] = tn & 0xff
+    buf[5] = tsc & 0xff
+    buf[6:8] = int(arfcn).to_bytes(2, "little")
+    buf[0:4] = _tch_seq.to_bytes(4, "little")
+    fd = os.open(TCH_CFG_PATH, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.pwrite(fd, bytes(buf), 0)
+    finally:
+        os.close(fd)
+
+def make_tch_binary():
+    """Copie patchee de grgsm_decode pour le TCH — DEUX ports a corriger.
+
+    grgsm_decode code en dur 127.0.0.1:4729 DEUX fois (l.122-123) :
+      - l.122 UDP_SERVER : ne sert QU'A eviter les ICMP port-unreachable. Deux
+        instances -> « bind: Address already in use » -> la 2e MEURT. C'est ce
+        qui faisait mourir le decodeur TCH aussitot lance (14 reamorcages
+        mesures le 11/08), donc feed_tch_sacch = 0, donc SACCH dediee muette.
+      - l.123 UDP_CLIENT : c'est la VRAIE sortie GSMTAP. En mode TCHF,
+        tch_f_decoder ET cch_decoder y publient (l.213-214).
+    On bind donc le serveur sur un port libre, et on pointe le client droit sur
+    4730, que le shunt ecoute : il dispatche par sub_type — TCH_F (0x02) ->
+    feed_facch, TCH_ACCH (0x82) -> feed_tch_sacch (calypso_dsp_shunt.c:3126-3134).
+    Pas de parsing de stdout : les donnees vont du decodeur au shunt en direct.
+    ⚠️ Remplacements CIBLES ligne par ligne : un `replace("4729","4730")` global
+    ferait binder le serveur sur 4730 et entrerait en conflit avec le shunt.
+    """
+    src = shutil.which("grgsm_decode")
+    if not src:
+        return "grgsm_decode"
+    dst = "/tmp/grgsm_decode_tch"
+    try:
+        with open(src) as f:
+            code = f.read()
+        a = '"UDP_SERVER", "127.0.0.1", "4729"'
+        b = '"UDP_CLIENT", "127.0.0.1", "4729"'
+        if a not in code or b not in code:
+            print("[si-bridge] grgsm TCH : motifs de port introuvables -> "
+                  "fallback non patche (conflit 4729 probable)", flush=True)
+            return src
+        code = code.replace(a, '"UDP_SERVER", "127.0.0.1", "4739"')
+        code = code.replace(b, '"UDP_CLIENT", "127.0.0.1", "4730"')
+        with open(dst, "w") as f:
+            f.write(code)
+        os.chmod(dst, 0o755)
+        print("[si-bridge] grgsm TCH patche -> %s (bind 4739, GSMTAP -> 4730)" % dst,
+              flush=True)
+        return dst
+    except Exception as e:
+        print("[si-bridge] patch grgsm TCH echoue (%s)" % e, flush=True)
+        return src
+GRGSM_TCH = make_tch_binary()
+
+def _tch_spawn(tn, arfcn):
+    """3e decodeur, sur le tube IQ dedie (alimente par CALYPSO_RELAY_FIFOS)."""
+    cmd = [GRGSM_TCH, "-m", "TCHF", "-t", str(tn), "-a", str(arfcn),
+           "-c", TCH_FIFO, "-s", "1083333", "-v", "-d", "FR", "-o", TCH_SPEECH]
+    try:
+        err = open("/tmp/osmo-nitb/logs/grgsm_decode_tch.log", "w")
+    except Exception:
+        err = subprocess.DEVNULL
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err, text=True)
+
+def arm_tch(tn, tsc, arfcn):
+    global _tch_proc, _tch_cur
+    cfg = (tn, tsc, arfcn)
+    vivant = _tch_proc is not None and _tch_proc.poll() is None
+    if cfg == _tch_cur and vivant:
+        return                                   # deja arme sur cette config
+    if _tch_proc is not None and vivant:
+        try: _tch_proc.terminate()
+        except Exception: pass
+    _tch_write_cfg(tn, tsc, arfcn)
+    _tch_proc = _tch_spawn(tn, arfcn)
+    _tch_cur = cfg
+    print("[si-bridge] TCH arme : TN=%d TSC=%d ARFCN=%d -> %s + grgsm -m TCHF (pid %s)"
+          % (tn, tsc, arfcn, TCH_CFG_PATH, _tch_proc.pid), flush=True)
+
+def check_assignment(by, fn):
+    """Detecte un ASSIGNMENT COMMAND (RR PD=0x06, MT=0x2e) sur le SDCCH DL.
+
+    Channel Description 2 (GSM 04.08 10.5.2.5), 3 octets, decodage aligne sur
+    `struct gsm48_chan_desc` de libosmocore :
+        b0 : chan_nr           -> TN = b0 & 0x07
+        b1 : tsc(3) h(1) arfcn_high(2) spare(2)
+             TSC = (b1>>5)&7   H = (b1>>4)&1   ARFCN_high = b1 & 0x03
+        b2 : ARFCN_low         -> ARFCN = (ARFCN_high<<8) | b2   [si H=0]
+    """
+    for off in range(2, min(7, len(by) - 5)):
+        if by[off] != 0x06 or by[off + 1] != 0x2e:
+            continue
+        b0, b1, b2 = by[off + 2], by[off + 3], by[off + 4]
+        tn  = b0 & 0x07
+        tsc = (b1 >> 5) & 0x07
+        h   = (b1 >> 4) & 0x01
+        if h:
+            # ⚠️ REFUS EXPLICITE. Cette chaine ne gere PAS le saut de frequence
+            # (cf. la meme limite cote injection UL). Fabriquer une ARFCN a
+            # partir des champs MAIO/HSN donnerait un nombre FAUX en silence,
+            # et le decodeur ecouterait a cote sans que rien ne le signale.
+            print("[si-bridge] ASSIGNMENT COMMAND avec SAUT DE FREQUENCE (H=1) : "
+                  "TCH NON arme (chaine sans hopping). FN=%d" % fn, flush=True)
+            return
+        arfcn = ((b1 & 0x03) << 8) | b2
+        print("[si-bridge] ASSIGNMENT COMMAND FN=%d -> chan_nr=0x%02x TN=%d TSC=%d ARFCN=%d"
+              % (fn, b0, tn, tsc, arfcn), flush=True)
+        arm_tch(tn, tsc, arfcn)
+        return
 
 def reader_loop(proc, tag):
     # log brut par grgsm (diagnostic decipher) : /root/grgsm_clair.raw / _ciph.raw

@@ -45,6 +45,76 @@ def gsmtap(fn, chan, l2):
 
 n = 0; nsch = 0; nsd = 0; nsa = 0; last_fn = 0; last_sd_fn = -1; last_sa_fn = -1
 
+# ---- SOUS-VOIE DEDIEE ACTIVE : lue, plus jamais supposee (12/08/2026) --------
+#
+# Ce fichier ne relayait le descendant dedie que pour `fn%51 in {22..25}`, soit le
+# SEUL sous-canal SS0 du SDCCH/4 combine. Mesure du 12/08 : sur trois tentatives
+# de LOCATION UPDATING consecutives, le BSC a donne SS2, puis SS1, puis SS0 ; les
+# deux premieres sont mortes sur `RR_REL_IND` a +6 s faute d'UA descendante, et
+# seule la troisieme a rendu `RR_EST_CNF` puis `LOCATION UPDATING ACCEPT`.
+# 48 secondes pour un LU, et deux tentatives perdues, par cette seule ligne.
+#
+# gr-gsm, lui, decode BIEN les quatre sous-canaux — releve sur /root/grgsm_clair.raw
+# (toutes les lignes du decodeur, AVANT cette gate) :
+#     fn%51=22 : 43 blocs (SS0)   fn%51=26 : 56 (SS1)
+#     fn%51=32 : 56   (SS2)       fn%51=36 : 36 (SS3)
+# Le probleme n'a donc jamais ete le decodage : c'etait ce filtre.
+#
+# SOURCE AUTORITAIRE — la MEME que celle qui pilote deja la fenetre de
+# presentation du shunt : le `chan_nr` que le FIRMWARE annonce, publie par
+# l1ctl_sock.c:418 dans /dev/shm/calypso_dcch_cfg.
+#   16 o : seq u32 LE @0 | kind @4 (0=SDCCH/4, 1=SDCCH/8) | ss @5 | tn @6 | chan_nr @7
+# ⚠️ NE PAS apprendre la sous-voie depuis les IMM ASSIGN du CCCH : il porte ceux
+#    de TOUS les abonnes (mesure du 08/08 : 68 IMM ASSIGN d'un RA etranger pour
+#    un RACH a nous). C'est la fausse piste que l1ctl_sock.c documente en tete.
+# ⚠️ os.pread obligatoire : un BufferedReader avec seek(0)+read() rendrait
+#    eternellement la premiere valeur.
+DCCH_CFG_PATH = "/dev/shm/calypso_dcch_cfg"
+_SD4_DL    = (22, 26, 32, 36)   # base fn%51  du canal principal, SDCCH/4 combine
+_SD4_SACCH = (42, 46, 93, 97)   # base fn%102 de la SACCH        (GSM 05.02)
+_dcch_vu = [None]
+
+def dcch_sousvoie():
+    """(base_dl fn%51, base_sacch fn%102, kind). Repli (22, 42, 0) = ancien defaut."""
+    try:
+        fd = os.open(DCCH_CFG_PATH, os.O_RDONLY)
+        try:
+            b = os.pread(fd, 16, 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        return 22, 42, 0
+    if len(b) < 8 or int.from_bytes(b[0:4], "little") == 0:
+        return 22, 42, 0
+    kind, ss = b[4], b[5]
+    if kind:
+        # SDCCH/8 : base principale ss*4, alignee sur calypso_dsp_shunt_set_dcch.
+        # Sa SACCH n'est modelisee NI ici NI dans le shunt (sacch_base n'a que 4
+        # entrees, indexees par les bases du /4) — et de toute facon aucun
+        # decodeur SDCCH/8 ne tourne : `-m BCCH_SDCCH4` ne peut pas les produire.
+        # On ne fabrique donc pas une fenetre SACCH qu'on ne sait pas calculer.
+        return (ss & 7) * 4, None, 1
+    i = ss & 3
+    return _SD4_DL[i], _SD4_SACCH[i], 0
+
+def dcch_annonce(base_dl, base_sa, kind):
+    """Une ligne a CHAQUE changement de sous-voie : sans elle, un relais sur la
+    mauvaise sous-voie serait indiscernable d'une absence de relais."""
+    etat = (base_dl, base_sa, kind)
+    if _dcch_vu[0] == etat:
+        return
+    _dcch_vu[0] = etat
+    if kind:
+        print("[si-bridge] sous-voie dediee : SDCCH/8 base fn%%51 %d-%d — "
+              "AUCUN decodeur ne produit ces blocs (-m BCCH_SDCCH4 ne les voit "
+              "pas) et leur SACCH n'est pas modelisee : ce dedie restera muet"
+              % (base_dl, base_dl + 3), flush=True)
+    else:
+        print("[si-bridge] sous-voie dediee : SDCCH/4 SS%d -> relais DL fn%%51 "
+              "%d-%d, SACCH fn%%102 %d-%d"
+              % (_SD4_DL.index(base_dl), base_dl, base_dl + 3,
+                 base_sa, base_sa + 3), flush=True)
+
 def handle_line(line):
     global n, nsch, nsd, nsa, last_fn, last_sd_fn, last_sa_fn
     # --- SCH reel : "SCHBSIC <bsic> <fn> <toa>" -> 4731 + horloge FN ---
@@ -83,10 +153,15 @@ def handle_line(line):
             print("[si-bridge] %s (mt=0x%02x) FN=%d (%%51=%d %s) -> %s (4730)  #%d"
                   % (name, by[2], si_fn, si_fn%51, fn51_role(si_fn),
                      "feed_agch/PCH" if is_ccch else "feed_si", n), flush=True)
-    # --- SDCCH/4 SS0 DL (#2) : LAPDm (UA/AUTH), pas du RR -> gate fn%51 in {22-25} ---
+    # --- DL du canal dedie (#2) : LAPDm (UA/AUTH), pas du RR ---
+    # La fenetre suit la sous-voie REELLEMENT active (cf. dcch_sousvoie), elle
+    # n'est plus figee sur SS0. C'est la correction du 12/08 : deux LU sur trois
+    # mouraient parce que le BSC avait donne SS2 puis SS1.
     mfn_sd = re.match(r"^\s*(\d+)\b", lstr)
     sd_fn = int(mfn_sd.group(1)) if mfn_sd else last_fn
-    if len(by) >= 3 and (sd_fn % 51) in (22, 23, 24, 25):
+    _b_dl, _b_sa, _kind = dcch_sousvoie()
+    dcch_annonce(_b_dl, _b_sa, _kind)
+    if len(by) >= 3 and _b_dl <= (sd_fn % 51) <= _b_dl + 3:
         L2 = (by[:23] + b"\x2b"*23)[:23]
         # DEDUP PAR FN (corrige) : gr-gsm peut re-decoder le MEME bloc on-air (meme FN)
         # -> il faut sauter ce doublon (re-decode). MAIS la BTS RE-EMET legitimement le
@@ -105,14 +180,21 @@ def handle_line(line):
             s.sendto(gsmtap(sd_fn, GSMTAP_SDCCH4, L2), ("127.0.0.1", 4730))
             nsd += 1
             if nsd <= 20 or nsd % 50 == 0:
-                print("[si-bridge] SDCCH/4 SS0 DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d) -> feed_sdcch (4730)  #%d [new]"
-                      % (by[0], ctrl, sd_fn, sd_fn%51, nsd), flush=True)
+                print("[si-bridge] SDCCH/%d DL (a0=0x%02x c=0x%02x) FN=%d (%%51=%d, base %d) -> feed_sdcch (4730)  #%d [new]"
+                      % (8 if _kind else 4, by[0], ctrl, sd_fn, sd_fn%51, _b_dl, nsd), flush=True)
+            # ARMEMENT DU TCH : l'ASSIGNMENT COMMAND passe par ce meme bloc DL.
+            check_assignment(by, sd_fn)
     # --- SACCH (SDCCH/4 SS0) DL : SI5(0x1d)/SI6(0x1e) REELS -> feed_sacch ---
     # Slots SACCH SS0 (combine CCCH+SDCCH/4) : fn%51 in {42-45}. grgsm donne le
     # bloc 23o = [L1 hdr 2][LAPDm: 03 03 len 06 mt L3...]. On detecte le RR header
     # "06 1d"/"06 1e" et on forwarde le bloc TEL QUEL au shunt (sub_type 0x87 =
     # SDCCH4|ACCH) -> feed_sacch REEL, remplace la fabrication SI3->SI6.
-    if len(by) >= 8 and (sd_fn % 51) in (42, 43, 44, 45):
+    # ⚠️ fn%102 et NON fn%51 : en 05.02 les SACCH de SS0/SS1 sont dans la
+    # premiere moitie du cycle 102 et celles de SS2/SS3 dans la seconde
+    # (42,46,93,97). Teste modulo 51, {42..45} acceptait AUSSI la SACCH de SS2
+    # (93-96 % 51 = 42-45) : on livrait la SACCH d'une autre sous-voie comme si
+    # c'etait la notre, et on ne voyait jamais celles de SS1/SS3.
+    if len(by) >= 8 and _b_sa is not None and _b_sa <= (sd_fn % 102) <= _b_sa + 3:
         mt_sa = None
         for off in range(2, min(9, len(by) - 1)):
             if by[off] == 0x06 and by[off + 1] in (0x1d, 0x1e):
@@ -177,6 +259,242 @@ def spawn_grgsm(fifo, algo=0, kc_hex=None, binary="grgsm_decode", errlog=None):
         cmd += ["-e", str(algo), "-k", kc_hex]
     err = open(errlog, "w") if errlog else subprocess.DEVNULL
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+
+# =============================================================================
+# ARMEMENT DU TCH : ASSIGNMENT COMMAND -> calypso_tch_cfg -> 3e grgsm_decode
+# =============================================================================
+# [2026-08-11] RECONSTRUIT. Cette logique existait (08/08) et a disparu de
+# l'arbre le 11/08. Sans elle la panne est en cascade et SILENCIEUSE :
+#   calypso_tch_cfg reste a 0 octet -> aucun `grgsm_decode -m TCHF` -> aucun
+#   GSMTAP dedie -> feed_tch_sacch JAMAIS appele -> la SACCH du TCH n'est pas
+#   alimentee -> le MS y lit le SI5/SI6 du camp (a_cd est PARTAGE camp<->TCH,
+#   avec DEUX conventions d'en-tete) -> "Short header message type 0x07
+#   unsupported" une fois par seconde, a partir de ~30 s apres l'ASSIGNMENT.
+#
+# CONTRAT DU FICHIER — lu chez son CONSOMMATEUR (qemu_wrap.c
+# calypso_tch_cfg_read), jamais devine :
+#   0..3 seq uint32 LE (≠0)   4 TN   5 TSC   6..7 ARFCN uint16 LE   (16 o)
+# Le seq est ecrit EN DERNIER : publication atomique, le lecteur ne voit jamais
+# un demi-enregistrement.
+#
+# JUGES : calypso_tch_cfg non vide ; un process `-m TCHF` vivant ;
+#         `feed_tch_sacch` > 0 dans qemu.log ; `Short header 0x07` = 0.
+TCH_CFG_PATH = "/dev/shm/calypso_tch_cfg"
+TCH_FIFO     = os.environ.get("CALYPSO_TCH_FIFO", "/tmp/iq_grgsm_tch.fifo")
+TCH_SPEECH   = "/dev/shm/calypso_tch_speech.gsm"
+_tch_proc = None
+_tch_cur  = None          # (tn, tsc, arfcn) actuellement arme
+_tch_seq  = 0
+
+def _tch_write_cfg(tn, tsc, arfcn):
+    """Publie TN/TSC/ARFCN. seq en dernier = publication atomique."""
+    global _tch_seq
+    _tch_seq += 1
+    buf = bytearray(16)
+    buf[4] = tn & 0xff
+    buf[5] = tsc & 0xff
+    buf[6:8] = int(arfcn).to_bytes(2, "little")
+    buf[0:4] = _tch_seq.to_bytes(4, "little")
+    fd = os.open(TCH_CFG_PATH, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.pwrite(fd, bytes(buf), 0)
+    finally:
+        os.close(fd)
+
+# ---- TAILEUR VOIX DL : calypso_tch_speech.gsm -> /dev/shm/calypso_tch_dl ----
+#
+# CHAINON MANQUANT, retabli le 12/08/2026. `grgsm_decode -d FR -o` ecrit la voix
+# descendante decodee en trames GSM-FR brutes de 33 o (verifie : taille toujours
+# multiple de 33, nibble haut du 1er octet = 0xD sur 200/200 trames, debit
+# 1650 o/s = exactement 50 trames/s). Le shunt QEMU, lui, lit un ANNEAU sideband.
+# Entre les deux il faut un taileur — il n'existait plus nulle part : mesure du
+# 12/08, appel ETABLI (`Call is answered`), `calypso_tch_speech.gsm` a +1650 o/s
+# et `/dev/shm/calypso_tch_dl` a **0 octet**. Aucun son possible, quelle que
+# soit la qualite du decodage en amont.
+#
+# FORMAT — contrat de `calypso_tch_dl_poll()` (calypso_dsp_shunt.c:983-1137) :
+#   entete 8 o : w_seq u32 LE @0 | n_slots u32 LE @4
+#   puis n_slots x 48 o ; slot du seq k = (k-1) % n_slots
+#   slot 48 o  : seq u32 LE @0 | fn u32 LE @4 | fr[33] @8
+#
+# ⚠️ ORDRE D'ECRITURE OBLIGATOIRE : le SLOT d'abord, w_seq ENSUITE. Le lecteur
+#    se protege deja (`sseq != next` -> il repassera), mais annoncer un seq dont
+#    le slot n'est pas ecrit lui ferait voir une trame a moitie remplie.
+# ⚠️ n_slots DOIT valoir 16 : hors de ]0,4096] le shunt retombe sur l'ancien
+#    format « slot unique », celui qui perdait 25 % des trames (mesure du 08/08).
+# ⚠️ Le champ `fn` est laisse a 0 : le fichier de gr-gsm ne porte AUCUN numero de
+#    trame. Y ecrire un compteur maison donnerait un nombre qui RESSEMBLE a un FN
+#    sans en etre un ; le shunt ne s'en sert pas.
+TCH_DL_PATH  = "/dev/shm/calypso_tch_dl"
+TCH_DL_SLOTS = 16          # = TCH_DL_RING_N du shunt, ne pas desynchroniser
+TCH_DL_SLOT  = 48
+FR_BYTES     = 33
+
+def _tch_dl_tailer():
+    """Publie chaque nouvelle trame FR de TCH_SPEECH dans l'anneau sideband."""
+    fdw = os.open(TCH_DL_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    os.ftruncate(fdw, 8 + TCH_DL_SLOTS * TCH_DL_SLOT)
+    os.pwrite(fdw, (0).to_bytes(4, "little")
+                 + TCH_DL_SLOTS.to_bytes(4, "little"), 0)
+    print("[si-bridge] taileur voix DL arme : %s -> %s (anneau %d x %d o)"
+          % (TCH_SPEECH, TCH_DL_PATH, TCH_DL_SLOTS, TCH_DL_SLOT), flush=True)
+    seq = 0
+    fdr = None
+    off = 0
+    rest = b""
+    npub = 0
+    while True:
+        try:
+            if fdr is None:
+                try:
+                    fdr = os.open(TCH_SPEECH, os.O_RDONLY)
+                except OSError:
+                    time.sleep(0.2)
+                    continue
+                # On repart de la FIN du fichier. Le retard deja accumule n'est
+                # pas de la voix a jouer, c'est du passe : le publier d'un coup
+                # deborderait l'anneau et ne produirait qu'une rafale.
+                off = os.fstat(fdr).st_size
+                rest = b""
+            st = os.fstat(fdr)
+            if st.st_size < off:            # decodeur relance -> fichier tronque
+                off = 0
+                rest = b""
+            if st.st_size == off:
+                time.sleep(0.005)
+                continue
+            # Jamais plus d'un anneau d'un coup : si on a pris du retard, c'est
+            # au shunt de compter le trou (il le fait, TCH-DL DEBORDEMENT), pas
+            # a nous de le noyer.
+            want = min(st.st_size - off, TCH_DL_SLOTS * FR_BYTES)
+            data = os.pread(fdr, want, off)
+            if not data:
+                time.sleep(0.005)
+                continue
+            off += len(data)
+            rest += data
+            while len(rest) >= FR_BYTES:
+                fr, rest = rest[:FR_BYTES], rest[FR_BYTES:]
+                seq += 1
+                rec = (seq.to_bytes(4, "little") + b"\x00\x00\x00\x00" + fr
+                       + b"\x00" * (TCH_DL_SLOT - 8 - FR_BYTES))
+                os.pwrite(fdw, rec, 8 + ((seq - 1) % TCH_DL_SLOTS) * TCH_DL_SLOT)
+                os.pwrite(fdw, seq.to_bytes(4, "little"), 0)   # w_seq EN DERNIER
+                npub += 1
+                if npub <= 3 or npub % 250 == 0:
+                    print("[si-bridge] TCH-DL : %d trames FR publiees (w_seq=%d)"
+                          % (npub, seq), flush=True)
+        except Exception as e:
+            print("[si-bridge] taileur voix DL interrompu : %s" % e, flush=True)
+            if fdr is not None:
+                try: os.close(fdr)
+                except Exception: pass
+                fdr = None
+            time.sleep(0.5)
+
+threading.Thread(target=_tch_dl_tailer, daemon=True, name="tch-dl-tailer").start()
+
+def make_tch_binary():
+    """Copie patchee de grgsm_decode pour le TCH — DEUX ports a corriger.
+
+    grgsm_decode code en dur 127.0.0.1:4729 DEUX fois (l.122-123) :
+      - l.122 UDP_SERVER : ne sert QU'A eviter les ICMP port-unreachable. Deux
+        instances -> « bind: Address already in use » -> la 2e MEURT. C'est ce
+        qui faisait mourir le decodeur TCH aussitot lance (14 reamorcages
+        mesures le 11/08), donc feed_tch_sacch = 0, donc SACCH dediee muette.
+      - l.123 UDP_CLIENT : c'est la VRAIE sortie GSMTAP. En mode TCHF,
+        tch_f_decoder ET cch_decoder y publient (l.213-214).
+    On bind donc le serveur sur un port libre, et on pointe le client droit sur
+    4730, que le shunt ecoute : il dispatche par sub_type — FACCH/F (0x09) ->
+    feed_facch, SACCH du dedie (0x89) -> feed_tch_sacch. ⚠️ Ces deux valeurs
+    sont celles de libosmocore/gr-gsm (GSMTAP_CHANNEL_FACCH_F = 0x09) ; le shunt
+    les comparait a 0x08/0x88 jusqu'au 12/08, ce qui rendait les deux feeds
+    inatteignables (0x08 est en fait SDCCH/8).
+    Pas de parsing de stdout : les donnees vont du decodeur au shunt en direct.
+    ⚠️ Remplacements CIBLES ligne par ligne : un `replace("4729","4730")` global
+    ferait binder le serveur sur 4730 et entrerait en conflit avec le shunt.
+    """
+    src = shutil.which("grgsm_decode")
+    if not src:
+        return "grgsm_decode"
+    dst = "/tmp/grgsm_decode_tch"
+    try:
+        with open(src) as f:
+            code = f.read()
+        a = '"UDP_SERVER", "127.0.0.1", "4729"'
+        b = '"UDP_CLIENT", "127.0.0.1", "4729"'
+        if a not in code or b not in code:
+            print("[si-bridge] grgsm TCH : motifs de port introuvables -> "
+                  "fallback non patche (conflit 4729 probable)", flush=True)
+            return src
+        code = code.replace(a, '"UDP_SERVER", "127.0.0.1", "4739"')
+        code = code.replace(b, '"UDP_CLIENT", "127.0.0.1", "4730"')
+        with open(dst, "w") as f:
+            f.write(code)
+        os.chmod(dst, 0o755)
+        print("[si-bridge] grgsm TCH patche -> %s (bind 4739, GSMTAP -> 4730)" % dst,
+              flush=True)
+        return dst
+    except Exception as e:
+        print("[si-bridge] patch grgsm TCH echoue (%s)" % e, flush=True)
+        return src
+GRGSM_TCH = make_tch_binary()
+
+def _tch_spawn(tn, arfcn):
+    """3e decodeur, sur le tube IQ dedie (alimente par CALYPSO_RELAY_FIFOS)."""
+    cmd = [GRGSM_TCH, "-m", "TCHF", "-t", str(tn), "-a", str(arfcn),
+           "-c", TCH_FIFO, "-s", "1083333", "-v", "-d", "FR", "-o", TCH_SPEECH]
+    try:
+        err = open("/tmp/osmo-nitb/logs/grgsm_decode_tch.log", "w")
+    except Exception:
+        err = subprocess.DEVNULL
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err, text=True)
+
+def arm_tch(tn, tsc, arfcn):
+    global _tch_proc, _tch_cur
+    cfg = (tn, tsc, arfcn)
+    vivant = _tch_proc is not None and _tch_proc.poll() is None
+    if cfg == _tch_cur and vivant:
+        return                                   # deja arme sur cette config
+    if _tch_proc is not None and vivant:
+        try: _tch_proc.terminate()
+        except Exception: pass
+    _tch_write_cfg(tn, tsc, arfcn)
+    _tch_proc = _tch_spawn(tn, arfcn)
+    _tch_cur = cfg
+    print("[si-bridge] TCH arme : TN=%d TSC=%d ARFCN=%d -> %s + grgsm -m TCHF (pid %s)"
+          % (tn, tsc, arfcn, TCH_CFG_PATH, _tch_proc.pid), flush=True)
+
+def check_assignment(by, fn):
+    """Detecte un ASSIGNMENT COMMAND (RR PD=0x06, MT=0x2e) sur le SDCCH DL.
+
+    Channel Description 2 (GSM 04.08 10.5.2.5), 3 octets, decodage aligne sur
+    `struct gsm48_chan_desc` de libosmocore :
+        b0 : chan_nr           -> TN = b0 & 0x07
+        b1 : tsc(3) h(1) arfcn_high(2) spare(2)
+             TSC = (b1>>5)&7   H = (b1>>4)&1   ARFCN_high = b1 & 0x03
+        b2 : ARFCN_low         -> ARFCN = (ARFCN_high<<8) | b2   [si H=0]
+    """
+    for off in range(2, min(7, len(by) - 5)):
+        if by[off] != 0x06 or by[off + 1] != 0x2e:
+            continue
+        b0, b1, b2 = by[off + 2], by[off + 3], by[off + 4]
+        tn  = b0 & 0x07
+        tsc = (b1 >> 5) & 0x07
+        h   = (b1 >> 4) & 0x01
+        if h:
+            # ⚠️ REFUS EXPLICITE. Cette chaine ne gere PAS le saut de frequence
+            # (cf. la meme limite cote injection UL). Fabriquer une ARFCN a
+            # partir des champs MAIO/HSN donnerait un nombre FAUX en silence,
+            # et le decodeur ecouterait a cote sans que rien ne le signale.
+            print("[si-bridge] ASSIGNMENT COMMAND avec SAUT DE FREQUENCE (H=1) : "
+                  "TCH NON arme (chaine sans hopping). FN=%d" % fn, flush=True)
+            return
+        arfcn = ((b1 & 0x03) << 8) | b2
+        print("[si-bridge] ASSIGNMENT COMMAND FN=%d -> chan_nr=0x%02x TN=%d TSC=%d ARFCN=%d"
+              % (fn, b0, tn, tsc, arfcn), flush=True)
+        arm_tch(tn, tsc, arfcn)
+        return
 
 def reader_loop(proc, tag):
     # log brut par grgsm (diagnostic decipher) : /root/grgsm_clair.raw / _ciph.raw

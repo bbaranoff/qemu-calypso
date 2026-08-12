@@ -1973,6 +1973,68 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             static int hold_on = -1, hold_ttl_max = -1;
             if (hold_on < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD"); hold_on = (!e || *e != '0') ? 1 : 0; }
             if (hold_ttl_max < 0) { const char *e = getenv("CALYPSO_UL_SABM_HOLD_TTL"); hold_ttl_max = (e && *e) ? atoi(e) : 30; }
+            /* ── AMPLIFICATION DU SABM : CALYPSO_UL_SABM_DEDUP ──────────────
+             * [2026-08-11] MESURE : le MS emet 4 SABM, la BTS en recoit
+             * 148 bursts = 37 BLOCS. Amplification ~9x. La premiere etablit le
+             * lien ; les 18 suivantes tombent sur un lchan deja {ESTABLISHED}
+             * -> « SABM L>0 not expected in timer recovery state » +
+             * MDL-ERROR-IND cause 14 -> la BTS lache le lien -> le MS retente.
+             * Resultat mesure : 1 RR_EST_CNF pour 9 « sending establish
+             * message », et un Location Update qui met ~10 min a passer.
+             *
+             * D'OU VIENT L'AMPLIFICATION : le TTL vaut 2 blocs (8 bursts) par
+             * capture, mais la MEME SABM est capturee et republiee 4 a 5 fois,
+             * et chaque republication REARME le hold ci-dessous. Le compteur
+             * n'expire donc jamais tant que la trame revient.
+             *
+             * ⛔ LE COMMENTAIRE HISTORIQUE EST DEMENTI PAR LA MESURE. Il dit que
+             * la SABM etant non numerotee « la repeter est inoffensif, le pair
+             * re-acquitte ». C'est faux pour osmo-bts : une fois ESTABLISHED sa
+             * LAPDm ne re-acquitte pas, elle renvoie MDL-ERROR cause 14 et casse
+             * le lien. La lecon du 09/08 sur les trames I (CALYPSO_UL_HOLD_IFRAME)
+             * vaut donc AUSSI pour la SABM, mais seulement APRES etablissement.
+             *
+             * CORRECTIF (gate a 1) : ne pas rearmer le hold si la trame capturee
+             * est IDENTIQUE octet pour octet a celle deja tenue. Une SABM -> un
+             * hold -> 2 blocs -> 8 bursts. Les 4 bursts d'un bloc restent
+             * coherents, donc l'intention d'origine (desentrelacement osmo-bts)
+             * est preservee.
+             *
+             * ⚠️ DEFAUT 0 = COMPORTEMENT D'AVANT, INCHANGE. Ce gate naît a 0
+             * DELIBEREMENT : le 10/08 j'ai pose par defaut un correctif de timing
+             * non valide (CALYPSO_UL_TCH_SMP_OFS=-19) et il a casse le LU. Un
+             * correctif qui touche l'etablissement de lien s'active par un run
+             * de test, pas par un defaut.
+             *
+             * JUGES (les trois, sur un meme run) :
+             *   grep -c "UL SDCCH inject.*SABM" calypso-ipc-device.log  ~32 pour
+             *          4 SABM, au lieu de 148
+             *   grep -c "not expected in timer recovery" bts.log        -> 0
+             *   grep -c "RR_EST_CNF" mobile.log   doit se rapprocher du nombre
+             *          de « sending establish message »
+             * Le compteur « SABM-DEDUP » ci-dessous dit combien de rearmements
+             * ont ete supprimes : cumulatif, jamais un taux. */
+            static int dedup_on = -1;
+            static unsigned long long dedup_n = 0;
+            if (dedup_on < 0) {
+                const char *e = getenv("CALYPSO_UL_SABM_DEDUP");
+                dedup_on = (e && *e == '1') ? 1 : 0;
+                LOGP(DDEV, LOGL_NOTICE,
+                     "UL DCCH : dedup SABM %s (CALYPSO_UL_SABM_DEDUP)\n",
+                     dedup_on ? "ACTIF" : "inactif — comportement d'avant");
+            }
+            if (dedup_on && sticky && pend_valid && held_valid
+                && memcmp(held_l2, pend_l2, sizeof(held_l2)) == 0) {
+                /* meme trame que celle deja tenue : on consomme la capture SANS
+                 * rearmer le TTL, sinon le hold ne s'eteint jamais. */
+                pend_valid = 0;
+                dedup_n++;
+                if (dedup_n <= 5 || (dedup_n % 50) == 0)
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "UL DCCH SABM-DEDUP #%llu : republication identique "
+                         "(ctrl=0x%02x) ignoree, TTL non rearme\n",
+                         dedup_n, held_l2[1]);
+            }
             /* capture persistante : toute nouvelle trame signalisante remplace held_l2 */
             if (sticky && pend_valid) {
                 memcpy(held_l2, pend_l2, sizeof(held_l2)); held_valid = 1;
@@ -2184,7 +2246,24 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             static int tch_smp = -999999;
             if (tch_smp == -999999) {
                 const char *e = getenv("CALYPSO_UL_TCH_SMP_OFS");
-                tch_smp = (e && *e) ? atoi(e) : -19;   /* 4,63672 bit x 4 sps */
+                /* [2026-08-11] DEFAUT REMIS A 0 — REGRESSION AVEREE.
+                 * Pose a -19 le 10/08 sans validation par un appel, et
+                 * c'etait une faute : bisect git du 11/08, un SEUL commit
+                 * separe « voice works bis and real » (68c4de1) de l'etat
+                 * casse, et ce commit ne contient que ce patch. Symptome :
+                 * le LU echoue en boucle, la BTS voit la SABM rejouee
+                 * (« SABM L>0 not expected in timer recovery state »,
+                 * « SABM frame with information not allowed in this state »).
+                 * Deplacer le burst montant de 19 echantillons n'est donc PAS
+                 * neutre pour l'etablissement de lien, contrairement a ce que
+                 * la seule fenetre CALYPSO_NB_MAXDLY=40 laissait croire.
+                 * 0 = geometrie d'avant, exactement celle de 68c4de1.
+                 * La valeur -19 reste JUSTE en theorie (toa=4,63672 bit x 4
+                 * sps = 18,55 echantillons) : elle annulerait l'emballement
+                 * TA. Mais elle se BALAYE, appel a l'appui, avec pour juge
+                 * conjoint « Location update failed » = 0 ET « toa= » -> ~0.
+                 * Ne jamais la remettre par defaut sans ce double juge. */
+                tch_smp = (e && *e) ? atoi(e) : 0;
                 LOGP(DDEV, LOGL_NOTICE,
                      "TCH-UL TOA : CALYPSO_UL_TCH_SMP_OFS=%d echantillons "
                      "(0 = comportement d'avant le 10/08)\n", tch_smp);

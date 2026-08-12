@@ -2700,8 +2700,28 @@ static const MemoryRegionOps shunt_ndb_trigger_ops = {
 #define GSMTAP_CHANNEL_SDCCH4   0x07   /* SDCCH/4 SS0 DL (UA/AUTH / #2) */
 #define GSMTAP_CHANNEL_ACCH     0x80   /* bit ACCH (SACCH) GSMTAP */
 #define GSMTAP_CHANNEL_SACCH    (GSMTAP_CHANNEL_SDCCH4 | GSMTAP_CHANNEL_ACCH) /* 0x87 : SI5/SI6 reels */
-#define GSMTAP_CHANNEL_TCH_F    0x08   /* FACCH/F du canal dedie (2026-08-08) */
-#define GSMTAP_CHANNEL_TCH_ACCH (GSMTAP_CHANNEL_TCH_F | GSMTAP_CHANNEL_ACCH)  /* 0x88 : SACCH du TCH */
+/* [2026-08-12] CORRIGE : ces deux constantes valaient 0x08 / 0x88 depuis le
+ * 08/08. FAUX. Le sous-type GSMTAP canonique de la FACCH/F est 0x09
+ * (libosmocore gsmtap.h : GSMTAP_CHANNEL_FACCH_F 0x09, GSMTAP_CHANNEL_TCH_F en
+ * est l'alias historique) ; 0x08 est GSMTAP_CHANNEL_SDCCH8. gr-gsm emet bien
+ * 0x09 / 0x89 : gr-gsm/lib/demapping/tch_f_chans_demapper_impl.cc:88-90
+ *     new_hdr->sub_type = GSMTAP_CHANNEL_TCH_F;                     (FACCH)
+ *     new_hdr->sub_type = GSMTAP_CHANNEL_ACCH|GSMTAP_CHANNEL_TCH_F; (SACCH)
+ * avec gr-gsm/include/gsm/gsmtap.h:43 TCH_F = 0x09.
+ * Consequence de l'erreur : les deux branches de shunt_gsmtap_read comparaient
+ * a 0x08/0x88, donc feed_facch et feed_tch_sacch etaient INATTEIGNABLES ; tout
+ * le trafic du canal dedie tombait dans le « autres canaux : drop ». Le mobile
+ * ne recevait aucun bloc SACCH dediee -> meas->frames == 0 -> MEAS REP
+ * meas-invalid=1 rxlev=-110, pas de SI5 -> ba 0 / no-ncell-n 7, puis
+ * defaillance de lien radio ~6 s apres l'ASSIGNMENT COMPLETE.
+ * Mesure qui l'etablit : feed_si 1869, feed_agch 3712, feed_sdcch 57,
+ * feed_sacch 21, mais feed_facch 0 et feed_tch_sacch 0 — sur un run ou la
+ * vanne shunt_tch_inject_on() etait ON (CALYPSO_SHUNT_LEGIT=1) et ou les 40
+ * premieres occurrences sont journalisees sans condition.
+ * ⚠️ Ce n'est PAS une regression de la reecriture d'arbre du 11/08 : les 21
+ * sauvegardes du fichier portent toutes 0x08. */
+#define GSMTAP_CHANNEL_TCH_F    0x09   /* = GSMTAP_CHANNEL_FACCH_F (libosmocore) */
+#define GSMTAP_CHANNEL_TCH_ACCH (GSMTAP_CHANNEL_TCH_F | GSMTAP_CHANNEL_ACCH)  /* 0x89 : SACCH du dedie */
 static int g_gsmtap_fd = -1;
 
 /* AGCH (#11) : range l'IMM ASSIGN forwardé par si_bridge (tag GSMTAP AGCH 0x04)
@@ -2980,7 +3000,7 @@ static void calypso_dsp_shunt_feed_sacch(const uint8_t *l2, int len)
 
 /* ---- TCH DL de signalisation : FACCH et SACCH-du-dedie (2026-08-08) --------
  * Source = le grgsm TCHF lance par si_bridge sur le timeslot assigne, achemine
- * en GSMTAP 4730 (sous-types 0x08 / 0x88). Aucune fabrication ici : si gr-gsm
+ * en GSMTAP 4730 (sous-types 0x09 / 0x89). Aucune fabrication ici : si gr-gsm
  * ne decode pas, rien n'est presente et le mobile le voit — c'est le point de
  * la doctrine shunt_legit (le decodeur hote tient le role du DSP, il ne l'imite
  * pas). Gate commun aux deux : CALYPSO_INJECT_TCH, sinon SHUNT_LEGIT. */
