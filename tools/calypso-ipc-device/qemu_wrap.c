@@ -168,6 +168,33 @@ static volatile size_t      g_dl_fifo_tail = 0;   /* next push index */
 static pthread_mutex_t      g_dl_fifo_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile uint32_t    g_last_qfn_sent = UINT32_MAX;
 
+/* [2026-08-12] Gates du rattrapage DL (cf. DL-FIFO-TRIM dans clk_listener).
+ * Lus une fois ; appeles uniquement depuis clk_listener (mono-thread). */
+static int dl_catchup_off(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CALYPSO_DL_FIFO_CATCHUP_OFF");
+        v = (e && atoi(e)) ? 1 : 0;
+    }
+    return v;
+}
+/* Profondeur au-dela de laquelle on purge, en entrees (1 entree = 1 trame TDMA
+ * = 4.615 ms). Defaut 4*DL_PREFILL = 128 ~= 590 ms : bien au-dessus du jitter
+ * normal (coussin DL_PREFILL = 32 ~= 148 ms), bien en-dessous du decalage
+ * pathologique observe (22 s). Reglable par CALYPSO_DL_FIFO_MAX_DEPTH. */
+static size_t dl_max_depth(void)
+{
+    static size_t v = 0;
+    if (!v) {
+        const char *e = getenv("CALYPSO_DL_FIFO_MAX_DEPTH");
+        long n = e ? atol(e) : 0;
+        v = (n >= DL_PREFILL * 2 && n < (long)DL_FIFO_SIZE)
+              ? (size_t)n : (size_t)(DL_PREFILL * 4);
+    }
+    return v;
+}
+
 /* GMSK signature : a FCCH burst (148 zero bits) has dphi = +π/2 every
  * sample at 1 SPS. We measure the fraction of positive dphi samples ;
  * ≥ 95 % positive = FCCH. Same logic as tools/dump_chunks_pattern.py. */
@@ -308,6 +335,37 @@ static void *clk_listener(void *arg)
             LOGP(DDEV, LOGL_NOTICE,
                  "DL FIFO pre-filled to %d, starting to serve at qfn=%u\n",
                  DL_PREFILL, fn);
+        }
+        /* ---- [2026-08-12] DL-FIFO-TRIM : rattrapage CONTINU ----
+         * Le rattrapage one-shot du premier tick (DL-FIFO-CATCHUP, plus haut)
+         * ne suffit PAS : il s'execute des le 1er tick QEMU (mesure : qfn=434),
+         * AVANT que le backlog ne se forme, donc depth0 <= DL_PREFILL et il ne
+         * jette rien -- verifie, 0 occurrence de DL-FIFO-CATCHUP en session
+         * alors que "first QEMU tick received" est bien present. Le backlog qui
+         * s'accumule ENSUITE n'etait donc jamais purge : Fix D cadence le DEBIT
+         * (1 burst/tick) mais ne corrige jamais l'OFFSET, d'ou un decalage fige
+         * qui ne derive plus.
+         * Mesure du 12/08 : 22,14 s de latence MONTANTE de bout en bout (bip
+         * 1 kHz injecte dans le sink gsm_mic, retrouve par Goertzel dans le
+         * -ul.wav de MixMonitor, corrobore par le temps mural). Le MS asservit
+         * son horloge au downlink : ce retard frappe LES DEUX SENS, pas
+         * seulement le montant.
+         * Sur : la FN de l'en-tete vient de e->ts (VRAIE FN du burst), pas du
+         * qfn courant -- jeter des entrees ne desaligne donc pas la FN, le MS
+         * se re-synchronise sur SCH. */
+        if (!dl_catchup_off() && (tail - head) > dl_max_depth()) {
+            size_t depth_before = tail - head;
+            size_t dropped = depth_before - DL_PREFILL;
+            head = tail - DL_PREFILL;
+            g_dl_fifo_head = head;
+            static uint64_t trim_count = 0;
+            if (trim_count < 10 || (trim_count % 100) == 0)
+                LOGP(DDEV, LOGL_NOTICE,
+                     "DL-FIFO-TRIM #%llu: dropping %zu stale entries "
+                     "(depth %zu -> %u, ~%zu ms of lag) at qfn=%u\n",
+                     (unsigned long long)trim_count, dropped,
+                     depth_before, DL_PREFILL, (dropped * 4615) / 1000, fn);
+            trim_count++;
         }
         if (head == tail) {
             /* Empty FIFO — nothing to serve this tick. */
@@ -1007,16 +1065,62 @@ static int calypso_ul_sb_read(const char *path, int *fdp, uint8_t *l2, uint32_t 
 }
 
 /* Voix montante : 64 o, seq@0 l1s_fn@4 fn@8 fr[33]@16. */
+/* [2026-08-12] Lecteur d'ANNEAU. Le producteur (calypso_dsp_shunt.c,
+ * tch_ul_publish_speech) ecrivait dans un SLOT UNIQUE : toute trame non lue
+ * avant la suivante etait perdue sans trace, et ce lecteur-ci relisait
+ * indefiniment « la derniere » — d'ou la latence montante, variable et
+ * croissante avec la derive des deux horloges.
+ *
+ * On consomme desormais EN ORDRE (seq+1), ce qui est le point : de la voix
+ * rejouee dans le desordre ou avec des trous n'est pas de la voix. Si on a pris
+ * trop de retard (plus d'un tour d'anneau), on SAUTE a la plus ancienne trame
+ * encore valide plutot que de servir du perime : un trou est audible une fois,
+ * du retard cumule l'est en permanence.
+ *
+ * Compat : un fichier de 64 o = ancien format slot unique (producteur pas encore
+ * recompile) -> on le lit comme avant. Sans ca, un binaire neuf face a un vieux
+ * shunt rendrait un montant MUET, ce qui est le pire des diagnostics.
+ *
+ * ⚠️ On relit l'entete a chaque appel (pread, pas de cache) : le producteur peut
+ * recreer le fichier entre deux appels. Cf. la regle du projet — lire /dev/shm
+ * avec un lecteur bufferise fige la valeur, `pread` est obligatoire. */
 static int calypso_tch_speech_ul_read(uint8_t *fr, uint32_t *seq_out)
 {
     static int fd = -1;
+    static uint32_t last_seq = 0;
     if (fd < 0) fd = open("/dev/shm/calypso_tch_ul", O_RDONLY);
     if (fd < 0) return 0;
+
+    uint32_t hdr[2];
+    if (pread(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return 0;
+    uint32_t w_seq = hdr[0], n_slots = hdr[1];
+
+    /* Ancien format : 64 o pile, pas d'entete -> hdr[0] est le seq. */
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size == 64) {
+        uint8_t buf[64];
+        if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
+        uint32_t seq; memcpy(&seq, buf, 4);
+        if (seq == 0) return 0;
+        if (seq_out) *seq_out = seq;
+        if (fr)      memcpy(fr, buf + 16, 33);
+        return 1;
+    }
+    if (w_seq == 0 || n_slots == 0 || n_slots > 1024) return 0;
+
+    uint32_t target = last_seq + 1;
+    if (last_seq == 0 || (w_seq >= n_slots && target < w_seq - n_slots + 1))
+        target = (w_seq >= n_slots) ? (w_seq - n_slots + 1) : 1;  /* trop tard : on saute */
+    if (target > w_seq) return 0;                                  /* rien de neuf */
+
     uint8_t buf[64];
-    if (pread(fd, buf, sizeof(buf), 0) != (ssize_t)sizeof(buf)) return 0;
-    uint32_t seq; memcpy(&seq, buf, 4);
-    if (seq == 0) return 0;
-    if (seq_out) *seq_out = seq;
+    off_t off = 8 + (off_t)((target - 1) % n_slots) * 64;
+    if (pread(fd, buf, sizeof(buf), off) != (ssize_t)sizeof(buf)) return 0;
+    uint32_t slot_seq; memcpy(&slot_seq, buf, 4);
+    if (slot_seq != target) return 0;   /* slot en cours d'ecriture : on repassera */
+
+    last_seq = target;
+    if (seq_out) *seq_out = target;
     if (fr)      memcpy(fr, buf + 16, 33);
     return 1;
 }
@@ -2147,7 +2251,33 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                  * tombe hors fenêtre. CALYPSO_UL_SDCCH_SMP_OFS=N (échantillons, sweepable,
                  * peut être négatif) décale le burst normal pour caler le TSC. */
                 static int sd_smp = -999999;
-                if (sd_smp == -999999) { const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS"); sd_smp = e ? atoi(e) : 0; }
+                if (sd_smp == -999999) {
+                    const char *e = getenv("CALYPSO_UL_SDCCH_SMP_OFS");
+                    sd_smp = e ? atoi(e) : 0;
+                    /* [2026-08-12] ANNONCE. Regle du projet : une sonde qui ne
+                     * s'annonce pas rend son silence indecidable. Ici c'etait
+                     * pire qu'une sonde — c'est la GEOMETRIE du burst montant,
+                     * donc la boucle TA de la BTS, et rien nulle part ne disait
+                     * quelle valeur avait ete recue.
+                     *
+                     * CE QUE CA TRANCHE, et que rien d'autre ne tranchait :
+                     * mesure du 12/08, un calypso-ipc-device vivant avait ZERO
+                     * variable CALYPSO_* dans son environ quand QEMU en avait
+                     * 183 (lance sous un autre serveur tmux, environnement
+                     * fossilise). Une gate posee dans un fichier .env et une
+                     * gate jamais recue par le binaire donnaient exactement le
+                     * meme journal. On imprime donc la valeur EFFECTIVE et si
+                     * elle vient de l'environnement ou du defaut compile.
+                     *
+                     * Volontairement au premier burst SDCCH et pas au demarrage
+                     * du process : c'est ici que la valeur est lue, et une
+                     * annonce placee ailleurs pourrait mentir si ce chemin
+                     * n'etait jamais atteint. Une seule fois (static). */
+                    LOGP(DDEV, LOGL_NOTICE,
+                         "SDCCH-UL TOA : CALYPSO_UL_SDCCH_SMP_OFS=%d echantillons (%s)\n",
+                         sd_smp, e ? "recu de l'environnement"
+                                   : "ABSENT de l'environnement -> defaut compile 0");
+                }
                 /* Offset dans LE chunk courant : dc_local, deja ramene dans la
                  * demi-trame par la phase. Sans config dedie lue, dc_local vaut
                  * 1875 = l'ancien ul_slotoff, donc comportement inchange. */

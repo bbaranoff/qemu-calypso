@@ -43,7 +43,15 @@ MOD_ENABLED_IF[l2]='[ "${CALYPSO_SKIP_L2:-0}" != 1 ]'
 : "${CALYPSO_L2_CLIENT:=mobile}"
 : "${CALYPSO_L1CTL_SOCK:=/tmp/osmocom_l2}"
 # Masque de catégories du mobile (L2075) ; séparateur `:`, pas `,`.
-: "${CALYPSO_MOBILE_DEBUG:=DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK}"
+# [2026-08-12] +DLLAPD. La liste ci-dessous etait, au caractere pres, le defaut
+# compile du binaire (`mobile -h`) : elle n'ajoutait donc RIEN. DLLAPD est la
+# categorie de `lapdm.c` / `lapd_core.c` (tag <001f>), la seule qui manquait pour
+# voir la couche 2 : « Received frame for unsupported SAPI N », les MDL-ERROR-IND
+# avec leur cause ET leur etat LAPD, les « N(S) sequence error », les
+# « I frame ignored in state LAPD_STATE_IDLE ». Sans elle, une rupture de lien ne
+# se lit que par ses consequences en couche 3, une fois qu'il est trop tard.
+# Ce masque sert AUX DEUX MS : 68-sidecar-mobile.sh le reprend tel quel.
+: "${CALYPSO_MOBILE_DEBUG:=DCS:DNB:DPLMN:DRR:DMM:DSIM:DCC:DMNCC:DSS:DLSMS:DPAG:DSUM:DSAP:DGPS:DMOB:DPRIM:DLUA:DGAPK:DLLAPD}"
 
 # ── DESCENDANT MUET : géométrie du tampon ALSA du mobile ─────────────────────
 # [2026-08-10] RACINE MESURÉE, pas déduite. `osmo-gapk/src/pq_alsa.c` (l.87-135)

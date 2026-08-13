@@ -396,21 +396,50 @@ static void tch_ul_publish_l2(const char *path, int *fdp, uint32_t *seq,
     if (pwrite(*fdp, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
 }
 
+/* [2026-08-12] ANNEAU — c'etait un SLOT UNIQUE, reecrit a l'offset 0.
+ *
+ * MEME DEFAUT, MEME CORRECTIF QUE LE DESCENDANT (fait le 08/08, jamais porte
+ * ici). Le producteur ecrit 50 trames/s ; le lecteur (calypso-ipc-device) lit
+ * au rythme de SON tick. Avec un slot unique, toute trame non lue avant la
+ * suivante est ECRASEE — definitivement et SANS TRACE : aucun compteur ne
+ * baisse, le fichier garde la bonne taille, la sonde de capture continue de
+ * compter des trames prises. Cote descendant la mesure avait donne ~25 % de
+ * perte ; cote montant elle se paie en plus en LATENCE, parce que le lecteur
+ * ne rattrape jamais : il relit indefiniment « la derniere », dont l'age varie
+ * avec la derive des deux horloges.
+ *
+ * Format, IDENTIQUE au descendant pour qu'il n'y ait qu'une discipline a
+ * retenir : entete 8 o [w_seq(u32) | n_slots(u32)], puis n_slots x 64 o,
+ * slot k = ((seq-1) % n_slots). Charge utile du slot INCHANGEE
+ * (seq@0, l1s_fn@4, fn@8, fr[33]@16) : le lecteur garde ses offsets.
+ *
+ * ORDRE D'ECRITURE, non negociable : le slot D'ABORD, w_seq ENSUITE. Un lecteur
+ * ne doit jamais voir annoncer un seq dont le slot n'est pas encore ecrit. */
+#define TCH_UL_RING_SLOTS 16
+#define TCH_UL_SLOT_SZ    64
 static void tch_ul_publish_speech(const uint8_t *fr, uint32_t fn, uint32_t l1s_fn)
 {
     static int fd = -2;
     if (fd == -2) {
         fd = open(TCH_UL_SPEECH_PATH, O_CREAT | O_RDWR, 0644);
-        if (fd >= 0 && ftruncate(fd, 64) < 0) { /* best-effort */ }
+        if (fd >= 0) {
+            if (ftruncate(fd, 8 + TCH_UL_RING_SLOTS * TCH_UL_SLOT_SZ) < 0) { /* best-effort */ }
+            /* w_seq=0 + n_slots : un lecteur qui arrive avant la 1re trame voit
+             * un anneau vide, pas un fichier d'un format inconnu. */
+            uint32_t hdr[2] = { 0, TCH_UL_RING_SLOTS };
+            if (pwrite(fd, hdr, sizeof(hdr), 0) < 0) { /* best-effort */ }
+        }
     }
     if (fd < 0) return;
     static uint32_t seq = 0; seq++;
-    uint8_t buf[64] = {0};
+    uint8_t buf[TCH_UL_SLOT_SZ] = {0};
+    memcpy(buf + 0,  &seq, sizeof(seq));
     memcpy(buf + 4,  &l1s_fn, sizeof(l1s_fn));
     memcpy(buf + 8,  &fn,     sizeof(fn));
     memcpy(buf + 16, fr, 33);
-    memcpy(buf + 0,  &seq, sizeof(seq));
-    if (pwrite(fd, buf, sizeof(buf), 0) < 0) { /* best-effort */ }
+    off_t off = 8 + (off_t)((seq - 1) % TCH_UL_RING_SLOTS) * TCH_UL_SLOT_SZ;
+    if (pwrite(fd, buf, sizeof(buf), off) < 0) { /* best-effort */ }
+    if (pwrite(fd, &seq, sizeof(seq), 0) < 0) { /* best-effort */ }
 }
 
 /* Lit un bloc UL de 23 o de L2 a NDB+off (L2 a [3] = +6, la ou
@@ -971,7 +1000,34 @@ static bool shunt_dcch_si_guard(void)
      * SDCCH). On ne renonce plus : le site d appel ecrit une trame de bourrage
      * LAPDm valide a la place. La garde redevient donc stricte sur tout canal
      * dedie -- c est le sens de l original, sans la famine. */
-    return true;
+    /* [2026-08-12] LE FILET DE SECURITE ETAIT DU CODE MORT — RETABLI.
+     *
+     * Il y avait ici un `return true;` SEC, place AVANT le test de peremption
+     * ci-dessous : tout le bloc etait donc inatteignable. La garde ne pouvait
+     * plus se lever que par DM_REL_REQ. Or DM_REL_REQ n arrive PAS quand
+     * l etablissement echoue avant le mode dedie (RR passe de
+     * « connection pending » a « release pending » sans jamais etre etabli) :
+     * la garde restait armee POUR TOUJOURS et le SI du camp ne revenait
+     * jamais dans a_cd. C est exactement le defaut que le commentaire de la
+     * garde disait vouloir eviter (« si le DM_REL_REQ est manque, la garde se
+     * leve seule plutot que d affamer le camp en SI pour toujours — le defaut
+     * no-cell-info a deja ete paye une fois »).
+     *
+     * MESURE QUI L ETABLIT (run 10:06:33 -> 10:10:16, profil shunt_legit) :
+     *   - qemu.log : « DCCH-GARDE : ARMEE » UNE fois (ligne 2600 / 27131),
+     *     « levee » ZERO fois sur tout le reste du journal ;
+     *   - mobile.log : camp C3 + LU OK a 10:06:37, deux tentatives d appel a
+     *     10:06:44 et 10:06:51, puis « MM IDLE, no cell available » a 10:07:12
+     *     et 45 boucles « C0 null » <-> « C6 any cell selection » jusqu a la
+     *     fin du run, sans jamais revenir en C3 ;
+     *   - la synchro, elle, reste bonne pendant tout ce temps (SCH decode,
+     *     BSIC=7, « Channel provides data ») : seul le SI manque.
+     *
+     * PIEGE DE MESURE A CONNAITRE : la sonde « feed_si: SI reel N o injecte
+     * -> a_cd » est EN AMONT de cette garde (point d injection, l. ~4185) et
+     * continue d imprimer alors que plus rien n atteint a_cd. Le juge correct
+     * est la paire ARMEE/levee ci-dessus, et la sonde « CAMP: a_cd<-SI » du
+     * site de presentation. */
     if ((uint32_t)(g_shunt.tick_cnt - g_shunt.dcch_guard_tick) > (uint32_t)ttl) {
         g_shunt.dcch_guard_armed = false;      /* plus de bloc dedie depuis ttl : canal fini */
         SHUNT_LOG("DCCH-GARDE : levee (peremption) -- SI du camp retabli\n");
@@ -3876,26 +3932,16 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         cfile2_wr(fbuf2, (size_t)n);
         pos += n;
     }
-    /* cfile #2 FN-espace : chaque burst TS0 a sa position de trame
-     * ((fn-base)*spf int16), trames manquantes zero-fillees -> grgsm retrouve la
-     * 51-mf -> SACCH (SI5/SI6) decodable. spf = int16/trame TDMA (def 2500=1x,
-     * sweepable via CALYPSO_IQ_CFILE_SPF pour le test offline). */
-    if (g_iq_cfile2) {
-        static int spf = -1; static uint32_t base_fn = 0; static int64_t pos = 0; static int have_base = 0;
-        if (spf < 0) { const char *e = getenv("CALYPSO_IQ_CFILE_SPF"); spf = (e && *e) ? atoi(e) : 2500; }
-        if (!have_base) { base_fn = fn; pos = 0; have_base = 1; }
-        int64_t target = (int64_t)fn - (int64_t)base_fn;
-        if (target < 0) target += 2715648;            /* hyperframe wrap */
-        target *= spf;
-        int64_t gap = target - pos;
-        if (gap < 0 || gap > (int64_t)spf * 300) { base_fn = fn; pos = 0; gap = 0; }  /* rebase si saut anormal */
-        static const float zeros[512] = {0};
-        while (gap > 0 && g_iq_cfile2) { int c = gap > 512 ? 512 : (int)gap; cfile2_wr(zeros, (size_t)c); pos += c; gap -= c; }
-        float fbuf2[SHM_IQ_LEN];
-        for (int i = 0; i < n; i++) fbuf2[i] = (float)iq[i] / 32768.0f;
-        cfile2_wr(fbuf2, (size_t)n);
-        pos += n;
-    }
+    /* [2026-08-12] LE BLOC CI-DESSUS ETAIT ECRIT DEUX FOIS, a la suite, dans
+     * cette meme fonction. Consequence : CHAQUE burst etait ecrit DEUX FOIS dans
+     * le cfile #2, et — pire — chaque copie avait ses PROPRES `static` (spf,
+     * base_fn, pos, have_base), donc deux suivis de position independants
+     * calculaient chacun leur zero-fill sur un `pos` qui ignorait les ecritures
+     * de l'autre. Le fichier produit n'avait donc plus aucune relation entre
+     * position et FN : c'est exactement ce que grgsm doit retrouver pour caler
+     * la multitrame. Un cfile #2 ne pouvait pas etre rejoue, et rien ne le
+     * signalait — il avait la bonne taille et le bon format.
+     * Doublon supprime. */
 }
 
 /* SORTIE du DSP shunte : gr-gsm a-t-il ecrit un nouveau SI ? Si oui -> a_cd. */

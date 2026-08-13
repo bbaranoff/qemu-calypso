@@ -53,8 +53,18 @@ mod_sidecar_mobile_start() {
     mod_say "mobile -c $SC_MOBILE_CFG (VTY $SC_MOBILE_VTY_PORT)"
     mod_say "journal : $log"
     mod_say "latence : PULSE_LATENCY_MSEC=${CALYPSO_PULSE_LATENCY_MSEC:-<defaut greffon>}"
+    # [2026-08-12] -d AJOUTE. Ce mobile-ci demarrait SANS masque de categories :
+    # il tombait sur le defaut compile, et son journal n'avait donc ni la couche 2
+    # (DLLAPD) ni le meme perimetre que celui du MS#1. Deux MS cote a cote avec
+    # deux journaux non comparables rendent bancal tout diagnostic differentiel
+    # (« le sidecar campe, pas le Calypso ») : une ligne absente d'un cote ne
+    # voulait rien dire. On reprend le MEME masque, defini une seule fois dans
+    # 70-l2.sh — tous les modules sont sources avant tout demarrage (run.sh:323),
+    # donc la variable est posee quand cette fonction s'execute.
+    mod_say "debug    : $CALYPSO_MOBILE_DEBUG"
     PULSE_LATENCY_MSEC="$CALYPSO_PULSE_LATENCY_MSEC" \
-        stdbuf -oL -eL "$SC_MOBILE_BIN" -c "$SC_MOBILE_CFG" >>"$log" 2>&1 &
+        stdbuf -oL -eL "$SC_MOBILE_BIN" -c "$SC_MOBILE_CFG" \
+        -d "$CALYPSO_MOBILE_DEBUG" >>"$log" 2>&1 &
     radio_save_pid sidecar-mobile $!
     mod_ok
 }

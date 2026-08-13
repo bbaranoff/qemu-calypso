@@ -60,7 +60,53 @@ mod_ipc_device_start() {
     : > "$IPC_DEVICE_LOG" 2>/dev/null || true
     export CALYPSO_IPC_RELAY CALYPSO_TRX_IQ_HOST CALYPSO_TRX_IQ_RX_PORT \
            CALYPSO_TRX_IQ_TX_PORT CALYPSO_RELAY_FIFOS
+    # [2026-08-12] LES 5 EXPORTS CI-DESSUS NE SUFFISENT PAS.
+    #
+    # `qemu_wrap.c` lit 56 variables d'environnement — tout le montant : RACH,
+    # SDCCH, TCH, SACCH, chiffrement A5, offsets de TOA, dedup SABM. Les cinq
+    # ci-dessus sont les seules a avoir jamais ete exportees ici. Les autres ne
+    # traversaient que si la chaine d'appel avait deja tout exporte (run.sh:286
+    # source load.env sous `set -a`, et calypso.env:51 y charge le fichier de
+    # profil). Cette condition N'EST PAS GARANTIE : mesure du 12/08, un
+    # calypso-ipc-device vivant avait ZERO variable CALYPSO_* dans son environ
+    # (`tr '\0' '\n' < /proc/<pid>/environ | grep -c '^CALYPSO_'`) quand QEMU en
+    # avait 183 — il pendait sous un autre serveur tmux, donc sous un
+    # environnement fossilise. Toutes ses gates tournaient au defaut compile,
+    # EN SILENCE : rien dans aucun journal ne distingue « gate posee a 0 » de
+    # « gate jamais recue ».
+    #
+    # On exporte donc explicitement, depuis le shell du module — qui, lui, a bien
+    # les valeurs. `export` sur une variable non definie n'ajoute rien a
+    # l'environnement : les gates non posees restent absentes et le binaire garde
+    # son defaut, exactement comme avant. Aucun changement de comportement, juste
+    # la garantie que ce qui EST pose ARRIVE.
+    #
+    # ⚠️ Cette liste doit suivre `qemu_wrap.c`. Pour la regenerer :
+    #   grep -ohE 'getenv\("[A-Z0-9_]+"\)' tools/calypso-ipc-device/*.c \
+    #     | sed 's/.*getenv("//;s/")//' | sort -u
+    export CALYPSO_BSP_CONT_FORWARD CALYPSO_BSP_HOST CALYPSO_BSP_PORT \
+           CALYPSO_CIPH_A5 CALYPSO_CIPH_FN_ADJ CALYPSO_DL_BURST_OFFSET \
+           CALYPSO_DL_FIFO_CATCHUP_OFF CALYPSO_DL_IQ_CONJ \
+           CALYPSO_FCCH_DUMP CALYPSO_FCCH_DUMP_N CALYPSO_FCCH_DUMP_SKIP \
+           CALYPSO_IPC_UL CALYPSO_QFN_FLOOR_NS CALYPSO_QFN_FORCE \
+           CALYPSO_QFN_LEAD CALYPSO_RELAY_ALSO_BSP \
+           CALYPSO_TCH_SACCH_CAL CALYPSO_TCH_SACCH_CLOCK CALYPSO_TDMA_NS \
+           CALYPSO_UL_ACTIVE_SYMS CALYPSO_UL_AMP CALYPSO_UL_BSIC \
+           CALYPSO_UL_DEBUG CALYPSO_UL_FN_ADJ CALYPSO_UL_FN_GATE \
+           CALYPSO_UL_FN_LOCK CALYPSO_UL_FN_OFFSET CALYPSO_UL_GMSK \
+           CALYPSO_UL_HOLD_IFRAME CALYPSO_UL_INVERT CALYPSO_UL_IQ_RECORD \
+           CALYPSO_UL_RA CALYPSO_UL_RACH_ENC CALYPSO_UL_RACH_ONCE \
+           CALYPSO_UL_RACH_REPS CALYPSO_UL_RACH_STICKY CALYPSO_UL_ROT \
+           CALYPSO_UL_ROT_SGN CALYPSO_UL_SABM_DEDUP CALYPSO_UL_SABM_HOLD \
+           CALYPSO_UL_SABM_HOLD_TTL CALYPSO_UL_SABM_STICKY \
+           CALYPSO_UL_SDCCH CALYPSO_UL_SDCCH_OFS CALYPSO_UL_SDCCH_SMP_OFS \
+           CALYPSO_UL_SLOT_OFFSET CALYPSO_UL_TCH CALYPSO_UL_TCH_SACCH_BID \
+           CALYPSO_UL_TCH_SACCH_OFS CALYPSO_UL_TCH_SMP_OFS
     mod_say "relay=$CALYPSO_IPC_RELAY iq=$CALYPSO_TRX_IQ_HOST rx=$CALYPSO_TRX_IQ_RX_PORT tx=$CALYPSO_TRX_IQ_TX_PORT"
+    # Les deux offsets de TOA du burst normal decident de la boucle TA de la BTS
+    # (toa constant -> TA qui rampe +2 par SACCH jusqu'a 63). On les annonce au
+    # demarrage : sans ca, « la gate est-elle arrivee ? » n'est pas decidable.
+    mod_say "TOA montant : SDCCH_SMP_OFS=${CALYPSO_UL_SDCCH_SMP_OFS:-<defaut 0>} TCH_SMP_OFS=${CALYPSO_UL_TCH_SMP_OFS:-<defaut 0>}"
     mod_say "socket maître attendu : $IPC_MSOCK_PATH"
 
     stdbuf -oL -eL "$CALYPSO_IPC_DEVICE" -u "$IPC_SOCK_DIR" -n 0 >>"$IPC_DEVICE_LOG" 2>&1 &
