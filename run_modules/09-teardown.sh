@@ -224,12 +224,15 @@ mod_teardown_start() {
     rm -f /tmp/osmocom_l2_* /tmp/irda.pty.link /tmp/irda_peer.pid 2>/dev/null
     rm -f /dev/shm/calypso_si.bin 2>/dev/null
     rm -f /dev/shm/calypso_kc 2>/dev/null            # cf. POURQUOI 4
-    # start-direct.sh ANNONCE « pont.log efface par le teardown » depuis le
-    # debut. C'etait FAUX : rien ne l'effacait, et il grossissait run apres run
-    # sur un tmpfs qui porte aussi les journaux. Un message d'interface qui ment
-    # sur l'etat du disque coute plus cher qu'il ne rapporte : on rend l'annonce
-    # vraie plutot que de la retirer.
-    rm -f /dev/shm/pont.log 2>/dev/null
+    # ⛔ NE PAS EFFACER /dev/shm/pont.log ICI — essaye le 16/08, REVERTE le jour
+    # meme. start-direct.sh ouvre la redirection `> /dev/shm/pont.log` AVANT de
+    # passer la main a run.sh : quand ce teardown s'execute, le lanceur differe
+    # du pont TIENT DEJA le descripteur. Un rm ne libere alors pas l'espace, il
+    # DELIE l'inode — le pont ecrit ensuite dans un fichier invisible
+    # (« /dev/shm/pont.log (deleted) » dans /proc/<pid>/fd/1) et le journal
+    # disparait entierement. C'est le piege deja documente pour LOG_DIR,
+    # transpose a /dev/shm. Le fichier n'a de toute facon pas besoin d'etre
+    # efface : la redirection `>` le TRONQUE a chaque demarrage.
     rm -f /tmp/relay_continu.cfile /tmp/record.cfile /tmp/record.cfile.off /tmp/record.cfile.ring 2>/dev/null
     if [ -n "${RECORD_FILE:-}" ]; then
         rm -f "$RECORD_FILE" "$RECORD_FILE.off" "$RECORD_FILE.ring" 2>/dev/null
