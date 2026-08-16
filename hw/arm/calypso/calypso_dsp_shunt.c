@@ -667,12 +667,51 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
             win[i] = (uint8_t)(w & 0xff);
             if (i + 1 < 30) win[i + 1] = (uint8_t)((w >> 8) & 0xff);
         }
+        /* [2026-08-16] RACINE DU MO SMS : le scanner refusait ctrl == 0x00.
+         *
+         * LE DEFAUT. L'ancienne condition blacklistait des valeurs de CONTROL
+         * (0x2b remplissage, 0xff memoire vierge, 0x00 « suppose vide »). Or
+         * 0x00 est une I-frame parfaitement legale : N(S)=0, N(R)=0, P=0 —
+         * c'est-a-dire la PREMIERE trame d'information de tout envoi.
+         *
+         * CE QUE CA CASSAIT. Mesure du run 16/08, CP-DATA d'un SMS MO. Le
+         * mobile poste (qemu.log:33720, L1CTL DATA_REQ, 23 o) :
+         *     0d 00 53 | 09 01 1b 00 2a 00 08 91 33 ...
+         *     addr 0x0d = EA=1 SAPI 3 (SMS) | ctrl 0x00 = I N(S)=0 N(R)=0 P=0
+         *     | len 0x53 = EL=1, M=1, L=20
+         * j=0 etait REFUSE sur `c != 0x00`. Le scanner glissait et tombait a
+         * j=4 sur `01 1b` (0x01 ressemble a une addr SAPI 0, 0x1b passe le
+         * filtre control) et publiait la L3 NUE, sans en-tete LAPDm :
+         *     01 1b 00 2a 00 08 91 33 ...
+         * osmo-bts lit alors l2[2]=0x00 comme octet de longueur -> EL=0 :
+         *     lapdm.c:971 « we don't support multi-octet length »
+         *     -> MDL-ERROR-IND 12 -> BSC « ERROR INDICATION cause=Frame not
+         *        implemented » -> SDCCH libere -> gsm48_rr.c:762 « Main
+         *        signallin link is down, so release SAPI 3 link locally »
+         *        -> MMSMS_REL_IND -> SMS jete.
+         * La retransmission T200 revient avec ctrl 0x10 (P=1), qui passait le
+         * filtre — d'ou UNE publication correcte, mais trop tard.
+         * ⚠️ NON specifique au pont : qemu_wrap.c lit le meme sideband, donc
+         * le MO SMS etait casse pareil en fake_trx. Et ca PERIME le diagnostic
+         * « Frame not implemented == chiffrement UL » : ce run est en a5/0.
+         *
+         * LE CHOIX. On ne blackliste plus de valeur de control : on valide le
+         * TRIPLET addr/ctrl/len, l'octet de LONGUEUR etant le vrai
+         * discriminant (EL=1 obligatoire, L <= N201=20). Il rejette le faux
+         * depart j=4 (len 0x00 -> EL=0) et accepte le vrai j=0. */
         int kk = -1;
         for (int j = 0; j <= 6; j++) {
-            uint8_t a = win[j], c = win[j + 1];
+            uint8_t a = win[j], c = win[j + 1], l = win[j + 2];
             int sapi = (a >> 2) & 7;
-            if ((a & 0x01) && (sapi == 0 || sapi == 3) &&
-                c != 0x2b && c != 0x00 && c != 0xff) { kk = j; break; }
+            /* addr : EA=1, LPD=0, SAPI 0 (signalisation) ou 3 (SMS) */
+            int addr_ok = (a & 0x01) && ((a & 0x60) == 0)
+                          && (sapi == 0 || sapi == 3);
+            /* ctrl : on n'ecarte QUE le remplissage et la memoire vierge.
+             * 0x00 est LEGAL (I-frame N(S)=0 N(R)=0 P=0) — cf. ci-dessus. */
+            int ctrl_ok = (c != 0x2b) && (c != 0xff);
+            /* len : EL=1 (osmo-bts refuse le multi-octet), L <= N201 */
+            int len_ok  = (l & 0x01) && ((l >> 2) <= 20);
+            if (addr_ok && ctrl_ok && len_ok) { kk = j; break; }
         }
         if (kk < 0) kk = 0;
         for (int i = 0; i < 23; i++) l2[i] = win[kk + i];
@@ -748,10 +787,15 @@ static void shunt_latch_task(uint16_t new_d_dsp_page)
         int non_idle = (l2[1] != 0x03);
         if (non_idle || ul_log < 6) {
             if (!non_idle) ul_log++;
-            SHUNT_LOG("SDCCH-UL%s task_u=0x%04x l1s%%51=%u "
+            /* kk = offset retenu par le scanner dans la fenetre a_cu. JUGE du
+             * fix du 16/08 : une trame saine se trouve a kk=0 ou kk=2 (header
+             * L1 SACCH). Un kk qui derive (4, 5, 6) signale un faux depart :
+             * on republierait de la L3 nue et osmo-bts repondrait
+             * « multi-octet length » / MDL-ERROR-IND 12. */
+            SHUNT_LOG("SDCCH-UL%s task_u=0x%04x l1s%%51=%u kk=%d "
                     "L2: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                     non_idle ? " *NONIDLE*" : "", g_shunt.d_task_u,
-                    (unsigned)(shunt_l1s_fn() % 51),
+                    (unsigned)(shunt_l1s_fn() % 51), kk,
                     l2[0], l2[1], l2[2], l2[3], l2[4], l2[5], l2[6], l2[7]);
         }
     }

@@ -122,6 +122,7 @@ _qemu_log_guard() {
 }
 
 mod_qemu_start() {
+    [ "${CALYPSO_BRIDGE:-}" = ipc ] && { mod_skip "CALYPSO_BRIDGE=ipc : MS#1 via osmo-trx-ms-ipc, firmware qemu non lance"; return $MOD_RC_SKIP; }
     local mach="calypso"
     mach="$mach,dsp-prom0=$DSP_PROM0,dsp-prom1=$DSP_PROM1,dsp-prom2=$DSP_PROM2"
     mach="$mach,dsp-prom3=$DSP_PROM3,dsp-drom=$DSP_DROM,dsp-pdrom=$DSP_PDROM"

@@ -71,6 +71,7 @@ mod_osmocon_check() {
 mod_osmocon_status() { _osmocon_vivant && have_unix "$L1CTL_SOCK_PATH"; }
 
 mod_osmocon_start() {
+    [ "${CALYPSO_BRIDGE:-}" = ipc ] && { mod_skip "CALYPSO_BRIDGE=ipc : MS#1 via osmo-trx-ms-ipc, osmocon non lance"; return $MOD_RC_SKIP; }
     local log; log="$(_osmocon_log)"
     # Socket d'un run précédent : osmocon refuse de créer par-dessus, et sa
     # présence ferait passer la barrière à tort.

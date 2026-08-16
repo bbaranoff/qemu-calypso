@@ -1764,7 +1764,7 @@ static void relay_init(void)
  * une trame (memcpy sous lock court ~20KB) ou la DROP ENTIERE si le ring est
  * plein ; le writer fait des write() BLOQUANTS COMPLETS (jamais partiels) ->
  * alignement byte toujours correct, jamais d'underrun cote QEMU. */
-enum { RELAY_NFIFO_MAX = 8, RELAY_RING = 64,   /* 8 : fft+grgsm+record+asciifft + grgsm_ciph (decipher DL) */
+enum { RELAY_NFIFO_MAX = 12, RELAY_RING = 64,  /* 9e tube = grgsm_tch_ciph (decipher DL TCH chiffre, design B) ; marge a 12 */
        RELAY_FRAME_FLOATS = CALYPSO_SHM_BUFSIZE * 2 };
 typedef struct {
     char            path[128];
@@ -1876,6 +1876,80 @@ static void relay_fifo_push(const float *frame, size_t nfloats)
             pthread_cond_signal(&rf->cv);
         }
         pthread_mutex_unlock(&rf->mtx);
+    }
+}
+
+/* === CHIFFREMENT A5 UL — etage unique, partage SDCCH + TCH =================
+ * [2026-08-14] FACTORISATION (feuille de route A5/1, phases 2b+5). Avant, deux
+ * etages divergeaient : le SDCCH honorait CALYPSO_CIPH_A5 (force debug) et
+ * CALYPSO_CIPH_FN_ADJ, le TCH utilisait cgalgo et internal_fn BRUTS. Tant que
+ * le reseau negocie A5/1 les deux coincident ; en A5/2 ou A5/3 le SDCCH serait
+ * parti FORCE en A5/1 et le TCH en A5/x — panne asymetrique, muette. Un seul
+ * chemin -> impossible par construction.
+ *   - meme selection d'algo : cgalgo negocie, override debug CALYPSO_CIPH_A5 ;
+ *   - meme FN de keystream : internal_fn (horloge osmo-trx/osmo-bts, PROUVE par
+ *     la RACH-DET) + CALYPSO_CIPH_FN_ADJ. /!\ FN_ADJ N'EST PAS balayable : le
+ *     decalage device<->bts est prouve nul, et le meme internal_fn sert la
+ *     grille RACH, le slot SDCCH/4 et l'index de la 26-multitrame TCH — un
+ *     FN_ADJ non nul casserait tout ce qui marche en clair. Molette debug, def 0.
+ * Porte aussi l'instrumentation (regle du projet : une sonde muette rend le
+ * silence indecidable) : annonce d'armement one-shot, 1er burst clair de chaque
+ * canal annonce, compteurs CUMULATIFS par canal imprimes A COTE du plafond
+ * d'affichage (jamais un plafond lu comme une mesure). */
+enum { A5CH_SDCCH = 0, A5CH_VOIX = 1, A5CH_FACCH = 2, A5CH_SACCH = 3, A5CH_N = 4 };
+static const char *const a5ch_name[A5CH_N] = { "SDCCH", "voix", "FACCH", "SACCH" };
+
+static void ul_cipher_burst(int8_t *ab, uint32_t internal_fn, int chan)
+{
+    static int      ci_init = -1, ci_fn_adj = 0, ci_force_n = -1;
+    static unsigned long long n_ciph[A5CH_N], n_clair[A5CH_N];
+    static int      announced, said[A5CH_N];
+    static unsigned nlog = 0;
+    uint8_t kc[16], cgalgo = 0, cklen = 0;
+
+    if (ci_init < 0) {
+        const char *e = getenv("CALYPSO_CIPH_FN_ADJ"); ci_fn_adj  = e ? atoi(e) : 0;
+        const char *f = getenv("CALYPSO_CIPH_A5");     ci_force_n = (f && *f) ? atoi(f) : -1;
+        ci_init = 1;
+    }
+    if (!announced) {
+        announced = 1;
+        LOGP(DDEV, LOGL_NOTICE,
+             "UL CIPHER: etage unique arme (SDCCH + TCH voix/FACCH/SACCH) — "
+             "chiffrement effectif seulement si un Kc est capte "
+             "(CALYPSO_CIPH_A5=%d, CALYPSO_CIPH_FN_ADJ=%d)\n", ci_force_n, ci_fn_adj);
+    }
+
+    int n_a5 = 0;
+    if (calypso_kc_read(&cgalgo, kc, &cklen))
+        n_a5 = (cgalgo >= 1 && cgalgo <= 3)
+             ? ((ci_force_n >= 0) ? ci_force_n : cgalgo) : 0;
+
+    if (n_a5 >= 1 && n_a5 <= 3) {
+        ubit_t   ks[114];
+        uint32_t fnc = (uint32_t)((long)internal_fn + ci_fn_adj);
+        osmo_a5(n_a5, kc, fnc, NULL, ks);              /* keystream UL, FN-keye */
+        for (int i = 0; i < 57; i++) {
+            if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
+            if (ks[i + 57]) ab[i + 88] = (int8_t)-ab[i + 88];
+        }
+        n_ciph[chan]++;
+        if (nlog++ < 30 || (nlog % 200) == 0)
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL CIPHER A5/%d %s fn=%u (adj=%d) Kc=%02x%02x%02x%02x.. | "
+                 "CUMUL chiffre[sdcch=%llu voix=%llu facch=%llu sacch=%llu] "
+                 "clair[sdcch=%llu voix=%llu facch=%llu sacch=%llu]\n",
+                 n_a5, a5ch_name[chan], fnc, ci_fn_adj, kc[0], kc[1], kc[2], kc[3],
+                 n_ciph[0], n_ciph[1], n_ciph[2], n_ciph[3],
+                 n_clair[0], n_clair[1], n_clair[2], n_clair[3]);
+    } else {
+        n_clair[chan]++;
+        if (!said[chan]) {
+            said[chan] = 1;
+            LOGP(DDEV, LOGL_NOTICE,
+                 "UL CIPHER: %s part EN CLAIR (aucun Kc capte, algo=%u) — "
+                 "normal tant que le reseau est en A5/0\n", a5ch_name[chan], cgalgo);
+        }
     }
 }
 
@@ -2193,55 +2267,11 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
             if (blk_valid) {
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
                 ul_build_sdcch_burst(ab, blk_l2, bid);
-                /* === CHIFFREMENT A5 UL ============================================
-                 * Si un Kc a ete capture (CIPHER MODE COMMAND -> /dev/shm/calypso_kc),
-                 * on chiffre les 114 bits data du burst (mapping IDENTIQUE a osmo-bts
-                 * scheduler.c:1614 : negation soft-bit ab[i+3] / ab[i+88]). osmo-bts
-                 * dechiffre l'UL avec le FN du burst -> A5 est FN-keye : FN = osmo_fn
-                 * (+ CALYPSO_CIPH_FN_ADJ, sweepable car l'alignement FN device<->bts
-                 * est la variable critique). CALYPSO_CIPH_A5 force le n (debug). */
-                {
-                    static int ci_init = -1, ci_fn_adj = 0, ci_force_n = -1;
-                    static uint8_t kc[16]; static int n_a5 = 0;
-                    if (ci_init < 0) {
-                        const char *e = getenv("CALYPSO_CIPH_FN_ADJ"); ci_fn_adj = e ? atoi(e) : 0;
-                        const char *f = getenv("CALYPSO_CIPH_A5");     ci_force_n = (f && *f) ? atoi(f) : -1;
-                        ci_init = 1;
-                    }
-                    uint8_t cgalgo = 0, cklen = 0;
-                    /* [2026-08-08] `ci_force_n` gagnait AVANT le test de cgalgo, et
-                     * CALYPSO_CIPH_A5=1 est vivant dans l'environnement des trois
-                     * process. Un Kc present avec un algo negocie a 0 (A5/0) partait
-                     * donc chiffre en A5/1 face a une BTS en clair — echec muet, et
-                     * indiscernable d'un mauvais alignement FN. Le forcage ne
-                     * s'applique plus qu'a un algo REELLEMENT negocie. */
-                    if (calypso_kc_read(&cgalgo, kc, &cklen))
-                        n_a5 = (cgalgo >= 1 && cgalgo <= 3)
-                             ? ((ci_force_n >= 0) ? ci_force_n : cgalgo)
-                             : 0;
-                    else
-                        n_a5 = 0;                       /* seq=0 -> cipher off */
-                    if (n_a5 >= 1 && n_a5 <= 3) {
-                        ubit_t ks[114];
-                        /* FN du keystream = internal_fn (= horloge osmo-trx/osmo-bts,
-                         * PROUVE par la RACH-DET a osmo-trx fn==internal_fn), PAS osmo_fn
-                         * (=internal_fn+36, label legacy trompeur). osmo-bts dechiffre le
-                         * burst UL recu avec SON FN = internal_fn ; on doit chiffrer au
-                         * meme FN sinon keystream different (A5 FN-keye) -> CIPHER MODE
-                         * COMPLETE illisible -> pas de LU ACCEPT. CALYPSO_CIPH_FN_ADJ=0. */
-                        uint32_t fnc = (uint32_t)((long)internal_fn + ci_fn_adj);
-                        osmo_a5(n_a5, kc, fnc, NULL, ks);       /* keystream UL */
-                        for (int i = 0; i < 57; i++) {
-                            if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
-                            if (ks[i + 57]) ab[i + 88] = (int8_t)-ab[i + 88];
-                        }
-                        static unsigned nci = 0;
-                        if (nci++ < 30 || (nci % 100) == 0)
-                            LOGP(DDEV, LOGL_NOTICE,
-                                 "UL CIPHER A5/%d bid=%d fn=%u (adj=%d) Kc=%02x%02x%02x%02x..\n",
-                                 n_a5, bid, fnc, ci_fn_adj, kc[0], kc[1], kc[2], kc[3]);
-                    }
-                }
+                /* Chiffrement A5 UL — etage unique partage SDCCH+TCH (ul_cipher_burst,
+                 * defini au-dessus). Le mapping soft-bit (negation ab[i+3]/ab[i+88])
+                 * et le FN de keystream (internal_fn) sont IDENTIQUES pour les deux
+                 * canaux : c'etait la raison d'etre de la factorisation du 14/08. */
+                ul_cipher_burst(ab, internal_fn, A5CH_SDCCH);
                 ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);  /* modulateur EXACT osmo-trx */
                 ul_iq_record(g_ul_iq, CALYPSO_BSP_BURSTLEN * CALYPSO_TRX_OSR);  /* record I/Q UL (SDCCH/SACCH) */
                 memset(ul_chunk, 0, sizeof(ul_chunk));
@@ -2415,62 +2445,12 @@ int32_t uhdwrap_read(void *dev, uint32_t num_chans)
                 int8_t ab[CALYPSO_BSP_BURSTLEN];
                 int kind = 0;
                 if (tch_ul_build_burst(ab, internal_fn, tsc, tn, &kind)) {
-                    /* Chiffrement A5 : meme mapping que le SDCCH (negation des
-                     * soft-bits data), meme FN de keystream (internal_fn). Inactif
-                     * tant qu'aucun Kc n'a ete capte. */
-                    {
-                        /* [2026-08-08] SONDE. Ce bloc n'en avait AUCUNE : ni LOGP, ni
-                         * compteur, pas meme au premier passage. On ne pouvait donc
-                         * pas distinguer « TCH chiffre », « Kc absent » et « bloc
-                         * jamais atteint ». Regle du projet : une sonde muette rend
-                         * le silence indecidable.
-                         * Compteurs CUMULATIFS par flux, imprimes a cote du plafond
-                         * d'affichage : le plafond ne doit jamais pouvoir etre lu
-                         * comme une mesure. */
-                        static uint8_t kc[16]; uint8_t cgalgo = 0, cklen = 0;
-                        static unsigned long long n_ciph[3], n_clair[3];
-                        static int announced;
-                        if (!announced) {
-                            announced = 1;
-                            LOGP(DDEV, LOGL_NOTICE,
-                                 "TCH CIPHER: sonde armee (voix/FACCH/SACCH) — "
-                                 "chiffrement effectif seulement si un Kc est capte\n");
-                        }
-                        int slot = (kind == 1) ? 1 : (kind == 2) ? 2 : 0;
-                        if (calypso_kc_read(&cgalgo, kc, &cklen) && cgalgo >= 1 && cgalgo <= 3) {
-                            ubit_t ks[114];
-                            osmo_a5(cgalgo, kc, internal_fn, NULL, ks);
-                            for (int i = 0; i < 57; i++) {
-                                if (ks[i])      ab[i + 3]  = (int8_t)-ab[i + 3];
-                                if (ks[i + 57]) ab[i + 88] = (int8_t)-ab[i + 88];
-                            }
-                            n_ciph[slot]++;
-                            static unsigned nl = 0;
-                            if (nl++ < 20 || (nl % 200) == 0)
-                                LOGP(DDEV, LOGL_NOTICE,
-                                     "TCH CIPHER A5/%d %s fn=%u Kc=%02x%02x%02x%02x.. | "
-                                     "CUMUL chiffre voix=%llu facch=%llu sacch=%llu | "
-                                     "clair voix=%llu facch=%llu sacch=%llu\n",
-                                     cgalgo, slot == 1 ? "FACCH" : slot == 2 ? "SACCH" : "voix",
-                                     internal_fn, kc[0], kc[1], kc[2], kc[3],
-                                     n_ciph[0], n_ciph[1], n_ciph[2],
-                                     n_clair[0], n_clair[1], n_clair[2]);
-                        } else {
-                            n_clair[slot]++;
-                            /* Le premier burst EN CLAIR de chaque flux est annonce :
-                             * un TCH qui part en clair alors que le reseau attend du
-                             * chiffre est un echec silencieux cote BTS. */
-                            static int said[3];
-                            if (!said[slot]) {
-                                said[slot] = 1;
-                                LOGP(DDEV, LOGL_NOTICE,
-                                     "TCH CIPHER: %s part EN CLAIR (aucun Kc capte, "
-                                     "algo=%u) — normal tant que le reseau est en A5/0\n",
-                                     slot == 1 ? "FACCH" : slot == 2 ? "SACCH" : "voix",
-                                     cgalgo);
-                            }
-                        }
-                    }
+                    /* Chiffrement A5 UL — etage unique partage SDCCH+TCH
+                     * (ul_cipher_burst). kind : 0=voix 1=FACCH 2=SACCH (convention
+                     * de tch_ul_build_burst). Meme mapping soft-bit, meme FN de
+                     * keystream (internal_fn) et memes compteurs que le SDCCH. */
+                    ul_cipher_burst(ab, internal_fn,
+                                    kind == 1 ? A5CH_FACCH : kind == 2 ? A5CH_SACCH : A5CH_VOIX);
                     ul_mod_laurent(ab, CALYPSO_BSP_BURSTLEN, g_ul_iq);
                     ul_iq_record(g_ul_iq, burst_n);
                     memset(ul_chunk, 0, sizeof(ul_chunk));

@@ -83,7 +83,9 @@ mod_panes_start() {
     specs+=("qemu|${LOG_DIR}/qemu.log")
     if [ "${CALYPSO_SKIP_DECODE_PANES:-0}" != 1 ] && [ -r "$CALYPSO_GSM_SNIFF" ]; then
         specs+=("burst|__BURST__")
-        specs+=("si|__SI__")
+        # En mode pont (CALYPSO_BRIDGE=pont) le decodeur SI (si_bridge/grgsm)
+        # est eteint : le pane afficherait un flux vide. On le retire.
+        [ "${CALYPSO_BRIDGE:-}" = pont ] || specs+=("si|__SI__")
     fi
     [ "${CALYPSO_SKIP_BRIDGE_PY:-1}" != 1 ] && specs+=("bridge-py|${LOG_DIR}/bridge.py.log")
     [ "${CALYPSO_SKIP_L2:-0}"        != 1 ] && specs+=("${CALYPSO_L2_CLIENT:-mobile}|$l2log")

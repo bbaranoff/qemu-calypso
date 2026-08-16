@@ -161,13 +161,21 @@ mod_gabarits_wait() {
 
     # Le chiffrement demandé est-il VRAIMENT dans la configuration posée ?
     # C'est le point 1 du POURQUOI : la panne silencieuse à supprimer.
-    local bsc="${OSMOCOM_CFG:-/etc/osmocom}/osmo-bsc.cfg"
-    if grep -q '__ENCRYPTION__' "$bsc" 2>/dev/null || ! grep -qF "$ENCRYPTION" "$bsc" 2>/dev/null; then
-        mod_hint "attendu « $ENCRYPTION » dans $bsc ; vérifiez que le gabarit porte bien __ENCRYPTION__"
-        mod_fail "le chiffrement demandé n'est pas dans la configuration installée"
-        return $MOD_RC_FAIL
-    fi
-    mod_say "chiffrement « $ENCRYPTION » confirmé dans $bsc"
+    # [2026-08-14] On contrôle DÉSORMAIS osmo-bsc.cfg ET osmo-msc.cfg. Le gabarit
+    # MSC porte lui aussi « encryption __ENCRYPTION__ » (ligne 155) : sa
+    # substitution était réelle mais NON contrôlée — un gabarit MSC cassé serait
+    # passé en silence, et en A5/1 c'est le MSC qui décide d'authentifier. Une
+    # panne silencieuse de moins avant la bascule.
+    local cfg
+    for cfg in "${OSMOCOM_CFG:-/etc/osmocom}/osmo-bsc.cfg" \
+               "${OSMOCOM_CFG:-/etc/osmocom}/osmo-msc.cfg"; do
+        if grep -q '__ENCRYPTION__' "$cfg" 2>/dev/null || ! grep -qF "$ENCRYPTION" "$cfg" 2>/dev/null; then
+            mod_hint "attendu « $ENCRYPTION » dans $cfg ; vérifiez que le gabarit porte bien __ENCRYPTION__"
+            mod_fail "le chiffrement demandé n'est pas dans la configuration installée ($cfg)"
+            return $MOD_RC_FAIL
+        fi
+        mod_say "chiffrement « $ENCRYPTION » confirmé dans $cfg"
+    done
     mod_ok
 }
 

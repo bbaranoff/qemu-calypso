@@ -282,9 +282,17 @@ def spawn_grgsm(fifo, algo=0, kc_hex=None, binary="grgsm_decode", errlog=None):
 TCH_CFG_PATH = "/dev/shm/calypso_tch_cfg"
 TCH_FIFO     = os.environ.get("CALYPSO_TCH_FIFO", "/tmp/iq_grgsm_tch.fifo")
 TCH_SPEECH   = "/dev/shm/calypso_tch_speech.gsm"
+# --- TCH DL CHIFFRE (design B, comme le SDCCH) : un 2e decodeur -e/-k tourne en
+#     parallele du clair JAMAIS tue, sur SA propre fifo IQ dediee (relay-fed).
+#     Le clair reste vivant : un Kc faux ne detruit alors que le flux chiffre,
+#     pas la voix en clair (le TCHF de gr-gsm est un if/else EXCLUSIF). ---------
+TCH_CIPH_FIFO   = os.environ.get("CALYPSO_TCH_CIPH_FIFO", "/tmp/iq_grgsm_tch_ciph.fifo")
+TCH_SPEECH_CIPH = "/dev/shm/calypso_tch_speech_ciph.gsm"
 _tch_proc = None
 _tch_cur  = None          # (tn, tsc, arfcn) actuellement arme
 _tch_seq  = 0
+_tch_ciph_proc    = None
+_tch_ciph_applied = (0, None, None)   # (algo, kc_hex, (tn,tsc,arfcn)) applique au decodeur chiffre
 
 def _tch_write_cfg(tn, tsc, arfcn):
     """Publie TN/TSC/ARFCN. seq en dernier = publication atomique."""
@@ -330,6 +338,13 @@ TCH_DL_SLOTS = 16          # = TCH_DL_RING_N du shunt, ne pas desynchroniser
 TCH_DL_SLOT  = 48
 FR_BYTES     = 33
 
+# Source voix DL ACTIVE, pilotee par le watcher Kc (sync_tch_ciph) : le fichier
+# -o du decodeur CLAIR (TCH_SPEECH) tant que le DL est en clair, celui du
+# decodeur CHIFFRE (TCH_SPEECH_CIPH) des qu'un Kc est applique. Les deux ne
+# produisent JAMAIS de voix en meme temps (le CRC de gr-gsm ne laisse passer que
+# le flux du bon algo) -> un seul ecrivain de l'anneau, jamais de course sur w_seq.
+_tch_active_speech = [TCH_SPEECH]
+
 def _tch_dl_tailer():
     """Publie chaque nouvelle trame FR de TCH_SPEECH dans l'anneau sideband."""
     fdw = os.open(TCH_DL_PATH, os.O_CREAT | os.O_RDWR, 0o644)
@@ -343,11 +358,23 @@ def _tch_dl_tailer():
     off = 0
     rest = b""
     npub = 0
+    cur_path = _tch_active_speech[0]
     while True:
         try:
+            want_path = _tch_active_speech[0]
+            if want_path != cur_path:
+                # bascule clair<->chiffre : on ferme et on repart du fichier
+                # ACTIF depuis sa FIN (le retard accumule est du passe, pas de la
+                # voix a jouer). Le seq de l'anneau reste monotone.
+                if fdr is not None:
+                    try: os.close(fdr)
+                    except Exception: pass
+                fdr = None
+                cur_path = want_path
+                rest = b""
             if fdr is None:
                 try:
-                    fdr = os.open(TCH_SPEECH, os.O_RDONLY)
+                    fdr = os.open(cur_path, os.O_RDONLY)
                 except OSError:
                     time.sleep(0.2)
                     continue
@@ -440,6 +467,40 @@ def make_tch_binary():
         return src
 GRGSM_TCH = make_tch_binary()
 
+def make_tch_ciph_binary():
+    """Copie patchee pour le TCH CHIFFRE (design B). Identique a make_tch_binary
+    mais le serveur UDP bind un port ENCORE different (4749) : le clair tient deja
+    4739 ; deux binds sur le meme port -> le 2e MEURT (silencieux). Le client
+    GSMTAP pointe le MEME 4730 que le clair -> le shunt recoit la FACCH(0x09) et
+    la SACCH(0x89) DECHIFFREES exactement comme celles du clair. Les deux
+    decodeurs ne sortent jamais de trame CRC-valide en meme temps (algo different),
+    donc aucune collision de contenu sur 4730 ni sur l'anneau voix."""
+    src = shutil.which("grgsm_decode")
+    if not src:
+        return "grgsm_decode"
+    dst = "/tmp/grgsm_decode_tch_ciph"
+    try:
+        with open(src) as f:
+            code = f.read()
+        a = '"UDP_SERVER", "127.0.0.1", "4729"'
+        b = '"UDP_CLIENT", "127.0.0.1", "4729"'
+        if a not in code or b not in code:
+            print("[si-bridge] grgsm TCH chiffre : motifs de port introuvables -> "
+                  "fallback non patche (conflit de bind probable)", flush=True)
+            return src
+        code = code.replace(a, '"UDP_SERVER", "127.0.0.1", "4749"')
+        code = code.replace(b, '"UDP_CLIENT", "127.0.0.1", "4730"')
+        with open(dst, "w") as f:
+            f.write(code)
+        os.chmod(dst, 0o755)
+        print("[si-bridge] grgsm TCH chiffre patche -> %s (bind 4749, GSMTAP -> 4730)" % dst,
+              flush=True)
+        return dst
+    except Exception as e:
+        print("[si-bridge] patch grgsm TCH chiffre echoue (%s)" % e, flush=True)
+        return src
+GRGSM_TCH_CIPH = make_tch_ciph_binary()
+
 def _tch_spawn(tn, arfcn):
     """3e decodeur, sur le tube IQ dedie (alimente par CALYPSO_RELAY_FIFOS)."""
     cmd = [GRGSM_TCH, "-m", "TCHF", "-t", str(tn), "-a", str(arfcn),
@@ -464,6 +525,49 @@ def arm_tch(tn, tsc, arfcn):
     _tch_cur = cfg
     print("[si-bridge] TCH arme : TN=%d TSC=%d ARFCN=%d -> %s + grgsm -m TCHF (pid %s)"
           % (tn, tsc, arfcn, TCH_CFG_PATH, _tch_proc.pid), flush=True)
+
+def _tch_ciph_spawn(tn, arfcn, algo, kc_hex):
+    """Decodeur TCH DL CHIFFRE : meme -m TCHF que le clair, sur SA fifo IQ dediee
+    (TCH_CIPH_FIFO, relay-fed), avec -e/-k et une sortie voix SEPAREE."""
+    cmd = [GRGSM_TCH_CIPH, "-m", "TCHF", "-t", str(tn), "-a", str(arfcn),
+           "-c", TCH_CIPH_FIFO, "-s", "1083333", "-v", "-d", "FR",
+           "-o", TCH_SPEECH_CIPH, "-e", str(algo), "-k", kc_hex]
+    try:
+        err = open("/tmp/osmo-nitb/logs/grgsm_decode_tch_ciph.log", "w")
+    except Exception:
+        err = subprocess.DEVNULL
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err, text=True)
+
+def sync_tch_ciph(seq, algo, kc):
+    """Aligne le decodeur TCH chiffre sur (Kc present) ET (TCH arme). Appele par
+    le watcher Kc (toutes les 0,5 s), JAMAIS par l'ASSIGNMENT COMMAND : a
+    l'instant de l'assignation le Kc vient d'etre efface par le DM_EST_REQ que le
+    firmware emet a chaque activation de canal dedie (osmocon l'efface) ->
+    read_kc() rendrait 0. Le decouplage par le watcher — exactement comme le grgsm
+    chiffre du SDCCH — resout ce piege. Le decodeur CLAIR (arm_tch) n'est JAMAIS
+    tue ici."""
+    global _tch_ciph_proc, _tch_ciph_applied
+    cfg = _tch_cur
+    want = (algo, kc, cfg) if (seq and algo in (1, 2, 3) and cfg is not None) else (0, None, None)
+    if want == _tch_ciph_applied:
+        return
+    p = _tch_ciph_proc
+    if p is not None:
+        try: p.kill(); p.wait(timeout=2)
+        except Exception: pass
+        _tch_ciph_proc = None
+    _tch_ciph_applied = want
+    if want[0]:
+        tn, tsc, arfcn = cfg
+        _tch_ciph_proc = _tch_ciph_spawn(tn, arfcn, want[0], want[1])
+        _tch_active_speech[0] = TCH_SPEECH_CIPH     # voix DL active = flux chiffre
+        print("[si-bridge] TCH CHIFFRE spawn : A5/%d kc=%s TN=%d ARFCN=%d -> %s "
+              "(voix DL active=chiffre, pid %s)"
+              % (want[0], want[1], tn, arfcn, TCH_CIPH_FIFO, _tch_ciph_proc.pid), flush=True)
+    else:
+        _tch_active_speech[0] = TCH_SPEECH          # voix DL active = flux clair
+        print("[si-bridge] TCH chiffre arrete (Kc absent ou TCH non arme) -> "
+              "voix DL active=clair", flush=True)
 
 def check_assignment(by, fn):
     """Detecte un ASSIGNMENT COMMAND (RR PD=0x06, MT=0x2e) sur le SDCCH DL.
@@ -543,6 +647,7 @@ while True:
     time.sleep(0.5)
     ensure_clear()                     # watchdog du grgsm clair
     seq, algo, kc = read_kc()
+    sync_tch_ciph(seq, algo, kc)       # design B du TCH : suit (Kc present) ET (TCH arme)
     want = (algo, kc) if (seq and algo in (1, 2, 3)) else (0, None)
     if want == ciph["applied"]:
         continue
