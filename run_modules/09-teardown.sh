@@ -52,6 +52,17 @@ MOD_TIMEOUT[teardown]=25
 #   x:<nom>      correspondance EXACTE sur le nom (pgrep/pkill -x) — pour les
 #                noms courts et communs (« mobile ») qu'un -f ferait sur-matcher.
 #   f:<motif>    correspondance sur la ligne de commande (pgrep/pkill -f).
+# [2026-08-16] `f:pont/pont.py` AJOUTE. Le mode CALYPSO_BRIDGE=pont fait tourner
+# /opt/GSM/pont/pont.py, qui tient 5700-5702. `_td_ports` le DETECTAIT deja
+# (ces trois ports y sont listes) mais aucun motif ne le TUAIT : on detectait
+# sans executer, d'ou la boucle « restes apres 12 s : port:5700 port:5701
+# port:5702 — deuxieme passe » puis l'abandon de la sequence.
+# ⚠️ Le motif seul ne suffit PAS : start-direct.sh arme un relanceur DIFFERE
+# (`( sleep N; ... exec setsid python3 -u "$_PONT" ) &`). Si le teardown dure
+# plus longtemps que ce delai — c'est le cas des qu'il archive de gros
+# journaux — le pont se rebinde EN PLEIN teardown et la deuxieme passe le
+# retrouve. Le delai fixe a donc ete remplace, cote start-direct.sh, par une
+# attente d'osmo-bts-trx : le pont ne binde plus qu'une fois la pile debout.
 _td_patterns() {
     cat <<'EOF'
 f:qemu-system-arm
@@ -69,6 +80,7 @@ f:bin/grgsm_decode
 f:grgsm_cfile
 f:gsmtap_relay
 f:si_bridge
+f:pont/pont.py
 f:relay_continu
 f:record_drain
 f:inject.py
@@ -155,6 +167,45 @@ _td_kill_all() {
     return 0
 }
 
+# DERNIER RECOURS — tuer QUI TIENT LE PORT, quand aucun motif ne matche.
+#
+# POURQUOI. `_td_ports` DETECTE un port occupe, mais `_td_kill_all` ne frappe que
+# des motifs NOMINATIFS. Tout binaire lance sous un chemin non prevu est donc vu
+# et jamais tue — et c'est exactement la boucle « restes apres 12 s : port:5700
+# port:5701 port:5702 — deuxieme passe » qui faisait abandonner la sequence.
+# Le cas n'est pas theorique : start-direct.sh lit
+# `_PONT="${PONT_PY:-/opt/GSM/pont/pont.py}"`, et /opt/GSM/pont/ contient deja
+# plusieurs sauvegardes. Un `PONT_PY=...bak` passe a travers `f:pont/pont.py`
+# sans etre inquiete. Ce qu'on sait DETECTER, on doit savoir le TUER : sinon la
+# detection ne sert qu'a faire echouer le run.
+#
+# GARDE-FOUS. Jamais PID 1, jamais nous-memes, et on ANNONCE la ligne de commande
+# de la victime avant de frapper : un kill silencieux par numero de port serait
+# plus dangereux que le reste qu'il nettoie.
+_td_kill_ports() {
+    command -v ss >/dev/null 2>&1 || { mod_say "ss absent : passe par port impossible"; return 0; }
+    local p pid cmd busy=0 named=0
+    while IFS= read -r p; do
+        _td_port_busy "$p" || continue
+        busy=1
+        for pid in $(ss -lnp "sport = :$p" 2>/dev/null \
+                     | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+            named=1
+            [ "$pid" -gt 1 ] 2>/dev/null || continue
+            [ "$pid" = "$$" ] && continue
+            cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+            mod_say "port $p tenu par PID $pid (${cmd:-cmdline illisible}) — kill -9"
+            kill -9 "$pid" 2>/dev/null
+        done
+    done < <(_td_ports)
+    # Une passe muette est indiscernable d'une passe absente : on dit POURQUOI
+    # elle n'a rien fait. Le `ss` de busybox n'a pas -p et ne rend aucun pid=.
+    if [ "$busy" = 1 ] && [ "$named" = 0 ]; then
+        mod_say "ports occupes mais ss n'a rendu aucun pid= (ss sans -p, ou proprietaire hors de notre namespace) — inspectez : ss -lnp"
+    fi
+    return 0
+}
+
 mod_teardown_start() {
     # --- 1. tmux (cf. POURQUOI 3) --------------------------------------------
     if [ -n "${TMUX:-}" ]; then
@@ -173,6 +224,12 @@ mod_teardown_start() {
     rm -f /tmp/osmocom_l2_* /tmp/irda.pty.link /tmp/irda_peer.pid 2>/dev/null
     rm -f /dev/shm/calypso_si.bin 2>/dev/null
     rm -f /dev/shm/calypso_kc 2>/dev/null            # cf. POURQUOI 4
+    # start-direct.sh ANNONCE « pont.log efface par le teardown » depuis le
+    # debut. C'etait FAUX : rien ne l'effacait, et il grossissait run apres run
+    # sur un tmpfs qui porte aussi les journaux. Un message d'interface qui ment
+    # sur l'etat du disque coute plus cher qu'il ne rapporte : on rend l'annonce
+    # vraie plutot que de la retirer.
+    rm -f /dev/shm/pont.log 2>/dev/null
     rm -f /tmp/relay_continu.cfile /tmp/record.cfile /tmp/record.cfile.off /tmp/record.cfile.ring 2>/dev/null
     if [ -n "${RECORD_FILE:-}" ]; then
         rm -f "$RECORD_FILE" "$RECORD_FILE.off" "$RECORD_FILE.ring" 2>/dev/null
@@ -192,6 +249,10 @@ mod_teardown_wait() {
     if wait_until "$half" "machine propre" _td_clean; then mod_ok; return $MOD_RC_OK; fi
     mod_say "restes après $half s : $(_td_leftovers) — deuxième passe"
     _td_kill_all
+    # Les motifs ont eu leur chance (une passe au start, une ici). Ce qui tient
+    # encore un port n'a PAS de motif : on le prend par le port. C'est la seule
+    # passe qu'un chemin inattendu ne peut pas mettre en defaut.
+    _td_kill_ports
     if wait_until "$half" "machine propre" _td_clean; then mod_ok; return $MOD_RC_OK; fi
     mod_hint "identifiez le tenace : pgrep -a -f <motif> ; ss -lnp | grep <port>"
     mod_fail "restes du run précédent : $(_td_leftovers)"
