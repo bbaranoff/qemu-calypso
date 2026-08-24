@@ -292,7 +292,6 @@ Toute la doc vit sous `hw/arm/calypso/doc/`.
 
 | Doc | Contenu |
 |---|---|
-| **[`RUN RESULTS.md`](https://github.com/bbaranoff/qemu-calypso/blob/main/run_results.md)** | ⭐ Source de vérité : ce qui marche en mode shunt legit |
 | **[RAPPORT_COMPLET_20260824.md](hw/arm/calypso/doc/RAPPORT_COMPLET_20260824.md)** | Relevé complet du banc shunt_legit : chaîne, Kc/HLR/MSC, A5/1, appel voix |
 | [QUICK_START.md](QUICK_START.md) | Build, lancer, modes, vérifications |
 | [TODO.md](hw/arm/calypso/doc/TODO.md) | TODO consolidé (P0/P1/P2), cadré par mode |
