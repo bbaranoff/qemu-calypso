@@ -29,6 +29,12 @@ static int      g_ecr = 1, g_lec = 1;      /* écritures / lectures */
 static int      g_only;                    /* 1 = seulement _CELLS */
 static uint16_t g_cells[32];
 static int      g_ncells;
+/* [2026-08-22] PLAGES arbitraires : la fenetre API seule laissait des regions
+ * entieres du modele hors de portee (la reference de correlation 0x2cea.., le
+ * tampon de burst 0x2a00.., le scratch-pad 0x0060..). 32 cellules unitaires ne
+ * suffisaient pas pour une region de 128 mots. */
+static struct { uint16_t lo, hi; } g_ranges[16];
+static int      g_nranges;
 static unsigned long g_n, g_max = 5000000UL;
 
 /* Repliement PAR CELLULE — journaliser au CHANGEMENT, pas au non-consécutif.
@@ -131,6 +137,43 @@ void calypso_mbx_init(void)
             p = fin;
         }
     }
+    /* [2026-08-22] CALYPSO_MAILBOX_RANGES=lo-hi,lo-hi,... (bornes INCLUSES).
+     * Meme analyse tolerante que _CELLS : on s arrete au premier illisible
+     * plutot que de deviner. Les bornes sont remises dans l ordre si besoin. */
+    e = getenv("CALYPSO_MAILBOX_RANGES");
+    if (e && *e) {
+        const char *p = e;
+        while (*p && g_nranges < 16) {
+            char *fin = NULL;
+            long lo, hi;
+            while (*p == ',' || *p == ' ') {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
+            lo = strtol(p, &fin, 0);
+            if (fin == p) {
+                break;
+            }
+            p = fin;
+            if (*p == '-' || *p == ':') {
+                p++;
+                hi = strtol(p, &fin, 0);
+                if (fin == p) {
+                    break;
+                }
+                p = fin;
+            } else {
+                hi = lo;              /* une borne seule = une cellule */
+            }
+            if (lo > hi) { long t = lo; lo = hi; hi = t; }
+            g_ranges[g_nranges].lo = (uint16_t)lo;
+            g_ranges[g_nranges].hi = (uint16_t)hi;
+            g_nranges++;
+        }
+    }
+
     e = getenv("CALYPSO_MAILBOX_ONLY");
     g_only = (e && *e == '1');
 
@@ -187,6 +230,26 @@ void calypso_mbx_init(void)
             "(ecr=%d lec=%d cellules_sup=%d only=%d max=%lu)\n",
             e, g_ecr, g_lec, g_ncells, g_only, g_max);
 
+    /* [2026-08-22] Annonce de ce qui est REELLEMENT couvert. Sans elle on ne
+     * distingue pas « la cellule n a pas bouge » de « la cellule n etait pas
+     * surveillee » — c est ce qui m avait fait chercher 0x2cea a la main. */
+    {
+        int i;
+        fprintf(stderr, "[mailbox] couverture : %s",
+                g_only ? "SEULEMENT les cellules et plages listees"
+                       : "fenetre API 0x0800-0x0FFF");
+        for (i = 0; i < g_ncells; i++) {
+            fprintf(stderr, " + 0x%04x", g_cells[i]);
+        }
+        for (i = 0; i < g_nranges; i++) {
+            fprintf(stderr, " + [0x%04x-0x%04x, %u mots]",
+                    g_ranges[i].lo, g_ranges[i].hi,
+                    (unsigned)(g_ranges[i].hi - g_ranges[i].lo + 1));
+        }
+        fprintf(stderr, " | sens : %s%s | garde-fou : %lu ligne(s)%s\n",
+                g_ecr ? "ecritures " : "", g_lec ? "lectures" : "",
+                g_max, g_max ? "" : " (illimite)");
+    }
     calypso_mbx_actif = 1;
 }
 
@@ -197,6 +260,11 @@ static int mbx_retenu(uint16_t mot)
 
     for (i = 0; i < g_ncells; i++) {
         if (g_cells[i] == mot) {
+            return 1;
+        }
+    }
+    for (i = 0; i < g_nranges; i++) {
+        if (mot >= g_ranges[i].lo && mot <= g_ranges[i].hi) {
             return 1;
         }
     }

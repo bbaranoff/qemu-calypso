@@ -626,8 +626,27 @@ void shunt_dispatch_allc(uint8_t page_idx)
      * firmware poste ALLC = a la sous-voie REELLE du mobile. On accepte donc l'UA
      * sur toute la region SDCCH du type de canal (pas besoin de deviner SS) :
      *   SDCCH/4 : fn%%51 [22,39] (SS0-3) ; SDCCH/8 : [0,31] (SS0-7). */
-    int _lo = g_shunt.sdcch_ch8 ? 0  : 22;
-    int _hi = g_shunt.sdcch_ch8 ? 31 : 39;
+    /* [2026-08-21] RACINE DE « LA 1re LU DU RUN RATE ».
+     * g_shunt.sdcch_ch8 demarre a FALSE et n'est arme que par set_dcch(), appelee
+     * au PREMIER DATA_IND du canal dedie (l1ctl_sock : seul le flux firmware->mobile
+     * est parse ; DM_EST_REQ est du code mort, le socket l1ctl est orphelin).
+     * Tant qu'il est faux la fenetre vaut [22,39] = la region du SDCCH/4. Or l'UA
+     * d'un SDCCH/8 arrive en fn%51 [0,3] : elle tombait HORS FENETRE, restait dans
+     * l'anneau et se faisait evincer au TTL. Le mobile ne voyait pas l'UA et
+     * retransmettait sa SABM ; la BTS, elle, avait deja etabli le lien et repondait
+     * « SABM L>0 not expected in timer recovery state » SANS renvoyer d'UA -> la
+     * tentative etait irrattrapable -> T200 x6 -> « Location update failed ».
+     * Une seule fois par run, parce que calypso_dsp_shunt_l1_reset() ne remet PAS
+     * sdcch_ch8 a false (defaut deja note l.2854 de calypso_dsp_shunt.c).
+     *
+     * TANT QUE LE TYPE N'EST PAS POSITIVEMENT CONNU, ON PREND L'UNION DES DEUX
+     * REGIONS [0,39] au lieu de PARIER sur le /4. Cette fenetre n'est qu'un
+     * garde-fou grossier : la selection fine de la sous-voie est faite par l'ALLC
+     * que poste le firmware (cf. le commentaire juste au-dessus). Une fois arme,
+     * on retrouve exactement le comportement d'avant. */
+    int _armed = g_shunt.sdcch_ss_set;
+    int _lo = _armed ? (g_shunt.sdcch_ch8 ? 0  : 22) : 0;
+    int _hi = _armed ? (g_shunt.sdcch_ch8 ? 31 : 39) : 39;
     if (sdcch_on && sdcch_ring_on) {
         while (g_shunt.sdcch_ring_tail != g_shunt.sdcch_ring_head) {
             uint32_t hidx = g_shunt.sdcch_ring_head % SDCCH_RING_N;

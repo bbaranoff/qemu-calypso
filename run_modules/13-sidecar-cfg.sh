@@ -61,7 +61,7 @@ _sc_bts_block() {
   cell reselection hysteresis 4
   rxlev access min 0
   radio-link-timeout 32
-  channel allocator mode chan-req ascending
+  channel allocator mode chan-req descending
   channel allocator mode assignment ascending
   channel allocator mode handover ascending
   rach tx integer 9
@@ -78,8 +78,15 @@ _sc_bts_block() {
    max_power_red 0
    rsl e1 tei 0
 $(for t in 0 1 2 3 4 5 6 7; do
-    printf '   timeslot %s\n    phys_chan_config %s\n    hopping enabled 0\n' \
-           "$t" "$([ "$t" = 0 ] && echo 'CCCH+SDCCH4' || echo 'TCH/F')"
+    # TS0 = CCCH+SDCCH4 (4 SDCCH repliés), TS1 = SDCCH8 dédié (8 SDCCH de plus),
+    # TS2..7 = voix. Symétrique du BTS#0 : sans ce TS1, toute la signalisation
+    # du side-car tient dans les 4 sous-canaux du TS0.
+    case "$t" in
+      0) pchan='CCCH+SDCCH4' ;;
+      1) pchan="${SC_TS1_PCHAN:-SDCCH8}" ;;
+      *) pchan='TCH/F' ;;
+    esac
+    printf '   timeslot %s\n    phys_chan_config %s\n    hopping enabled 0\n' "$t" "$pchan"
   done)
 BLOC
 }

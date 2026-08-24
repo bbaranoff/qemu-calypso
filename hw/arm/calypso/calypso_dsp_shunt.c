@@ -243,6 +243,28 @@ static void calypso_sdcch_ul_publish(const uint8_t *l2, uint16_t task_u,
 }
 
 static uint16_t shunt_pm_decan_apm(int fallback_target);   /* fwd : defini plus bas */
+static int feed_fn_canon(void);      /* fwd : defini plus bas (fix feed 22/08) */
+static int feed_decim_auto(void);    /* fwd : defini plus bas */
+static int feed_decim_eff(int decim, int n);  /* fwd : defini plus bas */
+
+/* [2026-08-22] Mesure ce qu'un feed vient d'ecrire. Les sondes precedentes
+ * n'imprimaient que les 3 premiers mots — inutilisable : un burst GSM commence
+ * par une garde, « s0=s1=s2=0 » ne dit RIEN du contenu. Piege vecu le 22/08. */
+static void feed_stats(const uint16_t *buf, int words, unsigned *nz,
+                       unsigned *maxi, unsigned *maxq, unsigned long long *nrj)
+{
+    unsigned _nz = 0, _mi = 0, _mq = 0;
+    unsigned long long _e = 0;
+    for (int i = 0; i < words; i++) {
+        int v = (int16_t)buf[i];
+        unsigned a2 = (v < 0) ? (unsigned)(-v) : (unsigned)v;
+        if (v) _nz++;
+        if (i & 1) { if (a2 > _mq) _mq = a2; }
+        else       { if (a2 > _mi) _mi = a2; }
+        _e += (unsigned long long)a2 * a2;
+    }
+    *nz = _nz; *maxi = _mi; *maxq = _mq; *nrj = _e;
+}
 
 /* Coherence interne des #define de repli (l'arithmetique NDB_W, pas l'accord
  * avec le firmware — c'est le role du resolveur DWARF ci-dessous). */
@@ -1491,22 +1513,41 @@ static void shunt_dcch_sacch_present(uint16_t *d)
             SHUNT_LOG("DCCH-SACCH : garde du canal principal %s\n",
                       garde ? "ACTIVE" : "desactivee");
         }
-        static const uint8_t sacch_base[4] = { 42, 46, 93, 97 };
+        /* [2026-08-21] CE SWITCH NE CONNAISSAIT QUE LES BASES DU SDCCH/4.
+         * g_shunt.sdcch_ss porte la base DL fn%51 posee par set_dcch() :
+         *   /4 -> {22,26,32,36}[ss]      /8 -> ss*4  ∈ {0,4,8,...,28}
+         * Sur un /8, AUCUN case ne matchait (26/32/36 sont hors de {0..28}) :
+         * ss_idx retombait a 0 et la SACCH dediee etait presentee en fn%102 42-45,
+         * la fenetre du SDCCH/4 SS0, alors qu'elle arrive en 32-35 (SS0 du /8).
+         * La SACCH d'un SDCCH/8 n'a donc JAMAIS ete presentee au bon endroit.
+         * Miroir exact, cote shunt, du plan /4-en-dur corrige le meme jour dans
+         * pont.py. Tables GSM 05.02, sur la 102-multitrame :
+         *   SACCH/C4 SS0..3 -> 42, 46, 93, 97
+         *   SACCH/C8 SS0..7 -> 32, 36, 40, 44, 83, 87, 91, 95
+         * (les sous-voies hautes vivent dans la seconde moitie de la 102.) */
+        static const uint8_t sacch_base4[4] = { 42, 46, 93, 97 };
+        static const uint8_t sacch_base8[8] = { 32, 36, 40, 44, 83, 87, 91, 95 };
         unsigned ss_idx;
-        switch (g_shunt.sdcch_ss) {          /* base fn%51 -> index de sous-canal */
-        case 26: ss_idx = 1; break;
-        case 32: ss_idx = 2; break;
-        case 36: ss_idx = 3; break;
-        default: ss_idx = 0; break;          /* 22 = SS0 */
+        uint32_t b;
+        if (g_shunt.sdcch_ch8) {
+            ss_idx = (g_shunt.sdcch_ss / 4u) & 7u;   /* base = ss*4 -> ss */
+            b = sacch_base8[ss_idx];
+        } else {
+            switch (g_shunt.sdcch_ss) {      /* base fn%51 -> index de sous-canal */
+            case 26: ss_idx = 1; break;
+            case 32: ss_idx = 2; break;
+            case 36: ss_idx = 3; break;
+            default: ss_idx = 0; break;      /* 22 = SS0 */
+            }
+            b = sacch_base4[ss_idx];
         }
         uint32_t f102 = (uint32_t)calypso_trx_get_fn() % 102u;
-        uint32_t b    = sacch_base[ss_idx];
         if (f102 < b || f102 > b + 3u) {
             static unsigned long long hors;
             if (++hors % 20000 == 1)
-                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du SS%u "
-                          "(#%llu) -- on ne presente pas\n",
-                          f102, b, b + 3u, ss_idx, hors);
+                SHUNT_LOG("DCCH-SACCH : fn%%102=%u hors fenetre SACCH [%u-%u] du "
+                          "SDCCH/%d SS%u (#%llu) -- on ne presente pas\n",
+                          f102, b, b + 3u, g_shunt.sdcch_ch8 ? 8 : 4, ss_idx, hors);
             return;
         }
         if (garde && (d[ndb_w(g_ndb.a_cd)] & (1u << B_BLUD))) {
@@ -1934,6 +1975,35 @@ static uint16_t shunt_pm_decan_apm(int fallback_target)
         return calypso_trf6151_apm_for_rf(rfi);
     }
     return calypso_trf6151_apm_for_rf(fallback_target);
+}
+
+/* [2026-08-22] MODÈLE INTÉGRATEUR RSSI HW — le vrai pm_meas natif.
+ * Sur vrai Calypso la tâche PM (md=1) ne calcule PAS a_pm depuis les samples : le
+ * DSP zéro-remplit la page résultat (PROM0 0xb446 : `stl *AR1+,A` en rptb 80), puis
+ * un intégrateur lit un REGISTRE HW de puissance (côté ABB/RF) et pose a_pm — jamais
+ * depuis 0x2a00. Ce registre n'est pas dans l'ADC modélisé ; on le MODÉLISE depuis la
+ * vraie magnitude du signal DL : g_shunt.last_pm = MAV(|I|+|Q|) mesurée dans feed_iq
+ * sur les échantillons réellement reçus. a_pm = calib_RF(20·log10(MAV/MAV_REF)+RF_REF).
+ * → a_pm SUIT le signal (aucun 0x7000 canné). L'ancrage MAV_REF→RF_REF est la
+ * calibration du frontend (comme le gain trf6151), pas une valeur décrétée : deux
+ * signaux différents donnent deux a_pm différents. Utilisé par le hook a_pm de
+ * calypso_c54x.c, qui intercepte l'écriture DSP vers data[0x834..836]/[0x848..84A]. */
+uint16_t calypso_dsp_shunt_rssi_apm(void)
+{
+    static double mav_ref = 20929.0, rf_ref = -60.0; static int init = 0;
+    if (!init) {
+        init = 1;
+        const char *mr = getenv("CALYPSO_DECAN_PM_MAV_REF"); if (mr && *mr) mav_ref = atof(mr);
+        const char *rr = getenv("CALYPSO_DECAN_PM_RF_REF");  if (rr && *rr) rf_ref = atof(rr);
+        if (mav_ref < 1.0) mav_ref = 1.0;
+    }
+    double mav = (double)g_shunt.last_pm;
+    if (mav < 1.0) mav = 1.0;
+    double rf = 20.0 * log10(mav / mav_ref) + rf_ref;
+    if (rf < -100.0) rf = -100.0;   /* plancher : suit le signal faible sans rejeter */
+    if (rf >  -30.0) rf =  -30.0;
+    int rfi = (int)(rf >= 0 ? rf + 0.5 : rf - 0.5);
+    return calypso_trf6151_apm_for_rf(rfi);
 }
 
 void calypso_dsp_shunt_on_frame_tick(void)
@@ -3297,6 +3367,9 @@ static void shunt_gsmtap_init(void)
  * SHUNT_CANNED_BSIC. C'est le "DSP qui poste son decode SCH dans le NDB". */
 static int g_sch_fd = -1;
 
+/* [2026-08-22] auto-recalage FN sur SCH (calypso_trx.c) — decl scope FICHIER. */
+extern void calypso_trx_autosync_fn(uint32_t sch_fn);
+
 static void shunt_sch_read(void *opaque)
 {
     uint8_t buf[64];
@@ -3350,6 +3423,28 @@ static void shunt_sch_read(void *opaque)
                         "delta=%d sch%%51=%u toa=%d\n",
                         (unsigned)fn, trx_fn, d, (unsigned)((uint32_t)fn % 51),
                         (int)g_shunt.sb_toa);
+            /* [2026-08-22] Recale l'horloge FN sur ce SCH (1er SCH -> offset auto
+             * fige). Remplace la bequille codee en dur CALYPSO_DL_FN_OFFSET.
+             *
+             * ⚠️ [2026-08-22 soir] GATE. En mode NATIF c'est une BEQUILLE : la FN
+             * vient du SCH decode par **gr-gsm**, pas du correlateur du DSP. Le
+             * natif est alors juge avec l'horloge deja calee pour lui, et la ligne
+             * FN-ALIGN affiche `toa=23` qui est la valeur du MODELE gr-gsm — a ne
+             * PAS lire comme un succes natif (piege vecu le 22/08).
+             * CALYPSO_GRGSM_FN_AUTOSYNC=0 -> le natif doit se caler tout seul.
+             * Defaut 1 : ne change RIEN au comportement existant. */
+            {
+                static int _gsync = -1;
+                if (_gsync < 0) {
+                    _gsync = calypso_gate("CALYPSO_GRGSM_FN_AUTOSYNC", 1);
+                    fprintf(stderr, "[feed-daram-dsp] GRGSM-FN-AUTOSYNC %s : "
+                            "recalage de l'horloge FN sur le SCH decode par gr-gsm\n",
+                            _gsync ? "ACTIF (=1 ; BEQUILLE si mode natif)"
+                                   : "INACTIF (=0 ; le natif doit se caler seul)");
+                }
+                if (_gsync)
+                    calypso_trx_autosync_fn((uint32_t)fn);
+            }
         }
     }
 }
@@ -3682,7 +3777,18 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
         int _p = (int)(fn % 51);
         /* [2026-07-26] FCCH positions {1,11,21,31,41} (offset +1 vs canon 0/10/20/30/40,
          * confirme par FN-ALIGN sch%51=1,21,31,41). */
-        int _is_fcch = (_p % 10 == 1) && (_p <= 41);
+        /* [2026-08-22] CORRIGE — la fenetre etait decalee de +1 et feedait le SCH.
+         * L'ancien commentaire disait « FCCH = {1,11,21,31,41}, offset +1 vs canon,
+         * confirme par FN-ALIGN sch%51=1,21,31,41 » : il lisait la sonde **SCH**
+         * (`sch_fn`) et en concluait FCCH. `sch%51 ∈ {1,11,21,31,41}` prouve au
+         * contraire que le SCH est aux positions CANONIQUES (GSM 05.02), donc que
+         * la FCCH est en {0,10,20,30,40}.
+         * MESURE : avec l'ancienne fenetre, `FB-IQ-DARAM ... s0=0x0000 s1=0x0000
+         * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
+         * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
+         * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
+        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
+                                       : ((_p % 10 == 1) && (_p <= 41));
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3705,17 +3811,116 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                         g_shunt.c54x->data[base], g_shunt.c54x->data[base+1], g_shunt.c54x->data[base+2]);
         } else if (_fid && g_shunt.c54x && g_shunt.c54x->data && (!_fcch || _is_fcch)) {
             uint16_t base = _iqbase; int dl = 0x128; int woff = 0;
-            for (int k = 0; 2*(k*_decim)+1 < n && woff < dl; k++) {
-                g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)];
+            /* [2026-08-22] decimation EFFECTIVE : l'entree est deja a 1 SPS ici
+             * (n=320 = 160 paires IQ) ; decimer encore par 4 aliase la tonalite
+             * FCCH (dphi=+pi/2 par echantillon -> 4*pi/2 = 2*pi = DC). */
+            int _de = feed_decim_eff(_decim, n);
+            for (int k = 0; 2*(k*_de)+1 < n && woff < dl; k++) {
+                g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_de)];
                 if (woff < dl)
-                    g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_decim)+1];
+                    g_shunt.c54x->data[base + woff++] = (uint16_t)iq[2*(k*_de)+1];
             }
-            static unsigned _l = 0;
-            if (_l++ < 16)
-                fprintf(stderr, "[feed-daram-dsp] FB-IQ-DARAM fn=%u p=%d wrote=%d decim=%d "
-                        "s0=0x%04x s1=0x%04x s2=0x%04x\n", fn, _p, woff, _decim,
-                        g_shunt.c54x->data[base], g_shunt.c54x->data[base+1],
-                        g_shunt.c54x->data[base+2]);
+            {
+                unsigned _nz, _mi, _mq; unsigned long long _e;
+                feed_stats(&g_shunt.c54x->data[base], woff, &_nz, &_mi, &_mq, &_e);
+                static unsigned _l2 = 0;
+                if (_l2++ < 16)
+                    fprintf(stderr, "[feed-daram-dsp] FB-IQ-DARAM fn=%u p=%d wrote=%d "
+                            "decim=%d (demande %d, n=%d) NONZERO=%u/%d max|I|=%u "
+                            "max|Q|=%u energie=%llu mid=0x%04x,0x%04x\n",
+                            fn, _p, woff, _de, _decim, n, _nz, woff, _mi, _mq, _e,
+                            woff > 152 ? g_shunt.c54x->data[base+150] : 0,
+                            woff > 152 ? g_shunt.c54x->data[base+151] : 0);
+            }
+        }
+    }
+
+    /* [2026-08-22] SB-IQ-DARAM — le pendant SB de FB_IQ_DARAM.
+     *
+     * CONSTAT. La chaine FB0 -> FB1 -> SB tourne bien (osmocon de ce run :
+     * FB0=19, FB1=20, SB=8 ; le `fb1_att=0` de la sonde fbsb est un ARTEFACT,
+     * `fb1_attempt` n'est incremente NULLE PART, cf. calypso_fbsb.c:54).
+     * Mais le SB rend invariablement ZERO : `TOA=0 Power=-138dBm`,
+     * `=> SB 0x00000000 BSIC=0`, et a_sch reste 0x0000.
+     *
+     * RAISON. FB_IQ_DARAM ci-dessus n'ecrit que **0x2a00** (buffer FB) et
+     * seulement sur les trames FCCH ({1,11,21,31,41} mod 51). Le correlateur SB
+     * lit un AUTRE buffer : **0x0e4e**, destination du DMA SB (AAD=0xc9c,
+     * cf. [rhea-dma] DMA2_AAD). Personne ne l'alimente -> le SB correle du vide.
+     *
+     * CE BLOC. Meme methode exactement que FB_IQ_DARAM (296 mots = 148 IQ a
+     * 1 SPS, decimation _decim, I puis Q, ecriture directe dans data[]), mais
+     * base 0x0e4e et fenetre SCH = FCCH+1 = {2,12,22,32,42} mod 51.
+     *
+     * @BEQUILLE — SB_IQ_DARAM (+ _BASE)  (CALYPSO_SB_IQ_DARAM, atoi>0, defaut OFF)
+     *   masque  : le DMA on-chip RX -> 0x0e4e. L'ecriture se fait hors data_write,
+     *             donc invisible des sondes WATCH_*.
+     *   retirer : quand la chaine BSP -> RHEA DMA -> 0x0e4e alimente le buffer SB
+     *             toute seule sur les trames SCH. C'est un instrument de DIAGNOSTIC
+     *             (repondre « le SB sait-il correler quand on le nourrit ? »),
+     *             PAS un correctif : tant qu'il est actif, le verdict natif est
+     *             fausse au meme titre que CALYPSO_GRGSM_FN_AUTOSYNC.
+     */
+    {
+        static int _sid = -1, _sdecim = 4;
+        static uint16_t _sbbase = 0;
+        if (_sid < 0) {
+            const char *e = getenv("CALYPSO_SB_IQ_DARAM"); _sid = (e && atoi(e) > 0) ? 1 : 0;
+            const char *d = getenv("CALYPSO_BSP_IQ_DECIM"); if (d && *d) _sdecim = atoi(d);
+            if (_sdecim < 1) _sdecim = 1;
+            const char *b = getenv("CALYPSO_SB_IQ_BASE");
+            _sbbase = (b && *b) ? (uint16_t)strtol(b, NULL, 0) : 0x0e4e;
+            fprintf(stderr, "[feed-daram-dsp] SB-IQ-DARAM %s : base=0x%04x decim=%d "
+                    "(nourrit le correlateur SB sur les trames SCH)\n",
+                    _sid ? "ACTIF (BEQUILLE de diagnostic)" : "INACTIF (defaut)",
+                    _sbbase, _sdecim);
+        }
+        if (_sid && g_shunt.c54x && g_shunt.c54x->data) {
+            int _sp = (int)(fn % 51);
+            /* SCH = FCCH+1 : FCCH est en {1,11,21,31,41} (offset +1 vs canon,
+             * confirme par FN-ALIGN sch%51=1,21,31,41) -> SCH en {2,12,22,32,42}. */
+            /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
+             * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
+             * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
+            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
+                                          : ((_sp % 10 == 2) && (_sp <= 42));
+            if (_is_sch) {
+                uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
+                /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est
+                 * api_ram[addr-0x0800] que le DSP LIT, pas data[] (calypso_c54x.c,
+                 * data_read : « API RAM (shared with ARM) » ; cf. aussi le
+                 * commentaire « AAD=0x99c -> api_ram[0x4ce] »). Ecrire data[] seul
+                 * serait INVISIBLE du DSP — c'est le bug deja paye le 2026-08-03
+                 * sur data[0x098c]/api_ram[0x098c]. On ecrit donc LES DEUX : data[]
+                 * pour les sondes, api_ram[] pour le DSP.
+                 * (0x2a00 du feed FB est HORS fenetre -> data[] y est correct.) */
+                int _sde = feed_decim_eff(_sdecim, n);
+                for (int k = 0; 2*(k*_sde)+1 < n && woff < dl; k++) {
+                    uint16_t a0 = (uint16_t)(base + woff);
+                    g_shunt.c54x->data[a0] = (uint16_t)iq[2*(k*_sde)];
+                    if (a0 >= 0x0800 && a0 < 0x2800 && g_shunt.c54x->api_ram)
+                        g_shunt.c54x->api_ram[a0 - 0x0800] = (uint16_t)iq[2*(k*_sde)];
+                    woff++;
+                    if (woff < dl) {
+                        uint16_t a1 = (uint16_t)(base + woff);
+                        g_shunt.c54x->data[a1] = (uint16_t)iq[2*(k*_sde)+1];
+                        if (a1 >= 0x0800 && a1 < 0x2800 && g_shunt.c54x->api_ram)
+                            g_shunt.c54x->api_ram[a1 - 0x0800] = (uint16_t)iq[2*(k*_sde)+1];
+                        woff++;
+                    }
+                }
+                static unsigned _sl = 0;
+                if (_sl++ < 16)
+                    {
+                        unsigned _nz, _mi, _mq; unsigned long long _e;
+                        feed_stats(&g_shunt.c54x->data[base], woff, &_nz, &_mi, &_mq, &_e);
+                        fprintf(stderr, "[feed-daram-dsp] SB-IQ-DARAM fn=%u p=%d wrote=%d "
+                                "decim=%d n=%d api_ram=%d NONZERO=%u/%d max|I|=%u "
+                                "max|Q|=%u energie=%llu\n",
+                                fn, _sp, woff, _sde, n,
+                                g_shunt.c54x->api_ram ? 1 : 0, _nz, woff, _mi, _mq, _e);
+                    }
+            }
         }
     }
 
@@ -4360,6 +4565,40 @@ bool calypso_dsp_shunt_fb_stream_next(uint16_t *outI, uint16_t *outQ)
         }
     }
     return true;
+}
+
+/* [2026-08-22] Gates des deux correctifs de feed (voir en-tete des blocs
+ * FB-IQ-DARAM / SB-IQ-DARAM). Separes pour permettre la bisection. */
+static int feed_fn_canon(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        g = calypso_gate("CALYPSO_FEED_FN_CANON", 1);
+        fprintf(stderr, "[feed-daram-dsp] FEED-FN-CANON %s : FCCH={0,10,20,30,40} "
+                "SCH={1,11,21,31,41} (GSM 05.02)\n",
+                g ? "ACTIF (positions canoniques)"
+                  : "INACTIF (ancien decalage +1, feedait les trames SCH)");
+    }
+    return g;
+}
+
+static int feed_decim_auto(void)
+{
+    static int g = -1;
+    if (g < 0) {
+        g = calypso_gate("CALYPSO_FEED_DECIM_AUTO", 1);
+        fprintf(stderr, "[feed-daram-dsp] FEED-DECIM-AUTO %s : ne decime que si "
+                "l'entree est a 4 SPS (n > 2*296), comme c54x_bsp_load\n",
+                g ? "ACTIF (garde 4 SPS)" : "INACTIF (decimation inconditionnelle)");
+    }
+    return g;
+}
+
+/* Decimation effective : 1 si l'entree est deja a 1 SPS. */
+static int feed_decim_eff(int decim, int n)
+{
+    if (!feed_decim_auto()) return decim;
+    return (decim > 1 && n > 2 * 296) ? decim : 1;
 }
 
 /* [2026-07-27] Reset L1 (Ctrl-C mobile / L1CTL_RESET_REQ FULL) : clear l'etat

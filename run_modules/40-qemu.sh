@@ -183,11 +183,60 @@ mod_qemu_start() {
         mod_say "trace asm : -d ${CALYPSO_ASM_FLAGS:-in_asm} -> $asm_out (anneau ${asm_mo} Mo)"
     fi
 
-    "$QEMU_BIN" -M "$mach" -cpu arm946 \
-        "${xflags[@]}" "${dflags[@]}" $gdbflag -serial pty -serial pty \
-        -monitor "unix:${RUN_DIR}/qemu-monitor.sock,server,nowait" \
-        -kernel "$FIRMWARE_ELF" >>"$qlog" 2>&1 &
-    local qpid=$!
+    # [2026-08-22] CALYPSO_HOSTGDB=1 : QEMU sous gdbserver, inspectable a chaud.
+    #   /!\ gdb de l HOTE, a ne pas confondre avec $gdbflag = gdbstub INVITE
+    #   (celui qui debogue l ARM emule). Ici on debogue le MODELE lui-meme.
+    #   Pourquoi gdbserver lance QEMU : `gdb -p` et `gdbserver --attach` echouent,
+    #   cap_sys_ptrace est retire du conteneur et ptrace_scope=1 n autorise qu un
+    #   parent a tracer son fils. `--multi` a ete ecarte apres essai : il ne
+    #   transmet pas les arguments a l inferieur.
+    #   /!\ `interrupt` FIGE QEMU : reserve aux structures qui PERSISTENT
+    #   (tampons, tables), jamais a une acquisition en cours.
+    local qpid=""
+    if [ "${CALYPSO_HOSTGDB:-0}" = "1" ]; then
+        local gport="${CALYPSO_HOSTGDB_PORT:-9997}"
+        local gin="${RUN_DIR}/gdb.in" gout="${LOG_DIR}/gdb.log"
+        rm -f "$gin"; mkfifo "$gin" || { mod_fail "mkfifo $gin"; return $MOD_RC_FAIL; }
+        gdbserver --no-startup-with-shell ":$gport" \
+            "$QEMU_BIN" -M "$mach" -cpu arm946 \
+            "${xflags[@]}" "${dflags[@]}" $gdbflag -serial pty -serial pty \
+            -monitor "unix:${RUN_DIR}/qemu-monitor.sock,server,nowait" \
+            -kernel "$FIRMWARE_ELF" >>"$qlog" 2>&1 &
+        local gspid=$!
+        printf '%s\n' "$gspid" > "${RUN_DIR}/gdbserver.pid"
+        # le vrai pid de QEMU : les barrieres en aval et les controles
+        # /proc/<pid>/exe doivent designer QEMU, pas gdbserver.
+        local _i=0
+        while [ "$_i" -lt 150 ]; do
+            qpid="$(pgrep -P "$gspid" -x qemu-system-arm 2>/dev/null | head -1)"
+            [ -n "$qpid" ] && break
+            kill -0 "$gspid" 2>/dev/null || break
+            sleep 0.1; _i=$((_i + 1))
+        done
+        if [ -z "$qpid" ]; then
+            mod_hint "regardez $qlog : gdbserver n a pas cree le processus QEMU"
+            mod_fail "CALYPSO_HOSTGDB : pid de QEMU introuvable sous gdbserver $gspid"
+            return $MOD_RC_FAIL
+        fi
+        # un processus garde le tube ouvert en ECRITURE, sinon gdb voit EOF et sort
+        sleep infinity > "$gin" &
+        printf '%s\n' "$!" > "${RUN_DIR}/gdb.holder.pid"
+        gdb -q -nx \
+            -ex "set pagination off" -ex "set confirm off" \
+            -ex "set sysroot /" \
+            -ex "target remote :$gport" \
+            -ex "continue &" < "$gin" > "$gout" 2>&1 &
+        printf '%s\n' "$!" > "${RUN_DIR}/gdb.client.pid"
+        mod_say "HOSTGDB ACTIF : gdbserver=$gspid qemu=$qpid port=$gport"
+        mod_say "  commandes -> $gin   |   sorties -> $gout"
+        mod_say "  poignee : bsp.dsp (C54xState*) — ex : tools/gdbq.sh \"p bsp.dsp->ar[2]\""
+    else
+        "$QEMU_BIN" -M "$mach" -cpu arm946 \
+            "${xflags[@]}" "${dflags[@]}" $gdbflag -serial pty -serial pty \
+            -monitor "unix:${RUN_DIR}/qemu-monitor.sock,server,nowait" \
+            -kernel "$FIRMWARE_ELF" >>"$qlog" 2>&1 &
+        qpid=$!
+    fi
     printf '%s\n' "$qpid" > "${RUN_DIR}/qemu.pid"
     [ -n "$asm_out" ] && _qemu_asm_ring "$asm_out" "$asm_mo" "$qpid" &
     _qemu_save_manifest "$qlog" "${LOG_DIR}/qemu-manifest.log" &
