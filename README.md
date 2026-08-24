@@ -58,6 +58,23 @@ conséquence :
   transfert et ne lève jamais `DMAC0..5`. Module `calypso_dma.c` présent, gaté
   `CALYPSO_DMA=1`, **défaut OFF**.
 
+### La question la plus rentable du moment
+
+Le front-end du démodulateur de la ROM (`0x9f95-0x9fcb`) est un filtre
+multi-cadence : il **lit** une entrée circulaire de 638 mots via `AR6` (`0x9fb5`)
+et **écrit** sa sortie linéairement via `AR4` (`0x9fb8`) — désassemblage vérifié.
+
+Or il existe **deux mesures du dépôt, prises à six mois d'écart et jamais
+confrontées** : `0x4c00` (« `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a`, stride 5 =
+polyphase 6 taps ») et `0x2a00` (« DSP READS `0xCAFE` at `0x2a00..0x2a13` via
+`PC=0x93a5` »). Elles ne se contredisent pas : ce sont les **deux extrémités du
+même étage**. Le défaut actuel dépose en `0x2a00`.
+
+Si `AR4` vaut `0x2a00`, alors on alimente la **sortie** du démodulateur, son
+entrée n'est nourrie par personne, et le Viterbi mange de l'I/Q — ce qui
+expliquerait d'un coup la constante `0xf8d8` et le CRC toujours faux. La sonde
+`DEMOD-IO-PROBE` (`CALYPSO_DEMODIO=1`, lecture seule) tranche en un run.
+
 Autre limite à connaître : l'ARM est modélisé par un cœur ARM946 (ARMv5TE) là où le
 Calypso a un ARM7TDMI (ARMv4T). Choix assumé, voir `hw/arm/calypso/calypso_mb.c:303`.
 
@@ -95,15 +112,25 @@ cd osmo_egprs
 ./build.sh
 ```
 
-Puis, **et c'est la seule porte d'entrée correcte** :
+Puis, **chaque mode a sa porte d'entrée — elles ne sont pas interchangeables** :
 
 ```bash
-cd /opt/GSM/osmo_egprs
-CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh --no-attach   # demarrer
-CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh --stop        # arreter
+# shunt_legit (le defaut) : la pile complete, jusqu'a l'appel voix
+cd /opt/GSM/osmo_egprs && CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh
+
+# native : le vrai DSP a la manoeuvre
+cd /opt/GSM/qemu-src && CALYPSO_MODE=native ./run.sh
 ```
 
-> ⚠️ **Le lancement n'est pas cosmétique.** Le même mode `shunt_legit` démarré par
+Pour arrêter, la même porte avec `--stop`. **Si une relance coince** — port déjà
+pris, pile à moitié morte : faire le `--stop`, **puis tuer les python restants**,
+qui survivent au teardown et retiennent les FIFO I/Q et les sockets :
+
+```bash
+pkill -f python3 ; pkill -f python ; sleep 2 ; pgrep -af 'python|qemu-system-arm'
+```
+
+> ⚠️ **Le lancement n'est pas cosmétique.** `shunt_legit` démarré par
 > `run.sh --restart` sans `CALYPSO_BRIDGE=pont` ne monte pas : la BTS n'atteint
 > pas le transceiver (`send() failed on TRXD … Connection refused`, mesuré 1268
 > fois), le réseau ne répond jamais et la Location Update **expire** (`T3211`
