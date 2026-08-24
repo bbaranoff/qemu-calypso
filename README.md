@@ -82,7 +82,7 @@ Calypso a un ARM7TDMI (ARMv4T). Choix assumé, voir `hw/arm/calypso/calypso_mb.c
 | 14 | DMA du DSP | — | ⬜ | `DSP_ERR_DMA_PROG` permanent ; `calypso_dma.c` gaté, défaut OFF |
 
 Source de vérité par mode :
-**[`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md)**. En cas de conflit entre
+**[`RUN RESULTS.md`](https://github.com/bbaranoff/qemu-calypso/blob/main/run_results.md)**. En cas de conflit entre
 docs, c'est lui qui prime.
 
 ---
