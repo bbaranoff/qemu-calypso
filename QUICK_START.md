@@ -1,8 +1,8 @@
 # QUICK START — QEMU-Calypso
 
-Lancer, **piloter** et **vérifier**. Ce fichier ne décrit que ce qui est mesuré,
-avec la commande et sa sortie réelle. Dernière campagne de mesures :
-**2026-08-24**.
+Lancer et **vérifier**. Ce fichier ne décrit que ce qui est mesuré aujourd'hui
+(2026-07-30). Chaque affirmation nomme son instrument. Vérité de fond :
+[`hw/arm/calypso/doc/ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md).
 
 Distinction employée partout : **MESURE** (relevé, avec sa commande) /
 **HYPOTHÈSE** (déduite du code, pas encore relevée) / **INVALIDE** (affirmation
@@ -14,635 +14,287 @@ retirée, ne pas réintroduire).
 
 | profil | FB / SB | SI | à quoi il sert |
 |---|---|---|---|
-| `shunt_legit` | hôte | gr-gsm | **le défaut.** La pile de bout en bout : camp, LU, auth, A5/1, SMS, appel voix (§2) |
-| `native_twl` | hôte / TWL | **DSP** | **le DSP traite-t-il le SI ?** (§4) |
+| `shunt_legit` | hôte | gr-gsm | la pile de bout en bout : camp, LU, SMS (§2) |
+| `native_twl` | hôte / TWL | **DSP** | **le DSP traite-t-il le SI ?** (§3bis) |
 | `native` | DSP | DSP | la vérité sur l'acquisition (§3) |
 | `native_helped` | DSP, entrée reroutée | DSP | observer le corrélateur — **sous béquille** |
 | `empty` | rien de posé | rien de posé | construire un banc gate par gate |
 
 Un profil ne pose que des `:=` : **la CLI garde toujours le dernier mot**, et
-c'est le **manifeste** qui dit ce que vous avez réellement obtenu (§6).
+c'est le **manifeste** qui dit ce que vous avez réellement obtenu (§5).
 
 ---
 
-# 1. Piloter le lab
+## 1. Prérequis
 
-Tout vit dans le conteneur **`osmo-operator-1`**. Depuis l'hôte, chaque commande
-prend la forme `docker exec osmo-operator-1 …`.
-
-```bash
-docker exec -it osmo-operator-1 bash          # entrer
-docker ps --format 'table {{.Names}}\t{{.Status}}'
-```
-
-## 1.1 Démarrer et arrêter
-
-**Chaque mode a SA porte d'entrée. Elles ne sont pas interchangeables**, et c'est
-pour cela que les journaux atterrissent à deux endroits différents (§1.2).
-
-### `shunt_legit` — le défaut
-
-```bash
-cd /opt/GSM/osmo_egprs && CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh
-```
-
-Depuis l'hôte, et sans s'attacher au tmux :
+1. Tout tourne **dans le conteneur `osmo-operator-1`** ; on y entre par
+   `docker exec -it osmo-operator-1 bash`. Depuis l'hôte, tout accès prend la
+   forme `docker exec osmo-operator-1 bash -lc '...'`.
+2. Le **runtime est `${QEMU_TREE}`** (build + `calypso.env` + `run.sh` +
+   `start-clean.sh`). `${GSM_ROOT}/qemu-calypso` est un **overlay mort au
+   runtime** : n'y écrire jamais (§5).
+3. Build : `ninja -C build qemu-system-arm` puis `./make-overlay.sh` (back-port
+   du working tree vers l'overlay git ; ne change rien au runtime).
 
 ```bash
 docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/osmo_egprs &&
-  CALYPSO_BRIDGE=pont ENCRYPTION="a5 1" ./start-direct.sh --no-attach'
-```
-
-### `native`
-
-```bash
-cd /opt/GSM/qemu-src && CALYPSO_MODE=native ./run.sh
-```
-
-Depuis l'hôte :
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src && CALYPSO_MODE=native ./run.sh --restart --no-attach'
-```
-
-### Arrêter — et le geste qui débloque
-
-```bash
-# shunt_legit
-cd /opt/GSM/osmo_egprs && CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh --stop
-# native
-cd /opt/GSM/qemu-src && ./run.sh --stop
-```
-
-**Si ça galère** — relance qui ne prend pas, port déjà pris, pile à moitié
-morte : faire le `--stop`, **puis tuer les python restants**, qui survivent au
-teardown et retiennent les FIFO I/Q et les sockets :
-
-```bash
-docker exec osmo-operator-1 bash -lc 'pkill -f python3 ; pkill -f python ; sleep 2 ; pgrep -af "python|qemu-system-arm"'
-```
-
-Puis relancer. C'est le geste qui résout la grande majorité des relances qui
-coincent.
-
-**MESURE (2026-08-24).** Le même mode lancé par `run.sh --restart` sans
-`CALYPSO_BRIDGE=pont` ne monte pas :
-
-| | `run.sh` (mauvaise porte) | `start-direct.sh` (bonne porte) |
-|---|---:|---:|
-| LU REQUEST | 19 | 1 |
-| **LU ACCEPT** | **0** | **1** |
-| TMSI | 0 | 5 |
-| timer d'échec | `T3211` ×74 | — |
-| erreurs BTS | **1798**, dont `send() failed on TRXD … Connection refused` ×1268 | **3** |
-
-La BTS n'atteint pas le transceiver, le réseau ne répond jamais, et la Location
-Update **expire** au lieu d'être rejetée.
-
-## 1.2 Où sont les journaux — le piège n°1
-
-Les deux lanceurs **n'écrivent pas au même endroit** :
-
-| lanceur | `RUN_DIR` | `LOG_DIR` |
-|---|---|---|
-| `run.sh` | `/tmp/calypso` | `/tmp/calypso/logs` |
-| **`start-direct.sh`** | `/tmp/osmo-nitb` | **`/tmp/osmo-nitb/logs`** |
-
-Analyser le mauvais répertoire donne des compteurs périmés qui **ressemblent à
-des pannes**. Le contrôle qui tranche :
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  P=$(pgrep -x qemu-system-arm | head -1)
-  tr "\0" "\n" < /proc/$P/environ | grep -E "^(LOG_DIR|RUN_DIR)="
-  ls -l /proc/$P/fd | grep qemu.log'
-```
-
-## 1.3 Le rapport de run — l'instrument à dégainer en premier
-
-```bash
-docker exec osmo-operator-1 /opt/GSM/qemu-src/tools/rapport-run.sh
-docker exec osmo-operator-1 /opt/GSM/qemu-src/tools/rapport-run.sh /tmp/ref-shunt-legit
-```
-
-Lecture seule, `LOG_DIR` **auto-détecté** depuis le processus vivant, et il
-signale un journal qui ne grossit pas. Sa règle de conception : **un compteur nul
-n'est jamais une absence prouvée** — il affiche pour chaque grandeur une ligne
-témoin, et annonce un zéro comme « motif jamais vu ».
-
-Sortie type (banc `shunt_legit` mûr) :
-
-```
-== 7. VERDICT — jusqu ou va la chaine ==
-  [ OK ] synchro FB             (11)
-  [ OK ] synchro SB             (22)
-  [ OK ] sysinfo                (16)
-  [ OK ] camp                   (15)
-  [ OK ] acces RACH             (3)
-  [ OK ] canal dedie            (7)
-  [ OK ] LU demande             (1)
-  [ OK ] LU accepte             (1)
-  [ OK ] SMS                    (1)
-```
-
-## 1.4 Les VTY — ports relevés
-
-`nc` **n'est pas installé** dans le conteneur ; utilisez `telnet` ou `socat`.
-
-| port | service | | port | service |
-|---|---|---|---|---|
-| 4239 | OsmoSTP | | 4254 | **OsmoMSC** |
-| 4242 | OsmoBSC | | 4256 | OsmoSIPcon |
-| 4243 | OsmoMGW | | 4258 | **OsmoHLR** |
-| 4245 | OsmoSGSN | | 4260 | OsmoGGSN |
-| 4247 | **mobile 10001** | | 4248 | **mobile 10002** |
-| 4238 · 4241 · 4250 | osmo-bts-trx | | | |
-
-Vérifier la liste sur un run vivant, et identifier chaque port par sa bannière :
-
-```bash
-docker exec osmo-operator-1 bash -lc "ss -lntp | grep '127.0.0.1:4'"
-```
-
-Helper non interactif (à poser une fois) :
-
-```bash
-docker exec -i osmo-operator-1 tee /tmp/vty.sh >/dev/null <<'EOF'
-#!/bin/bash
-# vty.sh <port> <commande> [commande...]
-P="$1"; shift
-{ printf 'enable\n'; sleep 0.6
-  for c in "$@"; do printf '%s\n' "$c"; sleep 1.2; done
-  printf 'exit\n'; sleep 0.4; } | socat -T5 - TCP:127.0.0.1:"$P" 2>/dev/null | tr -d '\r'
-EOF
-docker exec osmo-operator-1 chmod +x /tmp/vty.sh
-```
-
-En interactif : `docker exec -it osmo-operator-1 telnet 127.0.0.1 4254`.
-
-## 1.5 Les deux mobiles
-
-| MS | VTY | IMSI | MSISDN | ARFCN | CGI | journal |
-|---|---|---|---|---|---|---|
-| `ms 1` | **4247** | 001010001000001 | **10001** | 514 (DCS) | 001-01-1-**6001** | `mobile.log` |
-| `ms 1` | **4248** | 001010001000002 | **10002** | 516 (DCS) | 001-01-1-**6002** | `sidecar-mobile.log` |
-
-Un QEMU Calypso et un faketrx, **sur deux cellules distinctes** — les appels
-entre eux sont donc de vrais appels inter-cellules.
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4247 'show ms'
-```
-
-**MESURE :**
-
-```
-MS '1' is up, service is normal
-  IMEI: 358925005901010
-  automatic network selection state: A2 on PLMN
-                                     MCC=001 MNC=01 (Test, Test)
-  cell selection state: C3 camped normally
-                        ARFCN=514(DCS) CGI=001-01-1-6001
-```
-
-## 1.6 Appel voix 10001 ↔ 10002
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4247 'call 1 10002'    # appeler
-docker exec osmo-operator-1 /tmp/vty.sh 4248 'call 1 answer'   # decrocher
-docker exec osmo-operator-1 /tmp/vty.sh 4247 'call 1 hangup'   # raccrocher
-```
-
-Réponses VTY : `% Call is connected`, puis `% Call has been released`.
-
-**MESURE — machines à états CC des deux côtés :**
-
-```
-10001 (appelant)                        10002 (appele)
-NULL -> MM_CONNECTION_PEND              NULL -> CALL_PRESENT
-     -> INITIATED      (SETUP, T303)         -> MO_TERM_CALL_CONF (CALL CONFIRMED)
-     -> MO_CALL_PROC   (CALL PROCEEDING)     -> CALL_RECEIVED     (ALERTING)
-     -> CALL_DELIVERED (ALERTING)            -> CONNECT_REQUEST   (CONNECT, T313)
-        CONNECT -> CONNECT ACKNOWLEDGE       -> ACTIVE            (CONNECT ACK)
-```
-
-Audio, des **deux** côtés :
-
-```
-DGAPK pq_codec.c:81  Adding codec fr, decoding from format gsm
-DGAPK pq_alsa.c:197  Adding ALSA output (dev='gsm_out', blk_len=320)
-DGAPK gapk_io.c:472  GAPK I/O initialized for MS '1', codec 'fr'
-```
-
-## 1.7 SMS — les deux sens
-
-**MT (réseau → mobile)**, destinataire par **IMSI** :
-
-```bash
-docker exec osmo-operator-1 bash -lc \
-  "OPERATOR_ID=1 /etc/osmocom/send-mt-sms.sh 001010001000001 'texte'"
-```
-
-**MO (mobile → réseau)**, commande VTY `sms MS_NAME NUMBER .LINE` :
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4247 'sms 1 10002 test'
-docker exec osmo-operator-1 /tmp/vty.sh 4248 'sms 1 10001 test'
-```
-
-**MESURE — succès dans les deux sens, 0 erreur :**
-
-```
-MT :  gsm411_sms.c:306  RX SMS: MTI: 0x00, OA: 19990011444,
-                        UserData: "rapport-run test MT"
-      gsm411_sms.c:342  TX: SMS RP ACK
-
-MO :  gsm411_sms.c:717  TX: SMS DELIVER
-      gsm0411_smc.c:263 SMC(0) received CP-ACK
-      gsm411_sms.c:522  RX SMS RP-ACK (MT)
-```
-
-Boîte de réception du mobile — `/root/.osmocom/bb/sms.txt` :
-
-```
-[SMS from 19990011444]   [SMS from 10001]   [SMS from 10002]
-rapport-run test MT      test               test
-```
-
-⚠️ **Queue BÉNIGNE à ne jamais lire comme un échec** — elle est structurelle :
-
-```
-gsm0411_smc.c:338 cannot release yet current state: WAIT_CP_ACK
-gsm411_sms.c:954  MM connection released.
-gsm0411_smc.c:109 dropping pending message
-```
-
-`gsm0411_smr.c:236-237` envoie **puis** libère dans la même pile, et `cp_msg` est
-la **copie maître de retransmission** — l'émission part sur un clone
-(`gsm0411_smc.c:199-203`), la libérer ne perd aucun SMS. Le `RX SMS` et le
-`TX: SMS RP ACK` sont **deux lignes plus haut**. Lire cette machine à états par
-sa fin donne l'inverse de la vérité.
-
-Contrôles d'erreur (doivent valoir 0) :
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  L=/tmp/osmo-nitb/logs
-  grep -c MT_FORWARD_SM_ERROR $L/smsc-op1.log
-  grep -c "RP ERROR\|RP-ERROR"  $L/mobile.log'
-```
-
-## 1.8 HLR — abonnés, Ki, algorithme
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4258 'subscriber imsi 001010001000001 show'
-```
-
-**MESURE :**
-
-```
-    ID: 1
-    IMSI: 001010001000001
-    MSISDN: 10001
-    IMEI: 358925005901018
-    VLR number: VLR-SDR-OP1
-    last LU seen on CS: 2026-08-24T02:09:34+00:00
-    2G auth: COMP128v1
-             KI=00112233445566778899aabbccdd0101
-```
-
-Directement en base — `auc_3g` est **vide** (pas de Milenage) :
-
-```bash
-docker exec osmo-operator-1 bash -lc "
-  sqlite3 -readonly -header -column /var/lib/osmocom/hlr.db \
-    'select id,imsi,msisdn from subscriber;'
-  sqlite3 -readonly -header -column /var/lib/osmocom/hlr.db 'select * from auc_2g;'"
-```
-
-```
-id  imsi             msisdn      subscriber_id  algo_id_2g  ki
---  ---------------  ------      -------------  ----------  --------------------------------
-1   001010001000001  10001       1              1           00112233445566778899aabbccdd0101
-2   001010001000002  10002       2              1           00112233445566778899aabbccdd0201
-```
-
-## 1.9 MSC — TMSI, tuples A3A8, **Kc**
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4254 'show subscriber imsi 001010001000001'
-```
-
-**MESURE — 10001 :**
-
-```
-    MSISDN: 10001
-    LAC / cell ID: 1 / 6001
-    RAN type: GERAN-A
-    TMSI: 0719E3FE
-    Flags:  Conf. by radio contact: true   Location conf. in HLR: true
-    A3A8 last tuple (used 2 times):
-      seq # : 2
-      RAND  : e4 3c 35 78 9e 27 05 97 75 44 d8 7f 66 0e cc b2
-      SRES  : 33 29 ea 0c
-      Kc    : f7 3a 48 77 98 59 5c 00
-```
-
-**MESURE — 10002 :**
-
-```
-    TMSI: 3EF5D4F4
-    A3A8 last tuple (used 4 times):
-      seq # : 0
-      RAND  : 61 55 f4 59 b9 b4 10 e6 ee 98 00 0b bf 11 2e 7b
-      SRES  : 24 f0 f0 94
-      Kc    : 5e e5 25 bf f5 9f 24 00
-```
-
-### La signature COMP128v1 est lisible dans les Kc
-
-Les deux clés finissent par un octet nul **et** les deux bits de poids faible de
-l'octet précédent sont à zéro :
-
-```
-10001 : … 5c 00   ->  0x5c = 0101 11|00
-10002 : … 24 00   ->  0x24 = 0010 01|00
-```
-
-COMP128v1 ne produit que **54 bits utiles** sur 64 ; les 10 derniers sont forcés.
-Constaté indépendamment sur les deux abonnés — ce n'est pas un artefact.
-
-Compteurs d'authentification :
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4254 'show rate-counters' \
-  | grep -iE 'auth|cipher|tuple'
-```
-
-```
-gsup:rx:auth_tuples          : 10        gsup:rx:send_auth_info:err : 0
-gsup:tx:send_auth_info (req) : 2         gsup:tx:auth_fail:rep      : 0
-gsup:rx:send_auth_info:res   : 2         bssmap:cipher_mode_reject  : 0
-```
-
-⚠️ `bssmap:cipher_mode_complete = 0` alors que le mobile enregistre 7
-`CIPHERING MODE COMPLETE` : **écart de comptage, pas absence de chiffrement** —
-l'air dit le contraire (§1.10). À ne pas citer comme preuve d'un chiffrement
-absent.
-
-## 1.10 Chiffrement A5/1
-
-Côté BSC :
-
-```bash
-docker exec osmo-operator-1 /tmp/vty.sh 4242 'show running-config' | grep -i encryption
-#  encryption a5 1
-```
-
-Côté air, **MESURE** (7 occurrences) :
-
-```
-gsm48_rr.c:1219 CIPHERING MODE COMMAND (sc=1, algo=A5/1 cr=1)
-gsm48_rr.c:4035 Channel type 8, subch 0, ts 2, mode 1, cipher 1
-```
-
-`sc=1` = chiffrement activé · `algo=A5/1` · `cr=1` = IMEISV demandé.
-
-## 1.11 Build
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src/build && ninja qemu-system-arm'
+  cd ${QEMU_TREE} &&
+  ninja -C build qemu-system-arm &&
+  ./make-overlay.sh
+'
 ```
 
 Vérifier **quel binaire tourne** — `BUILD-STAMP` **ment** : la macro
 `__DATE__/__TIME__` vit dans `calypso_dsp_shunt.c:107` et date **son propre**
-translation-unit, pas celui qu'on vient de modifier :
+translation-unit, pas celui qu'on vient de modifier. Instrument correct = mtime
+du `.o` de l'unité modifiée + `lstart` du process :
 
 ```bash
 docker exec osmo-operator-1 bash -lc '
-  P=$(pgrep -x qemu-system-arm | head -1)
-  stat -c "%y  %n" /proc/$P/exe
-  find /opt/GSM/qemu-src/build -name "*calypso_c54x*.o" -printf "%T+ %p\n"'
+  cd ${QEMU_TREE} &&
+  stat -c "%y %n" build/qemu-system-arm &&
+  find build -name "*calypso_c54x*.o" -printf "%T+ %p\n" &&
+  ps -eo pid,lstart,cmd | grep [q]emu-system-arm
+'
 ```
 
 ---
 
-# 2. `shunt_legit` — le mode qui marche
+## 2. Le mode qui MARCHE : `SHUNT_LEGIT`
 
-C'est le **défaut**. Le FB/SB est produit côté hôte et présenté à l'ARM par
-intercept de lecture (`calypso_dsp_shunt.c:1463-1490`, appelé depuis
-`calypso_trx.c:297`) ; les SI viennent de gr-gsm.
+C'est le mode fiable : il campe, fait la Location Update et les SMS. Le FBSB y
+est produit **côté hôte** (détecteur FCCH cohérence+dφ + gr-gsm) et présenté à
+l'ARM par intercept de lecture (`calypso_dsp_shunt.c:1463-1490`, appelé depuis
+`calypso_trx.c:297`).
 
-Lancement : §1.1. Vérification : `tools/rapport-run.sh` (§1.3), puis les gestes
-de §1.5 à §1.10.
+### Lancer
 
-**MESURE 2026-08-24 — la chaîne va de bout en bout :**
+```bash
+docker exec -it osmo-operator-1 bash -lc '
+  cd ${QEMU_TREE} && CALYPSO_SHUNT_LEGIT=1 ./start-clean.sh
+'
+```
 
-| étape | valeur | preuve |
-|---|---:|---|
-| synchro SB | 22 | `=> SB 0x0125011c: BSIC=7 fn=3805` |
-| sysinfo | 16 | `New SYSTEM INFORMATION 4 (lai=001-01-1)` |
-| camp | 15 | `Going to camping (normal) ARFCN 514(DCS)` |
-| accès RACH | 3 | `CHANNEL REQUEST: 00 (Location Update with NECI)` |
-| authentification | 3 | COMP128v1, `gsup:rx:auth_tuples = 10` |
-| chiffrement A5/1 | 7 | `CIPHERING MODE COMMAND (sc=1, algo=A5/1 cr=1)` |
-| **LU accepté** | 1 | `LOCATION UPDATING ACCEPT (lai=001-01-1)` + TMSI |
-| **appel voix** | 1 | état `ACTIVE`, GAPK codec `fr` des deux côtés |
-| **SMS MO + MT** | ✅ | 0 erreur |
+Variantes utiles (mêmes vérifications) :
 
-Relevé complet, avec toutes les valeurs :
-[`RAPPORT_COMPLET_20260824.md`](hw/arm/calypso/doc/RAPPORT_COMPLET_20260824.md).
+| But | Commande |
+|---|---|
+| Injections nommées une par une, sans le parapluie | `CALYPSO_SHUNT_NO_LEGIT=1 ./start-clean.sh` |
+| Camp **et** c54x qui tourne en parallèle (plus réaliste, plus flaky) | `CALYPSO_SHUNT_LEGIT=DSP,NO_CANNED ./start-clean.sh` |
 
-⚠️ **Ce que ce mode NE prouve PAS** : rien sur le DSP. C'est gr-gsm qui
-démodule ; le firmware ARM, lui, tourne pour de vrai.
+`CALYPSO_SHUNT_LEGIT` est une **value-list résolue dans QEMU** par un
+constructeur exécuté avant `main()` (`calypso_dsp_shunt.c:86-105`) : `DSP` pose
+`CALYPSO_DSP_RUN_C54X=1` avec `overwrite=1`. Conséquence : `env | grep
+RUN_C54X` côté shell **ment**. L'instrument est le manifeste imprimé par ce même
+constructeur, ou l'environnement réel du process :
+
+```bash
+docker exec osmo-operator-1 bash -lc 'grep -a "calypso-manifest]" /root/qemu.log | head -40'
+docker exec osmo-operator-1 bash -lc 'tr "\0" "\n" < /proc/$(pgrep -f qemu-system-arm | head -1)/environ | grep ^CALYPSO_'
+```
+
+### Les 4 vérifications
+
+```bash
+# V1 — le FBSB hôte détecte (coh proche de 1, det=1)
+docker exec osmo-operator-1 bash -lc 'grep -a "REAL-FB" /root/qemu.log | tail -3'
+
+# V2 — le mobile campe : SI décodés + BSIC réel (7), pas BSIC=0
+docker exec osmo-operator-1 bash -lc '
+  grep -ac sysinfo /root/mobile.log ;
+  grep -aoE "BSIC=[0-9]+" /root/mobile.log | sort | uniq -c ;
+  grep -a "MON: f=" /root/mobile.log | tail -2'
+
+# V3 — Location Update acceptée + TMSI attribué
+docker exec osmo-operator-1 bash -lc '
+  grep -aicE "LOCATION UPDATING ACCEPT" /root/mobile.log ;
+  grep -aiE "TMSI|TMSI REALLOC" /root/mobile.log | tail -5 ;
+  grep -ac T3211 /root/mobile.log'
+
+# V4 — SMS
+docker exec osmo-operator-1 bash -lc 'grep -aiE "sms|SMSC" /root/smsc-op1.log | tail -10'
+```
+
+| # | Ce qu'on doit voir | Valeur de référence **mesurée** | Instrument |
+|---|---|---|---|
+| V1 | `REAL-FB fn=… coh=0.999 dphi=0.387 det=1 SNR=0x735b AFC=-186` | 280 lignes `det=1` sur les **300 premières lignes loguées** | `grep "REAL-FB" /root/qemu.log` |
+| V2 | `sysinfo` non nul, `BSIC=7`, `MON: f=… -47 dBm` | 20 SI décodés ; BSIC **7** (le vrai) ; rxlev −47/−56 dBm | `/root/mobile.log` |
+| V3 | `LOCATION UPDATING ACCEPT` ≥ 1, `lai=001-01-1`, TMSI `0x3dbeb85f`, `TMSI REALLOC COMPLETE` | RACH→ACCEPT en **2,70 s**, 0 retry T3211 (run A5) | `/root/mobile.log` |
+| V4 | MO et MT délivrés | DONE en `SHUNT_LEGIT` et `SHUNT_NO_LEGIT` ; **flaky** en `DSP,NO_CANNED` | `/root/smsc-op1.log` |
+
+**Piège de comptage sur V1.** Le logger `REAL-FB` est plafonné
+(`calypso_dsp_shunt.c:1670` : `rfl < 20 || (det && rfl < 300)`). « 280/300 »
+est le contenu des 300 premières **lignes loguées**, pas un taux de détection
+sur tout le run. Ne pas l'écrire autrement.
+
+**Réserve ouverte sur V3.** `doc/SHUNT_LEGIT_ADDRESS_MAP.md` §9 (26/07,
+antérieur au fix sous-voie SDCCH/8) mesure « LU ACCEPT intermittent, ~1 succès
+pour 19 retries T3211 », alors que `run_results.md` run A5 mesure « 2,70 s, 0
+retry » (n=2). **Non départagé.** Pour trancher : rejouer 5 runs `SHUNT_LEGIT`
+consécutifs et relever `grep -c T3211 /root/mobile.log`.
+
+**Oracle réseau.** Le cœur Osmocom est prouvé bon indépendamment de QEMU : la
+pile témoin `bts1` (mobile osmocom-bb sur `trxcon` + `fake_trx`) obtient un LU
+ACCEPT sur le même cœur — `grep -c "LOCATION UPDATING ACCEPT"
+/root/mobile-bts1.log` = 1. Tout échec côté Calypso est donc imputable à
+l'émulation.
 
 ---
 
-# 3. `native` — la vérité sur l'acquisition
+## 3. Le mode NATIF, en cours d'investigation
 
-Objectif : que ce soit le **DSP c54x** qui produise `d_fb_det`, puis le SCH, puis
-les SI. **Ce mode ne campe pas** aujourd'hui — mais il a franchi une étape.
+Objectif : que ce soit le **DSP c54x** qui produise `d_fb_det`, au lieu du
+détecteur hôte. **Ce mode ne campe pas** aujourd'hui.
 
-```bash
-cd /opt/GSM/qemu-src && CALYPSO_MODE=native ./run.sh
-
-# avec les sondes de cette section, depuis l hote :
-docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src &&
-  CALYPSO_MODE=native CALYPSO_SBFN=1 CALYPSO_SUBC=1 ./run.sh --restart --no-attach'
-```
-
-⚠️ Les journaux du natif sont donc dans **`/tmp/calypso/logs`** (§1.2).
-
-## 3.1 ✅ RÉSOLU — le FB est acquis par le vrai DSP (2026-08-24)
-
-L'ancienne rédaction de ce fichier affirmait « `d_fb_det` = 0 sur tous les runs ».
-**C'est périmé.**
+### Run de référence (chaîne d'entrée mesurée correcte)
 
 ```bash
+docker exec -it osmo-operator-1 bash -lc '
+  cd ${QEMU_TREE} && rm -f /dev/shm/daram_2a00.cfile /dev/shm/bursts.cfile &&
+  CALYPSO_NATIVE_HELPED=1 CALYPSO_FB_CORR_ENTRY=0x94f5 CALYPSO_DSP_RUN_C54X=1 \
+  CALYPSO_BSP_DARAM_FORCE=1 CALYPSO_BSP_DARAM_ADDR=0x4c00 CALYPSO_BSP_DARAM_LEN=296 \
+  CALYPSO_BSP_IQ_DECIM=4 CALYPSO_SHUNT_REAL_FB=1 CALYPSO_DEBUG=BSP ./start-clean.sh
+'
+```
+
+Deux réglages de ce run à connaître avant d'interpréter quoi que ce soit :
+
+- `CALYPSO_SHUNT_REAL_FB=1` **masque le natif à l'observateur ARM** : l'intercept
+  de lecture sert le `d_fb_det` **hôte** sur l'offset `0x01F0`. La seule cellule
+  qui mesure le natif est `data[0x08f8]`, imprimée par la ligne `DETECTOR-RUN`.
+  Pour un natif nu : `CALYPSO_SHUNT_REAL_FB=0 CALYPSO_DECAN=0`.
+- `CALYPSO_DEBUG=BSP` est **obligatoire** pour que les sondes BSP parlent. Sans
+  lui, `DMA fn=` / `BURST fn=` sont absents **parce que la sonde est muette**,
+  pas parce que le BSP est inerte (§5).
+
+### Vérifications, dans l'ordre
+
+```bash
+# N1 — les 3 gates BSP sont levées, aucun burst jeté
 docker exec osmo-operator-1 bash -lc '
-  q=/tmp/calypso/logs/qemu.log
-  grep -c "FBDET-WR .*0x0000 -> 0x0001" $q
-  grep    "FBDET-WR .*0x0000 -> 0x0001" $q | grep -oE "PC=0x[0-9a-f]+" | sort -u'
+  grep -ac "deliver: gate shunt LEVE" /root/qemu.log ;
+  grep -ac "dropping fn=" /root/qemu.log ;
+  grep -a "DMA fn=" /root/qemu.log | tail -2'
+
+# N2 — ce qui est déposé en DARAM est bien de la FCCH à 1 SPS
+docker exec osmo-operator-1 bash -lc '
+  cd ${QEMU_TREE}/tools && python3 corr_iq.py --src bursts | tail -8'
+
+# N3 — ce que le détecteur LIT réellement (dump interne, non-racy)
+#      exige CALYPSO_DARAM_DUMP=1 dans le run
+docker exec osmo-operator-1 bash -lc '
+  cd ${QEMU_TREE}/tools && python3 corr_iq.py --src ddump | tail -6 ;
+  grep -a "DARAM-SANITY" /root/qemu.log | tail -3'
+
+# N4 — le résultat natif
+docker exec osmo-operator-1 bash -lc '
+  grep -a "DETECTOR-RUN" /root/qemu.log | tail -2 ;
+  grep -a "DETECTOR-RUN" /root/qemu.log | grep -vc "d_fb_det\[08f8\]=0x0000"'
 ```
 
-**MESURE** : **437** transitions, **toutes** écrites par la mask-ROM à
-`PC=0x79e4`. Côté ARM :
+| # | Question | ATTENDU | ACTUEL (mesuré) |
+|---|---|---|---|
+| N1 | les bursts atteignent-ils `data[]` ? | `deliver: gate shunt LEVE (rxw=1)` présent, `dropping fn=` = **0** | **conforme** : gate levée, 0 drop. *(Les 3 gates sont `calypso_bsp.c:474`, `:997`, et `:1359` = la LIVRAISON, alignée le 28/07 sur `DARAM_FORCE` ; auparavant elle ne connaissait que `TPU_RX_WIRE`, d'où 2 verrous ouverts sur 3 et « rien n'arrive ».)* |
+| N2 | le feed est-il conforme ? | `VERDICT: FCCH @1SPS PROPRE (dphi=+1.00x pi/2)` | **conforme** : `coh=0.998`, `rms=3.25e4`, `\|DC\|=379`, `zeros=0%`, FFT `+67 708 Hz` |
+| N3 | la SORTIE du démod est-elle exploitable ? | `coh > 0.90`, `dphi ≈ +1.571` | **KO** : DC quasi pur et **figé** — `\|DC\|=2.86e4` pour `rms=2.94e4`, `dphi=+0.004` ; cellule témoin invariante sur 157–203 bursts (`0x9fb8@0x2a00=0x0000`, `0x9fe2@0x2a00=0x52ed`). Identique avec `DECIM=1` **et** `DECIM=4` |
+| N4 | `d_fb_det` passe-t-il à 1 ? | ≥ 1 ligne `DETECTOR-RUN` avec `d_fb_det[08f8]` ≠ `0x0000` | **KO** : `0` sur 3 600 exécutions (run 44 s) et sur 32 200 (run 437 s). Le détecteur **est armé** : `d_fb_mode[08f9]=0x0001` |
 
+Autrement dit : **entrée vivante, sortie morte**. C'est N3 (et non N4) qui est le
+critère de tranche — `d_fb_det` est trop en aval pour arbitrer un correctif.
+
+### État des pistes
+
+| Piste | Statut |
+|---|---|
+| Décodage d'opcode `0x1800/1A00/1C00/1E00` (`AND/OR/XOR/SUBC`) exécuté comme un `LD` → `T=31` → `LD Smem,TS` décale de 31 → `A=0x80000000` saturé → sortie indépendante des opérandes | **corrigé en source** (`calypso_c54x.c:9365-9389`), **non validé au run** : premier run post-correctif → `d_fb_det` toujours 0. Re-mesurer par N3, pas par N4 |
+| `DSP Error Status: 32` (`DMA_PEND`) permanent — 723 occurrences | ouvert. **HYPOTHÈSE** : le BSP écrit `data[]` en direct sans passer par la machinerie DMA, le drapeau n'est jamais effacé. `grep -oE "DSP Error Status: [0-9]+" /root/osmocon.log \| sort \| uniq -c` |
+| Le démod lit en **stride 5** (`0x4c00/05/0a/0f/15/1a`, polyphase 6 taps) alors que le BSP dépose 296 int16 contigus | ouvert, non tranché : le stride peut être correct et le **layout de remplissage** faux |
+| Même avec `d_fb_det=1`, le natif ne camperait pas : ni SCH ni SI (`dispatch_allc`=0, `feed_agch`=0, `sb_valid`=0) | connu. Ordre du plan : FB → SCH → SI |
+
+---
+
+## 3bis. `native_twl` — la question du SI, sans attendre le FB/SB
+
+Le FB/SB natif n'arrive pas (§3, critère N4 = 0 sur tous les runs depuis le
+28/07). Ce profil retourne le problème au lieu de l'attendre : **on donne la
+synchro au DSP, et on regarde s'il traite le SI.** C'est la dernière ligne du
+tableau des pistes de §3 (« ni SCH ni SI »), prise par l'autre bout.
+
+| profil | FB / SB (acquisition) | SI (décodage) | campe ? |
+|---|---|---|---|
+| `shunt_legit` | hôte | **gr-gsm** — le DSP est shunté | oui |
+| `native_twl` | hôte / TWL | **DSP** | oui (synchro fournie) |
+| `native` | DSP | DSP | non, aujourd'hui |
+
+**Règle de frontière** : *si les SI viennent de gr-gsm, ce n'est pas ce mode,
+c'est `shunt_legit`.* Les deux seules portes par lesquelles un bloc gr-gsm entre
+dans `a_cd` sont `CALYPSO_SHUNT_FEED_SI` et `CALYPSO_INJECT_ACD` — le profil les
+pose à 0, et `run_modules/01-profil.sh` proteste si on les rallume.
+
+⚠️ **BÉQUILLE assumée** : FB et SB sont **substitués** par l'hôte
+(`SHUNT_REAL_FB` + `INJECT_SB` + le transport `SHUNT_PUBLISH_FB`). Ce qu'elle
+masque : l'incapacité actuelle du corrélateur natif à publier `d_fb_det` — donc
+`data[0x08f8]` **n'est pas un verdict dans ce mode**, et ne doit jamais être cité
+comme tel ; le seul mode qui juge l'acquisition est `native` (§3). À retirer
+quand `native` sort un `d_fb_det` positif : ce profil se dissout alors dans
+`native`.
+
+### Lancer
+
+```bash
+docker exec -it osmo-operator-1 bash -lc '
+  cd /opt/GSM/osmo-qemu-calypso &&
+  CALYPSO_MODE=native_twl CALYPSO_DEBUG=BSP,A_CD-BY-BURST ./run.sh --restart'
 ```
-FB1 (3415:9): TOA=   39, Power= -52dBm, Angle=   -1Hz
-  fn_offset=3406 … scheduling next FB/SB detection task with delay 1
-Synchronize_TDMA
+
+Le profil pose lui-même, côté DSP : `DSP_RUN_C54X=1 DSP_SHUNT=0
+FRAME_IT_NATIVE=1 TPU_DSP_FRAME_IT=1 BSP_DARAM_FORCE=1 BSP_DARAM_ADDR=0x4c00
+BSP_DARAM_LEN=296 BSP_IQ_DECIM=4` ; côté synchro : `SHUNT_REAL_FB=1 INJECT_SB=1
+SHUNT_PUBLISH_FB=1 SHUNT_NO_GRGSM=0 SHUNT_NO_CANNED=1` ; côté SI : les cinq
+gates d'injection à `0` ; et l'instrument `WATCH_ACD=1`. Vérifiez-le **au
+manifeste**, jamais à la ligne de commande (§5).
+
+`CALYPSO_DEBUG` est obligatoire pour que les sondes BSP et les totaux `a_cd`
+parlent : leur silence ne veut alors rien dire (§5).
+
+### Les 3 vérifications, dans l'ordre
+
+```bash
+# T1 — la synchro est bien fournie : le mobile se cale sur un BSIC réel
+docker exec osmo-operator-1 bash -lc '
+  grep -a "BSIC" /root/qemu.log | tail -3 ;
+  grep -a "ALLC task=24" /root/qemu.log'
+
+# T2 — le DSP est alimenté en bursts, aucun jeté
+docker exec osmo-operator-1 bash -lc '
+  grep -ac "deliver: gate shunt LEVE" /root/qemu.log ;
+  grep -ac "dropping fn=" /root/qemu.log'
+
+# T3 — LE critère du mode : le DSP écrit-il a_cd de son propre opcode ?
+docker exec osmo-operator-1 bash -lc '
+  grep -a "WATCH-ACD" /root/qemu.log | head -10 ;
+  grep -a "A_CD-BY-BURST" /root/qemu.log | tail -2'
+
+# T3bis — contrôle d'honnêteté : AUCUNE injection au manifeste
+docker exec osmo-operator-1 bash -lc '
+  grep -aoE "CALYPSO_(SHUNT_FEED_SI|INJECT_ACD)=[0-9]" /root/qemu.log | sort -u'
 ```
 
-Aucune gate d'injection posée (`CALYPSO_INJECT_*=0`, `CALYPSO_CANNED` annonce
-`FBDET=0 TOA=0 PM=0 SNR=0 ANGLE=0`). L'IMR n'est plus à zéro non plus :
-`IMR-ARM 0x0000 -> 0x3000 PC=0xa4c7` puis `0x52ed`, vec28/bit12 armé.
-
-## 3.2 🔧 LE MUR COURANT — le décodage du SCH
-
-La tâche SB s'exécute, mesure un TOA plausible, écrit ses slots — et le firmware
-l'écarte :
-
-```
-a_sch[0] = 0x8100     = B_BLUD | B_SCH_CRC   ->  prim_fbsb.c:181 abandonne
-a_sch[3] = 0xf8d8     CONSTANT sur 21/21 ecritures
-```
-
-**MESURE décisive** : 10 contenus de burst **distincts** ont été présentés à la
-tâche SB (10 énergies distinctes, 15 trames SCH sur 16 grâce à
-`CALYPSO_BSP_DARAM_FCCH_ONLY=1`), et la sortie n'a pas bougé d'un bit. *Un
-décodeur dont la sortie ne dépend pas de l'entrée ne décode pas.*
-
-## 3.3 HYPOTHÈSE PRINCIPALE — on alimente le mauvais bout de la chaîne
-
-Le front-end du démodulateur de la ROM (`0x9f95-0x9fcb`) est un filtre
-multi-cadence, **désassemblage vérifié** :
-
-```
-0x9f9f  stm  #0x027e, BK      ; anneau de 638 mots
-0x9fa9  rptb 0x9fc7
-  0x9fb5  ld   *AR6-0%, A     ; LIT  l'entree, circulaire
-  0x9fb8  sth  A, *AR4+       ; ECRIT la sortie, lineaire
-0x9fcb  banz *AR7-, 0x9fa7
-```
-
-Deux mesures du dépôt, **prises à six mois d'écart et jamais confrontées** :
-
-| adresse | ce qui l'atteste | rôle probable |
+| # | Question | Critère de décision, posé d'avance |
 |---|---|---|
-| **`0x4c00`** | `TODO.md` P2 : « `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a`, stride 5 = polyphase 6 taps » | **entrée** du démod |
-| **`0x2a00`** | `calypso_bsp.c:1123-1129` : « DSP READS `0xCAFE` at `0x2a00..0x2a13` via `PC=0x93a5` » | **sortie** du démod, lue par le corrélateur |
+| T1 | la synchro est-elle fournie ? | un `BSIC` ≠ 0. Sinon le mode n'a pas démarré et **rien d'autre ne se lit** — on ne conclut pas sur le SI d'un DSP non synchronisé. `ALLC task=24` dit en plus que l'ARM a confié le CCCH au DSP (`calypso_fbsb.c:85`) |
+| T2 | le DSP est-il alimenté ? | `deliver: gate shunt LEVE` > 0 **et** `dropping fn=` = 0 |
+| T3 | **le DSP traite-t-il le SI ?** | ≥ 1 ligne `WATCH-ACD DSP-opcode-write data[0x09d2..0x09e0]` (`calypso_c54x.c:2563`, écriture **opcode**, plafonnée à 60). **Zéro est une réponse — négative — pas un échec de run.** |
+| T3bis | la réponse est-elle honnête ? | `FEED_SI=0` **et** `INJECT_ACD=0` au manifeste. Si l'un vaut 1, T3 est un artefact : c'est gr-gsm qui a rempli `a_cd` (`calypso_dsp_shunt.c:2249`) |
 
-Or le défaut actuel dépose en **`0x2a00`** (`calypso_bsp.c:1131`). Si `AR4` vaut
-bien `0x2a00`, on alimente la **sortie** du démodulateur et son **entrée** n'est
-alimentée par personne — le Viterbi mange de l'I/Q, ce qui expliquerait d'un coup
-la constante `0xf8d8` et le CRC toujours faux.
-
-**La mesure qui tranche** (sonde posée, lecture seule) :
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src &&
-  CALYPSO_MODE=native CALYPSO_DEMODIO=1 ./run.sh --restart --no-attach'
-
-docker exec osmo-operator-1 bash -lc \
-  'grep DEMOD-IO-PROBE /tmp/calypso/logs/qemu.log | head -20'
-```
-
-`SORTIE … (0x2a00 ? OUI)` → hypothèse confirmée, tout le feed BSP est à refaire.
-`… non` → elle tombe, chercher en aval.
-
-## 3.4 Les sondes du mode natif
-
-Toutes en **lecture seule**, inertes par défaut :
-
-| gate | sonde | ce qu'elle répond |
-|---|---|---|
-| `CALYPSO_SBFN=1` | `SBFN-PROBE` | quelle trame est en DARAM quand la tâche SB la lit (`fn`, `fn%51`, dépôts depuis le SB précédent, amplitude) |
-| `CALYPSO_SUBC=1` | `SUBC-PROBE` | dividende, quotient et `T` de la division qui alimente les coefficients — **avec un contrôle armé sur `0x989f`** qui atteste que la sonde est vivante |
-| `CALYPSO_SUBC=1` | `MVDD-PROBE` | la garde `0x7ccd` et les copies `0x7ce0`/`0x7ce4` qui remplissent les blocs 3 et 4 |
-| `CALYPSO_DEMODIO=1` | `DEMOD-IO-PROBE` | `AR6` (entrée) et `AR4` (sortie) du front-end démod — §3.3 |
-
-**Discipline non négociable** : toute sonde muette doit s'accompagner d'un
-**contrôle armé sur un site dont on sait qu'il s'exécute**. Sans lui, « la sonde
-n'a rien vu » et « le code ne tourne pas » sont indiscernables — piège payé
-plusieurs fois, dont une conclusion entièrement fausse sur une division jamais
-exécutée.
-
-## 3.5 Sas ISA ouvert : `CALYPSO_FIX_LK_SHFT`
-
-Défaut **OFF**. Le décodeur applique au champ de décalage des formes
-`ADD/SUB/LD/AND/OR/XOR #lk` — **4 bits** (`op & 0xF`) — la règle de signe d'un
-champ de **5 bits**. On ne représente pas −16..15 sur 4 bits : la conversion est
-incohérente en soi, et `doc/opcodes/tic54x-opc.c` donne bien `OP_SHFT` (non
-signé) pour `ld`.
-
-**MESURE** en `0x7d19` (`f02f 0001` = `LD #1, SHFT=15, A`) :
-
-| | sas OFF | sas ON |
-|---|---|---|
-| `A` avant le `SFTA` | `0x0000000000` | `0x0000008000` |
-| quotient en `0x7d1e` | `0x0000` | `0xfff4` |
-| `T` au `MPY` `0x81e4` | `0x0000` (27/27) | `0xfff4` |
-| `Synchronize_TDMA` | 8 | 13 (pas de régression) |
-
-Validé aux niveaux 1 (formel) et 2 (grandeur physique) de `environnement/fixes.env` ;
-niveau 3 à faire. Portée volontairement étroite (sous-codes 1–5, `ADD` non
-touché) pour que la mesure reste interprétable.
-
-## 3.6 `DSP_ERR_DMA_PROG` — l'erreur 8 permanente
-
-```bash
-docker exec osmo-operator-1 bash -lc \
-  "grep -oE 'DSP Error Status: [0-9]+' /tmp/calypso/logs/osmocon.log | sort | uniq -c"
-```
-
-**MESURE** : `404 DSP Error Status: 8` en natif, **0 en `shunt_legit`** — et
-présente même quand la tâche SB ne tourne quasiment pas, donc **indépendante** du
-mur SCH. `d_error_status == data[0x3f92] & 0x0FFF`, bit 3 = `DSP_ERR_DMA_PROG`.
-
-Cause documentée dans `hw/arm/calypso/calypso_dma.h` : la file DMA du firmware
-DSP sature parce que le modèle accepte la programmation mais n'exécute aucun
-transfert et ne lève jamais `DMAC0..5`. Module `calypso_dma.c` présent, gaté
-`CALYPSO_DMA=1`, **défaut OFF**, avec un conflit de mapping MMR à trancher
-(SPRU131 `DMPREC=0x54` contre le modèle qui y met `DMSA`).
+`a_cd` = `data[0x09D0..0x09DE]`. Une écriture **opcode** dans cette plage est du
+DSP ; une écriture directe du shunt n'en est pas — c'est précisément ce que
+`WATCH-ACD` distingue, et pourquoi la sonde a été écrite le 27/07.
 
 ---
+## 4. Boîte à outils de diagnostic
 
-# 4. `native_twl` — la question du SI, sans attendre le FB/SB
-
-Profil qui donne la synchro au DSP pour poser la question du SI sans attendre
-l'acquisition. **BÉQUILLE assumée** : FB et SB y sont substitués par l'hôte, donc
-`data[0x08f8]` **n'est pas un verdict dans ce mode**. Le seul mode qui juge
-l'acquisition est `native` (§3).
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  cd /opt/GSM/qemu-src &&
-  CALYPSO_MODE=native_twl CALYPSO_DEBUG=BSP,A_CD-BY-BURST ./run.sh --restart --no-attach'
-```
-
-**Le critère du mode** — le DSP écrit-il `a_cd` de son propre opcode ?
-
-```bash
-docker exec osmo-operator-1 bash -lc '
-  grep -a "WATCH-ACD" /tmp/calypso/logs/qemu.log | head -10'
-```
-
-≥ 1 ligne `WATCH-ACD DSP-opcode-write data[0x09d2..0x09e0]`
-(`calypso_c54x.c:2563`) = oui. **Zéro est une réponse — négative — pas un échec
-de run.** Contrôle d'honnêteté obligatoire : `CALYPSO_SHUNT_FEED_SI=0` **et**
-`CALYPSO_INJECT_ACD=0` au manifeste, sinon c'est gr-gsm qui a rempli `a_cd`.
-
----
-
-## 5. Boîte à outils de diagnostic
-
-### 5.1 Sondes (toutes gatées par variable d'environnement, **défaut OFF**)
+### 4.1 Sondes (toutes gatées par variable d'environnement, **défaut OFF**)
 
 Trois familles seulement dans ce tableau : **M** = mesure pure (lecture seule,
 le run est identique sans elle) ; **W** = wire (écrit une donnée que le matériel
@@ -679,7 +331,7 @@ variable :
 | `!e \|\| *e != '0'` (défaut **ON**) | OFF | `X=0` |
 | `getenv(X_OFF) ? 0 : 1` (défaut ON) | sans effet | poser `X_OFF=1` |
 
-### 5.2 `tools/corr_iq.py` — l'instrument de référence de la chaîne I/Q
+### 4.2 `tools/corr_iq.py` — l'instrument de référence de la chaîne I/Q
 
 Métrique : `coh = |Σ iq[k+1]·conj(iq[k])| / Σ|iq[k+1]||iq[k]|` (1.0 = ton pur
 FCCH, ~0 = bruit ou GMSK) et `dphi` exprimé **en unités de π/2**.
@@ -725,7 +377,7 @@ docker exec osmo-operator-1 bash -lc '
 
 ---
 
-### 5.3 Les captures I/Q sont ON par défaut dans tous les modes (2026-07-30)
+### 4.3 Les captures I/Q sont ON par défaut dans tous les modes (2026-07-30)
 
 Motif : `corr_iq.py` ne sert à rien si le run n'a rien écrit, et on ne s'en
 aperçoit qu'après. Sauf en `CALYPSO_MODE=empty`, tout run produit donc :
@@ -766,7 +418,7 @@ réellement livrée à ce DSP : `--src bursts`. Pour la faire tirer ici :
 plafond de 200 est consommé dès le boot pendant que `d_fb_mode[0x08f9]==0`, et on
 en conclut à tort « le buffer ne contient jamais de FCCH ».
 
-### 5.4 Décoder l'I/Q d'un run avec `grgsm_decode`
+### 4.4 Décoder l'I/Q d'un run avec `grgsm_decode`
 
 **La pile décode DÉJÀ cet I/Q avec gr-gsm, en direct.** Le module
 `66-grgsm-decode.sh` lance :
@@ -828,7 +480,7 @@ Pour `bursts.cfile` / `daram_2a00.cfile`, l'instrument n'est pas `grgsm_decode`
 mais `corr_iq.py` (§4.2) : ce sont des captures IQ16 par burst, pas un flux.
 ---
 
-## 6. Les pièges connus
+## 5. Les pièges connus
 
 1. **`CALYPSO_BSP_IQ_DECIM=1` est une RÉGRESSION.** Le feed part alors à 4 SPS
    (`dphi = +0.25×π/2`). La valeur correcte est **4** ; `corr_iq.py --src
@@ -896,7 +548,7 @@ mais `corr_iq.py` (§4.2) : ce sont des captures IQ16 par burst, pas un flux.
 
 ---
 
-## 7. Ne pas faire
+## 6. Ne pas faire
 
 - Ne pas écrire dans `${GSM_ROOT}/qemu-calypso` (overlay mort au runtime).
 - Ne pas modifier un **défaut** de configuration pour faire passer un test : les

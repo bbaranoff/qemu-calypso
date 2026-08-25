@@ -31,6 +31,10 @@ uint16_t calypso_dsp_shunt_burst_d(void);  /* d_burst_d echote (gates BURST_OFS/
  * Sert a gater les wires inter-blocs (BSP BRINT0) sur la mission FB/SB. */
 uint16_t calypso_dsp_shunt_get_task_md(void);
 
+/* Modèle intégrateur RSSI HW : a_pm calibré depuis la vraie magnitude MAV du DL
+ * (g_shunt.last_pm). Vrai pm_meas natif (voir calypso_dsp_shunt.c). */
+uint16_t calypso_dsp_shunt_rssi_apm(void);
+
 /* Phase 2 future hook (IPC fed). */
 void calypso_dsp_shunt_feed_fb_result(int found, int16_t toa,
                                       int16_t pm, int16_t angle, int16_t snr);

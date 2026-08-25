@@ -520,8 +520,38 @@ void calypso_rhea_dma_rx_request(C54xState *s)
         if (got <= 0)
             break;
 
+        /* [2026-08-22] DOUBLE-BUFFER §11.3.5 (CAL207) — la destination SUIT
+         * CURRENT_PAGE. Doc DMA_CTRL bit4 : « 0 = 1re page API, 1 = 2e page API,
+         * automatiquement mis a jour pendant le transfert ». Page 0 = AAD
+         * (dst_idx), page 1 = AAD+ALGTH (dst_idx+max_words). L'ancien code ecrivait
+         * TOUJOURS dst_idx -> la 2e page (0x0d2e) restait VIDE, alors que le DSP y
+         * lit une fois sur deux (desasm PROM 0xb2c4=0x0cce / 0xb2c9=0x0d2e) ->
+         * energie=0 -> d_fb_det jamais pose. Triangule doc + disasm + logs.
+         * A/B : CALYPSO_RHEA_DMA_PAGE_OFF=1 restaure le dst fixe (ancien comportement). */
+        /* [2026-08-22 soir] CORRELATEUR = 296 MOTS PLATS, PAS 2 PAGES DE 96.
+         * Le correlateur FB lit un buffer CONTIGU de 296 mots (=148 IQ @1SPS).
+         * Le ping-pong §11.3.5 a 2 pages (dst_idx / dst_idx+96 = 192 mots) repliait
+         * le burst 296 : page2->dst_idx (ecrase page0), page3->dst_idx+96 (ecrase
+         * page1). Resultat : FCCH corrompue, le correlateur pique au BORD (TOA=39).
+         * Le double-buffer HW est un artefact TEMPS-REEL (le DSP consomme la page 0
+         * pendant que le DMA remplit la page 1) ; il n'a PAS lieu d'etre quand on
+         * draine tout le burst en une passe synchrone. On ecrit donc les pages
+         * CONTIGUES : page k -> dst_idx + k*96, soit [0x0cce..0x0df6) plat -> le
+         * correlateur voit les 296 mots.
+         * A/B : CALYPSO_RHEA_DMA_PINGPONG=1 restaure l'ancien ping-pong 2-pages. */
+        unsigned pdst = dst_idx + (unsigned)(pages * max_words);
+        {
+            static int pingpong = -1;
+            if (pingpong < 0) pingpong = getenv("CALYPSO_RHEA_DMA_PINGPONG") ? 1 : 0;
+            if (pingpong) {
+                pdst = dst_idx;
+                if (rd.ch[n].ctrl & CTRL_CURRENT_PAGE)
+                    pdst = dst_idx + (unsigned)max_words;   /* 2e page API = AAD+ALGTH */
+            }
+        }
         for (int i = 0; i < got; i++)
-            api[dst_idx + i] = buf[i];
+            if (pdst + (unsigned)i < C54X_API_SIZE)
+                api[pdst + i] = buf[i];
 
         for (int i = 0; i < got; i++)
             if (buf[i]) nz_total++;

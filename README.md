@@ -1,60 +1,5 @@
 # QEMU-Calypso
 
-Let me read the top-level docs to describe it accurately.Voici ce que fait ce projet.
-
-## En une phrase
-
-**QEMU-Calypso** émule le baseband GSM **TI Calypso** (celui des Motorola C1xx / Compal E88) à l'intérieur de QEMU. Sa particularité : il fait tourner **deux cœurs en même temps**, exactement comme la vraie puce — un **ARM** qui exécute le firmware [osmocom-bb](https://osmocom.org/projects/baseband) *d'origine et non patché* (la Layer 1 temps réel), et un **DSP TMS320C54x** qui exécute la **vraie mask-ROM DSP de TI**. Les deux se parlent par la mailbox à l'adresse `0xFFD00000`, comme sur le silicium réel.
-
-L'intérêt revendiqué : aucun autre émulateur de baseband ne ferait tourner *à la fois* le firmware constructeur intact *et* le DSP de couche 1. FirmWire émule l'applicatif et bouchonne la L1 ; le `virt_phy` d'osmocom-bb n'exécute aucun code ARM. Ici, les deux cœurs sont réellement émulés.
-
-## Ce qu'il arrive à faire — ça dépend entièrement du *mode*
-
-C'est le point central du projet. Il y a deux familles de fonctionnement, et elles ne prouvent pas la même chose :
-
-| Famille | Qui acquiert la synchro (FB/SB) | Qui décode les infos réseau | Ce que ça démontre |
-|---|---|---|---|
-| **shunt** | l'hôte (gr-gsm démodule) | gr-gsm | la pile complète, de bout en bout, jusqu'à l'audio — **mais rien sur le DSP** |
-| **natif** | le vrai DSP | le DSP | la vérité sur l'acquisition — **ne "campe" pas encore aujourd'hui** |
-
-**En mode shunt** (le mode par défaut, `shunt_legit`), la chaîne GSM entière fonctionne : le téléphone émulé s'accroche au réseau, fait sa *Location Update*, s'authentifie (COMP128v1), chiffre en **A5/1**, échange des SMS, et tient même un **appel voix avec audio entre deux abonnés** (10001 ↔ 10002). Le firmware ARM tourne pour de vrai — mais c'est gr-gsm côté hôte qui démodule, le DSP est court-circuité.
-
-**En mode natif**, le DSP fait le vrai travail. L'état, mis à jour au 2026-08-24 :
-- ✅ **le FB (Frequency Burst, la première synchro) est bien acquis par le vrai DSP** — mesuré 437 fois, écrit par la mask-ROM elle-même, sans aucune injection truquée.
-- 🔧 le mur actuel est le **décodage du SCH** : la tâche tourne mais son décodeur sort une valeur constante (`0xf8d8`) quelle que soit l'entrée — donc il ne décode pas vraiment.
-- ⚠️ le DMA du DSP est modélisé mais désactivé par défaut, ce qui laisse une erreur permanente `DSP_ERR_DMA_PROG`.
-
-## Comment c'est branché
-
-```
- Réseau GSM réel (osmo-bts / fake_trx)  ──►  downlink I/Q
-                                              │
-              ┌───────────────────────────────┴──────────────┐
-              │  QEMU-Calypso                                 │
-              │   ARM ◄──── mailbox 0xFFD00000 ────► DSP C54x │
-              │  (firmware osmocom-bb non patché)             │
-              │   + gr-gsm + modèles RF (twl3025, trf6151)    │
-              └───────────────────────────────────────────────┘
-```
-
-Le firmware ARM est **interchangeable** : n'importe quel `layer1.highram.elf` issu de l'arbre osmocom-bb boote sans adaptation. C'est le test qui distingue « j'émule la plateforme » de « j'ai fait marcher *ce* binaire précis ».
-
-## Ce que contient le dépôt (les 290 fichiers du bundle)
-
-- **Sources C** (`hw/arm/calypso/`) : le cœur DSP c54x (décodeur d'instructions + MMIO + interruptions), le pont ARM↔DSP, le BSP (livraison des bursts), le séquenceur TPU/TSP (frontend RF), les modèles RF (trf6151, twl3025), le contrôleur DMA.
-- **Un pont IPC** (`tools/calypso-ipc-device/`) qui relie l'I/Q de QEMU à la mémoire partagée du transceiver.
-- **Beaucoup de scripts shell** (89) : orchestration du lancement, profils de modes, visualiseurs de logs en tmux (fenêtres cœur/DSP/asm/radio/voix pour deux abonnés).
-- **Scripts Python** (51) + **tests** (18).
-- **Documentation abondante** (46 fichiers, en français) : cartes d'adresses DSP, jeu d'instructions c54x, rapports de run datés, plans d'implémentation voix, architecture des "béquilles" (`crutches`) qui stubbent les branches non encore implémentées.
-
-## L'esprit du projet
-
-Ce qui ressort nettement de la doc, c'est une **discipline anti-illusion** : le projet insiste partout sur le fait qu'un compteur à zéro n'est *pas* une preuve d'absence, que la vérité d'un run est le manifeste imprimé par le modèle (pas la ligne de commande), et que les résultats "shunt" ne prouvent rien sur le DSP. Il y a un système de "sas" (`CALYPSO_FIXES`) pour mettre en quarantaine les correctifs non validés, et des sondes de diagnostic inertes par défaut. C'est un travail de rétro-ingénierie où chaque affirmation est présentée comme vérifiable — et cassable.
-
-En résumé : c'est un banc d'émulation matérielle fidèle du baseband Calypso, capable de faire tourner une pile GSM complète jusqu'à la voix en mode "assisté", et qui pousse progressivement le vrai DSP à faire lui-même l'acquisition radio en mode "natif".
-
-Veux-tu que je détaille un aspect précis — l'architecture DSP/ARM, la chaîne RF, le décodage SCH bloqué, ou le fonctionnement des modes ?
-
 Émulation du **baseband GSM TI Calypso** (Compal E88 / Motorola C1xx) sous QEMU.
 Deux cœurs tournent ensemble, reliés par la mailbox API RAM du vrai SoC :
 
@@ -113,23 +58,6 @@ conséquence :
   transfert et ne lève jamais `DMAC0..5`. Module `calypso_dma.c` présent, gaté
   `CALYPSO_DMA=1`, **défaut OFF**.
 
-### La question la plus rentable du moment
-
-Le front-end du démodulateur de la ROM (`0x9f95-0x9fcb`) est un filtre
-multi-cadence : il **lit** une entrée circulaire de 638 mots via `AR6` (`0x9fb5`)
-et **écrit** sa sortie linéairement via `AR4` (`0x9fb8`) — désassemblage vérifié.
-
-Or il existe **deux mesures du dépôt, prises à six mois d'écart et jamais
-confrontées** : `0x4c00` (« `PC=0x9fb5` lit `0x4c00/05/0a/0f/15/1a`, stride 5 =
-polyphase 6 taps ») et `0x2a00` (« DSP READS `0xCAFE` at `0x2a00..0x2a13` via
-`PC=0x93a5` »). Elles ne se contredisent pas : ce sont les **deux extrémités du
-même étage**. Le défaut actuel dépose en `0x2a00`.
-
-Si `AR4` vaut `0x2a00`, alors on alimente la **sortie** du démodulateur, son
-entrée n'est nourrie par personne, et le Viterbi mange de l'I/Q — ce qui
-expliquerait d'un coup la constante `0xf8d8` et le CRC toujours faux. La sonde
-`DEMOD-IO-PROBE` (`CALYPSO_DEMODIO=1`, lecture seule) tranche en un run.
-
 Autre limite à connaître : l'ARM est modélisé par un cœur ARM946 (ARMv5TE) là où le
 Calypso a un ARM7TDMI (ARMv4T). Choix assumé, voir `hw/arm/calypso/calypso_mb.c:303`.
 
@@ -154,7 +82,7 @@ Calypso a un ARM7TDMI (ARMv4T). Choix assumé, voir `hw/arm/calypso/calypso_mb.c
 | 14 | DMA du DSP | — | ⬜ | `DSP_ERR_DMA_PROG` permanent ; `calypso_dma.c` gaté, défaut OFF |
 
 Source de vérité par mode :
-**[`RUN RESULTS.md`](https://github.com/bbaranoff/qemu-calypso/blob/main/run_results.md)**. En cas de conflit entre
+**[`ETAT_ACTUEL.md`](hw/arm/calypso/doc/ETAT_ACTUEL.md)**. En cas de conflit entre
 docs, c'est lui qui prime.
 
 ---
@@ -167,25 +95,15 @@ cd osmo_egprs
 ./build.sh
 ```
 
-Puis, **chaque mode a sa porte d'entrée — elles ne sont pas interchangeables** :
+Puis, **et c'est la seule porte d'entrée correcte** :
 
 ```bash
-# shunt_legit (le defaut) : la pile complete, jusqu'a l'appel voix
-cd /opt/GSM/osmo_egprs && CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh
-
-# native : le vrai DSP a la manoeuvre
-cd /opt/GSM/qemu-src && CALYPSO_MODE=native ./run.sh
+cd /opt/GSM/osmo_egprs
+CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh --no-attach   # demarrer
+CALYPSO_BRIDGE=pont ENCRYPTION='a5 1' ./start-direct.sh --stop        # arreter
 ```
 
-Pour arrêter, la même porte avec `--stop`. **Si une relance coince** — port déjà
-pris, pile à moitié morte : faire le `--stop`, **puis tuer les python restants**,
-qui survivent au teardown et retiennent les FIFO I/Q et les sockets :
-
-```bash
-pkill -f python3 ; pkill -f python ; sleep 2 ; pgrep -af 'python|qemu-system-arm'
-```
-
-> ⚠️ **Le lancement n'est pas cosmétique.** `shunt_legit` démarré par
+> ⚠️ **Le lancement n'est pas cosmétique.** Le même mode `shunt_legit` démarré par
 > `run.sh --restart` sans `CALYPSO_BRIDGE=pont` ne monte pas : la BTS n'atteint
 > pas le transceiver (`send() failed on TRXD … Connection refused`, mesuré 1268
 > fois), le réseau ne répond jamais et la Location Update **expire** (`T3211`
@@ -374,6 +292,7 @@ Toute la doc vit sous `hw/arm/calypso/doc/`.
 
 | Doc | Contenu |
 |---|---|
+| **[ETAT_ACTUEL.md](hw/arm/calypso/doc/ETAT_ACTUEL.md)** | ⭐ Source de vérité : ce qui marche par mode, l'architecture réelle, les fausses pistes |
 | **[RAPPORT_COMPLET_20260824.md](hw/arm/calypso/doc/RAPPORT_COMPLET_20260824.md)** | Relevé complet du banc shunt_legit : chaîne, Kc/HLR/MSC, A5/1, appel voix |
 | [QUICK_START.md](QUICK_START.md) | Build, lancer, modes, vérifications |
 | [TODO.md](hw/arm/calypso/doc/TODO.md) | TODO consolidé (P0/P1/P2), cadré par mode |
