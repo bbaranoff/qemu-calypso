@@ -276,6 +276,7 @@ typedef struct C54xState {
     bool     par_set;
     bool     lk_used;    /* resolve_smem consumed extra word for lk */
     uint16_t mvpd_src;   /* MVPD auto-increment source address during RPT */
+    uint16_t firs_pmad;  /* FIRS auto-increment pmad cursor during RPT (2026-08-25) */
 
     /* RPTB state */
     bool     rptb_active;

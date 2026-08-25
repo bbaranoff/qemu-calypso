@@ -49,6 +49,7 @@
 #include "calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -1961,15 +1962,21 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * enroule -> le firmware enroule au rail sur une valeur stale. Ici
              * l'erreur effective DECROIT a mesure que le DAC monte -> converge. */
             if (g_rx_raw_valid) {
-                double _eff = g_rx_raw_hz - calypso_twl3025_get_afc_hz();
+                /* [2026-08-25] `raw - get_afc_hz()` codait en dur le signe de la
+                 * rotation. Depuis l inversion de ce signe (twl3025), apply_phase
+                 * AJOUTE +hz au bande de base tandis qu on en retranchait hz :
+                 * rx_afc annonçait une correction opposee a celle appliquee, soit
+                 * un residu faux de 2*hz. get_afc_applied_hz() porte le signe. */
+                double _applied = calypso_twl3025_get_afc_applied_hz();
+                double _eff = g_rx_raw_hz + _applied;
                 double _a = _eff * (65536.0 / 86208.0);
                 if (_a >  32767.0) _a =  32767.0;
                 if (_a < -32768.0) _a = -32768.0;
                 g_shunt.rx_afc = (int16_t)_a;
                 static unsigned _afl = 0;
                 if ((_afl++ % 200) == 0)
-                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz dac_hz=%.0f eff=%.0fHz -> rx_afc=%d\n",
-                            g_rx_raw_hz, calypso_twl3025_get_afc_hz(), _eff, g_shunt.rx_afc);
+                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz applique=%.0fHz eff=%.0fHz -> rx_afc=%d\n",
+                            g_rx_raw_hz, _applied, _eff, g_shunt.rx_afc);
             }
             /* [DECAN model-fidelity] garder le VRAI rx_snr (coherence feed_iq)
              * quand DECAN_SNR actif, sinon le de-can SNR est defait ici. */
@@ -3629,8 +3636,9 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
          * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
          * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
-        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
-                                       : ((_p % 10 == 1) && (_p <= 41));
+        int _is_fcch = feed_fn_canon()
+                       ? gsm0502_p51_is_fcch((unsigned)_p)
+                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3724,8 +3732,9 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
              * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
              * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
-            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
-                                          : ((_sp % 10 == 2) && (_sp <= 42));
+            int _is_sch = feed_fn_canon()
+                          ? gsm0502_p51_is_sch((unsigned)_sp)
+                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
             if (_is_sch) {
                 uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
                 /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est
@@ -3849,7 +3858,9 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                      * -> 0 => convergence (gain~1, init -700). fs=1083333 (4 SPS). */
                     double raw_hz = resid * (1083333.0 / (2.0 * M_PI));
                     g_rx_raw_hz = raw_hz; g_rx_raw_valid = 1; /* memo pour recompute per-tick */
-                    double eff_hz = raw_hz - calypso_twl3025_get_afc_hz();
+                    /* [2026-08-25] cf. AFC-LOOP : residu = brut + ce qui a ete
+                     * REELLEMENT applique aux echantillons (signe compris). */
+                    double eff_hz = raw_hz + calypso_twl3025_get_afc_applied_hz();
                     double a = eff_hz * (65536.0 / 86208.0);
                     if (a >  32767.0) a =  32767.0;
                     if (a < -32768.0) a = -32768.0;

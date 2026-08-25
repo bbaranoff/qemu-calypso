@@ -27,6 +27,12 @@
 
 extern int g_c54x_int3_src;  /* INT3 diagnostic source (RO) */
 
+/* d_dsp_page as a c54x DATA WORD address (what api_ram[] is indexed by), built
+ * from the NDB byte offset with the same NDB_W() conversion the rest of the
+ * shunt uses. NDB_D_DSP_PAGE alone is a byte offset INSIDE the NDB, so it must
+ * never be handed to `- C54X_API_BASE` directly. */
+#define D_DSP_PAGE_W  ((uint16_t)NDB_W(NDB_D_DSP_PAGE))
+
 /* Read the c54x data[] space DIRECTLY for an ARM-side API address, WITHOUT the
  * calypso_dsp_read MMIO round-trip. That round-trip takes
  * calypso_pcb_daram_lock, a non-recursive mutex — taking it again while
@@ -84,20 +90,21 @@ void shunt_route_to_c54x_header(uint8_t page_idx)
          * printed data[0x08E2] (never written) while FRAME-IT printed
          * api_ram[0x08E2] (written by the mirror below) — two distinct arrays,
          * two values, no concurrency involved. And 0x08E2 was not the right
-         * cell anyway: d_dsp_page = 0x08D4 (see calypso_fbsb.h). We now print
-         * the cell the ROM actually reads, in the array it actually reads
-         * (api_ram).
+         * cell anyway: d_dsp_page = 0x08D4. We now print the cell the ROM
+         * actually reads, in the array it actually reads (api_ram).
          *
-         * WARNING (found 2026-08-25, not yet fixed): this file resolves
-         * NDB_D_DSP_PAGE through calypso_dsp_internal.h, where it is 0x00 (an
-         * offset within the NDB), NOT through calypso_fbsb.h, where it is
-         * 0x08D4 (a DSP word address). The `- C54X_API_BASE` conversion below
-         * assumes the latter. See the FIXME on the mirror write. */
+         * [2026-08-25] FIXED. NDB_D_DSP_PAGE is a BYTE offset inside the NDB
+         * (0x00), not a DSP word address, so `NDB_D_DSP_PAGE - C54X_API_BASE`
+         * indexed api_ram[-2048] — 4 KiB BEFORE CalypsoTRX::dsp_ram, an
+         * out-of-bounds read here and an out-of-bounds WRITE on the mirror
+         * below. NDB_W() is the conversion this file was missing:
+         *   NDB_W(NDB_D_DSP_PAGE) == 0x0800 + (0x01A8 >> 1) == 0x08D4,
+         * so the api_ram index is 0x08D4 - C54X_API_BASE == 0xD4. */
         fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, "
                 "api_ram[0x%04x]=0x%04x) api_ram=%p\n",
-                dsp_page, (unsigned)page_idx, NDB_D_DSP_PAGE,
-                dsp->api_ram ? dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE]
-                             : dsp->data[NDB_D_DSP_PAGE],
+                dsp_page, (unsigned)page_idx, D_DSP_PAGE_W,
+                dsp->api_ram ? dsp->api_ram[D_DSP_PAGE_W - C54X_API_BASE]
+                             : dsp->data[D_DSP_PAGE_W],
                 (void*)dsp->api_ram);
         dsp->data[0x0584] = dsp_page;
         dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
@@ -112,16 +119,12 @@ void shunt_route_to_c54x_header(uint8_t page_idx)
          * removing the FIX_DPAGE_OFF crutch (calypso_c54x.c), dropped in the
          * same change.
          *
-         * FIXME (2026-08-25): NDB_D_DSP_PAGE is 0x00 in this translation unit,
-         * so this indexes api_ram[0x00 - 0x0800] = api_ram[-2048]. api_ram is
-         * set to the BASE of CalypsoTRX::dsp_ram (calypso_trx.c:2352), so this
-         * writes 4096 bytes BEFORE that array — out of bounds. The intended
-         * index is 0x08D4 - 0x0800 = 0xD4, which requires calypso_fbsb.h's
-         * definition. Left as-is here because this is a mechanical split: the
-         * whole path is dead unless CALYPSO_DSP_RUN_C54X=1, and shunt_legit
-         * sets it to 0. */
+         * [2026-08-25] The mirror used to index api_ram[NDB_D_DSP_PAGE -
+         * C54X_API_BASE] = api_ram[-2048] and corrupted 4 KiB of heap in front
+         * of CalypsoTRX::dsp_ram every time the c54x route posted a page. It
+         * now goes through D_DSP_PAGE_W (see above). */
         if (dsp->api_ram)
-            dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE] = dsp_page;
+            dsp->api_ram[D_DSP_PAGE_W - C54X_API_BASE] = dsp_page;
     }
     fprintf(stderr, "[c54x-route] a-daram-ok\n");
 }

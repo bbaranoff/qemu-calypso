@@ -30,6 +30,12 @@ double calypso_twl3025_get_afc_hz(void);
  * la rotation à appliquer aux samples bruts pour matcher le local osc. */
 double calypso_twl3025_get_afc_phase_step(void);
 
+/* Décalage de fréquence RÉELLEMENT appliqué aux échantillons par apply_phase,
+ * en Hz et AVEC son signe. Résidu après compensation = brut + cette valeur.
+ * À utiliser partout où l'on reconstitue l'erreur de fréquence résiduelle :
+ * `raw - get_afc_hz()` code en dur une convention de signe qui a changé. */
+double calypso_twl3025_get_afc_applied_hz(void);
+
 /* Apply AFC rotation in-place to N I/Q samples (interleaved int16).
  * No-op si AFC désactivée OU dac_value == 0.
  *

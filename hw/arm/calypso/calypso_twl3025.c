@@ -186,23 +186,52 @@ double calypso_twl3025_get_afc_hz(void)
     return (double)effective_dac * hz_lsb;
 }
 
+/* Sens de la rotation de compensation, en un seul endroit.
+ * [2026-08-22] SIGNE INVERSÉ (- -> +). Une fois la boucle AFC réellement fermée
+ * (apply_phase déplacé dans c54x_bsp_load, point de convergence des feeds),
+ * l'ancien signe (-) donnait un feedback POSITIF : la DAC partait en runaway
+ * (-700 -> 4095, +34 kHz) au lieu de converger vers -700. Le raisonnement
+ * d'origine « VCXO+ -> baseband DOWN -> -phase_step » ne correspond pas au signe
+ * de la mesure freq_error du DSP émulé. Défaut = + (converge) ;
+ * A/B : CALYPSO_TWL3025_AFC_SIGN_OLD=1 restaure l'ancien -. */
+static double twl3025_afc_sign(void)
+{
+    static int sign_old = -1;
+    if (sign_old < 0) {
+        sign_old = getenv("CALYPSO_TWL3025_AFC_SIGN_OLD") ? 1 : 0;
+    }
+    return sign_old ? -1.0 : 1.0;
+}
+
 double calypso_twl3025_get_afc_phase_step(void)
 {
     twl3025_lazy_env();
     if (!twl.afc_enabled) return 0.0;   /* CALYPSO_TWL3025_AFC=0 → pas de rotation AFC */
     double hz = calypso_twl3025_get_afc_hz();
     if (hz == 0.0) return 0.0;
-    /* Phase step per sample = ±2π × freq / fs.
-     * [2026-08-22] SIGNE INVERSÉ (- -> +). Une fois la boucle AFC réellement
-     * fermée (apply_phase déplacé dans c54x_bsp_load, point de convergence des
-     * feeds), l'ancien signe (-) donnait un feedback POSITIF : la DAC partait en
-     * runaway (-700 -> 4095, +34 kHz) au lieu de converger vers -700. Le
-     * raisonnement d'origine « VCXO+ -> baseband DOWN -> -phase_step » ne
-     * correspond pas au signe de la mesure freq_error du DSP émulé. Défaut = +
-     * (converge) ; A/B : CALYPSO_TWL3025_AFC_SIGN_OLD=1 restaure l'ancien -. */
-    static int sign_old = -1;
-    if (sign_old < 0) sign_old = getenv("CALYPSO_TWL3025_AFC_SIGN_OLD") ? 1 : 0;
-    return (sign_old ? -1.0 : 1.0) * 2.0 * M_PI * hz / GSM_SAMPLE_RATE_HZ;
+    /* Phase step per sample = ±2π × freq / fs ; le sens vit dans
+     * twl3025_afc_sign(), partagé avec get_afc_applied_hz(). */
+    return twl3025_afc_sign() * 2.0 * M_PI * hz / GSM_SAMPLE_RATE_HZ;
+}
+
+/* [2026-08-25] DECALAGE REELLEMENT APPLIQUE aux echantillons, en Hz, signe
+ * compris.
+ *
+ * POURQUOI IL FAUT LA. Le signe de la rotation vient d etre inverse ci-dessus,
+ * mais deux sites de calypso_dsp_shunt.c continuaient de reconstituer l erreur
+ * de frequence residuelle par `raw_hz - calypso_twl3025_get_afc_hz()` — une
+ * soustraction qui n est juste QUE pour l ancien signe. Depuis l inversion,
+ * apply_phase AJOUTE +hz au bande de base alors que ces sites en retranchaient
+ * hz : rx_afc annonçait une correction du signe oppose a celle reellement
+ * appliquee, et la boucle AFC etait jugee sur un residu faux de 2*hz.
+ * La regle, elle, ne depend pas du signe : residu = brut + ce_qui_a_ete_applique.
+ * On expose donc « ce qui a ete applique » plutot que de demander a chaque
+ * appelant de deviner la convention. */
+double calypso_twl3025_get_afc_applied_hz(void)
+{
+    twl3025_lazy_env();
+    if (!twl.afc_enabled) return 0.0;
+    return twl3025_afc_sign() * calypso_twl3025_get_afc_hz();
 }
 
 void calypso_twl3025_apply_phase(int16_t *iq_samples, int n_samples,

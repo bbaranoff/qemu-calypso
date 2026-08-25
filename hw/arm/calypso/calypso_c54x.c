@@ -17,6 +17,7 @@
 #include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
+#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "hw/arm/calypso/calypso_full_pcb.h"  /* daram_lock, api_ram_lock */
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,18 @@ static inline int64_t sext40(int64_t v)
     else
         v &= ((int64_t)1 << 40) - 1;
     return v;
+}
+
+/* [2026-08-25] Arrondi « R » du C54x — UNE definition.
+ * SPRU172C : les formes MACR/MASR/MPYR/... ajoutent 2^15 au produit PUIS
+ * METTENT A ZERO la moitie basse. Deux sites du fichier le faisaient en deux
+ * lignes (`+= 0x8000` puis `&= ~0xFFFF`), tous les autres — dont les quatre
+ * familles ajoutees en aout — oubliaient la mise a zero et gardaient les bits
+ * de poids faible du produit non arrondi. Le suffixe R veut dire la meme chose
+ * partout : une seule fonction, appelee par tous. */
+static inline int64_t c54x_round16(int64_t v)
+{
+    return (v + 0x8000) & ~(int64_t)0xFFFF;
 }
 
 /* Saturate 40-bit to 32-bit (OVM mode) */
@@ -2193,14 +2206,24 @@ static void data_write(C54xState *s, uint16_t addr, uint16_t val)
                     const char *t = getenv("CALYPSO_TRF_TARGET_RF");
                     _tp = calypso_gate("CALYPSO_TRF_RXLEV", (l && *l == '1') ? 1 : 0);
                     if (t && *t) _tgt = atoi(t);
-                    /* [2026-08-22] MODELE INTEGRATEUR RSSI HW = vrai pm_meas natif.
-                     * a_pm depuis la MAV reelle du DL (calypso_dsp_shunt_rssi_apm),
-                     * pas la cible -60 figee ni le 0x7000 canne. Defaut ON en natif ;
-                     * prime sur trf. CALYPSO_PM_RSSI=0 le coupe (retombe sur trf). */
-                    const char *r = getenv("CALYPSO_PM_RSSI");
-                    const char *m = getenv("CALYPSO_MODE");
-                    int native = (m && strstr(m, "native")) ? 1 : 0;
-                    _rssi = r ? (atoi(r) != 0) : native;
+                    /* @BEQUILLE — PM_RSSI  (CALYPSO_PM_RSSI, defaut OFF)
+                     *   masque  : a_pm que le DSP ecrit a 0. On substitue un modele
+                     *             d integrateur RSSI cote hote (MAV reelle du DL,
+                     *             calypso_dsp_shunt_rssi_apm) au lieu de la cible
+                     *             -60 figee ; prime sur TRF_RXLEV quand il est pose.
+                     *   retirer : quand a_pm natif est non nul.
+                     *
+                     * [2026-08-25] N EST PLUS ALLUME TOUT SEUL. Il se posait a 1 des
+                     * que CALYPSO_MODE contenait « native » — c est-a-dire dans le
+                     * SEUL mode qui sert de reference de fidelite, et sans que la
+                     * ligne de commande le mentionne : `CALYPSO_MODE=native
+                     * CALYPSO_TRF_RXLEV=0` rendait quand meme un a_pm fabrique par
+                     * l hote, en silence. Or le protocole du projet veut qu une
+                     * bequille soit POSEE EXPLICITEMENT dans environnement/*.env, ou
+                     * elle est lisible et retirable. Le profil `native` la pose
+                     * desormais lui-meme (modes.env) : comportement identique,
+                     * declaration visible. */
+                    _rssi = calypso_gate("CALYPSO_PM_RSSI", 0);
                 }
                 /* DSP 33-36 : db_r = {..d_task_ra(7), a_serv_demod[4](8..11),
                  * a_pm[3](12..14), a_sch[5](15..19)}. a_pm read page 0 = word 12
@@ -4306,57 +4329,46 @@ static uint16_t c54x_ovly_bas(void)
  * charge en 0x815e : quelque chose l ecrase entre les deux.
  * A 0, la famille duale PRESERVE T -> on voit si le T de 0x815e survit.
  * ⚠️ Effet global : T sert a toutes les formes a operande unique. */
-static int c54x_dual_sett(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_DUAL_SETT", 1);
-        fprintf(stderr, "[c54x] ISA-DUAL-SETT %s : la famille duale %s T\n",
-                g ? "ACTIF (defaut)" : "INACTIF",
-                g ? "ECRIT" : "PRESERVE");
+/* [2026-08-25] Les accesseurs de gate ISA etaient SEPT copies du meme corps :
+ * un cache statique, calypso_gate(), et une annonce imprimee une seule fois.
+ * Une macro les declare en une ligne de tete chacun. Ce n est pas que de
+ * l esthetique : recopier la mecanique, c est risquer d oublier le cache (le
+ * gate serait relu a chaque instruction) ou de le partager par accident entre
+ * deux gates. Le message garde acces a `g` : il decrit l etat choisi. */
+#define C54X_ISA_GATE(fn, env, def, ...)                                       \
+    static int fn(void)                                                        \
+    {                                                                          \
+        static int g = -1;                                                     \
+        if (g < 0) {                                                           \
+            g = calypso_gate(env, def);                                        \
+            fprintf(stderr, __VA_ARGS__);                                      \
+        }                                                                      \
+        return g;                                                              \
     }
-    return g;
-}
+
+C54X_ISA_GATE(c54x_dual_sett, "CALYPSO_ISA_DUAL_SETT", 1,
+              "[c54x] ISA-DUAL-SETT %s : la famille duale %s T\n",
+              g ? "ACTIF (defaut)" : "INACTIF",
+              g ? "ECRIT" : "PRESERVE")
 
 /* [2026-08-23] Gates du lot de correctifs ISA issu du balayage exhaustif.
  * Chacun isole une famille pour permettre la bissection. Tous ont un EFFET
  * GLOBAL : ce sont des opcodes courants du DSP. */
-static int c54x_mpy_fam(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_MPY_FAM", 1);
-        fprintf(stderr, "[c54x] ISA-MPY-FAM %s : mpyr 0x22xx / mpyu 0x24xx / "
-                "squr 0x26xx de-permutes (T : mpyu ne l ecrit plus, squr l ecrit)\n",
-                g ? "ACTIF" : "INACTIF (ancien decodage)");
-    }
-    return g;
-}
+C54X_ISA_GATE(c54x_mpy_fam, "CALYPSO_ISA_MPY_FAM", 1,
+              "[c54x] ISA-MPY-FAM %s : mpyr 0x22xx / mpyu 0x24xx / "
+              "squr 0x26xx de-permutes (T : mpyu ne l ecrit plus, squr l ecrit)\n",
+              g ? "ACTIF" : "INACTIF (ancien decodage)")
 
-static int c54x_ld_par(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_LD_PAR", 1);
-        fprintf(stderr, "[c54x] ISA-LD-PAR %s : 0xA800-0xAFFF = "
-                "LD Xmem,dst || MAC/MACR/MAS/MASR Ymem, UN MOT (etait 2 mots "
-                "sur trois des quatre -> desynchronisation)\n",
-                g ? "ACTIF" : "INACTIF (ancien decodage)");
-    }
-    return g;
-}
+C54X_ISA_GATE(c54x_ld_par, "CALYPSO_ISA_LD_PAR", 1,
+              "[c54x] ISA-LD-PAR %s : 0xA800-0xAFFF = "
+              "LD Xmem,dst || MAC/MACR/MAS/MASR Ymem, UN MOT (etait 2 mots "
+              "sur trois des quatre -> desynchronisation)\n",
+              g ? "ACTIF" : "INACTIF (ancien decodage)")
 
-static int c54x_mas_dual(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_MAS_DUAL", 1);
-        fprintf(stderr, "[c54x] ISA-MAS-DUAL %s : mas/masr = src - Xmem*Ymem "
-                "et T = Xmem (au lieu de T*Xmem puis T = Ymem ; masr etait POLY)\n",
-                g ? "ACTIF" : "INACTIF (ancien decodage)");
-    }
-    return g;
-}
+C54X_ISA_GATE(c54x_mas_dual, "CALYPSO_ISA_MAS_DUAL", 1,
+              "[c54x] ISA-MAS-DUAL %s : mas/masr = src - Xmem*Ymem "
+              "et T = Xmem (au lieu de T*Xmem puis T = Ymem ; masr etait POLY)\n",
+              g ? "ACTIF" : "INACTIF (ancien decodage)")
 
 static uint16_t prog_read(C54xState *s, uint32_t addr)
 {
@@ -4449,6 +4461,83 @@ static void c54x_par_postmod(C54xState *s, int ar, int mod)
     }
 }
 
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * [2026-08-25] NORM — UNE seule implementation.
+ *
+ * Il y en avait TROIS recopiees a la main (deux handlers `(op & 0xFEFF) ==
+ * 0xF48F` dans deux branches du decodeur, plus un bloc separe pour les deux
+ * encodages que le masque etroit ratait). Elles avaient deja diverge :
+ *
+ *  - src/dst. binutils donne `norm 0xF48F/0xFCFF {OP_SRC, OP_DST}` : bit 9 =
+ *    SOURCE, bit 8 = DESTINATION. Les deux copies a masque etroit lisaient le
+ *    bit 8 comme SOURCE *et* destination, donc `norm A,B` (0xF58F) lisait B au
+ *    lieu de A. Seul le bloc ajoute pour 0xF68F/0xF78F decodait juste : deux
+ *    conventions opposees dans la meme fonction.
+ *
+ *  - compte de decalage. `val << (int16_t)s->t` prend les SEIZE bits de T. Le
+ *    barrel shifter du C54x n en lit que SIX, en complement a 2 (-16..31). Des
+ *    que le firmware laisse autre chose qu un exposant dans T (p.ex. T=0x0100,
+ *    pose par un `stm #0x0100`), `val << 256` est un COMPORTEMENT INDEFINI en C
+ *    — resultat au choix du compilateur, et de toute facon different de la puce.
+ *    T = 0x8000 donnait meme `val >> -(-32768)` = decalage de 32768.
+ *
+ * Semantique retenue (SPRU172C) : dst = src decale de T[5:0] signe ; NORM LIT T
+ * et ne l ecrit pas ; TC reflete « les deux MSB de src different » (donc « il
+ * restait a normaliser »), evalue AVANT le decalage.
+ * Gate CALYPSO_FIX_NORM_T=0 : ancien modele 1 bit + T--, conserve pour l A/B.
+ * Gate CALYPSO_ISA_NORM_MASK=0 : masque etroit 0xFEFF (2 encodages sur 4).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static int c54x_norm_shift_count(uint16_t t)
+{
+    int n = t & 0x3F;                 /* T[5:0] */
+    if (n & 0x20) {
+        n -= 0x40;                    /* complement a 2 sur 6 bits : -16..31 */
+    }
+    if (n >  31) n =  31;
+    if (n < -16) n = -16;
+    return n;
+}
+
+/* true si `op` est un NORM, et l annonce du masque en vigueur. */
+static bool c54x_op_is_norm(uint16_t op)
+{
+    static int wide = -1;
+    if (wide < 0) {
+        wide = calypso_gate("CALYPSO_ISA_NORM_MASK", 1);
+        fprintf(stderr, "[c54x] ISA-NORM-MASK %s : norm = 0xF48F/0xFCFF "
+                "(4 encodages, bit9=src bit8=dst) au lieu de 0xFEFF "
+                "qui en ratait 10 sur 29 dans PROM0\n",
+                wide ? "ACTIF" : "INACTIF (masque etroit)");
+    }
+    return wide ? ((op & 0xFCFF) == 0xF48F) : ((op & 0xFEFF) == 0xF48F);
+}
+
+static void c54x_norm_exec(C54xState *s, uint16_t op)
+{
+    int src = (op >> 9) & 1;          /* bit 9 = source      */
+    int dst = (op >> 8) & 1;          /* bit 8 = destination */
+    int64_t val = sext40(src ? s->b : s->a);
+    bool unnormalized = (((val >> 39) & 1) != ((val >> 38) & 1));
+
+    static int fix_norm = -1;
+    if (fix_norm < 0) {
+        fix_norm = calypso_gate("CALYPSO_FIX_NORM_T", 1);
+    }
+    if (fix_norm) {
+        int n = c54x_norm_shift_count(s->t);
+        val = (n >= 0) ? sext40(val << n) : sext40(val >> (-n));
+        if (dst) s->b = val; else s->a = val;
+        /* NORM lit T, ne l ecrit pas (SPRU172C). */
+    } else if (unnormalized) {
+        val = sext40(val << 1);
+        if (dst) s->b = val; else s->a = val;
+        s->t = (uint16_t)(s->t - 1);
+    }
+    if (unnormalized) s->st0 |= ST0_TC;
+    else              s->st0 &= ~ST0_TC;
+}
+
 /* ================================================================
  * [2026-08-22] FIX ISA — adressage a BITS INVERSES (reverse carry)
  *     mode 7 = *ARn+0B      mode 4 = *ARn-0B
@@ -4474,17 +4563,10 @@ static void c54x_par_postmod(C54xState *s, int ar, int mod)
  * /!\ EFFET GLOBAL : ces modes servent a toute FFT/IFFT du firmware.
  * Bascule A/B : CALYPSO_ISA_BITREV=0 restaure le +/-AR0 plat.
  * ================================================================ */
-static int c54x_bitrev_on(void)
-{
-    static int g = -1;
-    if (g < 0) {
-        g = calypso_gate("CALYPSO_ISA_BITREV", 1);
-        fprintf(stderr, "[c54x] ISA-BITREV %s : *ARn+0B / *ARn-0B = retenue "
-                "INVERSEE (etait un +/-AR0 plat)\n",
-                g ? "ACTIF (fidele SPRU131G)" : "INACTIF (ancien +/-AR0 plat)");
-    }
-    return g;
-}
+C54X_ISA_GATE(c54x_bitrev_on, "CALYPSO_ISA_BITREV", 1,
+              "[c54x] ISA-BITREV %s : *ARn+0B / *ARn-0B = retenue "
+              "INVERSEE (etait un +/-AR0 plat)\n",
+              g ? "ACTIF (fidele SPRU131G)" : "INACTIF (ancien +/-AR0 plat)")
 
 static inline uint16_t c54x_bitrev16(uint16_t v)
 {
@@ -5286,8 +5368,7 @@ static int c54x_mac_bit_family(C54xState *s, uint16_t op, int consumed)
                 int16_t macr_mem = (int16_t)data_read(s, macr_addr);
                 int32_t macr_prod = (int32_t)(int16_t)s->t * (int32_t)macr_mem;
                 if (s->st1 & ST1_FRCT) macr_prod <<= 1;
-                macr_prod += 0x8000; /* round */
-                macr_prod &= ~0xFFFF; /* zero low half after round */
+                macr_prod = (int32_t)c54x_round16(macr_prod);
                 int macr_dst = (op >> 8) & 1;
                 int64_t *macr_acc = macr_dst ? &s->b : &s->a;
                 int64_t macr_term = (int64_t)(int32_t)macr_prod;
@@ -5329,8 +5410,7 @@ static int c54x_mac_bit_family(C54xState *s, uint16_t op, int consumed)
                 int16_t macar_ahi = (int16_t)((s->a >> 16) & 0xFFFF);
                 int32_t macar_prod = (int32_t)macar_ahi * (int32_t)macar_mem;
                 if (s->st1 & ST1_FRCT) macar_prod <<= 1;
-                macar_prod += 0x8000;
-                macar_prod &= ~0xFFFF;
+                macar_prod = (int32_t)c54x_round16(macar_prod);
                 s->b = sext40((s->b + (int64_t)(int32_t)macar_prod) & 0xFFFFFFFFFFULL);
                 return (int)(consumed + s->lk_used);
             }
@@ -5347,62 +5427,21 @@ static int c54x_mac_bit_family(C54xState *s, uint16_t op, int consumed)
                 return (int)(consumed + s->lk_used);
             }
 
-            /* [2026-08-23] 6e MANQUE — MPY Smem,dst et LTD Smem n etaient
-             * decodes NULLE PART. Balayage de toutes les conditions de
-             * l emulateur : LD Smem,T (0x3000) et ST T,Smem (0x8C00) sont
-             * decodes, mais 0x2000/0xFE00 et 0x4C00/0xFF00 n avaient AUCUN
-             * handler.
-             * Chemin critique : la boucle qui alimente les blocs 3 et 4 du banc
-             * SCH est  0x81e3 LD #1,ASM ; 0x81e4 MPY Smem,dst ; 0x81e5/0x81e6
-             * ST A,*ARx+ (stores paralleles). L instruction qui doit PRODUIRE la
-             * valeur ne s executait pas : A gardait zero et les stores ecrasaient
-             * avec des zeros les copies saines du correlateur (112 ecritures non
-             * nulles par les MVDD 0x7ce0/0x7ce4, puis 210 zeros).
-             * Semantique : MPY Smem,dst -> dst = T * Smem  (bit 8 = accumulateur)
-             *              LTD Smem     -> T = Smem ; data[Smem+1] = Smem
-             * Gate CALYPSO_ISA_MPY_SMEM (defaut 1).
-             * ⚠️ EFFET GLOBAL : instruction courante du DSP. */
-            {
-                static int _ms = -1;
-                if (_ms < 0) {
-                    _ms = calypso_gate("CALYPSO_ISA_MPY_SMEM", 1);
-                    fprintf(stderr, "[c54x] ISA-MPY-SMEM %s : MPY Smem,dst "
-                            "(0x2000/0xFE00, dst = T*Smem) et LTD Smem "
-                            "(0x4C00/0xFF00) %s\n",
-                            _ms ? "ACTIF" : "INACTIF",
-                            _ms ? "IMPLEMENTES" : "restent inertes");
-                }
-                if (_ms && (op & 0xFE00) == 0x2000) {
-                    bool mp_ind;
-                    uint16_t mp_addr = resolve_smem(s, op, &mp_ind);
-                    int16_t  mp_v = (int16_t)data_read(s, mp_addr);
-                    int64_t  mp_p = (int64_t)(int16_t)s->t * (int64_t)mp_v;
-                    if (s->st1 & ST1_FRCT) mp_p <<= 1;
-                    if ((op >> 8) & 1) s->b = sext40(mp_p);
-                    else               s->a = sext40(mp_p);
-                    {   static int _t = -1; static unsigned _tn = 0;
-                        if (_t < 0) _t = calypso_gate("CALYPSO_ISA_MPY_TRACE", 0);
-                        if (_t && _tn < 24) {
-                            _tn++;
-                            fprintf(stderr, "[c54x] MPY-SMEM #%u PC=0x%04x op=0x%04x "
-                                    "T=0x%04x Smem@0x%04x=%d -> %s=0x%010llx insn=%u\n",
-                                    _tn, s->pc, op, (unsigned)s->t, mp_addr, (int)mp_v,
-                                    ((op >> 8) & 1) ? "B" : "A",
-                                    (unsigned long long)(mp_p & 0xFFFFFFFFFFULL),
-                                    s->insn_count);
-                        }
-                    }
-                    return (int)(consumed + s->lk_used);
-                }
-                if (_ms && (op & 0xFF00) == 0x4C00) {
-                    bool lt_ind;
-                    uint16_t lt_addr = resolve_smem(s, op, &lt_ind);
-                    uint16_t lt_v = data_read(s, lt_addr);
-                    s->t = lt_v;
-                    data_write(s, (uint16_t)(lt_addr + 1), lt_v);  /* insertion de delai */
-                    return (int)(consumed + s->lk_used);
-                }
-            }
+            /* [2026-08-25] BLOC RETIRE — il partait d une premisse fausse.
+             *
+             * Il ajoutait ici « MPY Smem,dst » (0x2000/0xFE00) et « LTD Smem »
+             * (0x4C00/0xFF00) au motif qu ils n etaient « decodes NULLE PART ».
+             * Les deux l etaient deja :
+             *   - MPY Smem,dst  -> `case 0x2:` du switch(hi4), sous-code 0x0/0x1,
+             *     avec exactement la meme semantique (dst = T * Smem, affectation) ;
+             *   - LTD Smem      -> `case 0x4:` du switch(hi4), branche op8 == 0x4C.
+             * Le doublon MPY faisait deux implementations de la meme instruction
+             * dans le meme fichier — la configuration qui a produit le bug de
+             * NORM (deux conventions src/dst opposees). Et la branche LTD etait
+             * de toute facon MORTE : c54x_mac_bit_family() n est appelee que
+             * depuis `case 0x2:` et `case 0x3:`, donc un opcode de hi4 = 4 ne
+             * peut pas l atteindre. Le gate CALYPSO_ISA_MPY_SMEM disparait avec
+             * elle : il ne commandait rien. */
 
             /* 0x3000 LD Smem, T (mask FF00, 1 word) — T = data[Smem]. */
             if ((op & 0xFF00) == 0x3000) {
@@ -7496,34 +7535,8 @@ static int c54x_exec_one(C54xState *s)
              * and decrement T. Otherwise do nothing. Used by the FB-det
              * correlator to normalize results; the loop exits when
              * NORM stops shifting (MSBs match = value is normalized). */
-            if ((op & 0xFEFF) == 0xF48F) {
-                int src = (op >> 8) & 1;
-                int64_t val = sext40(src ? s->b : s->a);
-                int bit39 = (val >> 39) & 1;
-                int bit38 = (val >> 38) & 1;
-                /* [2026-08-22] FIX_NORM_T — le vrai C54x NORM decale l'accu de T
-                 * (exposant produit par EXP) en un cycle, SANS ecrire T (SPRU172C).
-                 * L'ancien modele decalait 1 bit + T-- -> les paires exp;norm ISOLEES
-                 * (reference correlateur 0x796c/796d, division SNR 0x79b1) ne recalaient
-                 * jamais en pleine echelle -> reference {0,-1}, SNR minuscule. Prouve par
-                 * le firmware : 0x79ca stm #1->T puis rptb norm A = decalage variable
-                 * data-dependant, n'a de sens que si NORM decale de T. Meme classe que
-                 * FIX_SFTA_CARRY. Gate CALYPSO_FIX_NORM_T (defaut ON) ; =0 = ancien 1-bit. */
-                static int fix_norm = -1;
-                if (fix_norm < 0) fix_norm = calypso_gate("CALYPSO_FIX_NORM_T", 1);
-                if (fix_norm) {
-                    int16_t t = (int16_t)s->t;               /* compte signe */
-                    if (t >= 0) val = sext40(val << t);
-                    else        val = sext40(val >> (-t));   /* decalage arithmetique (SXM) */
-                    if (src) s->b = val; else s->a = val;
-                    /* NE PAS modifier T (SPRU172C : NORM lit T, ne l'ecrit pas) */
-                } else if (bit39 != bit38) {
-                    val = sext40(val << 1);
-                    if (src) s->b = val; else s->a = val;
-                    s->t = (uint16_t)(s->t - 1);
-                }
-                if (bit39 != bit38) s->st0 |= ST0_TC;
-                else                s->st0 &= ~ST0_TC;
+            if (c54x_op_is_norm(op)) {
+                c54x_norm_exec(s, op);
                 return consumed + s->lk_used;
             }
 
@@ -7810,68 +7823,14 @@ static int c54x_exec_one(C54xState *s)
                  * and decrement T. Otherwise do nothing. Used by the FB-det
                  * correlator to normalize results; the loop exits when
                  * NORM stops shifting (MSBs match = value is normalized). */
-              /* [2026-08-23] MASQUE ELARGI. binutils : norm 0xF48F/0xFCFF,
-               * {OP_SRC, OP_DST} -- bit 9 = source, bit 8 = destination, donc
-               * QUATRE encodages : 0xF48F 0xF58F 0xF68F 0xF78F. Le test etait
-               * `(op & 0xFEFF)`, qui ne liberait que le bit 8 : 0xF68F et
-               * 0xF78F passaient a travers sans etre decodes.
-               * Mesure PROM0 : 29 NORM, 19 captures, 10 RATES -- dont 0x75cf
-               * (sequence EXP/NORM qui fabrique B juste avant 0x75d3 STLM B,BRC,
-               * d ou le BRC absurde et la boucle de ~50000 tours sur le SUBC),
-               * 0x796d et 0x79ad (reference du correlateur, division SNR), et
-               * 0x9a08 0x9a27 0x9a4c EN ZONE VITERBI.
-               * Meme classe que RPTZ 0xF171. Gate CALYPSO_ISA_NORM_MASK.
-               * ⚠️ EFFET GLOBAL : correlateur, division, Viterbi. */
-              {
-                  static int _nm = -1;
-                  if (_nm < 0) {
-                      _nm = calypso_gate("CALYPSO_ISA_NORM_MASK", 1);
-                      fprintf(stderr, "[c54x] ISA-NORM-MASK %s : norm = 0xF48F/0xFCFF "
-                              "(4 encodages, bit9=src bit8=dst) au lieu de 0xFEFF "
-                              "qui en ratait 10 sur 29 dans PROM0\n",
-                              _nm ? "ACTIF" : "INACTIF (masque etroit)");
-                  }
-                  if (_nm && (op & 0xFCFF) == 0xF48F && (op & 0xFEFF) != 0xF48F) {
-                      /* les deux encodages que l ancien masque ratait */
-                      int nsrc = (op >> 9) & 1, ndst = (op >> 8) & 1;
-                      int64_t nv = sext40(nsrc ? s->b : s->a);
-                      int b39 = (nv >> 39) & 1, b38 = (nv >> 38) & 1;
-                      static int fnt = -1;
-                      if (fnt < 0) fnt = calypso_gate("CALYPSO_FIX_NORM_T", 1);
-                      if (fnt) {
-                          int16_t t = (int16_t)s->t;
-                          nv = (t >= 0) ? sext40(nv << t) : sext40(nv >> (-t));
-                          if (ndst) s->b = nv; else s->a = nv;
-                      } else if (b39 != b38) {
-                          nv = sext40(nv << 1);
-                          if (ndst) s->b = nv; else s->a = nv;
-                          s->t = (uint16_t)(s->t - 1);
-                      }
-                      if (b39 != b38) s->st0 |= ST0_TC; else s->st0 &= ~ST0_TC;
-                      return consumed + s->lk_used;
-                  }
-              }
-              if ((op & 0xFEFF) == 0xF48F) {
-                  int src = (op >> 8) & 1;
-                  int64_t val = sext40(src ? s->b : s->a);
-                    int bit39 = (val >> 39) & 1;
-                    int bit38 = (val >> 38) & 1;
-                    /* [2026-08-22] FIX_NORM_T (copie 2, cf. ~7972) — NORM decale de T,
-                     * pas 1 bit, et n'ecrit pas T. Gate CALYPSO_FIX_NORM_T (defaut ON). */
-                    static int fix_norm_2 = -1;
-                    if (fix_norm_2 < 0) fix_norm_2 = calypso_gate("CALYPSO_FIX_NORM_T", 1);
-                    if (fix_norm_2) {
-                        int16_t t = (int16_t)s->t;
-                        if (t >= 0) val = sext40(val << t);
-                        else        val = sext40(val >> (-t));
-                        if (src) s->b = val; else s->a = val;
-                    } else if (bit39 != bit38) {
-                        val = sext40(val << 1);
-                        if (src) s->b = val; else s->a = val;
-                        s->t = (uint16_t)(s->t - 1);
-                    }
-                    if (bit39 != bit38) s->st0 |= ST0_TC;
-                    else                s->st0 &= ~ST0_TC;
+                /* [2026-08-25] Les QUATRE encodages (0xF48F/F58F/F68F/F78F,
+                 * bit9=src bit8=dst) passent par c54x_norm_exec(). Le bloc
+                 * separe qui traitait a part les deux que le masque etroit
+                 * ratait a disparu : il decodait src/dst autrement que le
+                 * handler d a cote, ce qui faisait deux semantiques opposees
+                 * pour la meme instruction dans la meme fonction. */
+                if (c54x_op_is_norm(op)) {
+                    c54x_norm_exec(s, op);
                     return consumed + s->lk_used;
                 }
                 /* F49F: DELAY (pipeline flush, NOP) */
@@ -9894,14 +9853,28 @@ static int c54x_exec_one(C54xState *s)
                     int yar  = ( op       & 0x03) + 2;
 
                     if (_fi) {
-                        /* pmad auto-increment : meme PC repete => on avance. */
-                        static uint16_t _fpm = 0; static uint16_t _fpc = 0xFFFF;
-                        if (s->pc != _fpc) { _fpm = pmad0; _fpc = s->pc; }
-                        else               { _fpm++; }
+                        /* pmad auto-increment sous RPT.
+                         * [2026-08-25] CORRIGE. C etait un couple de statics
+                         * `_fpm/_fpc` remis a pmad0 UNIQUEMENT quand le PC
+                         * changeait. A la deuxieme execution du meme FIRS — le
+                         * burst suivant, une nouvelle boucle RPT au MEME PC —
+                         * le test `s->pc == PC precedent` etait encore vrai :
+                         * le curseur ne repartait pas de la base, il continuait
+                         * a monter. Le filtre lisait donc ses coefficients de
+                         * plus en plus loin de la table a chaque burst, et
+                         * l etat fuyait aussi entre deux instances de C54xState.
+                         * On adopte l idiome deja utilise par READA/MVPD
+                         * (cf. rpt_fresh) et on range le curseur dans l etat. */
+                        if (!s->rpt_active || s->rpt_fresh) {
+                            s->firs_pmad = pmad0;
+                            s->rpt_fresh = false;
+                        } else {
+                            s->firs_pmad++;
+                        }
 
                         uint16_t xv = data_read(s, s->ar[xar]);
                         uint16_t yv = data_read(s, s->ar[yar]);
-                        int16_t  coef = (int16_t)prog_fetch(s, _fpm);
+                        int16_t  coef = (int16_t)prog_fetch(s, s->firs_pmad);
 
                         int64_t prod = (int64_t)(int16_t)((s->a >> 16) & 0xFFFF)
                                      * (int64_t)coef;
@@ -9917,8 +9890,8 @@ static int c54x_exec_one(C54xState *s)
                                         "Xar=AR%d@0x%04x=0x%04x "
                                         "Yar=AR%d@0x%04x=0x%04x -> A=0x%010llx "
                                         "B=0x%010llx insn=%u\n",
-                                        _fn2, s->pc, _fpm, (unsigned)(uint16_t)coef,
-                                        (unsigned)s->data[_fpm],
+                                        _fn2, s->pc, s->firs_pmad, (unsigned)(uint16_t)coef,
+                                        (unsigned)s->data[s->firs_pmad],
                                         !!(s->pmst & PMST_OVLY),
                                         xar, s->ar[xar], xv, yar, s->ar[yar], yv,
                                         (unsigned long long)(s->a & 0xFFFFFFFFFFULL),
@@ -9950,11 +9923,29 @@ static int c54x_exec_one(C54xState *s)
                     c54x_par_postmod(s, yar, ymod);
                     return consumed + s->lk_used;
                 }
+                /* [2026-08-25] LMS / SQDST / ABDST : arithmetique non modelisee,
+                 * mais les POINTEURS AVANCENT. Ce sont des instructions duales
+                 * Xmem,Ymem au meme format que FIRS ; les laisser totalement
+                 * inertes reproduisait exactement la panne que le commentaire
+                 * ci-dessus documente pour ISA_FIRS=0 — AR figes, la boucle
+                 * RPTB qui les contient sort du tampon et ecrase la reference
+                 * de correlation. Une instruction dont on ne modelise pas le
+                 * calcul doit quand meme laisser la machine dans l etat ou le
+                 * silicium la laisse. */
+                {
+                    int lxmod = (op >> 6) & 0x03;
+                    int lxar  = ((op >> 4) & 0x03) + 2;
+                    int lymod = (op >> 2) & 0x03;
+                    int lyar  = ( op       & 0x03) + 2;
+                    c54x_par_postmod(s, lxar, lxmod);
+                    c54x_par_postmod(s, lyar, lymod);
+                }
                 if (_e0_n < 40) {
                     _e0_n++;
-                    C54_LOG("E0-FAM non implemente op=0x%04x (%s) PC=0x%04x "
-                            "consumed=%d insn=%u", op,
-                            hi8 == 0xE0 ? "FIRS" : hi8 == 0xE1 ? "LMS" :
+                    C54_LOG("E0-FAM arithmetique non modelisee op=0x%04x (%s) "
+                            "PC=0x%04x consumed=%d insn=%u (pointeurs avances)",
+                            op,
+                            hi8 == 0xE1 ? "LMS" :
                             hi8 == 0xE2 ? "SQDST" : "ABDST",
                             s->pc, consumed, s->insn_count);
                 }
@@ -11275,7 +11266,7 @@ static int c54x_exec_one(C54xState *s)
                 if (c54x_mpy_fam()) {
                     product = (int64_t)(int16_t)s->t * (int64_t)(int16_t)val;
                     if (s->st1 & ST1_FRCT) product <<= 1;
-                    product += 0x8000;                 /* arrondi */
+                    product = c54x_round16(product);   /* arrondi R */
                     if (sub & 1) s->b = sext40(product);
                     else         s->a = sext40(product);
                     return consumed + s->lk_used;      /* T INCHANGE */
@@ -11563,13 +11554,11 @@ static int c54x_exec_one(C54xState *s)
             int ymod_m = (op >> 2) & 0x03;
             uint16_t xval_m = data_read(s, s->ar[xar_m]);
             uint16_t yval_m = data_read(s, s->ar[yar_m]);
-            switch (xmod_m) { case 1: s->ar[xar_m]--; break; case 2: s->ar[xar_m]++; break;
-                case 3: s->ar[xar_m] = c54x_circ_ref(s->ar[xar_m], +(int16_t)s->ar[0], s->bk); break; }
-            switch (ymod_m) { case 1: s->ar[yar_m]--; break; case 2: s->ar[yar_m]++; break;
-                case 3: s->ar[yar_m] = c54x_circ_ref(s->ar[yar_m], +(int16_t)s->ar[0], s->bk); break; }
+            c54x_par_postmod(s, xar_m, xmod_m);
+            c54x_par_postmod(s, yar_m, ymod_m);
             int64_t prod_m = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_m;
             if (s->st1 & ST1_FRCT) prod_m <<= 1;
-            if (hi8 & 0x01) prod_m += 0x8000; /* round */
+            if (hi8 & 0x01) prod_m = c54x_round16(prod_m);
             int dst_m = (hi8 & 0x02) ? 1 : 0;
             if (dst_m) s->b = sext40(s->b + prod_m);
             else       s->a = sext40(s->a + prod_m);
@@ -12030,16 +12019,8 @@ static int c54x_exec_one(C54xState *s)
                 }
             }
             /* Post-modify (SPRU131G Table 5-8) */
-            switch (xmod_d) {
-            case 1: s->ar[xar_d]--; break;
-            case 2: s->ar[xar_d]++; break;
-            case 3: s->ar[xar_d] = c54x_circ_ref(s->ar[xar_d], +(int16_t)s->ar[0], s->bk); break;
-            }
-            switch (ymod_d) {
-            case 1: s->ar[yar_d]--; break;
-            case 2: s->ar[yar_d]++; break;
-            case 3: s->ar[yar_d] = c54x_circ_ref(s->ar[yar_d], +(int16_t)s->ar[0], s->bk); break;
-            }
+            c54x_par_postmod(s, xar_d, xmod_d);
+            c54x_par_postmod(s, yar_d, ymod_d);
             /* [2026-08-23] 5e CLASSE — la famille duale multiplie ses DEUX
              * operandes MEMOIRE entre eux, pas T par Xmem. binutils :
              *   0xa400-0xa5ff mpy   X,Y,dst   dst = X*Y      (AFFECTATION)
@@ -12075,7 +12056,7 @@ static int c54x_exec_one(C54xState *s)
                         ? (int64_t)(uint16_t)xval_d * (int64_t)(int16_t)yval_d
                         : (int64_t)(int16_t)xval_d * (int64_t)(int16_t)yval_d;
                     if (s->st1 & ST1_FRCT) p <<= 1;
-                    if (is_macr) p += 0x8000;
+                    if (is_macr) p = c54x_round16(p);
                     int dstb, srcb;
                     if (is_mpy || is_macsu) {          /* masque 0xFE00 : bit8 = acc */
                         dstb = hi8 & 1; srcb = dstb;
@@ -12112,7 +12093,7 @@ static int c54x_exec_one(C54xState *s)
             int64_t prod = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_d;
             if (s->st1 & ST1_FRCT) prod <<= 1;
             /* Round if R bit set (odd hi8) */
-            if (hi8 & 0x01) prod += 0x8000;
+            if (hi8 & 0x01) prod = c54x_round16(prod);
             /* Determine dest and operation.
              * FIX 2026-05-29 (binutils tic54x-opc.c, confirmé) : 0xB4-0xB7 =
              * MACR = mac+round = ADDITION (0xB400/0xFC00), PAS soustraction.
@@ -12150,10 +12131,8 @@ static int c54x_exec_one(C54xState *s)
             int ymod_sq = (op >> 2) & 0x03;
             uint16_t xval_sq = data_read(s, s->ar[xar_sq]);
             uint16_t yval_sq = data_read(s, s->ar[yar_sq]);
-            switch (xmod_sq) { case 1: s->ar[xar_sq]--; break; case 2: s->ar[xar_sq]++; break;
-                case 3: s->ar[xar_sq] = c54x_circ_ref(s->ar[xar_sq], +(int16_t)s->ar[0], s->bk); break; }
-            switch (ymod_sq) { case 1: s->ar[yar_sq]--; break; case 2: s->ar[yar_sq]++; break;
-                case 3: s->ar[yar_sq] = c54x_circ_ref(s->ar[yar_sq], +(int16_t)s->ar[0], s->bk); break; }
+            c54x_par_postmod(s, xar_sq, xmod_sq);
+            c54x_par_postmod(s, yar_sq, ymod_sq);
             int16_t ah_sq = (int16_t)((s->a >> 16) & 0xFFFF);
             int32_t diff = (int32_t)ah_sq - (int32_t)(int16_t)xval_sq;
             int64_t sq = (int64_t)diff * (int64_t)diff;
@@ -12176,10 +12155,8 @@ static int c54x_exec_one(C54xState *s)
             int ymod_p = (op >> 2) & 0x03;
             uint16_t xval_p = data_read(s, s->ar[xar_p]);
             uint16_t yval_p = data_read(s, s->ar[yar_p]);
-            switch (xmod_p) { case 1: s->ar[xar_p]--; break; case 2: s->ar[xar_p]++; break;
-                case 3: s->ar[xar_p] = c54x_circ_ref(s->ar[xar_p], +(int16_t)s->ar[0], s->bk); break; }
-            switch (ymod_p) { case 1: s->ar[yar_p]--; break; case 2: s->ar[yar_p]++; break;
-                case 3: s->ar[yar_p] = c54x_circ_ref(s->ar[yar_p], +(int16_t)s->ar[0], s->bk); break; }
+            c54x_par_postmod(s, xar_p, xmod_p);
+            c54x_par_postmod(s, yar_p, ymod_p);
             /* [2026-08-23] 0xBC00-0xBFFF est MASR dual, pas POLY. binutils :
              *   { "masr", 0xBC00, 0xFC00, {OP_Xmem,OP_Ymem,OP_SRC,OP_DST} }
              *   { "poly", 0x3600, 0xFF00, {OP_Smem} }   <- POLY est ailleurs
@@ -12190,7 +12167,7 @@ static int c54x_exec_one(C54xState *s)
             if (c54x_mas_dual()) {
                 int64_t pr = (int64_t)(int16_t)xval_p * (int64_t)(int16_t)yval_p;
                 if (s->st1 & ST1_FRCT) pr <<= 1;
-                pr += 0x8000;                       /* arrondi */
+                pr = c54x_round16(pr);              /* arrondi R */
                 int srcr = (op >> 9) & 1, dstr = (op >> 8) & 1;
                 int64_t baser = srcr ? s->b : s->a;
                 if (dstr) s->b = sext40(baser - pr);
@@ -12201,7 +12178,7 @@ static int c54x_exec_one(C54xState *s)
             int16_t ah_p = (int16_t)((s->a >> 16) & 0xFFFF);
             int64_t prod_p = (int64_t)ah_p * (int64_t)(int16_t)s->t;
             if (s->st1 & ST1_FRCT) prod_p <<= 1;
-            prod_p += 0x8000; /* round */
+            prod_p = c54x_round16(prod_p);
             s->b = sext40(s->b + prod_p);
             s->a = sext40((int64_t)(int16_t)xval_p << 16);
             s->t = yval_p;
@@ -12219,10 +12196,8 @@ static int c54x_exec_one(C54xState *s)
             int ymod_b8 = (op >> 2) & 0x03;
             uint16_t xval_b8 = data_read(s, s->ar[xar_b8]);
             uint16_t yval_b8 = data_read(s, s->ar[yar_b8]);
-            switch (xmod_b8) { case 1: s->ar[xar_b8]--; break; case 2: s->ar[xar_b8]++; break;
-                case 3: s->ar[xar_b8] = c54x_circ_ref(s->ar[xar_b8], +(int16_t)s->ar[0], s->bk); break; }
-            switch (ymod_b8) { case 1: s->ar[yar_b8]--; break; case 2: s->ar[yar_b8]++; break;
-                case 3: s->ar[yar_b8] = c54x_circ_ref(s->ar[yar_b8], +(int16_t)s->ar[0], s->bk); break; }
+            c54x_par_postmod(s, xar_b8, xmod_b8);
+            c54x_par_postmod(s, yar_b8, ymod_b8);
             /* [2026-08-23] MAS dual : binutils { "mas", 0xB800, 0xFC00,
              * {OP_Xmem,OP_Ymem,OP_SRC,OP_DST} }. SPRU172C l.1122 :
              *     dst = src - Xmem*Ymem   ET   T = Xmem
@@ -12245,7 +12220,7 @@ static int c54x_exec_one(C54xState *s)
             }
             prod_b8 = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_b8;
             if (s->st1 & ST1_FRCT) prod_b8 <<= 1;
-            if (hi8 & 0x01) prod_b8 += 0x8000;
+            if (hi8 & 0x01) prod_b8 = c54x_round16(prod_b8);
             dst_b8 = (hi8 & 0x02) ? 1 : 0;
             /* MAS: subtract */
             if (dst_b8) s->b = sext40(s->b - prod_b8);
@@ -12307,7 +12282,7 @@ ba_handler:
             int arrondi= ((op >> 9)  & 1);           /* 0xAA/0xAE = arrondi      */
             int64_t p_l = (int64_t)(int16_t)s->t * (int64_t)(int16_t)yv_l;
             if (s->st1 & ST1_FRCT) p_l <<= 1;
-            if (arrondi) p_l += 0x8000;
+            if (arrondi) p_l = c54x_round16(p_l);
             int64_t *acc_ld = dst_l ? &s->b : &s->a;   /* recoit le LD  */
             int64_t *acc_op = dst_l ? &s->a : &s->b;   /* recoit le MAC */
             *acc_op = sext40(soust ? (*acc_op - p_l) : (*acc_op + p_l));
@@ -12613,8 +12588,7 @@ ba_handler:
                     prod = (int64_t)(int16_t)s->t * xs;
                     if (s->st1 & ST1_FRCT) prod <<= 1;
                     if (op & 0x0400) {            /* R = b10 : arrondi */
-                        prod += 0x8000;
-                        prod &= ~0xFFFFLL;
+                        prod = c54x_round16(prod);
                     }
                     *dstp = sext40((op & 0x0800) ? (*dstp - prod)
                                                  : (*dstp + prod));
@@ -12647,18 +12621,8 @@ ba_handler:
             int yar_c  = (op & 0x03) + 2;
             uint16_t xval_c = data_read(s, s->ar[xar_c]);
             uint16_t yval_c = data_read(s, s->ar[yar_c]);
-            switch (xmod_c) {
-            case 0: break;
-            case 1: s->ar[xar_c]--; break;   /* *AR- (SPRU131G T.5-8 : 01=dec) — fix 2026-06-22 */
-            case 2: s->ar[xar_c]++; break;   /* *AR+ (10=inc) */
-            case 3: s->ar[xar_c] = c54x_circ_ref(s->ar[xar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
-            }
-            switch (ymod_c) {
-            case 0: break;
-            case 1: s->ar[yar_c]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
-            case 2: s->ar[yar_c]++; break;
-            case 3: s->ar[yar_c] = c54x_circ_ref(s->ar[yar_c], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ (Ymem 0xd3dc @0xfa98) — fix 2026-06-01 */
-            }
+            c54x_par_postmod(s, xar_c, xmod_c);
+            c54x_par_postmod(s, yar_c, ymod_c);
             /* MAC dual-mem formula : T × Xmem (pas X × Y per SPRU pure).
              *
              * 2026-05-08 retest empirique avec pipeline stable :
@@ -12675,7 +12639,7 @@ ba_handler:
              * matche pas la sémantique attendue par le firmware. */
             int64_t prod_c = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_c;
             if (s->st1 & ST1_FRCT) prod_c <<= 1;
-            if (hi8 & 0x01) prod_c += 0x8000; /* round */
+            if (hi8 & 0x01) prod_c = c54x_round16(prod_c);
             int is_sub_c = (hi8 >= 0xD4);
             int dst_c = (hi8 & 0x02) ? 1 : 0;
             if (dst_c) {
@@ -12701,18 +12665,8 @@ ba_handler:
             int yar_db  = (op & 0x03) + 2;
             uint16_t xval_db = data_read(s, s->ar[xar_db]);
             (void)data_read(s, s->ar[yar_db]); /* Ymem read (unused) */
-            switch (xmod_db) {
-            case 0: break;
-            case 1: s->ar[xar_db]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
-            case 2: s->ar[xar_db]++; break;
-            case 3: s->ar[xar_db] = c54x_circ_ref(s->ar[xar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
-            }
-            switch (ymod_db) {
-            case 0: break;
-            case 1: s->ar[yar_db]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
-            case 2: s->ar[yar_db]++; break;
-            case 3: s->ar[yar_db] = c54x_circ_ref(s->ar[yar_db], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
-            }
+            c54x_par_postmod(s, xar_db, xmod_db);
+            c54x_par_postmod(s, yar_db, ymod_db);
             int64_t prod_db = (int64_t)(int16_t)s->t * (int64_t)(int16_t)xval_db;
             if (s->st1 & ST1_FRCT) prod_db <<= 1;
             s->a = sext40(s->a + prod_db);
@@ -12730,18 +12684,8 @@ ba_handler:
             int yar_dc  = (op & 0x03) + 2;
             uint16_t xval_dc = data_read(s, s->ar[xar_dc]);
             (void)data_read(s, s->ar[yar_dc]); /* Ymem pipeline read */
-            switch (xmod_dc) {
-            case 0: break;
-            case 1: s->ar[xar_dc]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
-            case 2: s->ar[xar_dc]++; break;
-            case 3: s->ar[xar_dc] = c54x_circ_ref(s->ar[xar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
-            }
-            switch (ymod_dc) {
-            case 0: break;
-            case 1: s->ar[yar_dc]--; break;   /* fix 2026-06-22 (SPRU131G T.5-8) */
-            case 2: s->ar[yar_dc]++; break;
-            case 3: s->ar[yar_dc] = c54x_circ_ref(s->ar[yar_dc], +(int16_t)s->ar[0], s->bk); break; /* *AR+0% circ — fix 2026-06-01 */
-            }
+            c54x_par_postmod(s, xar_dc, xmod_dc);
+            c54x_par_postmod(s, yar_dc, ymod_dc);
             s->t = xval_dc;
             int64_t prod_dc = (int64_t)(int16_t)xval_dc * (int64_t)(int16_t)xval_dc;
             if (s->st1 & ST1_FRCT) prod_dc <<= 1;
@@ -12913,39 +12857,16 @@ ba_handler:
             uint16_t ld_val = data_read(s, s->ar[xar]);
             int64_t loaded = (int64_t)(int16_t)ld_val << 16;
             if (d_acc) s->b = sext40(loaded); else s->a = sext40(loaded);
-            switch (xmod) {
-            case 0: break;                             /* *ARi (no mod) */
-            case 1: s->ar[xar]--; break;               /* *ARi- (SPRU131G T.5-8 : 01=dec) — fix 2026-06-22 */
-            case 2: s->ar[xar]++; break;               /* *ARi+ (10=inc) */
-            case 3:                                    /* *ARi+0% — CIRCULAIRE modulo BK
-                                                        * (était linear += AR0 → AR drift
-                                                        * 16-bit vers 0x18=MMR_SP → SP-CATAS).
-                                                        * Miroir du single-operand case 0xE. */
-                if (s->bk) {
-                    uint16_t base = s->ar[xar] - (s->ar[xar] % s->bk);
-                    uint16_t v = s->ar[xar] + s->ar[0];
-                    if (v >= (uint16_t)(base + s->bk)) v -= s->bk;
-                    s->ar[xar] = v;
-                } else {
-                    s->ar[xar] += s->ar[0];            /* BK=0 → linéaire (pas de circ) */
-                }
-                break;
-            }
-            switch (ymod) {
-            case 0: break;
-            case 1: s->ar[yar]--; break;               /* *ARi- (SPRU131G 01=dec) — fix 2026-06-22 */
-            case 2: s->ar[yar]++; break;               /* *ARi+ (10=inc) */
-            case 3:                                    /* *ARi+0% — circulaire modulo BK */
-                if (s->bk) {
-                    uint16_t base = s->ar[yar] - (s->ar[yar] % s->bk);
-                    uint16_t v = s->ar[yar] + s->ar[0];
-                    if (v >= (uint16_t)(base + s->bk)) v -= s->bk;
-                    s->ar[yar] = v;
-                } else {
-                    s->ar[yar] += s->ar[0];
-                }
-                break;
-            }
+            /* [2026-08-25] Ces deux switch etaient la DERNIERE copie manuelle du
+             * post-modificateur dual — et la seule a porter encore l ANCIENNE
+             * addressage circulaire (base = AR - AR % BK, une grille de multiples
+             * de BK). c54x_circ_ref l a remplacee le 2026-07-29 : sur le C54x la
+             * base est alignee sur la puissance de 2 qui couvre BK, pas sur un
+             * multiple de BK. Les deux implementations coexistaient donc dans le
+             * meme fichier et divergeaient des que BK n etait pas une puissance de
+             * 2. Tout passe desormais par c54x_par_postmod(). */
+            c54x_par_postmod(s, xar, xmod);
+            c54x_par_postmod(s, yar, ymod);
             return consumed + s->lk_used;
         }
         goto unimpl;
@@ -20322,9 +20243,14 @@ void c54x_bsp_load(C54xState *s, const uint16_t *samples, int n)
                  * du sens à TS0. On pousse donc FCCH **et** SCH (=FCCH+1). Le DMA route
                  * par AAD (FCCH→0x0cce, SCH→0x0e4e) sur des trames DIFFÉRENTES, donc
                  * 0x0cce reste propre (que du FCCH), 0x0e4e reçoit enfin un vrai SCH. */
-                int _is_fcch = ((_p % 10) == 1) && (_p <= 41); /* FCCH ∈ {1,11,21,31,41} */
-                int _is_sch  = ((_p % 10) == 2) && (_p <= 42); /* SCH  ∈ {2,12,22,32,42} */
-                _push = _is_fcch || _is_sch;
+                /* [2026-08-25] CORRIGE — ce site utilisait la convention « +1 »
+                 * ({1,11,21,31,41} pour la FCCH) alors que le meme lot corrigeait
+                 * feed_iq vers les positions CANONIQUES ({0,10,20,30,40}). Avec
+                 * CALYPSO_RIF_FCCH_ONLY=1 le filtre jetait donc TOUTES les vraies
+                 * FCCH et ne poussait que le SCH et la trame suivante — l inverse
+                 * exact de son intention. Predicats partages : calypso_gsm0502.h. */
+                _push = gsm0502_p51_is_fcch((unsigned)_p) ||
+                        gsm0502_p51_is_sch((unsigned)_p);
             }
         }
         if (_push)
