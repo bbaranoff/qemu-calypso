@@ -263,6 +263,37 @@ void calypso_trx_api_commit_w(uint32_t arm_offset, uint16_t value)
     }
 }
 
+/* [2026-08-22] AUTO-RECALAGE FN sur la SCH — LE VRAI FIX (remplace la béquille
+ * DL_FN_OFFSET codée en dur). Un vrai mobile adopte la FN du BTS portée par le SCH
+ * (T1/T2/T3). calypso_trx_autosync_fn() reçoit la FN du SCH décodé et, au 1er SCH,
+ * fige offset = sch_fn - trx_fn -> l'horloge émulée se cale à la source, sans valeur
+ * codée en dur. Gate CALYPSO_DL_FN_AUTOSYNC (défaut 1). Un CALYPSO_DL_FN_OFFSET
+ * manuel désactive l'auto (override explicite, ancien comportement). */
+static int64_t g_auto_fn_off = 0;
+static int     g_auto_fn_armed = 0;
+
+/* Appelee depuis calypso_dsp_shunt.c (chemin SCH gr-gsm), qui la declare en
+ * `extern`. Sans prototype visible ici, -Werror=missing-prototypes casse le
+ * build. Meme convention que calypso_dsp_shunt_set_dcch plus haut. */
+void calypso_trx_autosync_fn(uint32_t sch_fn);   /* -Werror=missing-prototypes */
+
+void calypso_trx_autosync_fn(uint32_t sch_fn)
+{
+    if (g_auto_fn_armed || !g_trx) return;
+    if (getenv("CALYPSO_DL_FN_OFFSET")) { g_auto_fn_armed = 1; return; } /* override manuel gagne */
+    static int gate = -1;
+    if (gate < 0) {
+        const char *e = getenv("CALYPSO_DL_FN_AUTOSYNC");
+        gate = (e && *e == '0') ? 0 : 1;   /* défaut ON */
+    }
+    if (!gate) { g_auto_fn_armed = 1; return; }
+    g_auto_fn_off = (int64_t)sch_fn - (int64_t)g_trx->fn;
+    g_auto_fn_armed = 1;
+    fprintf(stderr, "[trx] AUTO-SYNC FN sur SCH : sch_fn=%u trx_fn=%u -> offset=%lld "
+            "(recalage a la source, remplace la bequille DL_FN_OFFSET)\n",
+            sch_fn, (unsigned)g_trx->fn, (long long)g_auto_fn_off);
+}
+
 uint32_t calypso_trx_get_fn(void)
 {
     if (!g_trx) {
@@ -289,7 +320,7 @@ uint32_t calypso_trx_get_fn(void)
             off = atoi(e);
         }
     }
-    return (uint32_t)((int64_t)g_trx->fn + off);
+    return (uint32_t)((int64_t)g_trx->fn + off + g_auto_fn_off);
 }
 
 /* ---- DSP API RAM ---- */
