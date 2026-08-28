@@ -49,7 +49,6 @@
 #include "calypso_dsp_shunt.h"
 #include "hw/arm/calypso/calypso_trf6151.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
-#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_c54x.h"   /* C54xState + c54x_bsp_load/run/interrupt_ex/wake (CALYPSO_DSP=c54x route) */
 #include "calypso_layer1.h" /* calypso_l1_c_active() : ungate SB/SI (+FB) sous CALYPSO_L1=c */
 #include "hw/arm/calypso/calypso_dsp_internal.h" /* shared state + NDB-write primitives (split) */
@@ -1770,6 +1769,164 @@ static void shunt_dispatch_tch_sacch(uint8_t page_idx)
  * helper wp_base() existant. Replique la DMA de trx calypso_dsp_done(@711) :
  * data[0x0584]=page, data[0x0585]=fn, data[0x0586+i]=wp[i] (i<20), et le mirror
  * api_ram[0x08E2 - C54X_API_BASE]=page (d_dsp_page cote DSP, lu par le firmware). */
+/* Lecture DIRECTE de l'espace data[] du c54x pour une adresse API ARM,
+ * SANS round-trip MMIO calypso_dsp_read (qui prend calypso_pcb_daram_lock,
+ * mutex non-recursif -> re-lock/abort quand on est deja dans le contexte
+ * frame-tick). Meme mapping que calypso_dsp_read : ARM off O -> data[O/2+0x800]. */
+static inline uint16_t shunt_c54x_api_rd(C54xState *dsp, uint32_t arm_addr)
+{
+    return dsp->data[((arm_addr - 0xFFD00000UL) >> 1) + 0x0800];
+}
+
+/* [2026-07-24] CADENCE SPLIT : shunt_route_to_c54x() etait appelee UNIQUEMENT
+ * quand g_shunt.pending (= l'ARM vient de poster un NOUVEAU d_dsp_page), soit
+ * ~1 fois toutes les ~12 trames reelles en pratique (mesure runtime : 708 insn
+ * DSP/tour mais ~57ms reels/tour -- le go-live retry loop du DSP n'a donc
+ * qu'une fraction de son temps reel pour attraper la fenetre de survie de
+ * data[0x0810]/d_ctrl_system, contrairement au natif ou c54x_run tourne a
+ * chaque trame SANS gate sur un dispatch ARM frais). Le natif ne connait pas
+ * ce probleme : calypso_tdma_tick() appelle c54x_run() inconditionnellement
+ * (gate uniquement sur running/idle/shunt_active), jamais sur "tache neuve".
+ *
+ * Fix : separer le header (partie A, a besoin de page_idx/d_fn FRAIS, donc
+ * reste gate sur pending -- cf le fix staleness du meme jour juste au-dessus)
+ * du wake+run (partie B, ne depend pas d'un dispatch frais : rejoue le
+ * dernier IQ connu, tire l'IT frame, tourne le budget DSP -- exactement ce
+ * que native fait a chaque trame). Partie B devient appelable a CHAQUE trame,
+ * pending ou pas, pour retrouver une cadence proche du natif (~217Hz au lieu
+ * de ~17Hz). */
+static void shunt_route_to_c54x_header(uint8_t page_idx)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+    fprintf(stderr, "[c54x-route] enter page=%u dsp=%p\n", (unsigned)page_idx, (void*)dsp);
+
+    /* (a) API write-page -> DARAM 0x0586 (replique de la DMA trx gatee a :711).
+     * wp_base(page_idx) = adresse MMIO absolue de la write-page (== dsp_ram).
+     * Le mot d_dsp_page (NDB+0 = 0xFFD001A8) est lu live (= s->dsp_ram[0x01A8/2]
+     * cote trx) pour data[0x0584] et le mirror 0x08E2. */
+    {
+        uint32_t wbase    = wp_base(page_idx);
+        fprintf(stderr, "[c54x-route] a1 wbase=0x%08x\n", wbase);
+        /* [2026-07-24] FIX RACE : l'ancien lisait dsp->data[NDB_D_DSP_PAGE]=data[0x08E2]
+         * ICI-MEME (mid-frame), une cellule que data[0x08E2] toggle entre ce
+         * moment et le FRAME-IT qui suit dans CETTE MEME invocation (confirme
+         * runtime : a2 voit 186/186 fois 0x0000, FRAME-IT# voit 559/559 fois
+         * 0x0003, sur la MEME cellule -- pas un bug d'adresse, un bug de
+         * timing/staleness). page_idx (parametre) est DEJA la valeur fraiche,
+         * capturee au moment de l'ecriture ARM (cf ligne ~135 :
+         * page_idx = (new_d_dsp_page & B_GSM_PAGE) ? 1 : 0). On reconstruit
+         * dsp_page depuis cette valeur connue-fraiche au lieu de relire une
+         * cellule sujette a race, evitant de repropager du perime dans
+         * data[0x0584]/api_ram[0x08E2] ci-dessous. */
+        uint16_t dsp_page = B_GSM_TASK | page_idx;
+        /* [2026-07-29] La « race » decrite juste au-dessus n'en etait pas une :
+         * a2 affichait data[0x08E2] (jamais ecrit) et le FRAME-IT affichait
+         * api_ram[0x08E2] (ecrit par le miroir ci-dessous) — deux tableaux
+         * distincts, deux valeurs, aucune course. Et 0x08E2 n'etait de toute
+         * facon pas la bonne cellule : d_dsp_page = 0x08D4 (cf calypso_fbsb.h).
+         * On affiche desormais la cellule que la ROM lit reellement, dans le
+         * tableau qu'elle lit reellement (api_ram). */
+        fprintf(stderr, "[c54x-route] a2 dsp_page=0x%04x (from page_idx=%u, "
+                "api_ram[0x%04x]=0x%04x) api_ram=%p\n",
+                dsp_page, (unsigned)page_idx, NDB_D_DSP_PAGE,
+                dsp->api_ram ? dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE]
+                             : dsp->data[NDB_D_DSP_PAGE],
+                (void*)dsp->api_ram);
+        dsp->data[0x0584] = dsp_page;
+        dsp->data[0x0585] = (uint16_t)(g_shunt.d_fn & 0xFFFF);
+        fprintf(stderr, "[c54x-route] a3 data-hdr-ok\n");
+        for (int i = 0; i < 20; i++)
+            dsp->data[0x0586 + i] = shunt_c54x_api_rd(dsp, wbase + (uint32_t)i * 2);
+        fprintf(stderr, "[c54x-route] a4 wp-copy-ok\n");
+        /* [2026-07-29] Miroir d_dsp_page cote DSP. Ecrivait 0x08E2 = d_dsp_state :
+         * la page ecrasait le C_DSP_IDLE3 pose par l'ARM (dsp.c:215), et la ROM,
+         * qui lit 0x08D4 (0xa51c/0xc8ea), ne voyait rien. Corrige a la source —
+         * ce qui remplit la condition de retrait de la bequille FIX_DPAGE_OFF
+         * (calypso_c54x.c), retiree du meme coup. */
+        if (dsp->api_ram)
+            dsp->api_ram[NDB_D_DSP_PAGE - C54X_API_BASE] = dsp_page;
+    }
+    fprintf(stderr, "[c54x-route] a-daram-ok\n");
+}
+
+static void shunt_route_to_c54x_run(void)
+{
+    C54xState *dsp = g_shunt.c54x;
+    if (!dsp)
+        return;
+
+    /* (b) rejoue le dernier burst I/Q (cs16 entrelace I,Q) dans bsp_buf. */
+    if (g_shunt.last_iq_valid && g_shunt.last_iq_n > 0)
+        c54x_bsp_load(dsp, (const uint16_t *)g_shunt.last_iq, g_shunt.last_iq_n);
+
+    fprintf(stderr, "[c54x-route] b-bsp-load-ok n=%d\n", g_shunt.last_iq_n);
+    /* (c) INT3 FRAME + wake : reveille le DSP s'il etait idle/halt. */
+    g_c54x_int3_src = 3;
+    /* [2026-07-22] FRAME_IT_NATIVE : tick propre — livre le scheduler frame
+     * (vec28/bit12) DIRECTEMENT au frame-tick, pas via le remap 19/3. Le
+     * c54x_irq_level_check le prend quand INTM=0 (prise naturelle, pas de force).
+     * = le vrai primitif HW frame-sync. Sinon (legacy) : vec19/bit3 (+remap VEC28). */
+    {
+        /* @BEQUILLE — FRAME_IT_NATIVE  (CALYPSO_FRAME_IT_NATIVE, EXISTS ; :=1 en
+         *              native / native_helped / wire)
+         *   masque  : l'absence de cablage frame-TPU -> vecteur DSP. On appelle
+         *             directement c54x_interrupt_ex(dsp,28,12) au frame-tick au lieu de
+         *             19/3 (le stub vec19 est un RETE).
+         *   retirer : quand le TPU delivre l'IT frame sur le bon vecteur tout seul
+         *             (idem VEC28_REMAP cote calypso_c54x.c).
+         */
+        static int fin = -1;
+        if (fin < 0) fin = calypso_gate("CALYPSO_FRAME_IT_NATIVE", 0);
+        if (fin)
+            c54x_interrupt_ex(dsp, 28, 12);   /* scheduler frame IT, tick propre */
+        else
+            c54x_interrupt_ex(dsp, C54X_INT_FRAME_VEC, C54X_INT_FRAME_BIT);
+        /* [2026-07-23] TINT MASTER CLOCK sync frame : fire TINT au MEME tick TDMA
+         * (pas per-2000-insn). Handler 0x72d3 = driver slots op.
+         * [2026-08-03] CAL000 §5.1 : TINT = bit3/vec19, pas bit4/vec20 (= RINT/SPI
+         * receive). Bascule sous le sas CALYPSO_IT_TABLE_DOC, cf. calypso_c54x.c. */
+        {
+            /* @BEQUILLE — TINT0_MASTER (fire au frame-tick)  (CALYPSO_TINT0_MASTER, EXISTS,
+             *              defaut OFF hors profil WIRE)
+             *   masque  : la configuration/demarrage du TIMER0 par le ROM. Le firmware arrete
+             *             le timer (TSS=1) dans une init non-tournee ; on fabrique TINT
+             *             a la cadence trame.
+             *   retirer : quand la sequence d'init TIMER0 du ROM s'execute (TCR programme).
+             */
+            static int _t0m = -1;
+            if (_t0m < 0) _t0m = calypso_gate("CALYPSO_TINT0_MASTER", 0);
+            if (_t0m) {
+                static int _doc = -1;
+                if (_doc < 0) _doc = calypso_gate("CALYPSO_IT_TABLE_DOC", 0);
+                if (_doc)   /* §5.1 : TINT = IMR bit 3 / vec 19 */
+                    c54x_interrupt_ex(dsp, C54X_IT_TINT_VEC, C54X_IT_TINT_BIT);
+                else        /* legacy SPRU131 : en fait RINT / SPI receive */
+                    c54x_interrupt_ex(dsp, C54X_IT_SPI_RX_VEC, C54X_IT_SPI_RX_BIT);
+            }
+        }
+    }
+    c54x_wake(dsp);
+    /* revive: c54x_run loop gate = (running && !idle). c54x_wake ne clear que
+     * idle ; en mode route_c54x le chemin trx qui posait running=true est gate
+     * off -> forcer running ici sinon la boucle c54x_run est sautee (0 insn). */
+    dsp->running = true;
+
+    fprintf(stderr, "[c54x-route] c-wake-ok running=%d idle=%d\n", dsp->running, dsp->idle);
+    /* (d) execute le budget (1 trame nominale ~256000 insns ; ajustable env). */
+    {
+        static int budget = -1;
+        if (budget < 0) {
+            const char *b = getenv("CALYPSO_DSP_BUDGET");
+            budget = (b && *b) ? atoi(b) : 256000;
+            if (budget <= 0) budget = 256000;
+        }
+        fprintf(stderr, "[c54x-route] d-pre-c54x_run budget=%d\n", budget);
+        c54x_run(dsp, budget);
+        fprintf(stderr, "[c54x-route] d-c54x_run-RETURNED\n");
+    }
+}
 
 /* ---- Service hook : called from calypso_trx frame_irq tick ---- */
 /* [AFC loop-close v2] derniere mesure de frequence BRUTE du FCCH (Hz), pour
@@ -1962,21 +2119,15 @@ void calypso_dsp_shunt_on_frame_tick(void)
              * enroule -> le firmware enroule au rail sur une valeur stale. Ici
              * l'erreur effective DECROIT a mesure que le DAC monte -> converge. */
             if (g_rx_raw_valid) {
-                /* [2026-08-25] `raw - get_afc_hz()` codait en dur le signe de la
-                 * rotation. Depuis l inversion de ce signe (twl3025), apply_phase
-                 * AJOUTE +hz au bande de base tandis qu on en retranchait hz :
-                 * rx_afc annonçait une correction opposee a celle appliquee, soit
-                 * un residu faux de 2*hz. get_afc_applied_hz() porte le signe. */
-                double _applied = calypso_twl3025_get_afc_applied_hz();
-                double _eff = g_rx_raw_hz + _applied;
+                double _eff = g_rx_raw_hz - calypso_twl3025_get_afc_hz();
                 double _a = _eff * (65536.0 / 86208.0);
                 if (_a >  32767.0) _a =  32767.0;
                 if (_a < -32768.0) _a = -32768.0;
                 g_shunt.rx_afc = (int16_t)_a;
                 static unsigned _afl = 0;
                 if ((_afl++ % 200) == 0)
-                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz applique=%.0fHz eff=%.0fHz -> rx_afc=%d\n",
-                            g_rx_raw_hz, _applied, _eff, g_shunt.rx_afc);
+                    fprintf(stderr, "[AFC-LOOP] raw=%.0fHz dac_hz=%.0f eff=%.0fHz -> rx_afc=%d\n",
+                            g_rx_raw_hz, calypso_twl3025_get_afc_hz(), _eff, g_shunt.rx_afc);
             }
             /* [DECAN model-fidelity] garder le VRAI rx_snr (coherence feed_iq)
              * quand DECAN_SNR actif, sinon le de-can SNR est defait ici. */
@@ -3636,9 +3787,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
          * s2=0x0000` — le feed ecrivait des ZEROS depuis le debut. Confirme
          * independamment par tools_/corr_iq.py : bursts non nuls a fn%51 ∈
          * {0,10,20,30,40}. Gate CALYPSO_FEED_FN_CANON=0 pour restaurer le +1. */
-        int _is_fcch = feed_fn_canon()
-                       ? gsm0502_p51_is_fcch((unsigned)_p)
-                       : gsm0502_p51_is_fcch_legacy_plus1((unsigned)_p);
+        int _is_fcch = feed_fn_canon() ? ((_p % 10 == 0) && (_p <= 40))
+                                       : ((_p % 10 == 1) && (_p <= 41));
         /* @BEQUILLE — FB_IQ_MARKER  (CALYPSO_FB_IQ_MARKER, atoi>0, defaut OFF)
          *   masque  : rien de reel — remplace l'IQ par une RAMPE 0x1000+woff pour tester
          *             la reachabilite de la vue DARAM du noyau. Court-circuite la branche
@@ -3732,9 +3882,8 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
             /* [2026-08-22] CORRIGE : le SCH est en {1,11,21,31,41} (canonique
              * GSM 05.02, prouve par FN-ALIGN sch%51). J'avais herite de la fausse
              * premisse « FCCH=+1 » du bloc FB et vise {2,12,22,32,42} -> zeros. */
-            int _is_sch = feed_fn_canon()
-                          ? gsm0502_p51_is_sch((unsigned)_sp)
-                          : gsm0502_p51_is_sch_legacy_plus1((unsigned)_sp);
+            int _is_sch = feed_fn_canon() ? ((_sp % 10 == 1) && (_sp <= 41))
+                                          : ((_sp % 10 == 2) && (_sp <= 42));
             if (_is_sch) {
                 uint16_t base = _sbbase; int dl = 0x128; int woff = 0;
                 /* /!\ 0x0e4e est DANS la fenetre API (0x0800..0x27FF) : c'est
@@ -3858,9 +4007,7 @@ void calypso_dsp_shunt_feed_iq(uint32_t fn, const int16_t *iq, int n)
                      * -> 0 => convergence (gain~1, init -700). fs=1083333 (4 SPS). */
                     double raw_hz = resid * (1083333.0 / (2.0 * M_PI));
                     g_rx_raw_hz = raw_hz; g_rx_raw_valid = 1; /* memo pour recompute per-tick */
-                    /* [2026-08-25] cf. AFC-LOOP : residu = brut + ce qui a ete
-                     * REELLEMENT applique aux echantillons (signe compris). */
-                    double eff_hz = raw_hz + calypso_twl3025_get_afc_applied_hz();
+                    double eff_hz = raw_hz - calypso_twl3025_get_afc_hz();
                     double a = eff_hz * (65536.0 / 86208.0);
                     if (a >  32767.0) a =  32767.0;
                     if (a < -32768.0) a = -32768.0;

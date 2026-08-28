@@ -303,10 +303,4 @@ void shunt_dispatch_sb(uint8_t page_idx);
 void shunt_dispatch_allc(uint8_t page_idx);
 void shunt_dispatch_pm(uint8_t page_idx);
 
-/* ---- "Legit" c54x route (calypso_dsp_legit.c) ----
- * Both gated on CALYPSO_DSP_RUN_C54X=1 at their call sites in
- * calypso_dsp_shunt.c; shunt_legit sets it to 0, so neither runs by default. */
-void shunt_route_to_c54x_header(uint8_t page_idx);
-void shunt_route_to_c54x_run(void);
-
 #endif /* CALYPSO_DSP_INTERNAL_H */

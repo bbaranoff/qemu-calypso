@@ -34,7 +34,6 @@
 #include "hw/arm/calypso/calypso_invariants.h"
 #include "hw/arm/calypso/calypso_twl3025.h"
 #include "hw/arm/calypso/calypso_trx.h"
-#include "hw/arm/calypso/calypso_gsm0502.h"  /* positions FCCH/SCH, definition unique */
 #include "calypso_tint0.h"  /* GSM_HYPERFRAME */
 #include "calypso_full_pcb.h"  /* DARAM lock helpers — voir pcb.h gap #3 */
 #include "calypso_dsp_shunt.h"
@@ -1632,8 +1631,8 @@ void calypso_bsp_rx_burst(uint8_t tn, uint32_t fn,
              *   FCCH = {0,10,20,30,40} mod 51   (tache FB)
              *   SCH  = {1,11,21,31,41} mod 51   (tache SB, canonique GSM 05.02)
              * Mettre 2 pour restreindre a la FCCH seule (ancien comportement). */
-            bool _is_fcch = gsm0502_p51_is_fcch((unsigned)_p51);
-            bool _is_sch  = gsm0502_p51_is_sch((unsigned)_p51);
+            int _is_fcch = (_p51 % 10 == 0) && (_p51 <= 40);
+            int _is_sch  = (_p51 % 10 == 1) && (_p51 <= 41);
             _skip_nonfcch = (_dfo >= 2) ? !_is_fcch : !(_is_fcch || _is_sch);
             if (_skip_nonfcch) {
                 static unsigned _sk2 = 0;
@@ -1940,35 +1939,22 @@ void calypso_bsp_deliver_buffered(uint32_t current_fn)
          * de TOUS les feeds -> RIF). Ce chemin (deliver_buffered) n'est pas le
          * chemin natif vivant, et l'appliquer ici seul laissait la boucle AFC
          * ouverte sur le natif. Le laisser ici EN PLUS ferait une double rotation
-         * (deliver_buffered passe aussi par c54x_bsp_load). Retiré donc.
-         *
-         * [2026-08-25] MAIS il fallait aller au bout du déplacement. c54x_bsp_load
-         * tourne SA PROPRE COPIE (bsp.dsp->bsp_buf) ; il ne touche pas sl->iq. La
-         * boucle DARAM ci-dessous recopiait donc sl->iq — c'est-à-dire de l'I/Q
-         * NON TOURNÉ — alors qu'avant le déplacement elle voyait les échantillons
-         * tournés (apply_phase modifiait sl->iq sur place). Le tampon que le
-         * corrélateur FB lit en DARAM était le seul consommateur à avoir PERDU
-         * l'AFC. On écrit maintenant depuis bsp_buf, la copie tournée : une seule
-         * rotation, et les deux consommateurs voient la même chose. */
-        int nload = (n > 296) ? 296 : n;
+         * (deliver_buffered passe aussi par c54x_bsp_load). Retiré donc. */
+
         uint16_t samples[296];
-        for (int i = 0; i < nload; i++)
+        for (int i = 0; i < n && i < 296; i++)
             samples[i] = (uint16_t)sl->iq[i];
-        c54x_bsp_load(bsp.dsp, samples, nload);
-        /* c54x_bsp_load a pu décimer (entrée 4 SPS) : bsp_len est la longueur
-         * qui fait foi après rotation, jamais `n`. */
-        const uint16_t *rot = bsp.dsp->bsp_buf;
-        int nrot = (bsp.dsp->bsp_len < nload) ? bsp.dsp->bsp_len : nload;
+        c54x_bsp_load(bsp.dsp, samples, n > 296 ? 296 : n);
 
         /* ⚠️ TESTING : woff LOCAL (était static rolling cross-burst). */
         unsigned woff = 0;
         calypso_pcb_daram_lock_acquire();
-        for (int i = 0; i < nrot; i++) {
+        for (int i = 0; i < n; i++) {
             uint16_t a = (uint16_t)(bsp.daram_addr + woff);
             /* HACK CALYPSO_BSP_INJECT_CANARY : overwrite avec marker 0xCAFE
              * pour identifier le vrai buffer cible cote DSP via le hook
              * canary-read en c54x. Voir doc/TODO.md. */
-            uint16_t v = bsp.inject_canary ? 0xCAFE : rot[i];
+            uint16_t v = bsp.inject_canary ? 0xCAFE : (uint16_t)sl->iq[i];
             bsp.dsp->data[a] = v;
             bsp_daram_wr_bucket(a);
             woff++;

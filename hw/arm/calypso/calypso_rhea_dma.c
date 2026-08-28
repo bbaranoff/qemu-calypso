@@ -549,34 +549,9 @@ void calypso_rhea_dma_rx_request(C54xState *s)
                     pdst = dst_idx + (unsigned)max_words;   /* 2e page API = AAD+ALGTH */
             }
         }
-        /* [2026-08-25] BORNE EXPLICITE. Les pages contigues avancent la
-         * destination de max_words a chaque tour, alors que le seul plafond
-         * calcule plus haut (dst_idx + max_words <= C54X_API_SIZE) ne couvre
-         * QU UNE page. Le garde-fou etait un `if (... < C54X_API_SIZE)` a
-         * l interieur de la boucle de copie : il empechait le debordement du
-         * tableau, mais il jetait les mots EN SILENCE et continuait a drainer
-         * la FIFO du RIF — donc a perdre du burst sans que rien ne le dise. On
-         * s arrete a la fenetre, en le disant, et on laisse le reste dans la
-         * FIFO plutot que de le consommer pour rien. */
-        if (pdst >= (unsigned)C54X_API_SIZE) {
-            static unsigned n_full;
-            if (n_full++ < 5)
-                fprintf(stderr, "[rhea-dma] fenetre API pleine apres %d page(s) : "
-                        "AAD=0x%03x + %d mots atteint la fin de la memoire API, "
-                        "reste non draine\n", pages, rd.ch[n].aad, pages * max_words);
-            break;
-        }
-        if (pdst + (unsigned)got > (unsigned)C54X_API_SIZE) {
-            int fits = (int)((unsigned)C54X_API_SIZE - pdst);
-            static unsigned n_trim;
-            if (n_trim++ < 5)
-                fprintf(stderr, "[rhea-dma] page %d TRONQUEE a %d mots sur %d : "
-                        "AAD=0x%03x atteint la fin de la memoire API\n",
-                        pages, fits, got, rd.ch[n].aad);
-            got = fits;
-        }
         for (int i = 0; i < got; i++)
-            api[pdst + i] = buf[i];
+            if (pdst + (unsigned)i < C54X_API_SIZE)
+                api[pdst + i] = buf[i];
 
         for (int i = 0; i < got; i++)
             if (buf[i]) nz_total++;
