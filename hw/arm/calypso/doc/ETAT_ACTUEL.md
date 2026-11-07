@@ -1015,6 +1015,16 @@ manifeste ne trahit rien). Diagnostic :
 **QUATRE** variables `FIRMWARE_*` dans `environnement/local.env` — poser
 `FIRMWARE_DIR` seul ne suffit pas, la premiere branche de `paths.env` construirait
 le chemin sans le `board/` de l'arborescence de build.
+
+> **[2026-08-28] CADUC — lire ceci d'abord.** Il n'y a plus de branches : le
+> firmware a une source unique, `/opt/GSM/firmware`, posee en clair dans
+> `environnement/paths.env`. Les quatre `FIRMWARE_*` de `local.env` sont
+> supprimees, et le lien que `build-iso.sh` posait vers l'arbre de build
+> embarque avec elles aussi. Le piege decrit ci-dessus — recompiler `osmocom-bb` et voir
+> le run charger quand meme un autre ELF, sans un mot — ne peut donc plus se
+> produire ; sa contrepartie est qu'un firmware recompile doit desormais etre
+> DEPOSE dans `/opt/GSM/firmware` pour que le run le prenne. Le diagnostic, lui,
+> ne change pas : `ps -C qemu-system-arm -o args= | grep -o '\-kernel [^ ]*'`.
 ⚠️ `BUILD-STAMP` du manifeste **ne bouge pas** quand seul `calypso_c54x.c` est
 recompile : ne pas s'en servir pour verifier qu'une sonde est dans le binaire — le
 seul test fiable est **sa ligne d'armement**.

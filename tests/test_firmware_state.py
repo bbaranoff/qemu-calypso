@@ -39,9 +39,12 @@ KNOWN_BUSY_LOOPS = [
 ]
 
 # Path firmware ELF pour résoudre rxDoneFlag via nm.
+# [2026-08-28] Un seul candidat de depot : /opt/GSM/firmware. L'arbre de build
+# embarque qui passait en premier n'est plus consulte (source unique, cf.
+# environnement/paths.env) ; le garder ferait choisir ici un ELF que le run ne
+# charge pas, et les adresses resolues au nm ne vaudraient plus rien.
 FW_ELF_CANDIDATES = [
-    "/opt/GSM/qemu-src/target/firmware/board/compal_e88/layer1.highram.elf",
-    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf",   # repli : depot d artefacts
+    "/opt/GSM/firmware/board/compal_e88/layer1.highram.elf",
     os.environ.get("FW_ELF", ""),
 ]
 
